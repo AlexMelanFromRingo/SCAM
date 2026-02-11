@@ -42,6 +42,10 @@ pub enum WireMessage {
         locator: Vec<Hash256>,
         stop: Option<Hash256>,
     },
+    GetBlocks {
+        locator: Vec<Hash256>,
+        stop: Option<Hash256>,
+    },
     Headers {
         headers: Vec<BlockHeader>,
     },

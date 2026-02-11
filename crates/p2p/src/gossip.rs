@@ -128,6 +128,7 @@ impl GossipEngine {
             | WireMessage::Pong { .. }
             | WireMessage::NotFound { .. }
             | WireMessage::GetHeaders { .. }
+            | WireMessage::GetBlocks { .. }
             | WireMessage::Headers { .. } => Ok(Vec::new()),
         }
     }

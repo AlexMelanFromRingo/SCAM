@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use scam_core::{BlockHeader, Hash256};
 
 pub const MAX_HEADERS_PER_MESSAGE: usize = 2000;
+pub const MAX_BLOCK_HASHES_PER_MESSAGE: usize = 2000;
 pub const LOCATOR_SOFT_LIMIT: usize = 32;
 
 pub fn build_block_locator(main_chain: &[Hash256]) -> Vec<Hash256> {
@@ -45,15 +46,8 @@ pub fn select_headers_for_peer(
     }
 
     let max_headers = max_headers.min(MAX_HEADERS_PER_MESSAGE);
-    let mut height_by_hash = HashMap::<Hash256, usize>::with_capacity(main_chain.len());
-    for (height, hash) in main_chain.iter().copied().enumerate() {
-        height_by_hash.insert(hash, height);
-    }
-
-    let fork_height = locator
-        .iter()
-        .find_map(|hash| height_by_hash.get(hash).copied())
-        .unwrap_or(0);
+    let height_by_hash = build_height_index(main_chain);
+    let fork_height = fork_height_from_locator(locator, &height_by_hash);
     let mut start = fork_height.saturating_add(1);
     if start >= main_chain.len() {
         return Vec::new();
@@ -75,13 +69,61 @@ pub fn select_headers_for_peer(
     out
 }
 
+pub fn select_block_hashes_for_peer(
+    main_chain: &[Hash256],
+    locator: &[Hash256],
+    stop: Option<Hash256>,
+    max_hashes: usize,
+) -> Vec<Hash256> {
+    if main_chain.is_empty() || max_hashes == 0 {
+        return Vec::new();
+    }
+
+    let max_hashes = max_hashes.min(MAX_BLOCK_HASHES_PER_MESSAGE);
+    let height_by_hash = build_height_index(main_chain);
+    let fork_height = fork_height_from_locator(locator, &height_by_hash);
+    let mut start = fork_height.saturating_add(1);
+    if start >= main_chain.len() {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    while start < main_chain.len() && out.len() < max_hashes {
+        let hash = main_chain[start];
+        if Some(hash) == stop {
+            break;
+        }
+        out.push(hash);
+        start += 1;
+    }
+    out
+}
+
+fn build_height_index(main_chain: &[Hash256]) -> HashMap<Hash256, usize> {
+    let mut height_by_hash = HashMap::<Hash256, usize>::with_capacity(main_chain.len());
+    for (height, hash) in main_chain.iter().copied().enumerate() {
+        height_by_hash.insert(hash, height);
+    }
+    height_by_hash
+}
+
+fn fork_height_from_locator(
+    locator: &[Hash256],
+    height_by_hash: &HashMap<Hash256, usize>,
+) -> usize {
+    locator
+        .iter()
+        .find_map(|hash| height_by_hash.get(hash).copied())
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
 
     use scam_core::{BlockHeader, Hash256, Target, hash::hash256};
 
-    use crate::sync::{build_block_locator, select_headers_for_peer};
+    use crate::sync::{build_block_locator, select_block_hashes_for_peer, select_headers_for_peer};
 
     fn chain_headers(count: usize) -> (Vec<Hash256>, HashMap<Hash256, BlockHeader>) {
         let mut chain = Vec::new();
@@ -131,5 +173,24 @@ mod tests {
         let selected = select_headers_for_peer(&chain, &headers, &locator, stop, 100);
         assert_eq!(selected.len(), 4);
         assert_eq!(selected.last().expect("last").block_hash(), chain[14]);
+    }
+
+    #[test]
+    fn select_block_hashes_respects_stop_hash() {
+        let (chain, _) = chain_headers(30);
+        let locator = vec![chain[5], chain[0]];
+        let stop = Some(chain[9]);
+        let hashes = select_block_hashes_for_peer(&chain, &locator, stop, 100);
+        assert_eq!(hashes, vec![chain[6], chain[7], chain[8]]);
+    }
+
+    #[test]
+    fn select_block_hashes_is_limited() {
+        let (chain, _) = chain_headers(40);
+        let locator = vec![chain[10], chain[0]];
+        let hashes = select_block_hashes_for_peer(&chain, &locator, None, 3);
+        assert_eq!(hashes.len(), 3);
+        assert_eq!(hashes[0], chain[11]);
+        assert_eq!(hashes[2], chain[13]);
     }
 }

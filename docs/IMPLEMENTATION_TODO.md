@@ -176,7 +176,7 @@ Status: draft v1 (frozen decisions from user session on 2026-02-11)
 - [x] `ping`, `pong`
 - [x] `inv`, `getdata`, `tx`, `block`
 - [x] `getheaders`, `headers`
-- [ ] `getblocks` (optional if headers-first + getdata is enough)
+- [x] `getblocks` (optional if headers-first + getdata is enough)
 - [x] Use inventory-first propagation:
 - [x] announce hashes via `inv`
 - [x] request unknown objects via `getdata`

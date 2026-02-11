@@ -4,7 +4,7 @@ use std::net::TcpStream;
 use scam_core::{BlockHeader, Hash256};
 use thiserror::Error;
 
-use crate::wire::{WireMessage, decode_message, encode_message};
+use crate::wire::{InventoryItem, WireMessage, decode_message, encode_message};
 
 #[derive(Clone, Debug)]
 pub struct FramingConfig {
@@ -161,6 +161,37 @@ pub fn request_headers(
     }
 }
 
+pub fn request_blocks(
+    stream: &mut TcpStream,
+    cfg: &FramingConfig,
+    locator: Vec<Hash256>,
+    stop: Option<Hash256>,
+) -> Result<Vec<Hash256>, TransportError> {
+    send_message(stream, &WireMessage::GetBlocks { locator, stop }, cfg)?;
+    let response = read_message(stream, cfg)?;
+    match response {
+        WireMessage::Inv { items } => {
+            let mut hashes = Vec::<Hash256>::new();
+            for item in items {
+                match item {
+                    InventoryItem::Block(hash) => hashes.push(hash),
+                    InventoryItem::Tx(hash) => {
+                        return Err(TransportError::UnexpectedInventoryItem {
+                            expected: "block hash inventory",
+                            got: format!("tx:{hash}"),
+                        });
+                    }
+                }
+            }
+            Ok(hashes)
+        }
+        other => Err(TransportError::UnexpectedMessage {
+            expected: "inv",
+            got: format!("{other:?}"),
+        }),
+    }
+}
+
 fn parse_version(message: WireMessage) -> Result<RemoteHandshake, TransportError> {
     match message {
         WireMessage::Version {
@@ -193,6 +224,8 @@ pub enum TransportError {
     MessageTooLarge { limit: usize, got: usize },
     #[error("unexpected message: expected {expected}, got {got}")]
     UnexpectedMessage { expected: &'static str, got: String },
+    #[error("unexpected inventory item: expected {expected}, got {got}")]
+    UnexpectedInventoryItem { expected: &'static str, got: String },
 }
 
 #[cfg(test)]
@@ -203,9 +236,9 @@ mod tests {
 
     use scam_core::{Hash256, Target, hash::hash256};
 
-    use crate::sync::{build_block_locator, select_headers_for_peer};
+    use crate::sync::{build_block_locator, select_block_hashes_for_peer, select_headers_for_peer};
     use crate::transport::{
-        FramingConfig, LocalHandshake, WireMessage, client_handshake, read_message,
+        FramingConfig, LocalHandshake, WireMessage, client_handshake, read_message, request_blocks,
         request_headers, send_message, server_handshake,
     };
 
@@ -247,6 +280,17 @@ mod tests {
             let headers = select_headers_for_peer(&chain, &headers_map, &locator, stop, 2000);
             send_message(&mut stream, &WireMessage::Headers { headers }, &cfg)
                 .expect("send headers");
+
+            let request = read_message(&mut stream, &cfg).expect("read req");
+            let WireMessage::GetBlocks { locator, stop } = request else {
+                panic!("expected getblocks");
+            };
+            let hashes = select_block_hashes_for_peer(&chain, &locator, stop, 2000);
+            let items = hashes
+                .into_iter()
+                .map(crate::wire::InventoryItem::Block)
+                .collect();
+            send_message(&mut stream, &WireMessage::Inv { items }, &cfg).expect("send inv");
         });
 
         let mut stream = TcpStream::connect(addr).expect("connect");
@@ -265,6 +309,11 @@ mod tests {
         let headers = request_headers(&mut stream, &FramingConfig::default(), locator, None)
             .expect("headers");
         assert!(!headers.is_empty());
+
+        let locator = build_block_locator(&local_chain);
+        let blocks =
+            request_blocks(&mut stream, &FramingConfig::default(), locator, None).expect("blocks");
+        assert!(!blocks.is_empty());
 
         server.join().expect("server join");
     }
