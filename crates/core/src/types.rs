@@ -2,9 +2,11 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::codec::Encoder;
-use crate::hash::{Hash256, hash256};
+use crate::hash::{Hash256, hash256, tagged_hash256};
 use crate::merkle::merkle_root;
 use crate::target::Target;
+
+const TX_SIGNING_TAG: &[u8] = b"SCAM-tx-signing-v1";
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct OutPoint {
@@ -65,7 +67,10 @@ impl Transaction {
                 total_inputs: self.inputs.len(),
             });
         }
-        Ok(hash256(&self.encode_for_signing(input_index)))
+        Ok(tagged_hash256(
+            TX_SIGNING_TAG,
+            &self.encode_for_signing(input_index),
+        ))
     }
 
     pub fn encode_for_hash(&self) -> Vec<u8> {
@@ -246,5 +251,30 @@ mod tests {
         let first = tx.signing_digest(0).expect("digest");
         let second = tx.signing_digest(0).expect("digest");
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn signing_digest_is_domain_separated() {
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: OutPoint {
+                    txid: crate::hash::hash256(b"prev"),
+                    vout: 0,
+                },
+                signature: vec![],
+                pubkey_compressed: vec![2u8; 33],
+                sequence: 1,
+            }],
+            outputs: vec![TxOut {
+                value: 42,
+                key_hash20: [7u8; 20],
+            }],
+            lock_time: 0,
+        };
+
+        let tagged = tx.signing_digest(0).expect("digest");
+        let untagged = crate::hash::hash256(&tx.encode_for_signing(0));
+        assert_ne!(tagged, untagged);
     }
 }

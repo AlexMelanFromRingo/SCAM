@@ -80,7 +80,7 @@ Status: draft v1 (frozen decisions from user session on 2026-02-11)
 - [x] Integrate secp256k1 Schnorr signing and verification.
 - [x] Enforce canonical signatures and strict pubkey parsing.
 - [x] Implement compressed pubkey encode/decode (SEC33).
-- [ ] Add domain-separated signing tags (prevent cross-context replay).
+- [x] Add domain-separated signing tags for tx signing digest (`SCAM-tx-signing-v1`).
 
 ## 6) Wallet and Key Management TODO
 

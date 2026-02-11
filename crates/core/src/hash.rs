@@ -29,6 +29,15 @@ pub fn hash256(data: &[u8]) -> Hash256 {
     Hash256(*digest.as_bytes())
 }
 
+pub fn tagged_hash256(tag: &[u8], data: &[u8]) -> Hash256 {
+    let tag_hash = blake3::hash(tag);
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(tag_hash.as_bytes());
+    hasher.update(tag_hash.as_bytes());
+    hasher.update(data);
+    Hash256(*hasher.finalize().as_bytes())
+}
+
 pub fn decode_hex_array<const N: usize>(raw: &str) -> Result<[u8; N], ParseHexError> {
     let normalized = raw.strip_prefix("0x").unwrap_or(raw);
     let decoded = hex::decode(normalized)?;
@@ -57,7 +66,7 @@ pub enum ParseHexError {
 
 #[cfg(test)]
 mod tests {
-    use super::{Hash256, hash256};
+    use super::{Hash256, hash256, tagged_hash256};
 
     #[test]
     fn hash_is_stable_for_same_input() {
@@ -71,5 +80,12 @@ mod tests {
         let expected = hash256(b"roundtrip");
         let parsed = Hash256::from_hex(&expected.to_hex()).expect("hash hex should parse");
         assert_eq!(expected, parsed);
+    }
+
+    #[test]
+    fn tagged_hash_changes_with_tag() {
+        let a = tagged_hash256(b"scam-tag-a", b"payload");
+        let b = tagged_hash256(b"scam-tag-b", b"payload");
+        assert_ne!(a, b);
     }
 }
