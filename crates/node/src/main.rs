@@ -323,6 +323,32 @@ enum WalletCommand {
         #[arg(long, default_value_t = 500_000)]
         max_nonce: u64,
     },
+    Send {
+        #[arg(long, value_enum, default_value_t = Network::Devnet)]
+        network: Network,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        mnemonic: String,
+        #[arg(long, default_value = "")]
+        passphrase: String,
+        #[arg(long, default_value_t = 0)]
+        account: u32,
+        #[arg(long, default_value_t = 0)]
+        index: u32,
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        amount: u64,
+        #[arg(long, default_value_t = 1)]
+        fee: u64,
+        #[arg(long, default_value_t = 0)]
+        mine_blocks: u32,
+        #[arg(long, default_value_t = 120)]
+        interval_sec: u64,
+        #[arg(long, default_value_t = 500_000)]
+        max_nonce: u64,
+    },
     Decode {
         #[arg(long)]
         address: String,
@@ -682,6 +708,13 @@ fn run_hash_visual(args: HashVisualArgs) -> Result<(), NodeError> {
 }
 
 fn run_wallet(command: WalletCommand) -> Result<(), NodeError> {
+    fn key_hash20_from_pubkey(pubkey_compressed: [u8; 33]) -> [u8; 20] {
+        let digest = scam_core::hash::hash256(&pubkey_compressed);
+        let mut key_hash20 = [0u8; 20];
+        key_hash20.copy_from_slice(&digest.0[..20]);
+        key_hash20
+    }
+
     fn derive_and_print_address(
         mnemonic_phrase: &str,
         passphrase: &str,
@@ -759,9 +792,7 @@ fn run_wallet(command: WalletCommand) -> Result<(), NodeError> {
             let mnemonic = WalletMnemonic::parse(&mnemonic)?;
             let seed = mnemonic.to_seed(&passphrase);
             let key = derive_wallet_key(&seed, account, index)?;
-            let mut key_hash20 = [0u8; 20];
-            let digest = scam_core::hash::hash256(&key.pubkey_compressed());
-            key_hash20.copy_from_slice(&digest.0[..20]);
+            let key_hash20 = key_hash20_from_pubkey(key.pubkey_compressed());
 
             let mut total: u128 = 0;
             let mut spendable: u128 = 0;
@@ -797,6 +828,121 @@ fn run_wallet(command: WalletCommand) -> Result<(), NodeError> {
             println!("Total: {}", total);
             println!("Spendable: {} ({} utxos)", spendable, spendable_count);
             println!("Immature: {} ({} utxos)", immature, immature_count);
+        }
+        WalletCommand::Send {
+            network,
+            config,
+            mnemonic,
+            passphrase,
+            account,
+            index,
+            to,
+            amount,
+            fee,
+            mine_blocks,
+            interval_sec,
+            max_nonce,
+        } => {
+            let (_cfg, runtime) = build_runtime_for_query(
+                network,
+                config,
+                mine_blocks,
+                interval_sec,
+                max_nonce,
+                "wallet-send",
+            )?;
+            let recipient = parse_address(&to)?;
+            let needed = amount
+                .checked_add(fee)
+                .ok_or_else(|| NodeError::Runtime("amount + fee overflow".to_owned()))?;
+
+            let mnemonic = WalletMnemonic::parse(&mnemonic)?;
+            let seed = mnemonic.to_seed(&passphrase);
+            let key = derive_wallet_key(&seed, account, index)?;
+            let sender_pubkey = key.pubkey_compressed();
+            let sender_key_hash20 = key_hash20_from_pubkey(sender_pubkey);
+
+            let tip_height = runtime.tip_height();
+            let coinbase_maturity = runtime.config().coinbase_maturity as u64;
+            let mut selected: Option<(OutPoint, u64)> = None;
+            let mut spendable_total = 0u128;
+            for (outpoint, utxo) in runtime.utxo_set() {
+                if utxo.key_hash20 != sender_key_hash20 {
+                    continue;
+                }
+                let is_immature_coinbase = utxo.is_coinbase
+                    && tip_height < utxo.created_height.saturating_add(coinbase_maturity);
+                if is_immature_coinbase {
+                    continue;
+                }
+                spendable_total = spendable_total.saturating_add(utxo.value as u128);
+                if utxo.value < needed {
+                    continue;
+                }
+                let should_replace = selected
+                    .as_ref()
+                    .map(|(_, value)| utxo.value < *value)
+                    .unwrap_or(true);
+                if should_replace {
+                    selected = Some((outpoint.clone(), utxo.value));
+                }
+            }
+
+            let (selected_outpoint, selected_value) = selected.ok_or_else(|| {
+                NodeError::Runtime(format!(
+                    "no spendable UTXO with value >= {} for this wallet (spendable total: {})",
+                    needed, spendable_total
+                ))
+            })?;
+            let change_value = selected_value.checked_sub(needed).ok_or_else(|| {
+                NodeError::Runtime("selected UTXO is smaller than needed".to_owned())
+            })?;
+
+            let mut tx = Transaction {
+                version: 1,
+                inputs: vec![TxIn {
+                    prev_out: selected_outpoint,
+                    signature: vec![],
+                    pubkey_compressed: sender_pubkey.to_vec(),
+                    sequence: 0,
+                }],
+                outputs: vec![TxOut {
+                    value: amount,
+                    key_hash20: recipient.key_hash20,
+                }],
+                lock_time: 0,
+            };
+            if change_value > 0 {
+                tx.outputs.push(TxOut {
+                    value: change_value,
+                    key_hash20: sender_key_hash20,
+                });
+            }
+
+            let digest = tx
+                .signing_digest(0)
+                .map_err(|e| NodeError::Runtime(format!("signing digest failed: {e}")))?;
+            let signature = sign_digest(&key, digest.0)?;
+            tx.inputs[0].signature = signature.to_vec();
+
+            let sig_ok = verify_digest(digest.0, signature, sender_pubkey)?;
+            if !sig_ok {
+                return Err(NodeError::Runtime(
+                    "internal signature self-check failed".to_owned(),
+                ));
+            }
+
+            println!("Transaction created and signed:");
+            println!("Txid: {}", tx.txid());
+            println!(
+                "Input: {}:{} (value={})",
+                tx.inputs[0].prev_out.txid, tx.inputs[0].prev_out.vout, selected_value
+            );
+            println!("To key-hash20: {}", hex::encode(recipient.key_hash20));
+            println!("Amount: {}", amount);
+            println!("Fee: {}", fee);
+            println!("Change: {}", change_value);
+            println!("RawTx (hex): {}", hex::encode(tx.encode_for_hash()));
         }
         WalletCommand::Decode { address } => {
             let decoded = parse_address(&address)?;
