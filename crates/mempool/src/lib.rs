@@ -6,12 +6,24 @@ use thiserror::Error;
 #[derive(Debug, Clone)]
 pub struct Mempool {
     max_txs: usize,
-    txs: HashMap<Hash256, Transaction>,
+    min_relay_fee_per_kb: u64,
+    txs: HashMap<Hash256, MempoolEntry>,
     spent_outpoints: HashMap<OutPoint, Hash256>,
+}
+
+#[derive(Debug, Clone)]
+struct MempoolEntry {
+    tx: Transaction,
+    fee: u64,
+    serialized_size: usize,
 }
 
 impl Mempool {
     pub fn new(max_txs: usize) -> Result<Self, MempoolError> {
+        Self::with_policy(max_txs, 0)
+    }
+
+    pub fn with_policy(max_txs: usize, min_relay_fee_per_kb: u64) -> Result<Self, MempoolError> {
         if max_txs == 0 {
             return Err(MempoolError::InvalidLimit(
                 "max_txs must be greater than 0".to_owned(),
@@ -20,6 +32,7 @@ impl Mempool {
 
         Ok(Self {
             max_txs,
+            min_relay_fee_per_kb,
             txs: HashMap::new(),
             spent_outpoints: HashMap::new(),
         })
@@ -34,7 +47,7 @@ impl Mempool {
     }
 
     pub fn get(&self, txid: &Hash256) -> Option<&Transaction> {
-        self.txs.get(txid)
+        self.txs.get(txid).map(|entry| &entry.tx)
     }
 
     pub fn contains(&self, txid: &Hash256) -> bool {
@@ -42,9 +55,47 @@ impl Mempool {
     }
 
     pub fn insert(&mut self, tx: Transaction) -> Result<InsertOutcome, MempoolError> {
+        self.insert_with_fee(tx, 0)
+    }
+
+    pub fn min_required_fee(&self, tx: &Transaction) -> Result<u64, MempoolError> {
+        required_fee_for_size(tx.encode_for_hash().len(), self.min_relay_fee_per_kb)
+    }
+
+    pub fn txids_by_feerate_desc(&self) -> Vec<Hash256> {
+        let mut ranked = self
+            .txs
+            .iter()
+            .map(|(txid, entry)| {
+                let fee_rate_key = ((entry.fee as u128) * 1000) / (entry.serialized_size as u128);
+                (*txid, fee_rate_key)
+            })
+            .collect::<Vec<_>>();
+        ranked.sort_unstable_by(|(txid_a, rate_a), (txid_b, rate_b)| {
+            rate_b.cmp(rate_a).then_with(|| txid_a.cmp(txid_b))
+        });
+        ranked.into_iter().map(|(txid, _)| txid).collect()
+    }
+
+    pub fn insert_with_fee(
+        &mut self,
+        tx: Transaction,
+        fee: u64,
+    ) -> Result<InsertOutcome, MempoolError> {
         let txid = tx.txid();
         if self.txs.contains_key(&txid) {
             return Ok(InsertOutcome::AlreadyPresent { txid });
+        }
+        let serialized_size = tx.encode_for_hash().len();
+        let required_fee = required_fee_for_size(serialized_size, self.min_relay_fee_per_kb)?;
+        if fee < required_fee {
+            return Err(MempoolError::FeeTooLow {
+                incoming: txid,
+                fee,
+                required_fee,
+                size_bytes: serialized_size,
+                min_relay_fee_per_kb: self.min_relay_fee_per_kb,
+            });
         }
 
         let mut conflict_txid: Option<Hash256> = None;
@@ -58,7 +109,14 @@ impl Mempool {
         if let Some(existing_txid) = conflict_txid {
             if txid < existing_txid {
                 let removed = self.remove_with_descendants(existing_txid);
-                self.txs.insert(txid, tx);
+                self.txs.insert(
+                    txid,
+                    MempoolEntry {
+                        tx,
+                        fee,
+                        serialized_size,
+                    },
+                );
                 self.rebuild_spent_outpoints();
                 return Ok(InsertOutcome::Replaced {
                     inserted: txid,
@@ -78,7 +136,14 @@ impl Mempool {
             });
         }
 
-        self.txs.insert(txid, tx);
+        self.txs.insert(
+            txid,
+            MempoolEntry {
+                tx,
+                fee,
+                serialized_size,
+            },
+        );
         self.rebuild_spent_outpoints();
         Ok(InsertOutcome::Accepted { txid })
     }
@@ -89,11 +154,12 @@ impl Mempool {
 
         loop {
             let mut changed = false;
-            for (txid, tx) in &self.txs {
+            for (txid, entry) in &self.txs {
                 if to_remove.contains(txid) {
                     continue;
                 }
-                if tx
+                if entry
+                    .tx
                     .inputs
                     .iter()
                     .any(|input| to_remove.contains(&input.prev_out.txid))
@@ -117,12 +183,30 @@ impl Mempool {
 
     fn rebuild_spent_outpoints(&mut self) {
         self.spent_outpoints.clear();
-        for (txid, tx) in &self.txs {
-            for input in &tx.inputs {
+        for (txid, entry) in &self.txs {
+            for input in &entry.tx.inputs {
                 self.spent_outpoints.insert(input.prev_out.clone(), *txid);
             }
         }
     }
+}
+
+fn required_fee_for_size(
+    size_bytes: usize,
+    min_relay_fee_per_kb: u64,
+) -> Result<u64, MempoolError> {
+    if min_relay_fee_per_kb == 0 {
+        return Ok(0);
+    }
+    let numerator = (size_bytes as u128)
+        .checked_mul(min_relay_fee_per_kb as u128)
+        .and_then(|n| n.checked_add(999))
+        .ok_or_else(|| {
+            MempoolError::InvalidLimit("fee calculation overflow in mempool policy".to_owned())
+        })?;
+    let fee = numerator / 1000;
+    u64::try_from(fee)
+        .map_err(|_| MempoolError::InvalidLimit("required fee does not fit into u64".to_owned()))
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -149,13 +233,23 @@ pub enum MempoolError {
     InvalidLimit(String),
     #[error("mempool full (limit={limit}), incoming txid={incoming}")]
     Full { limit: usize, incoming: Hash256 },
+    #[error(
+        "relay fee too low for {incoming}: fee={fee}, required={required_fee}, size={size_bytes}B, min_relay_fee_per_kb={min_relay_fee_per_kb}"
+    )]
+    FeeTooLow {
+        incoming: Hash256,
+        fee: u64,
+        required_fee: u64,
+        size_bytes: usize,
+        min_relay_fee_per_kb: u64,
+    },
 }
 
 #[cfg(test)]
 mod tests {
     use scam_core::{OutPoint, Transaction, TxIn, TxOut};
 
-    use crate::{InsertOutcome, Mempool};
+    use crate::{InsertOutcome, Mempool, MempoolError};
 
     fn mk_tx(
         spends_txid: [u8; 32],
@@ -251,5 +345,45 @@ mod tests {
             assert!(mempool.contains(&parent_old_id));
             assert!(mempool.contains(&child_id));
         }
+    }
+
+    #[test]
+    fn relay_fee_policy_rejects_low_fee_tx() {
+        let mut mempool = Mempool::with_policy(100, 1_000).expect("mempool must initialize");
+        let tx = mk_tx([5u8; 32], 0, b"fee-test", 1);
+        let required = mempool.min_required_fee(&tx).expect("required fee");
+        assert!(required > 0);
+
+        let err = mempool
+            .insert_with_fee(tx.clone(), required - 1)
+            .expect_err("must reject low fee");
+        assert!(matches!(err, MempoolError::FeeTooLow { .. }));
+
+        let accepted = mempool
+            .insert_with_fee(tx, required)
+            .expect("must accept fee at threshold");
+        assert!(matches!(accepted, InsertOutcome::Accepted { .. }));
+    }
+
+    #[test]
+    fn txids_are_sorted_by_feerate_desc() {
+        let mut mempool = Mempool::with_policy(100, 0).expect("mempool must initialize");
+        let tx_low = mk_tx([1u8; 32], 0, b"same-size-a", 1);
+        let tx_mid = mk_tx([2u8; 32], 0, b"same-size-b", 2);
+        let tx_high = mk_tx([3u8; 32], 0, b"same-size-c", 3);
+
+        let low_id = tx_low.txid();
+        let mid_id = tx_mid.txid();
+        let high_id = tx_high.txid();
+
+        mempool.insert_with_fee(tx_low, 10).expect("insert low");
+        mempool.insert_with_fee(tx_mid, 20).expect("insert mid");
+        mempool.insert_with_fee(tx_high, 50).expect("insert high");
+
+        let ranked = mempool.txids_by_feerate_desc();
+        assert_eq!(ranked.len(), 3);
+        assert_eq!(ranked[0], high_id);
+        assert_eq!(ranked[1], mid_id);
+        assert_eq!(ranked[2], low_id);
     }
 }

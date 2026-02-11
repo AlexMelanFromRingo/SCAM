@@ -116,8 +116,8 @@ Status: draft v1 (frozen decisions from user session on 2026-02-11)
 - [x] no overflow / no negative amounts
 - [x] coinbase special rules enforced
 - [ ] Fee policy:
-- [ ] min relay fee
-- [ ] mempool sorting by fee rate
+- [x] min relay fee
+- [x] mempool sorting by fee rate
 
 ## 9) Mempool TODO (Conflict Rule)
 
