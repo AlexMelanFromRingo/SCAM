@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use scam_consensus::validate_block_basic;
+use scam_consensus::{UtxoSet, validate_and_apply_block, validate_block_basic};
 use scam_core::{ChainConfig, ChainConfigError, block_meets_pow};
 use scam_wallet::{
     AddressError, DeriveKeyError, MnemonicError, QrError, SchnorrError, WalletMnemonic,
@@ -199,6 +199,15 @@ fn run_node(
         "Genesis consensus-valid: {}",
         validate_block_basic(&genesis).is_ok()
     );
+    let mut utxos = UtxoSet::new();
+    let applied = validate_and_apply_block(
+        &genesis,
+        0,
+        cfg.block_subsidy,
+        cfg.coinbase_maturity as u64,
+        &mut utxos,
+    );
+    println!("Genesis UTXO-apply valid: {}", applied.is_ok());
     println!("Block target: {}", genesis.header.target);
 
     if print_genesis {

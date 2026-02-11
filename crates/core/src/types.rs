@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 use crate::codec::Encoder;
 use crate::hash::{Hash256, hash256};
@@ -57,6 +58,16 @@ impl Transaction {
         hash256(&self.encode_for_hash())
     }
 
+    pub fn signing_digest(&self, input_index: usize) -> Result<Hash256, TxSigningError> {
+        if input_index >= self.inputs.len() {
+            return Err(TxSigningError::InputOutOfBounds {
+                index: input_index,
+                total_inputs: self.inputs.len(),
+            });
+        }
+        Ok(hash256(&self.encode_for_signing(input_index)))
+    }
+
     pub fn encode_for_hash(&self) -> Vec<u8> {
         let mut enc = Encoder::with_capacity(256);
         enc.write_u32(self.version);
@@ -78,6 +89,38 @@ impl Transaction {
         enc.write_u32(self.lock_time);
         enc.into_bytes()
     }
+
+    fn encode_for_signing(&self, signing_input_index: usize) -> Vec<u8> {
+        let mut enc = Encoder::with_capacity(256);
+        enc.write_u32(self.version);
+        enc.write_varint(self.inputs.len());
+        for (idx, input) in self.inputs.iter().enumerate() {
+            enc.write_bytes(&input.prev_out.txid.0);
+            enc.write_u32(input.prev_out.vout);
+            if idx == signing_input_index {
+                enc.write_len_prefixed_bytes(&input.pubkey_compressed);
+            } else {
+                enc.write_len_prefixed_bytes(&[]);
+            }
+            enc.write_u32(input.sequence);
+        }
+
+        enc.write_varint(self.outputs.len());
+        for output in &self.outputs {
+            enc.write_u64(output.value);
+            enc.write_bytes(&output.key_hash20);
+        }
+
+        enc.write_u32(self.lock_time);
+        enc.write_u32(signing_input_index as u32);
+        enc.into_bytes()
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum TxSigningError {
+    #[error("input index {index} out of bounds (total inputs: {total_inputs})")]
+    InputOutOfBounds { index: usize, total_inputs: usize },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -178,5 +221,30 @@ mod tests {
         };
 
         assert!(block.has_valid_merkle_root());
+    }
+
+    #[test]
+    fn signing_digest_is_stable() {
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: OutPoint {
+                    txid: crate::hash::hash256(b"prev"),
+                    vout: 0,
+                },
+                signature: vec![1, 2, 3],
+                pubkey_compressed: vec![2u8; 33],
+                sequence: 0,
+            }],
+            outputs: vec![TxOut {
+                value: 50,
+                key_hash20: [3u8; 20],
+            }],
+            lock_time: 0,
+        };
+
+        let first = tx.signing_digest(0).expect("digest");
+        let second = tx.signing_digest(0).expect("digest");
+        assert_eq!(first, second);
     }
 }

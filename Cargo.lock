@@ -368,9 +368,11 @@ dependencies = [
 name = "scam-consensus"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "num-bigint",
  "num-traits",
  "scam-core",
+ "secp256k1",
  "thiserror",
 ]
 
