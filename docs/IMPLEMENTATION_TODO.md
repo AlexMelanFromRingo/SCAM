@@ -150,9 +150,9 @@ Status: draft v1 (frozen decisions from user session on 2026-02-11)
 - [x] `new_target = old_target * actual / expected`
 - [x] Clamp change per window (for stability).
 - [x] Enforce min/max target bounds.
-- [ ] Add protections for timestamp abuse:
-- [ ] median-time-past check
-- [ ] max future block time
+- [x] Add protections for timestamp abuse:
+- [x] median-time-past check
+- [x] max future block time
 
 ## 12) Storage TODO
 

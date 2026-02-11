@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use num_bigint::BigUint;
 use scam_consensus::{
@@ -7,6 +8,9 @@ use scam_consensus::{
 };
 use scam_core::{Block, BlockHeader, ChainConfig, Hash256, Target};
 use thiserror::Error;
+
+const MEDIAN_TIME_PAST_WINDOW: usize = 11;
+const MAX_FUTURE_BLOCK_TIME_SEC: u64 = 2 * 60 * 60;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BlockSubmissionOutcome {
@@ -120,6 +124,59 @@ impl ChainRuntime {
         self.headers.get(hash)
     }
 
+    fn median_time_past(&self, parent_hash: Hash256) -> Result<u64, ChainError> {
+        let mut timestamps = Vec::with_capacity(MEDIAN_TIME_PAST_WINDOW);
+        let mut cursor = Some(parent_hash);
+
+        for _ in 0..MEDIAN_TIME_PAST_WINDOW {
+            let Some(hash) = cursor else {
+                break;
+            };
+            let header = self
+                .headers
+                .get(&hash)
+                .ok_or(ChainError::MissingHeader { block_hash: hash })?;
+            timestamps.push(header.timestamp);
+
+            if header.prev_block == Hash256::ZERO {
+                break;
+            }
+            cursor = Some(header.prev_block);
+        }
+
+        if timestamps.is_empty() {
+            return Err(ChainError::InvalidRuntime(
+                "cannot compute median-time-past without headers".to_owned(),
+            ));
+        }
+        timestamps.sort_unstable();
+        Ok(timestamps[timestamps.len() / 2])
+    }
+
+    fn validate_contextual_timestamps(&self, block: &Block) -> Result<(), ChainError> {
+        let block_hash = block.header.block_hash();
+        let median_time_past = self.median_time_past(block.header.prev_block)?;
+        if block.header.timestamp <= median_time_past {
+            return Err(ChainError::TimestampTooOld {
+                block_hash,
+                median_time_past,
+                got: block.header.timestamp,
+            });
+        }
+
+        let now = current_unix_timestamp()?;
+        let max_allowed = now.saturating_add(MAX_FUTURE_BLOCK_TIME_SEC);
+        if block.header.timestamp > max_allowed {
+            return Err(ChainError::TimestampTooFarInFuture {
+                block_hash,
+                got: block.header.timestamp,
+                max_allowed,
+            });
+        }
+
+        Ok(())
+    }
+
     pub fn expected_target_for_next_block(&self) -> Result<Target, ChainError> {
         let next_height = self.tip_height() + 1;
         let window = self.config.difficulty_adjustment_window as u64;
@@ -167,6 +224,7 @@ impl ChainRuntime {
                 got_prev: block.header.prev_block,
             });
         }
+        self.validate_contextual_timestamps(&block)?;
 
         let expected_target = self.expected_target_for_next_block()?;
         if block.header.target != expected_target {
@@ -212,6 +270,7 @@ impl ChainRuntime {
                 parent: block.header.prev_block,
             });
         }
+        self.validate_contextual_timestamps(&block)?;
 
         let parent_work = self
             .cumulative_work
@@ -326,6 +385,13 @@ impl ChainRuntime {
     }
 }
 
+fn current_unix_timestamp() -> Result<u64, ChainError> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| ChainError::InvalidRuntime(format!("system clock before unix epoch: {e}")))?;
+    Ok(now.as_secs())
+}
+
 #[derive(Debug, Error)]
 pub enum ChainError {
     #[error("chain config error: {0}")]
@@ -352,6 +418,18 @@ pub enum ChainError {
     MissingBlock { block_hash: Hash256 },
     #[error("unexpected block target: expected {expected}, got {got}")]
     UnexpectedTarget { expected: Target, got: Target },
+    #[error("block {block_hash} timestamp too old: got={got}, median-time-past={median_time_past}")]
+    TimestampTooOld {
+        block_hash: Hash256,
+        median_time_past: u64,
+        got: u64,
+    },
+    #[error("block {block_hash} timestamp too far in future: got={got}, max_allowed={max_allowed}")]
+    TimestampTooFarInFuture {
+        block_hash: Hash256,
+        got: u64,
+        max_allowed: u64,
+    },
     #[error("{0}")]
     InvalidRuntime(String),
 }
@@ -361,7 +439,7 @@ mod tests {
     use scam_core::{OutPoint, Transaction, TxIn, TxOut};
     use scam_miner::{BlockTemplate, mine_block};
 
-    use crate::{BlockSubmissionOutcome, ChainRuntime};
+    use crate::{BlockSubmissionOutcome, ChainError, ChainRuntime};
 
     fn coinbase(value: u64, key_hash20: [u8; 20], tag: &[u8]) -> Transaction {
         Transaction {
@@ -482,5 +560,70 @@ mod tests {
 
         assert!(saw_reorg, "expected at least one reorg event");
         assert_ne!(runtime.tip_hash(), old_tip);
+    }
+
+    #[test]
+    fn block_timestamp_must_be_greater_than_median_time_past() {
+        let mut config: scam_core::ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        config.difficulty_adjustment_window = 50;
+        let mut runtime = ChainRuntime::from_config(config.clone()).expect("runtime");
+        let reward = config.genesis_reward_key_hash20().expect("key");
+
+        let mut timestamp = runtime.tip_header().timestamp + 30;
+        for i in 0..11 {
+            let template = BlockTemplate {
+                version: 1,
+                prev_block: runtime.tip_hash(),
+                timestamp,
+                target: runtime.expected_target_for_next_block().expect("target"),
+                transactions: vec![coinbase(
+                    config.block_subsidy,
+                    reward,
+                    format!("mtp-main-{i}").as_bytes(),
+                )],
+            };
+            let block = mine_block(&template, 200_000).expect("mine");
+            runtime.apply_next_block(block).expect("apply");
+            timestamp += 30;
+        }
+
+        let mtp = runtime
+            .median_time_past(runtime.tip_hash())
+            .expect("median-time-past");
+        let template = BlockTemplate {
+            version: 1,
+            prev_block: runtime.tip_hash(),
+            timestamp: mtp,
+            target: runtime.expected_target_for_next_block().expect("target"),
+            transactions: vec![coinbase(config.block_subsidy, reward, b"mtp-reject")],
+        };
+        let block = mine_block(&template, 200_000).expect("mine");
+        let err = runtime.apply_next_block(block).expect_err("must reject");
+        assert!(matches!(err, ChainError::TimestampTooOld { .. }));
+    }
+
+    #[test]
+    fn block_timestamp_too_far_in_future_is_rejected() {
+        let config: scam_core::ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let mut runtime = ChainRuntime::from_config(config.clone()).expect("runtime");
+        let now = super::current_unix_timestamp().expect("now");
+        let future_timestamp = now + super::MAX_FUTURE_BLOCK_TIME_SEC + 1;
+
+        let template = BlockTemplate {
+            version: 1,
+            prev_block: runtime.tip_hash(),
+            timestamp: future_timestamp,
+            target: runtime.expected_target_for_next_block().expect("target"),
+            transactions: vec![coinbase(
+                config.block_subsidy,
+                config.genesis_reward_key_hash20().expect("key"),
+                b"future-reject",
+            )],
+        };
+        let block = mine_block(&template, 200_000).expect("mine");
+        let err = runtime.apply_next_block(block).expect_err("must reject");
+        assert!(matches!(err, ChainError::TimestampTooFarInFuture { .. }));
     }
 }
