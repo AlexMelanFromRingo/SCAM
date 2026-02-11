@@ -180,8 +180,8 @@ Status: draft v1 (frozen decisions from user session on 2026-02-11)
 - [x] Maintain per-peer `known_inventory` to avoid duplicate sends.
 - [x] Keep local dedup cache for recently seen object IDs.
 - [x] Implement headers-first sync for new nodes.
-- [ ] Implement peer scoring and ban for invalid data spam.
-- [ ] Add rate limits and max message size guards.
+- [x] Implement peer scoring and ban for invalid data spam.
+- [x] Add rate limits and max message size guards.
 
 ## 14) Mining TODO
 

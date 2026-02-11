@@ -16,11 +16,14 @@ pub struct OutboundMessage {
 #[derive(Default)]
 struct PeerState {
     known_inventory: HashSet<InventoryItem>,
+    score: u32,
 }
 
 pub struct GossipEngine {
     max_inv_items: usize,
+    ban_threshold: u32,
     peers: HashMap<PeerId, PeerState>,
+    banned_peers: HashSet<PeerId>,
     local_inventory: HashSet<InventoryItem>,
     tx_store: HashMap<Hash256, Transaction>,
     block_store: HashMap<Hash256, Block>,
@@ -28,14 +31,25 @@ pub struct GossipEngine {
 
 impl GossipEngine {
     pub fn new(max_inv_items: usize) -> Result<Self, GossipError> {
+        Self::with_limits(max_inv_items, 100)
+    }
+
+    pub fn with_limits(max_inv_items: usize, ban_threshold: u32) -> Result<Self, GossipError> {
         if max_inv_items == 0 {
             return Err(GossipError::InvalidConfig(
                 "max_inv_items must be greater than zero".to_owned(),
             ));
         }
+        if ban_threshold == 0 {
+            return Err(GossipError::InvalidConfig(
+                "ban_threshold must be greater than zero".to_owned(),
+            ));
+        }
         Ok(Self {
             max_inv_items,
+            ban_threshold,
             peers: HashMap::new(),
+            banned_peers: HashSet::new(),
             local_inventory: HashSet::new(),
             tx_store: HashMap::new(),
             block_store: HashMap::new(),
@@ -43,6 +57,9 @@ impl GossipEngine {
     }
 
     pub fn connect_peer(&mut self, peer_id: PeerId) {
+        if self.banned_peers.contains(&peer_id) {
+            return;
+        }
         self.peers.entry(peer_id).or_default();
     }
 
@@ -52,6 +69,14 @@ impl GossipEngine {
 
     pub fn peer_count(&self) -> usize {
         self.peers.len()
+    }
+
+    pub fn peer_score(&self, peer_id: PeerId) -> Option<u32> {
+        self.peers.get(&peer_id).map(|state| state.score)
+    }
+
+    pub fn is_banned(&self, peer_id: PeerId) -> bool {
+        self.banned_peers.contains(&peer_id)
     }
 
     pub fn has_inventory(&self, item: &InventoryItem) -> bool {
@@ -79,6 +104,9 @@ impl GossipEngine {
         from_peer: PeerId,
         message: WireMessage,
     ) -> Result<Vec<OutboundMessage>, GossipError> {
+        if self.banned_peers.contains(&from_peer) {
+            return Err(GossipError::BannedPeer { peer_id: from_peer });
+        }
         if !self.peers.contains_key(&from_peer) {
             return Err(GossipError::UnknownPeer { peer_id: from_peer });
         }
@@ -110,6 +138,7 @@ impl GossipEngine {
         items: Vec<InventoryItem>,
     ) -> Result<Vec<OutboundMessage>, GossipError> {
         if items.len() > self.max_inv_items {
+            self.penalize_peer(from_peer, 25);
             return Err(GossipError::TooManyInventoryItems {
                 limit: self.max_inv_items,
                 got: items.len(),
@@ -142,6 +171,7 @@ impl GossipEngine {
         items: Vec<InventoryItem>,
     ) -> Result<Vec<OutboundMessage>, GossipError> {
         if items.len() > self.max_inv_items {
+            self.penalize_peer(from_peer, 25);
             return Err(GossipError::TooManyInventoryItems {
                 limit: self.max_inv_items,
                 got: items.len(),
@@ -249,12 +279,24 @@ impl GossipEngine {
         }
         out
     }
+
+    fn penalize_peer(&mut self, peer_id: PeerId, penalty: u32) {
+        if let Some(state) = self.peers.get_mut(&peer_id) {
+            state.score = state.score.saturating_add(penalty);
+            if state.score >= self.ban_threshold {
+                self.peers.remove(&peer_id);
+                self.banned_peers.insert(peer_id);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Error)]
 pub enum GossipError {
     #[error("unknown peer: {peer_id}")]
     UnknownPeer { peer_id: PeerId },
+    #[error("peer is banned: {peer_id}")]
+    BannedPeer { peer_id: PeerId },
     #[error("too many inventory items: limit={limit}, got={got}")]
     TooManyInventoryItems { limit: usize, got: usize },
     #[error("{0}")]
@@ -354,5 +396,36 @@ mod tests {
             .on_message(1, WireMessage::Tx { tx })
             .expect("second");
         assert!(second.is_empty());
+    }
+
+    #[test]
+    fn oversized_inventory_is_penalized_and_banned() {
+        let mut engine = GossipEngine::with_limits(2, 50).expect("engine");
+        engine.connect_peer(42);
+
+        let oversized = vec![
+            InventoryItem::Tx(scam_core::hash::hash256(b"a")),
+            InventoryItem::Tx(scam_core::hash::hash256(b"b")),
+            InventoryItem::Tx(scam_core::hash::hash256(b"c")),
+        ];
+
+        let _ = engine.on_message(
+            42,
+            WireMessage::Inv {
+                items: oversized.clone(),
+            },
+        );
+        assert_eq!(engine.peer_score(42), Some(25));
+
+        let _ = engine.on_message(42, WireMessage::Inv { items: oversized });
+        assert!(engine.is_banned(42));
+
+        let err = engine
+            .on_message(42, WireMessage::Inv { items: vec![] })
+            .expect_err("banned peer must be rejected");
+        assert!(matches!(
+            err,
+            super::GossipError::BannedPeer { peer_id: 42 }
+        ));
     }
 }
