@@ -245,7 +245,7 @@ Status: draft v1 (frozen decisions from user session on 2026-02-11)
 
 ## 19) Optional Utility: 16x16 Hash Visualizer
 
-- [ ] Input: 32-byte hash.
-- [ ] Convert bytes to 256 bits (MSB-first, freeze exact bit order in code docs).
-- [ ] Render 16x16 matrix where `1 = white`, `0 = black`.
-- [ ] Provide CLI command: `util hash-visual <hex>`.
+- [x] Input: 32-byte hash.
+- [x] Convert bytes to 256 bits (MSB-first, freeze exact bit order in code docs).
+- [x] Render 16x16 matrix where `1 = white`, `0 = black`.
+- [x] Provide CLI command: `scam-node hash-visual --hash-hex <hex>`.

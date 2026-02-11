@@ -6,7 +6,8 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use scam_chain::{ChainError, ChainRuntime};
 use scam_consensus::{TxValidationError, UtxoSet, validate_and_apply_block, validate_block_basic};
 use scam_core::{
-    ChainConfig, ChainConfigError, OutPoint, Transaction, TxIn, TxOut, block_meets_pow,
+    ChainConfig, ChainConfigError, Hash256, OutPoint, Transaction, TxIn, TxOut, block_meets_pow,
+    render_hash_bitmap_16x16,
 };
 use scam_miner::{BlockTemplate, mine_block};
 use scam_p2p::{GossipEngine, WireMessage, build_block_locator, select_headers_for_peer};
@@ -42,6 +43,7 @@ enum Command {
     GetBlock(GetBlockArgs),
     GetTx(GetTxArgs),
     AddPeer(AddPeerArgs),
+    HashVisual(HashVisualArgs),
     Wallet(WalletArgs),
     MineOnce(MineOnceArgs),
     ChainDemo(ChainDemoArgs),
@@ -118,6 +120,12 @@ struct AddPeerArgs {
     peer: String,
     #[arg(long, default_value = "data/peers")]
     peers_dir: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct HashVisualArgs {
+    #[arg(long)]
+    hash_hex: String,
 }
 
 #[derive(Debug, Args)]
@@ -562,6 +570,16 @@ fn run_add_peer(args: AddPeerArgs) -> Result<(), NodeError> {
     Ok(())
 }
 
+fn run_hash_visual(args: HashVisualArgs) -> Result<(), NodeError> {
+    let hash = Hash256::from_hex(&args.hash_hex)
+        .map_err(|e| NodeError::Runtime(format!("bad hash: {e}")))?;
+    let rendered = render_hash_bitmap_16x16(hash);
+    println!("Hash: {}", hash.to_hex());
+    println!("Legend: 1=white pixel, 0=black pixel");
+    println!("{rendered}");
+    Ok(())
+}
+
 fn run_wallet(command: WalletCommand) -> Result<(), NodeError> {
     match command {
         WalletCommand::New {
@@ -985,6 +1003,7 @@ fn run() -> Result<(), NodeError> {
         Some(Command::GetBlock(args)) => run_get_block(args),
         Some(Command::GetTx(args)) => run_get_tx(args),
         Some(Command::AddPeer(args)) => run_add_peer(args),
+        Some(Command::HashVisual(args)) => run_hash_visual(args),
         Some(Command::Wallet(args)) => run_wallet(args.command),
         Some(Command::MineOnce(args)) => run_mine_once(args),
         Some(Command::ChainDemo(args)) => run_chain_demo(args),
