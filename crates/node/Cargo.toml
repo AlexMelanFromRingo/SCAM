@@ -9,6 +9,7 @@ clap.workspace = true
 hex.workspace = true
 scam-consensus = { path = "../consensus" }
 scam-core = { path = "../core" }
+scam-miner = { path = "../miner" }
 scam-p2p = { path = "../p2p" }
 scam-wallet = { path = "../wallet" }
 thiserror.workspace = true

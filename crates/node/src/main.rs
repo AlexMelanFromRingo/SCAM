@@ -2,10 +2,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use scam_consensus::{UtxoSet, validate_and_apply_block, validate_block_basic};
+use scam_consensus::{TxValidationError, UtxoSet, validate_and_apply_block, validate_block_basic};
 use scam_core::{
     ChainConfig, ChainConfigError, OutPoint, Transaction, TxIn, TxOut, block_meets_pow,
 };
+use scam_miner::{BlockTemplate, mine_block};
 use scam_p2p::{GossipEngine, WireMessage};
 use scam_wallet::{
     AddressError, DeriveKeyError, MnemonicError, QrError, SchnorrError, WalletMnemonic,
@@ -34,6 +35,7 @@ struct Cli {
 enum Command {
     Node(NodeArgs),
     Wallet(WalletArgs),
+    MineOnce(MineOnceArgs),
     P2pDemo,
 }
 
@@ -51,6 +53,16 @@ struct NodeArgs {
 struct WalletArgs {
     #[command(subcommand)]
     command: WalletCommand,
+}
+
+#[derive(Debug, Args)]
+struct MineOnceArgs {
+    #[arg(long, value_enum, default_value_t = Network::Devnet)]
+    network: Network,
+    #[arg(long)]
+    config: Option<PathBuf>,
+    #[arg(long, default_value_t = 50_000)]
+    max_nonce: u64,
 }
 
 #[derive(Debug, Subcommand)]
@@ -146,6 +158,8 @@ enum NodeError {
     },
     #[error("invalid chain config: {0}")]
     InvalidConfig(#[from] ChainConfigError),
+    #[error("block/tx validation failed: {0}")]
+    Validation(#[from] TxValidationError),
     #[error("mnemonic error: {0}")]
     Mnemonic(#[from] MnemonicError),
     #[error("key derivation error: {0}")]
@@ -368,11 +382,81 @@ fn run_p2p_demo() -> Result<(), NodeError> {
     Ok(())
 }
 
+fn run_mine_once(args: MineOnceArgs) -> Result<(), NodeError> {
+    let config_path = args
+        .config
+        .unwrap_or_else(|| PathBuf::from(format!("config/{}.toml", args.network.as_str())));
+
+    let cfg = load_chain_config(&config_path)?;
+    let genesis = cfg.build_genesis_block()?;
+    let mut utxos = UtxoSet::new();
+    validate_and_apply_block(
+        &genesis,
+        0,
+        cfg.block_subsidy,
+        cfg.coinbase_maturity as u64,
+        &mut utxos,
+    )?;
+
+    let miner_key_hash = cfg.genesis_reward_key_hash20()?;
+    let coinbase = Transaction {
+        version: 1,
+        inputs: vec![TxIn {
+            prev_out: OutPoint::coinbase(),
+            signature: b"mine-once".to_vec(),
+            pubkey_compressed: vec![],
+            sequence: u32::MAX,
+        }],
+        outputs: vec![TxOut {
+            value: cfg.block_subsidy,
+            key_hash20: miner_key_hash,
+        }],
+        lock_time: 0,
+    };
+    let template = BlockTemplate {
+        version: 1,
+        prev_block: genesis.header.block_hash(),
+        timestamp: genesis
+            .header
+            .timestamp
+            .saturating_add(cfg.target_block_time_sec),
+        target: genesis.header.target,
+        transactions: vec![coinbase],
+    };
+
+    let Some(mined_block) = mine_block(&template, args.max_nonce) else {
+        println!(
+            "Mining failed: no nonce found in range 0..={}",
+            args.max_nonce
+        );
+        return Ok(());
+    };
+
+    let summary = validate_and_apply_block(
+        &mined_block,
+        1,
+        cfg.block_subsidy,
+        cfg.coinbase_maturity as u64,
+        &mut utxos,
+    )?;
+
+    println!("Mine-once result:");
+    println!("Config: {}", config_path.display());
+    println!("Mined block hash: {}", mined_block.header.block_hash());
+    println!("Nonce: {}", mined_block.header.nonce);
+    println!("PoW valid: {}", block_meets_pow(&mined_block));
+    println!("Applied: true");
+    println!("UTXO size: {}", utxos.len());
+    println!("Coinbase value: {}", summary.coinbase_value);
+    Ok(())
+}
+
 fn run() -> Result<(), NodeError> {
     let cli = Cli::parse();
     match cli.command {
         Some(Command::Node(args)) => run_node(args.network, args.config, args.print_genesis),
         Some(Command::Wallet(args)) => run_wallet(args.command),
+        Some(Command::MineOnce(args)) => run_mine_once(args),
         Some(Command::P2pDemo) => run_p2p_demo(),
         None => run_node(cli.network, cli.config, cli.print_genesis),
     }

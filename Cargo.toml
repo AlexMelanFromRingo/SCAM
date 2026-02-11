@@ -3,6 +3,7 @@ members = [
     "crates/core",
     "crates/consensus",
     "crates/mempool",
+    "crates/miner",
     "crates/p2p",
     "crates/wallet",
     "crates/node",

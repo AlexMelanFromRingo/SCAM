@@ -404,6 +404,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "scam-miner"
+version = "0.1.0"
+dependencies = [
+ "scam-core",
+]
+
+[[package]]
 name = "scam-node"
 version = "0.1.0"
 dependencies = [
@@ -411,6 +418,7 @@ dependencies = [
  "hex",
  "scam-consensus",
  "scam-core",
+ "scam-miner",
  "scam-p2p",
  "scam-wallet",
  "thiserror",
