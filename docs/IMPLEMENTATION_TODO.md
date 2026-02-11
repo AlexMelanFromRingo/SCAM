@@ -191,7 +191,7 @@ Status: draft v1 (frozen decisions from user session on 2026-02-11)
 - [x] Build block template from mempool by fee rate.
 - [x] Insert coinbase with fixed subsidy + collected fees.
 - [x] Implement nonce search loop.
-- [ ] Add extra nonce in coinbase to extend search space.
+- [x] Add extra nonce in coinbase to extend search space.
 - [ ] Rebuild template on new best block or mempool updates.
 - [x] Add CPU miner mode for devnet/testnet.
 

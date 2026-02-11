@@ -33,6 +33,12 @@ pub struct TemplateBuildSummary {
     pub total_fees: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MinedBlock {
+    pub block: Block,
+    pub extra_nonce: u64,
+}
+
 impl BlockTemplate {
     pub fn build_with_nonce(&self, nonce: u64) -> Block {
         let txids: Vec<Hash256> = self.transactions.iter().map(Transaction::txid).collect();
@@ -161,14 +167,40 @@ fn build_coinbase_tx(tag: &str, value: u64, key_hash20: [u8; 20]) -> Transaction
     }
 }
 
-pub fn mine_block(template: &BlockTemplate, max_nonce: u64) -> Option<Block> {
-    for nonce in 0..=max_nonce {
-        let candidate = template.build_with_nonce(nonce);
-        if header_meets_pow(&candidate.header) {
-            return Some(candidate);
+fn template_with_extra_nonce(template: &BlockTemplate, extra_nonce: u64) -> BlockTemplate {
+    let mut candidate = template.clone();
+    if let Some(coinbase) = candidate.transactions.first_mut()
+        && coinbase.is_coinbase()
+    {
+        coinbase.inputs[0]
+            .signature
+            .extend_from_slice(&extra_nonce.to_le_bytes());
+    }
+    candidate
+}
+
+pub fn mine_block_with_extra_nonce(
+    template: &BlockTemplate,
+    max_extra_nonce: u64,
+    max_nonce: u64,
+) -> Option<MinedBlock> {
+    for extra_nonce in 0..=max_extra_nonce {
+        let candidate_template = template_with_extra_nonce(template, extra_nonce);
+        for nonce in 0..=max_nonce {
+            let candidate = candidate_template.build_with_nonce(nonce);
+            if header_meets_pow(&candidate.header) {
+                return Some(MinedBlock {
+                    block: candidate,
+                    extra_nonce,
+                });
+            }
         }
     }
     None
+}
+
+pub fn mine_block(template: &BlockTemplate, max_nonce: u64) -> Option<Block> {
+    mine_block_with_extra_nonce(template, 0, max_nonce).map(|mined| mined.block)
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -184,7 +216,10 @@ mod tests {
     use scam_core::{OutPoint, Target, Transaction, TxIn, TxOut};
     use scam_mempool::Mempool;
 
-    use crate::{BlockTemplate, MempoolTemplateParams, build_template_from_mempool, mine_block};
+    use crate::{
+        BlockTemplate, MempoolTemplateParams, build_template_from_mempool, mine_block,
+        mine_block_with_extra_nonce, template_with_extra_nonce,
+    };
 
     fn coinbase() -> Transaction {
         Transaction {
@@ -306,5 +341,36 @@ mod tests {
         assert_eq!(summary.total_fees, 101);
         assert_eq!(template.transactions[1].txid(), parent_id);
         assert_eq!(template.transactions[2].txid(), child_id);
+    }
+
+    #[test]
+    fn extra_nonce_is_injected_into_coinbase_signature() {
+        let template = BlockTemplate {
+            version: 1,
+            prev_block: scam_core::Hash256::ZERO,
+            timestamp: 1_770_763_200,
+            target: Target::MAX,
+            transactions: vec![coinbase()],
+        };
+        let mut expected = b"coinbase".to_vec();
+        expected.extend_from_slice(&7u64.to_le_bytes());
+
+        let enriched = template_with_extra_nonce(&template, 7);
+        assert_eq!(enriched.transactions[0].inputs[0].signature, expected);
+    }
+
+    #[test]
+    fn mine_block_with_zero_extra_nonce_matches_mine_block() {
+        let template = BlockTemplate {
+            version: 1,
+            prev_block: scam_core::Hash256::ZERO,
+            timestamp: 1_770_763_200,
+            target: Target::MAX,
+            transactions: vec![coinbase()],
+        };
+        let legacy = mine_block(&template, 10).expect("legacy mining");
+        let mined = mine_block_with_extra_nonce(&template, 0, 10).expect("extra nonce mining");
+        assert_eq!(legacy.header.block_hash(), mined.block.header.block_hash());
+        assert_eq!(mined.extra_nonce, 0);
     }
 }
