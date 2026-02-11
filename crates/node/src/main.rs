@@ -16,8 +16,8 @@ use scam_core::{
 use scam_miner::{BlockTemplate, mine_block};
 use scam_p2p::{
     FramingConfig, GossipEngine, LocalHandshake, TransportError, WireMessage, build_block_locator,
-    client_handshake, read_message, request_headers, select_headers_for_peer, send_message,
-    server_handshake,
+    client_handshake, read_message, request_blocks, request_headers, select_block_hashes_for_peer,
+    select_headers_for_peer, send_message, server_handshake,
 };
 use scam_rpc::{StatusResponse, TxResponse, header_to_block_response, to_pretty_json};
 use scam_storage::{
@@ -1489,6 +1489,23 @@ fn run_net_demo(args: NetDemoArgs) -> Result<(), NodeError> {
             }
         }
 
+        let request = read_message(&mut stream, &framing_server).map_err(|e| e.to_string())?;
+        match request {
+            WireMessage::GetBlocks { locator, stop } => {
+                let hashes =
+                    select_block_hashes_for_peer(&remote_chain, &locator, stop, max_headers);
+                let items = hashes
+                    .into_iter()
+                    .map(scam_p2p::InventoryItem::Block)
+                    .collect();
+                send_message(&mut stream, &WireMessage::Inv { items }, &framing_server)
+                    .map_err(|e| e.to_string())?;
+            }
+            other => {
+                return Err(format!("expected getblocks, got {other:?}"));
+            }
+        }
+
         Ok(())
     });
 
@@ -1520,6 +1537,7 @@ fn run_net_demo(args: NetDemoArgs) -> Result<(), NodeError> {
 
     let locator = build_block_locator(local.block_hashes());
     let headers = request_headers(&mut client, &framing, locator.clone(), None)?;
+    let block_hashes = request_blocks(&mut client, &framing, locator.clone(), None)?;
 
     let server_result = server
         .join()
@@ -1528,7 +1546,7 @@ fn run_net_demo(args: NetDemoArgs) -> Result<(), NodeError> {
         return Err(NodeError::Runtime(format!("server error: {err}")));
     }
 
-    println!("Net demo (TCP + handshake + headers-first)");
+    println!("Net demo (TCP + handshake + headers/getblocks)");
     println!(
         "Client tip: h={} hash={}",
         local.tip_height(),
@@ -1541,11 +1559,15 @@ fn run_net_demo(args: NetDemoArgs) -> Result<(), NodeError> {
     );
     println!("Locator sent: {}", locator.len());
     println!("Headers received: {}", headers.len());
+    println!("Block hashes received: {}", block_hashes.len());
     if let Some(first) = headers.first() {
         println!("First header prev: {}", first.prev_block);
     }
     if let Some(last) = headers.last() {
         println!("Last header hash: {}", last.block_hash());
+    }
+    if let Some(last) = block_hashes.last() {
+        println!("Last announced block hash: {}", last);
     }
     Ok(())
 }
