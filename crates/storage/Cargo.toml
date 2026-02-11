@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 bincode.workspace = true
+redb.workspace = true
 scam-consensus = { path = "../consensus" }
 scam-core = { path = "../core" }
 serde.workspace = true

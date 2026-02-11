@@ -20,7 +20,10 @@ use scam_p2p::{
     server_handshake,
 };
 use scam_rpc::{StatusResponse, TxResponse, header_to_block_response, to_pretty_json};
-use scam_storage::{ChainStateSnapshot, StorageError, load_snapshot, save_snapshot};
+use scam_storage::{
+    ChainStateSnapshot, StorageError, load_snapshot, load_snapshot_db, save_snapshot,
+    save_snapshot_db,
+};
 use scam_wallet::{
     AddressError, DeriveKeyError, MnemonicError, QrError, SchnorrError, WalletMnemonic,
     derive_wallet_key, new_mnemonic, parse_address, qr_for_payment_uri, sign_digest, to_address,
@@ -259,7 +262,19 @@ enum SnapshotCommand {
         #[arg(long, default_value = "data/chain.snapshot")]
         out: PathBuf,
     },
+    SaveGenesisDb {
+        #[arg(long, value_enum, default_value_t = Network::Devnet)]
+        network: Network,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long, default_value = "data/chain.redb")]
+        out: PathBuf,
+    },
     Show {
+        #[arg(long)]
+        path: PathBuf,
+    },
+    ShowDb {
         #[arg(long)]
         path: PathBuf,
     },
@@ -1070,9 +1085,52 @@ fn run_snapshot(command: SnapshotCommand) -> Result<(), NodeError> {
             println!("Tip hash: {}", snapshot.tip_hash);
             println!("UTXO count: {}", snapshot.utxos.len());
         }
+        SnapshotCommand::SaveGenesisDb {
+            network,
+            config,
+            out,
+        } => {
+            let config_path = config
+                .unwrap_or_else(|| PathBuf::from(format!("config/{}.toml", network.as_str())));
+            let cfg = load_chain_config(&config_path)?;
+            let genesis = cfg.build_genesis_block()?;
+            let genesis_hash = genesis.header.block_hash();
+
+            let mut utxos = UtxoSet::new();
+            validate_and_apply_block(
+                &genesis,
+                0,
+                cfg.block_subsidy,
+                cfg.coinbase_maturity as u64,
+                &mut utxos,
+            )?;
+
+            let snapshot = ChainStateSnapshot::from_utxo_set(
+                cfg.network_id.clone(),
+                0,
+                genesis_hash,
+                vec![genesis_hash],
+                &utxos,
+            );
+            save_snapshot_db(&out, &snapshot)?;
+            println!("Snapshot DB saved: {}", out.display());
+            println!("Network: {}", snapshot.network_id);
+            println!("Tip height: {}", snapshot.tip_height);
+            println!("Tip hash: {}", snapshot.tip_hash);
+            println!("UTXO count: {}", snapshot.utxos.len());
+        }
         SnapshotCommand::Show { path } => {
             let snapshot = load_snapshot(&path)?;
             println!("Snapshot: {}", path.display());
+            println!("Network: {}", snapshot.network_id);
+            println!("Tip height: {}", snapshot.tip_height);
+            println!("Tip hash: {}", snapshot.tip_hash);
+            println!("Blocks tracked: {}", snapshot.block_hashes_by_height.len());
+            println!("UTXO count: {}", snapshot.utxos.len());
+        }
+        SnapshotCommand::ShowDb { path } => {
+            let snapshot = load_snapshot_db(&path)?;
+            println!("Snapshot DB: {}", path.display());
             println!("Network: {}", snapshot.network_id);
             println!("Tip height: {}", snapshot.tip_height);
             println!("Tip hash: {}", snapshot.tip_hash);

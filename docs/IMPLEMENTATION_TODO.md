@@ -15,6 +15,7 @@ Status: draft v1 (frozen decisions from user session on 2026-02-11)
 - [x] P2P TCP transport framing + `version/verack` handshake + `ping/pong` + `getheaders/headers` demo implemented.
 - [x] Miner template + nonce search loop implemented (`mine-once` CLI).
 - [x] Chainstate snapshot save/load implemented.
+- [x] redb-backed snapshot persistence implemented (`snapshot save-genesis-db` / `snapshot show-db`).
 - [x] Reorg-safe best-chain selection by cumulative work implemented in chain runtime.
 - [x] Minimal HTTP JSON RPC transport implemented (`scam-node rpc-serve`).
 - [ ] Remaining major items: socketed p2p sync runtime beyond demo mode, persistent DB-backed node runtime.
@@ -156,13 +157,13 @@ Status: draft v1 (frozen decisions from user session on 2026-02-11)
 
 ## 12) Storage TODO
 
-- [ ] Pick DB engine (`redb` recommended for simple embedded start).
+- [x] Pick DB engine (`redb` embedded backend added in `scam-storage`).
 - [ ] Buckets/tables:
 - [ ] blocks by hash
 - [ ] headers by hash
 - [ ] block index (height, work, parent)
-- [ ] UTXO set
-- [ ] chain tip metadata
+- [x] UTXO set
+- [x] chain tip metadata
 - [ ] mempool persistence (optional, bounded)
 - [ ] peer address book
 - [ ] Atomic commit for block connect/disconnect state updates.
