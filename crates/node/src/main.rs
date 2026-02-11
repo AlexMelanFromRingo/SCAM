@@ -3,7 +3,10 @@ use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use scam_consensus::{UtxoSet, validate_and_apply_block, validate_block_basic};
-use scam_core::{ChainConfig, ChainConfigError, block_meets_pow};
+use scam_core::{
+    ChainConfig, ChainConfigError, OutPoint, Transaction, TxIn, TxOut, block_meets_pow,
+};
+use scam_p2p::{GossipEngine, WireMessage};
 use scam_wallet::{
     AddressError, DeriveKeyError, MnemonicError, QrError, SchnorrError, WalletMnemonic,
     derive_wallet_key, new_mnemonic, parse_address, qr_for_payment_uri, sign_digest, to_address,
@@ -31,6 +34,7 @@ struct Cli {
 enum Command {
     Node(NodeArgs),
     Wallet(WalletArgs),
+    P2pDemo,
 }
 
 #[derive(Debug, Args)]
@@ -163,6 +167,8 @@ enum NodeError {
         expected: usize,
         got: usize,
     },
+    #[error("{0}")]
+    Runtime(String),
 }
 
 fn load_chain_config(path: &Path) -> Result<ChainConfig, NodeError> {
@@ -323,11 +329,51 @@ fn run_wallet(command: WalletCommand) -> Result<(), NodeError> {
     Ok(())
 }
 
+fn run_p2p_demo() -> Result<(), NodeError> {
+    let mut engine = GossipEngine::new(256)
+        .map_err(|e| NodeError::Runtime(format!("cannot create gossip engine: {e}")))?;
+    engine.connect_peer(1);
+    engine.connect_peer(2);
+    engine.connect_peer(3);
+
+    let tx = Transaction {
+        version: 1,
+        inputs: vec![TxIn {
+            prev_out: OutPoint {
+                txid: scam_core::hash::hash256(b"demo-prev"),
+                vout: 0,
+            },
+            signature: vec![0u8; 64],
+            pubkey_compressed: vec![2u8; 33],
+            sequence: 0,
+        }],
+        outputs: vec![TxOut {
+            value: 1,
+            key_hash20: [9u8; 20],
+        }],
+        lock_time: 0,
+    };
+
+    let fanout = engine
+        .on_message(1, WireMessage::Tx { tx })
+        .map_err(|e| NodeError::Runtime(format!("gossip processing failed: {e}")))?;
+
+    println!("P2P gossip demo:");
+    println!("Incoming: peer #1 sent tx object");
+    println!("Engine produced {} outbound messages", fanout.len());
+    for outbound in fanout {
+        println!(" -> to peer #{}: {:?}", outbound.peer_id, outbound.message);
+    }
+    println!("Pattern: inv/getdata/object relay with peer-level dedup");
+    Ok(())
+}
+
 fn run() -> Result<(), NodeError> {
     let cli = Cli::parse();
     match cli.command {
         Some(Command::Node(args)) => run_node(args.network, args.config, args.print_genesis),
         Some(Command::Wallet(args)) => run_wallet(args.command),
+        Some(Command::P2pDemo) => run_p2p_demo(),
         None => run_node(cli.network, cli.config, cli.print_genesis),
     }
 }

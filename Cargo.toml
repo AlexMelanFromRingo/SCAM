@@ -3,6 +3,7 @@ members = [
     "crates/core",
     "crates/consensus",
     "crates/mempool",
+    "crates/p2p",
     "crates/wallet",
     "crates/node",
 ]
@@ -16,6 +17,7 @@ license = "MIT OR Apache-2.0"
 [workspace.dependencies]
 blake3 = "1.8"
 clap = { version = "4.5", features = ["derive"] }
+bincode = "1.3"
 bech32 = "0.9"
 bip39 = { version = "2.2", default-features = true, features = ["rand"] }
 hex = "0.4"
