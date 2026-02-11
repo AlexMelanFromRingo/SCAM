@@ -6,3 +6,5 @@ license.workspace = true
 
 [dependencies]
 scam-core = { path = "../core" }
+scam-mempool = { path = "../mempool" }
+thiserror.workspace = true

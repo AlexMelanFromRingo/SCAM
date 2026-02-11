@@ -54,6 +54,14 @@ impl Mempool {
         self.txs.contains_key(txid)
     }
 
+    pub fn fee(&self, txid: &Hash256) -> Option<u64> {
+        self.txs.get(txid).map(|entry| entry.fee)
+    }
+
+    pub fn get_with_fee(&self, txid: &Hash256) -> Option<(&Transaction, u64)> {
+        self.txs.get(txid).map(|entry| (&entry.tx, entry.fee))
+    }
+
     pub fn insert(&mut self, tx: Transaction) -> Result<InsertOutcome, MempoolError> {
         self.insert_with_fee(tx, 0)
     }

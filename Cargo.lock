@@ -427,6 +427,8 @@ name = "scam-miner"
 version = "0.1.0"
 dependencies = [
  "scam-core",
+ "scam-mempool",
+ "thiserror",
 ]
 
 [[package]]
