@@ -2,10 +2,30 @@ use std::collections::HashMap;
 
 use num_bigint::BigUint;
 use scam_consensus::{
-    BlockApplySummary, UtxoSet, chainwork_for_target, retarget_next, validate_and_apply_block,
+    BlockApplySummary, BlockValidationError, UtxoSet, chainwork_for_target, retarget_next,
+    validate_and_apply_block, validate_block_basic,
 };
 use scam_core::{Block, BlockHeader, ChainConfig, Hash256, Target};
 use thiserror::Error;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BlockSubmissionOutcome {
+    AlreadyKnown {
+        block_hash: Hash256,
+    },
+    StoredSideBranch {
+        block_hash: Hash256,
+    },
+    ExtendedTip {
+        new_tip: Hash256,
+        new_height: u64,
+    },
+    Reorged {
+        old_tip: Hash256,
+        new_tip: Hash256,
+        new_height: u64,
+    },
+}
 
 pub struct ChainRuntime {
     config: ChainConfig,
@@ -178,6 +198,132 @@ impl ChainRuntime {
         self.cumulative_work.insert(block_hash, work);
         Ok(summary)
     }
+
+    pub fn submit_block(&mut self, block: Block) -> Result<BlockSubmissionOutcome, ChainError> {
+        validate_block_basic(&block).map_err(ChainError::InvalidBlockStructure)?;
+
+        let block_hash = block.header.block_hash();
+        if self.headers.contains_key(&block_hash) {
+            return Ok(BlockSubmissionOutcome::AlreadyKnown { block_hash });
+        }
+        if !self.headers.contains_key(&block.header.prev_block) {
+            return Err(ChainError::UnknownParent {
+                block_hash,
+                parent: block.header.prev_block,
+            });
+        }
+
+        let parent_work = self
+            .cumulative_work
+            .get(&block.header.prev_block)
+            .expect("parent work must exist")
+            .clone();
+        let candidate_work = parent_work + chainwork_for_target(block.header.target);
+
+        self.headers.insert(block_hash, block.header.clone());
+        self.blocks.insert(block_hash, block);
+        self.cumulative_work
+            .insert(block_hash, candidate_work.clone());
+
+        let current_tip = self.tip_hash();
+        let current_work = self
+            .cumulative_work
+            .get(&current_tip)
+            .expect("tip work must exist")
+            .clone();
+        if candidate_work <= current_work {
+            return Ok(BlockSubmissionOutcome::StoredSideBranch { block_hash });
+        }
+
+        let candidate_chain = self.collect_chain_to_genesis(block_hash)?;
+        let replayed = match self.replay_chain(&candidate_chain) {
+            Ok(runtime) => runtime,
+            Err(err) => {
+                self.headers.remove(&block_hash);
+                self.blocks.remove(&block_hash);
+                self.cumulative_work.remove(&block_hash);
+                return Err(err);
+            }
+        };
+
+        self.main_chain = candidate_chain;
+        self.utxos = replayed.utxos;
+
+        let new_tip = self.tip_hash();
+        if self
+            .headers
+            .get(&new_tip)
+            .expect("new tip header must exist")
+            .prev_block
+            == current_tip
+        {
+            return Ok(BlockSubmissionOutcome::ExtendedTip {
+                new_tip,
+                new_height: self.tip_height(),
+            });
+        }
+
+        Ok(BlockSubmissionOutcome::Reorged {
+            old_tip: current_tip,
+            new_tip,
+            new_height: self.tip_height(),
+        })
+    }
+
+    fn collect_chain_to_genesis(&self, tip_hash: Hash256) -> Result<Vec<Hash256>, ChainError> {
+        let genesis_hash = self.main_chain[0];
+        let mut cursor = tip_hash;
+        let mut reversed = Vec::<Hash256>::new();
+
+        loop {
+            reversed.push(cursor);
+            if cursor == genesis_hash {
+                break;
+            }
+
+            let header = self
+                .headers
+                .get(&cursor)
+                .ok_or(ChainError::MissingHeader { block_hash: cursor })?;
+            if !self.headers.contains_key(&header.prev_block) {
+                return Err(ChainError::UnknownParent {
+                    block_hash: cursor,
+                    parent: header.prev_block,
+                });
+            }
+            cursor = header.prev_block;
+        }
+
+        reversed.reverse();
+        Ok(reversed)
+    }
+
+    fn replay_chain(&self, chain_hashes: &[Hash256]) -> Result<Self, ChainError> {
+        let Some(genesis_hash) = chain_hashes.first().copied() else {
+            return Err(ChainError::InvalidRuntime(
+                "candidate chain cannot be empty".to_owned(),
+            ));
+        };
+
+        let genesis = self
+            .blocks
+            .get(&genesis_hash)
+            .ok_or(ChainError::MissingBlock {
+                block_hash: genesis_hash,
+            })?
+            .clone();
+        let mut replay = ChainRuntime::new(self.config.clone(), genesis)?;
+
+        for hash in chain_hashes.iter().copied().skip(1) {
+            let block = self
+                .blocks
+                .get(&hash)
+                .ok_or(ChainError::MissingBlock { block_hash: hash })?
+                .clone();
+            replay.apply_next_block(block)?;
+        }
+        Ok(replay)
+    }
 }
 
 #[derive(Debug, Error)]
@@ -188,11 +334,22 @@ pub enum ChainError {
     Validation(#[from] scam_consensus::TxValidationError),
     #[error("difficulty retarget error: {0}")]
     Difficulty(#[source] scam_consensus::difficulty::DifficultyError),
+    #[error("invalid block structure: {0}")]
+    InvalidBlockStructure(#[from] BlockValidationError),
     #[error("block prev hash must point to current tip: expected {expected_tip}, got {got_prev}")]
     PrevBlockMustBeTip {
         expected_tip: Hash256,
         got_prev: Hash256,
     },
+    #[error("unknown parent for block {block_hash}: parent={parent}")]
+    UnknownParent {
+        block_hash: Hash256,
+        parent: Hash256,
+    },
+    #[error("missing header for block {block_hash}")]
+    MissingHeader { block_hash: Hash256 },
+    #[error("missing block body for block {block_hash}")]
+    MissingBlock { block_hash: Hash256 },
     #[error("unexpected block target: expected {expected}, got {got}")]
     UnexpectedTarget { expected: Target, got: Target },
     #[error("{0}")]
@@ -204,7 +361,7 @@ mod tests {
     use scam_core::{OutPoint, Transaction, TxIn, TxOut};
     use scam_miner::{BlockTemplate, mine_block};
 
-    use crate::ChainRuntime;
+    use crate::{BlockSubmissionOutcome, ChainRuntime};
 
     fn coinbase(value: u64, key_hash20: [u8; 20], tag: &[u8]) -> Transaction {
         Transaction {
@@ -262,5 +419,68 @@ mod tests {
 
         assert_eq!(runtime.tip_height(), 3);
         assert_eq!(runtime.block_hashes().len(), 4);
+    }
+
+    #[test]
+    fn side_branch_with_more_work_triggers_reorg() {
+        let mut config: scam_core::ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        config.difficulty_adjustment_window = 50;
+        let mut runtime = ChainRuntime::from_config(config.clone()).expect("runtime");
+
+        let mut timestamp = runtime.tip_header().timestamp + 30;
+        for i in 0..4 {
+            let template = BlockTemplate {
+                version: 1,
+                prev_block: runtime.tip_hash(),
+                timestamp,
+                target: runtime.expected_target_for_next_block().expect("target"),
+                transactions: vec![coinbase(
+                    config.block_subsidy,
+                    config.genesis_reward_key_hash20().expect("key"),
+                    format!("main-{i}").as_bytes(),
+                )],
+            };
+            let mined = mine_block(&template, 300_000).expect("main mined");
+            runtime.apply_next_block(mined).expect("main apply");
+            timestamp += 30;
+        }
+        let old_tip = runtime.tip_hash();
+        let fork_point = runtime.block_hash_at_height(1).expect("fork height exists");
+        let fork_target = runtime
+            .header_by_hash(&fork_point)
+            .expect("fork header")
+            .target;
+        let mut fork_prev = fork_point;
+        let mut fork_ts = runtime
+            .header_by_hash(&fork_point)
+            .expect("fork header")
+            .timestamp
+            + 20;
+
+        let mut saw_reorg = false;
+        for i in 0..6 {
+            let template = BlockTemplate {
+                version: 1,
+                prev_block: fork_prev,
+                timestamp: fork_ts,
+                target: fork_target,
+                transactions: vec![coinbase(
+                    config.block_subsidy,
+                    config.genesis_reward_key_hash20().expect("key"),
+                    format!("fork-{i}").as_bytes(),
+                )],
+            };
+            let block = mine_block(&template, 300_000).expect("fork mined");
+            fork_prev = block.header.block_hash();
+            let outcome = runtime.submit_block(block).expect("submit");
+            if matches!(outcome, BlockSubmissionOutcome::Reorged { .. }) {
+                saw_reorg = true;
+            }
+            fork_ts += 20;
+        }
+
+        assert!(saw_reorg, "expected at least one reorg event");
+        assert_ne!(runtime.tip_hash(), old_tip);
     }
 }

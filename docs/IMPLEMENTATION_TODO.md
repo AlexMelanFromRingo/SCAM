@@ -137,8 +137,8 @@ Status: draft v1 (frozen decisions from user session on 2026-02-11)
 - [x] Validate PoW with numeric target compare (`hash <= target`).
 - [x] Validate block tx ordering and coinbase position.
 - [x] Validate subsidy + fees in coinbase output total.
-- [ ] Implement chain selection by cumulative work (not height only).
-- [ ] Implement reorg: disconnect old branch, connect new branch.
+- [x] Implement chain selection by cumulative work (not height only).
+- [x] Implement reorg: disconnect old branch, connect new branch.
 
 ## 11) Difficulty Retarget TODO
 

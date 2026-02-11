@@ -6,7 +6,7 @@ use std::thread;
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use scam_chain::{ChainError, ChainRuntime};
+use scam_chain::{BlockSubmissionOutcome, ChainError, ChainRuntime};
 use scam_consensus::{TxValidationError, UtxoSet, validate_and_apply_block, validate_block_basic};
 use scam_core::{
     ChainConfig, ChainConfigError, Hash256, OutPoint, Transaction, TxIn, TxOut, block_meets_pow,
@@ -56,6 +56,7 @@ enum Command {
     ChainDemo(ChainDemoArgs),
     SyncDemo(SyncDemoArgs),
     NetDemo(NetDemoArgs),
+    ReorgDemo(ReorgDemoArgs),
     Snapshot(SnapshotArgs),
     P2pDemo,
 }
@@ -198,6 +199,26 @@ struct NetDemoArgs {
     max_headers: usize,
     #[arg(long, default_value_t = 30)]
     interval_sec: u64,
+    #[arg(long, default_value_t = 500_000)]
+    max_nonce: u64,
+}
+
+#[derive(Debug, Args)]
+struct ReorgDemoArgs {
+    #[arg(long, value_enum, default_value_t = Network::Devnet)]
+    network: Network,
+    #[arg(long)]
+    config: Option<PathBuf>,
+    #[arg(long, default_value_t = 4)]
+    main_blocks: u32,
+    #[arg(long, default_value_t = 6)]
+    fork_blocks: u32,
+    #[arg(long, default_value_t = 1)]
+    fork_from_height: u64,
+    #[arg(long, default_value_t = 30)]
+    main_interval_sec: u64,
+    #[arg(long, default_value_t = 20)]
+    fork_interval_sec: u64,
     #[arg(long, default_value_t = 500_000)]
     max_nonce: u64,
 }
@@ -1195,6 +1216,107 @@ fn run_net_demo(args: NetDemoArgs) -> Result<(), NodeError> {
     Ok(())
 }
 
+fn run_reorg_demo(args: ReorgDemoArgs) -> Result<(), NodeError> {
+    let config_path = args
+        .config
+        .unwrap_or_else(|| PathBuf::from(format!("config/{}.toml", args.network.as_str())));
+    let mut cfg = load_chain_config(&config_path)?;
+    if cfg.difficulty_adjustment_window < 50 {
+        cfg.difficulty_adjustment_window = 50;
+    }
+    let miner_key_hash = cfg.genesis_reward_key_hash20()?;
+    let mut runtime = ChainRuntime::from_config(cfg.clone())?;
+
+    let main_params = MiningLoopParams {
+        count: args.main_blocks,
+        interval_sec: args.main_interval_sec,
+        max_nonce: args.max_nonce,
+        subsidy: cfg.block_subsidy,
+        miner_key_hash,
+        label_prefix: "main",
+        print_each: false,
+    };
+    mine_blocks_on_runtime(&mut runtime, &main_params)?;
+
+    let old_tip = runtime.tip_hash();
+    let Some(fork_from_hash) = runtime.block_hash_at_height(args.fork_from_height) else {
+        return Err(NodeError::Runtime(format!(
+            "fork_from_height {} out of range",
+            args.fork_from_height
+        )));
+    };
+    let Some(fork_header) = runtime.header_by_hash(&fork_from_hash).cloned() else {
+        return Err(NodeError::Runtime("fork header missing".to_owned()));
+    };
+    let fork_target = fork_header.target;
+    let mut fork_prev = fork_from_hash;
+    let mut fork_ts = fork_header.timestamp.saturating_add(args.fork_interval_sec);
+
+    let mut reorg_count = 0u32;
+    for i in 0..args.fork_blocks {
+        let template = BlockTemplate {
+            version: 1,
+            prev_block: fork_prev,
+            timestamp: fork_ts,
+            target: fork_target,
+            transactions: vec![build_coinbase_tx(
+                format!("fork-{i}"),
+                cfg.block_subsidy,
+                miner_key_hash,
+            )],
+        };
+
+        let Some(block) = mine_block(&template, args.max_nonce) else {
+            return Err(NodeError::Runtime(format!(
+                "cannot mine fork block {i} in range 0..={}",
+                args.max_nonce
+            )));
+        };
+        fork_prev = block.header.block_hash();
+        fork_ts = fork_ts.saturating_add(args.fork_interval_sec);
+
+        let outcome = runtime.submit_block(block)?;
+        match outcome {
+            BlockSubmissionOutcome::AlreadyKnown { block_hash } => {
+                println!("fork block already known: {}", block_hash);
+            }
+            BlockSubmissionOutcome::StoredSideBranch { block_hash } => {
+                println!("stored side block: {}", block_hash);
+            }
+            BlockSubmissionOutcome::ExtendedTip {
+                new_tip,
+                new_height,
+            } => {
+                println!(
+                    "extended tip via fork path: h={} hash={}",
+                    new_height, new_tip
+                );
+            }
+            BlockSubmissionOutcome::Reorged {
+                old_tip,
+                new_tip,
+                new_height,
+            } => {
+                reorg_count += 1;
+                println!(
+                    "reorg occurred: old_tip={} -> new_tip={} at h={}",
+                    old_tip, new_tip, new_height
+                );
+            }
+        }
+    }
+
+    println!("Reorg demo summary");
+    println!("Initial main tip: {}", old_tip);
+    println!(
+        "Final tip: h={} hash={}",
+        runtime.tip_height(),
+        runtime.tip_hash()
+    );
+    println!("Reorg events: {}", reorg_count);
+    Ok(())
+}
+
 fn run() -> Result<(), NodeError> {
     let cli = Cli::parse();
     match cli.command {
@@ -1209,6 +1331,7 @@ fn run() -> Result<(), NodeError> {
         Some(Command::ChainDemo(args)) => run_chain_demo(args),
         Some(Command::SyncDemo(args)) => run_sync_demo(args),
         Some(Command::NetDemo(args)) => run_net_demo(args),
+        Some(Command::ReorgDemo(args)) => run_reorg_demo(args),
         Some(Command::Snapshot(args)) => run_snapshot(args.command),
         Some(Command::P2pDemo) => run_p2p_demo(),
         None => run_node(cli.network, cli.config, cli.print_genesis),
