@@ -130,7 +130,7 @@ Status: draft v1 (frozen decisions from user session on 2026-02-11)
 - [x] else reject new tx.
 - [ ] Broadcast replacement/eviction events to peers as inventory updates.
 - [ ] Add orphan tx pool with size/time limits.
-- [ ] Add eviction policy for full mempool.
+- [x] Add eviction policy for full mempool.
 
 ## 10) Block and Chain TODO
 

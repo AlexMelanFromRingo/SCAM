@@ -75,7 +75,7 @@ impl Mempool {
             .txs
             .iter()
             .map(|(txid, entry)| {
-                let fee_rate_key = ((entry.fee as u128) * 1000) / (entry.serialized_size as u128);
+                let fee_rate_key = feerate_key(entry.fee, entry.serialized_size);
                 (*txid, fee_rate_key)
             })
             .collect::<Vec<_>>();
@@ -138,9 +138,33 @@ impl Mempool {
         }
 
         if self.txs.len() >= self.max_txs {
-            return Err(MempoolError::Full {
-                limit: self.max_txs,
-                incoming: txid,
+            let incoming_rate = feerate_key(fee, serialized_size);
+            let Some((victim_txid, victim_rate)) = self.lowest_feerate_txid() else {
+                return Err(MempoolError::Full {
+                    limit: self.max_txs,
+                    incoming: txid,
+                });
+            };
+            if incoming_rate <= victim_rate {
+                return Err(MempoolError::Full {
+                    limit: self.max_txs,
+                    incoming: txid,
+                });
+            }
+
+            let removed = self.remove_with_descendants(victim_txid);
+            self.txs.insert(
+                txid,
+                MempoolEntry {
+                    tx,
+                    fee,
+                    serialized_size,
+                },
+            );
+            self.rebuild_spent_outpoints();
+            return Ok(InsertOutcome::AcceptedWithEviction {
+                inserted: txid,
+                removed,
             });
         }
 
@@ -154,6 +178,15 @@ impl Mempool {
         );
         self.rebuild_spent_outpoints();
         Ok(InsertOutcome::Accepted { txid })
+    }
+
+    fn lowest_feerate_txid(&self) -> Option<(Hash256, u128)> {
+        self.txs
+            .iter()
+            .map(|(txid, entry)| (*txid, feerate_key(entry.fee, entry.serialized_size)))
+            .min_by(|(txid_a, rate_a), (txid_b, rate_b)| {
+                rate_a.cmp(rate_b).then_with(|| txid_b.cmp(txid_a))
+            })
     }
 
     fn remove_with_descendants(&mut self, root_txid: Hash256) -> Vec<Hash256> {
@@ -217,6 +250,10 @@ fn required_fee_for_size(
         .map_err(|_| MempoolError::InvalidLimit("required fee does not fit into u64".to_owned()))
 }
 
+fn feerate_key(fee: u64, serialized_size: usize) -> u128 {
+    ((fee as u128) * 1000) / (serialized_size as u128)
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum InsertOutcome {
     Accepted {
@@ -226,6 +263,10 @@ pub enum InsertOutcome {
         txid: Hash256,
     },
     Replaced {
+        inserted: Hash256,
+        removed: Vec<Hash256>,
+    },
+    AcceptedWithEviction {
         inserted: Hash256,
         removed: Vec<Hash256>,
     },
@@ -393,5 +434,50 @@ mod tests {
         assert_eq!(ranked[0], high_id);
         assert_eq!(ranked[1], mid_id);
         assert_eq!(ranked[2], low_id);
+    }
+
+    #[test]
+    fn full_mempool_evicts_lowest_feerate_tx() {
+        let mut mempool = Mempool::with_policy(2, 0).expect("mempool");
+        let tx_low = mk_tx([10u8; 32], 0, b"same-size-a", 1);
+        let tx_high = mk_tx([11u8; 32], 0, b"same-size-b", 2);
+        let tx_mid = mk_tx([12u8; 32], 0, b"same-size-c", 3);
+        let low_id = tx_low.txid();
+        let high_id = tx_high.txid();
+        let mid_id = tx_mid.txid();
+
+        mempool.insert_with_fee(tx_low, 10).expect("insert low");
+        mempool.insert_with_fee(tx_high, 100).expect("insert high");
+        let outcome = mempool.insert_with_fee(tx_mid, 50).expect("insert mid");
+        assert!(matches!(
+            outcome,
+            InsertOutcome::AcceptedWithEviction { inserted, .. } if inserted == mid_id
+        ));
+        assert_eq!(mempool.len(), 2);
+        assert!(!mempool.contains(&low_id));
+        assert!(mempool.contains(&mid_id));
+        assert!(mempool.contains(&high_id));
+    }
+
+    #[test]
+    fn full_mempool_rejects_tx_with_lower_feerate() {
+        let mut mempool = Mempool::with_policy(2, 0).expect("mempool");
+        let tx_a = mk_tx([21u8; 32], 0, b"same-size-a", 1);
+        let tx_b = mk_tx([22u8; 32], 0, b"same-size-b", 2);
+        let tx_c = mk_tx([23u8; 32], 0, b"same-size-c", 3);
+        let a_id = tx_a.txid();
+        let b_id = tx_b.txid();
+        let c_id = tx_c.txid();
+
+        mempool.insert_with_fee(tx_a, 40).expect("insert a");
+        mempool.insert_with_fee(tx_b, 30).expect("insert b");
+        let err = mempool
+            .insert_with_fee(tx_c, 5)
+            .expect_err("must reject low feerate");
+        assert!(matches!(err, MempoolError::Full { .. }));
+        assert_eq!(mempool.len(), 2);
+        assert!(mempool.contains(&a_id));
+        assert!(mempool.contains(&b_id));
+        assert!(!mempool.contains(&c_id));
     }
 }
