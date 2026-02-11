@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -57,6 +58,7 @@ enum Command {
     SyncDemo(SyncDemoArgs),
     NetDemo(NetDemoArgs),
     ReorgDemo(ReorgDemoArgs),
+    RpcServe(RpcServeArgs),
     Snapshot(SnapshotArgs),
     P2pDemo,
 }
@@ -221,6 +223,24 @@ struct ReorgDemoArgs {
     fork_interval_sec: u64,
     #[arg(long, default_value_t = 500_000)]
     max_nonce: u64,
+}
+
+#[derive(Debug, Args)]
+struct RpcServeArgs {
+    #[arg(long, value_enum, default_value_t = Network::Devnet)]
+    network: Network,
+    #[arg(long)]
+    config: Option<PathBuf>,
+    #[arg(long, default_value = "127.0.0.1:18080")]
+    bind: String,
+    #[arg(long, default_value_t = 0)]
+    mine_blocks: u32,
+    #[arg(long, default_value_t = 120)]
+    interval_sec: u64,
+    #[arg(long, default_value_t = 500_000)]
+    max_nonce: u64,
+    #[arg(long, default_value_t = 0)]
+    max_requests: u32,
 }
 
 #[derive(Debug, Args)]
@@ -1317,6 +1337,214 @@ fn run_reorg_demo(args: ReorgDemoArgs) -> Result<(), NodeError> {
     Ok(())
 }
 
+fn json_error_body(message: &str) -> String {
+    let escaped = message
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n");
+    format!("{{\"error\":\"{escaped}\"}}")
+}
+
+fn write_http_json_response(
+    stream: &mut TcpStream,
+    status_line: &str,
+    body: &str,
+) -> Result<(), NodeError> {
+    let response = format!(
+        "HTTP/1.1 {status_line}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream
+        .write_all(response.as_bytes())
+        .map_err(|e| NodeError::Runtime(format!("http write failed: {e}")))?;
+    stream
+        .flush()
+        .map_err(|e| NodeError::Runtime(format!("http flush failed: {e}")))?;
+    Ok(())
+}
+
+fn read_http_get_path(stream: &mut TcpStream) -> Result<Option<String>, NodeError> {
+    let mut buffer = [0u8; 4096];
+    let read = stream
+        .read(&mut buffer)
+        .map_err(|e| NodeError::Runtime(format!("http read failed: {e}")))?;
+    if read == 0 {
+        return Ok(None);
+    }
+    let raw = std::str::from_utf8(&buffer[..read])
+        .map_err(|e| NodeError::Runtime(format!("invalid utf8 in request: {e}")))?;
+    let Some(line) = raw.lines().next() else {
+        return Ok(None);
+    };
+    let mut parts = line.split_whitespace();
+    let method = parts.next().unwrap_or_default();
+    let raw_target = parts.next().unwrap_or("/");
+    if method != "GET" {
+        return Err(NodeError::Runtime(format!(
+            "unsupported method {method}, only GET is allowed"
+        )));
+    }
+    let path = raw_target.split('?').next().unwrap_or("/");
+    Ok(Some(path.to_owned()))
+}
+
+fn run_rpc_serve(args: RpcServeArgs) -> Result<(), NodeError> {
+    let (cfg, runtime) = build_runtime_for_query(
+        args.network,
+        args.config,
+        args.mine_blocks,
+        args.interval_sec,
+        args.max_nonce,
+        "rpc-serve",
+    )?;
+
+    let listener = TcpListener::bind(&args.bind)
+        .map_err(|e| NodeError::Runtime(format!("rpc bind failed on {}: {e}", args.bind)))?;
+    println!(
+        "RPC listening on {} (network={} tip_h={} tip_hash={})",
+        args.bind,
+        cfg.network_id,
+        runtime.tip_height(),
+        runtime.tip_hash()
+    );
+    println!("Endpoints: GET /health, /status, /block/<height>, /tx/<height>/<index>");
+    if args.max_requests > 0 {
+        println!("Max requests before exit: {}", args.max_requests);
+    }
+
+    let mut served = 0u32;
+    for incoming in listener.incoming() {
+        let mut stream =
+            incoming.map_err(|e| NodeError::Runtime(format!("rpc accept failed: {e}")))?;
+        configure_stream_timeouts(&stream)?;
+
+        let path = match read_http_get_path(&mut stream) {
+            Ok(Some(path)) => path,
+            Ok(None) => continue,
+            Err(err) => {
+                let body = json_error_body(&err.to_string());
+                write_http_json_response(&mut stream, "400 Bad Request", &body)?;
+                continue;
+            }
+        };
+
+        let (status, body) = if path == "/health" {
+            ("200 OK", "{\"ok\":true}".to_owned())
+        } else if path == "/status" {
+            let payload = StatusResponse {
+                network_id: cfg.network_id.clone(),
+                tip_height: runtime.tip_height(),
+                tip_hash: runtime.tip_hash().to_hex(),
+                utxo_count: runtime.utxo_len(),
+                cumulative_work: runtime.cumulative_work().to_str_radix(10),
+            };
+            match to_pretty_json(&payload) {
+                Ok(body) => ("200 OK", body),
+                Err(e) => (
+                    "500 Internal Server Error",
+                    json_error_body(&format!("status serialization failed: {e}")),
+                ),
+            }
+        } else if let Some(height_raw) = path.strip_prefix("/block/") {
+            match height_raw.parse::<u64>() {
+                Ok(height) => match runtime.block_hash_at_height(height) {
+                    Some(hash) => match runtime.block_by_hash(&hash) {
+                        Some(block) => {
+                            let payload = header_to_block_response(
+                                height,
+                                &block.header,
+                                block.transactions.len(),
+                            );
+                            match to_pretty_json(&payload) {
+                                Ok(body) => ("200 OK", body),
+                                Err(e) => (
+                                    "500 Internal Server Error",
+                                    json_error_body(&format!("block serialization failed: {e}")),
+                                ),
+                            }
+                        }
+                        None => (
+                            "500 Internal Server Error",
+                            json_error_body(&format!("block for height {height} missing")),
+                        ),
+                    },
+                    None => (
+                        "404 Not Found",
+                        json_error_body(&format!("height {height} not found")),
+                    ),
+                },
+                Err(_) => (
+                    "400 Bad Request",
+                    json_error_body("invalid block height, expected unsigned integer"),
+                ),
+            }
+        } else if let Some(rest) = path.strip_prefix("/tx/") {
+            let mut segments = rest.split('/');
+            let height_raw = segments.next().unwrap_or_default();
+            let index_raw = segments.next().unwrap_or_default();
+            if height_raw.is_empty() || index_raw.is_empty() || segments.next().is_some() {
+                (
+                    "400 Bad Request",
+                    json_error_body("tx path must be /tx/<height>/<index>"),
+                )
+            } else {
+                match (height_raw.parse::<u64>(), index_raw.parse::<usize>()) {
+                    (Ok(height), Ok(index)) => match runtime.block_hash_at_height(height) {
+                        Some(hash) => match runtime.block_by_hash(&hash) {
+                            Some(block) => match block.transactions.get(index) {
+                                Some(tx) => {
+                                    let payload = TxResponse::from_tx(height, index, tx);
+                                    match to_pretty_json(&payload) {
+                                        Ok(body) => ("200 OK", body),
+                                        Err(e) => (
+                                            "500 Internal Server Error",
+                                            json_error_body(&format!(
+                                                "tx serialization failed: {e}"
+                                            )),
+                                        ),
+                                    }
+                                }
+                                None => (
+                                    "404 Not Found",
+                                    json_error_body(&format!(
+                                        "tx index {index} not found in block at height {height}"
+                                    )),
+                                ),
+                            },
+                            None => (
+                                "500 Internal Server Error",
+                                json_error_body(&format!("block for height {height} missing")),
+                            ),
+                        },
+                        None => (
+                            "404 Not Found",
+                            json_error_body(&format!("height {height} not found")),
+                        ),
+                    },
+                    _ => (
+                        "400 Bad Request",
+                        json_error_body("invalid tx path numbers, expected /tx/<height>/<index>"),
+                    ),
+                }
+            }
+        } else {
+            (
+                "404 Not Found",
+                json_error_body(
+                    "unknown endpoint, use /health, /status, /block/<height>, /tx/<height>/<index>",
+                ),
+            )
+        };
+
+        write_http_json_response(&mut stream, status, &body)?;
+        served = served.saturating_add(1);
+        if args.max_requests > 0 && served >= args.max_requests {
+            break;
+        }
+    }
+    Ok(())
+}
+
 fn run() -> Result<(), NodeError> {
     let cli = Cli::parse();
     match cli.command {
@@ -1332,6 +1560,7 @@ fn run() -> Result<(), NodeError> {
         Some(Command::SyncDemo(args)) => run_sync_demo(args),
         Some(Command::NetDemo(args)) => run_net_demo(args),
         Some(Command::ReorgDemo(args)) => run_reorg_demo(args),
+        Some(Command::RpcServe(args)) => run_rpc_serve(args),
         Some(Command::Snapshot(args)) => run_snapshot(args.command),
         Some(Command::P2pDemo) => run_p2p_demo(),
         None => run_node(cli.network, cli.config, cli.print_genesis),

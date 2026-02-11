@@ -15,7 +15,9 @@ Status: draft v1 (frozen decisions from user session on 2026-02-11)
 - [x] P2P TCP transport framing + `version/verack` handshake + `ping/pong` + `getheaders/headers` demo implemented.
 - [x] Miner template + nonce search loop implemented (`mine-once` CLI).
 - [x] Chainstate snapshot save/load implemented.
-- [ ] Remaining major items: full chain runtime with reorg-safe best-chain handling, socketed p2p sync runtime, RPC surface.
+- [x] Reorg-safe best-chain selection by cumulative work implemented in chain runtime.
+- [x] Minimal HTTP JSON RPC transport implemented (`scam-node rpc-serve`).
+- [ ] Remaining major items: socketed p2p sync runtime beyond demo mode, persistent DB-backed node runtime.
 
 ## 1) Frozen Design Decisions
 
@@ -207,7 +209,7 @@ Status: draft v1 (frozen decisions from user session on 2026-02-11)
 - [ ] `wallet balance`
 - [ ] `wallet send`
 - [x] `wallet address --qr`
-- [ ] Add JSON-RPC or REST facade for automation. (`scam-rpc` types added; transport still pending)
+- [x] Add JSON-RPC or REST facade for automation. (`scam-node rpc-serve` supports `/health`, `/status`, `/block/<height>`, `/tx/<height>/<index>`)
 
 ## 16) Test Plan TODO
 
