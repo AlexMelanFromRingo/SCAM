@@ -74,6 +74,14 @@ impl ChainRuntime {
         &self.main_chain
     }
 
+    pub fn block_hash_at_height(&self, height: u64) -> Option<Hash256> {
+        self.main_chain.get(height as usize).copied()
+    }
+
+    pub fn block_by_hash(&self, hash: &Hash256) -> Option<&Block> {
+        self.blocks.get(hash)
+    }
+
     pub fn utxo_set(&self) -> &UtxoSet {
         &self.utxos
     }

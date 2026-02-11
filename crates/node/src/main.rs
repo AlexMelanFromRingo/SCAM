@@ -10,6 +10,7 @@ use scam_core::{
 };
 use scam_miner::{BlockTemplate, mine_block};
 use scam_p2p::{GossipEngine, WireMessage, build_block_locator, select_headers_for_peer};
+use scam_rpc::{StatusResponse, TxResponse, header_to_block_response, to_pretty_json};
 use scam_storage::{ChainStateSnapshot, StorageError, load_snapshot, save_snapshot};
 use scam_wallet::{
     AddressError, DeriveKeyError, MnemonicError, QrError, SchnorrError, WalletMnemonic,
@@ -37,6 +38,10 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     Node(NodeArgs),
+    Status(StatusArgs),
+    GetBlock(GetBlockArgs),
+    GetTx(GetTxArgs),
+    AddPeer(AddPeerArgs),
     Wallet(WalletArgs),
     MineOnce(MineOnceArgs),
     ChainDemo(ChainDemoArgs),
@@ -53,6 +58,66 @@ struct NodeArgs {
     config: Option<PathBuf>,
     #[arg(long, default_value_t = false)]
     print_genesis: bool,
+}
+
+#[derive(Debug, Args)]
+struct StatusArgs {
+    #[arg(long, value_enum, default_value_t = Network::Devnet)]
+    network: Network,
+    #[arg(long)]
+    config: Option<PathBuf>,
+    #[arg(long, default_value_t = 0)]
+    mine_blocks: u32,
+    #[arg(long, default_value_t = 120)]
+    interval_sec: u64,
+    #[arg(long, default_value_t = 500_000)]
+    max_nonce: u64,
+    #[arg(long, default_value_t = true)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct GetBlockArgs {
+    #[arg(long, value_enum, default_value_t = Network::Devnet)]
+    network: Network,
+    #[arg(long)]
+    config: Option<PathBuf>,
+    #[arg(long)]
+    height: u64,
+    #[arg(long, default_value_t = 120)]
+    interval_sec: u64,
+    #[arg(long, default_value_t = 500_000)]
+    max_nonce: u64,
+    #[arg(long, default_value_t = true)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct GetTxArgs {
+    #[arg(long, value_enum, default_value_t = Network::Devnet)]
+    network: Network,
+    #[arg(long)]
+    config: Option<PathBuf>,
+    #[arg(long)]
+    height: u64,
+    #[arg(long)]
+    tx_index: usize,
+    #[arg(long, default_value_t = 120)]
+    interval_sec: u64,
+    #[arg(long, default_value_t = 500_000)]
+    max_nonce: u64,
+    #[arg(long, default_value_t = true)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct AddPeerArgs {
+    #[arg(long, value_enum, default_value_t = Network::Devnet)]
+    network: Network,
+    #[arg(long)]
+    peer: String,
+    #[arg(long, default_value = "data/peers")]
+    peers_dir: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -300,6 +365,33 @@ fn run_node(
     Ok(())
 }
 
+fn build_runtime_for_query(
+    network: Network,
+    config: Option<PathBuf>,
+    mine_blocks: u32,
+    interval_sec: u64,
+    max_nonce: u64,
+    label_prefix: &'static str,
+) -> Result<(ChainConfig, ChainRuntime), NodeError> {
+    let config_path =
+        config.unwrap_or_else(|| PathBuf::from(format!("config/{}.toml", network.as_str())));
+    let cfg = load_chain_config(&config_path)?;
+    let mut runtime = ChainRuntime::from_config(cfg.clone())?;
+    if mine_blocks > 0 {
+        let params = MiningLoopParams {
+            count: mine_blocks,
+            interval_sec,
+            max_nonce,
+            subsidy: cfg.block_subsidy,
+            miner_key_hash: cfg.genesis_reward_key_hash20()?,
+            label_prefix,
+            print_each: false,
+        };
+        mine_blocks_on_runtime(&mut runtime, &params)?;
+    }
+    Ok((cfg, runtime))
+}
+
 fn decode_fixed_hex<const N: usize>(field: &'static str, raw: &str) -> Result<[u8; N], NodeError> {
     let normalized = raw.strip_prefix("0x").unwrap_or(raw);
     let decoded =
@@ -315,6 +407,159 @@ fn decode_fixed_hex<const N: usize>(field: &'static str, raw: &str) -> Result<[u
     let mut out = [0u8; N];
     out.copy_from_slice(&decoded);
     Ok(out)
+}
+
+fn run_status(args: StatusArgs) -> Result<(), NodeError> {
+    let (cfg, runtime) = build_runtime_for_query(
+        args.network,
+        args.config,
+        args.mine_blocks,
+        args.interval_sec,
+        args.max_nonce,
+        "status",
+    )?;
+    let payload = StatusResponse {
+        network_id: cfg.network_id,
+        tip_height: runtime.tip_height(),
+        tip_hash: runtime.tip_hash().to_hex(),
+        utxo_count: runtime.utxo_len(),
+        cumulative_work: runtime.cumulative_work().to_str_radix(10),
+    };
+
+    if args.json {
+        println!(
+            "{}",
+            to_pretty_json(&payload).map_err(|e| NodeError::Runtime(e.to_string()))?
+        );
+    } else {
+        println!(
+            "network={} tip_height={} tip_hash={} utxos={} chainwork={}",
+            payload.network_id,
+            payload.tip_height,
+            payload.tip_hash,
+            payload.utxo_count,
+            payload.cumulative_work
+        );
+    }
+    Ok(())
+}
+
+fn run_get_block(args: GetBlockArgs) -> Result<(), NodeError> {
+    let mine_blocks = args.height as u32;
+    let (_cfg, runtime) = build_runtime_for_query(
+        args.network,
+        args.config,
+        mine_blocks,
+        args.interval_sec,
+        args.max_nonce,
+        "get-block",
+    )?;
+    let Some(hash) = runtime.block_hash_at_height(args.height) else {
+        return Err(NodeError::Runtime(format!(
+            "height {} not found",
+            args.height
+        )));
+    };
+    let Some(block) = runtime.block_by_hash(&hash) else {
+        return Err(NodeError::Runtime(format!("block {} not found", hash)));
+    };
+
+    let payload = header_to_block_response(args.height, &block.header, block.transactions.len());
+    if args.json {
+        println!(
+            "{}",
+            to_pretty_json(&payload).map_err(|e| NodeError::Runtime(e.to_string()))?
+        );
+    } else {
+        println!(
+            "height={} hash={} prev={} timestamp={} target={} txs={}",
+            payload.height,
+            payload.hash,
+            payload.prev_hash,
+            payload.timestamp,
+            payload.target,
+            payload.tx_count
+        );
+    }
+    Ok(())
+}
+
+fn run_get_tx(args: GetTxArgs) -> Result<(), NodeError> {
+    let mine_blocks = args.height as u32;
+    let (_cfg, runtime) = build_runtime_for_query(
+        args.network,
+        args.config,
+        mine_blocks,
+        args.interval_sec,
+        args.max_nonce,
+        "get-tx",
+    )?;
+    let Some(hash) = runtime.block_hash_at_height(args.height) else {
+        return Err(NodeError::Runtime(format!(
+            "height {} not found",
+            args.height
+        )));
+    };
+    let Some(block) = runtime.block_by_hash(&hash) else {
+        return Err(NodeError::Runtime(format!("block {} not found", hash)));
+    };
+    let Some(tx) = block.transactions.get(args.tx_index) else {
+        return Err(NodeError::Runtime(format!(
+            "tx index {} not found in block {}",
+            args.tx_index, hash
+        )));
+    };
+    let payload = TxResponse::from_tx(args.height, args.tx_index, tx);
+    if args.json {
+        println!(
+            "{}",
+            to_pretty_json(&payload).map_err(|e| NodeError::Runtime(e.to_string()))?
+        );
+    } else {
+        println!(
+            "height={} tx_index={} txid={} inputs={} outputs={}",
+            payload.block_height,
+            payload.tx_index,
+            payload.txid,
+            payload.input_count,
+            payload.output_count
+        );
+    }
+    Ok(())
+}
+
+fn run_add_peer(args: AddPeerArgs) -> Result<(), NodeError> {
+    let network_name = args.network.as_str();
+    let peers_path = args.peers_dir.join(format!("{network_name}.txt"));
+    if let Some(parent) = peers_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| NodeError::Runtime(e.to_string()))?;
+    }
+
+    let mut existing = if peers_path.exists() {
+        fs::read_to_string(&peers_path)
+            .map_err(|e| NodeError::Runtime(e.to_string()))?
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+
+    if !existing.iter().any(|entry| entry == &args.peer) {
+        existing.push(args.peer.clone());
+        existing.sort();
+        existing.dedup();
+        let content = format!("{}\n", existing.join("\n"));
+        fs::write(&peers_path, content).map_err(|e| NodeError::Runtime(e.to_string()))?;
+        println!("Peer added for {}: {}", network_name, args.peer);
+    } else {
+        println!("Peer already exists for {}: {}", network_name, args.peer);
+    }
+    println!("Peer book: {}", peers_path.display());
+    println!("Total peers: {}", existing.len());
+    Ok(())
 }
 
 fn run_wallet(command: WalletCommand) -> Result<(), NodeError> {
@@ -736,6 +981,10 @@ fn run() -> Result<(), NodeError> {
     let cli = Cli::parse();
     match cli.command {
         Some(Command::Node(args)) => run_node(args.network, args.config, args.print_genesis),
+        Some(Command::Status(args)) => run_status(args),
+        Some(Command::GetBlock(args)) => run_get_block(args),
+        Some(Command::GetTx(args)) => run_get_tx(args),
+        Some(Command::AddPeer(args)) => run_add_peer(args),
         Some(Command::Wallet(args)) => run_wallet(args.command),
         Some(Command::MineOnce(args)) => run_mine_once(args),
         Some(Command::ChainDemo(args)) => run_chain_demo(args),

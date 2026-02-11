@@ -1,0 +1,10 @@
+[package]
+name = "scam-rpc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+scam-core = { path = "../core" }
+serde.workspace = true
+serde_json.workspace = true

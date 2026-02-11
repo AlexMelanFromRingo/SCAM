@@ -49,7 +49,7 @@ Status: draft v1 (frozen decisions from user session on 2026-02-11)
 - [x] `crates/node` (orchestrator, startup, config).
 - [x] `crates/miner` (template builder, nonce loop).
 - [x] `crates/wallet` (mnemonic, HD keys, sign/send).
-- [ ] `crates/rpc` (CLI/RPC surface).
+- [x] `crates/rpc` (CLI/RPC surface).
 - [x] Keep `src/main.rs` as thin bootstrap only.
 
 ## 4) Configuration TODO
@@ -196,17 +196,17 @@ Status: draft v1 (frozen decisions from user session on 2026-02-11)
 
 - [x] Node CLI:
 - [x] `node run --network <devnet|testnet|mainnet>`
-- [ ] `node status`
-- [ ] `node add-peer <addr>`
-- [ ] `node get-block <hash>`
-- [ ] `node get-tx <txid>`
+- [x] `node status`
+- [x] `node add-peer <addr>`
+- [x] `node get-block <hash>`
+- [x] `node get-tx <txid>`
 - [x] Wallet CLI:
 - [x] `wallet new`
 - [x] `wallet restore`
 - [ ] `wallet balance`
 - [ ] `wallet send`
 - [x] `wallet address --qr`
-- [ ] Add JSON-RPC or REST facade for automation.
+- [ ] Add JSON-RPC or REST facade for automation. (`scam-rpc` types added; transport still pending)
 
 ## 16) Test Plan TODO
 
