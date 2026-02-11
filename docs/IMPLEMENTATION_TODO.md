@@ -85,12 +85,12 @@ Status: draft v1 (frozen decisions from user session on 2026-02-11)
 
 ## 6) Wallet and Key Management TODO
 
-- [ ] Implement BIP39 mnemonic generation (12/24 words).
+- [x] Implement BIP39 mnemonic generation (12/24 words).
 - [x] Implement wallet restore from mnemonic.
-- [ ] Implement BIP32 HD derivation.
-- [ ] Freeze derivation path in config/constants.
-- [ ] Derive compressed pubkeys for address generation.
-- [ ] Derive address payload from `blake3(pubkey_compressed)[0..20]`.
+- [x] Implement BIP32 HD derivation.
+- [x] Freeze derivation path in config/constants.
+- [x] Derive compressed pubkeys for address generation.
+- [x] Derive address payload from `blake3(pubkey_compressed)[0..20]`.
 - [ ] Add encrypted at-rest key storage.
 - [ ] Add wallet rescan (rebuild UTXO ownership from chain).
 
@@ -226,7 +226,7 @@ Status: draft v1 (frozen decisions from user session on 2026-02-11)
 - [ ] initial sync from genesis to tip
 - [ ] fork + reorg correctness
 - [ ] difficulty update every 20 blocks
-- [ ] wallet mnemonic restore and deterministic addresses
+- [x] wallet mnemonic restore and deterministic addresses
 - [ ] Soak test:
 - [ ] local devnet running for 24h with mining and tx flow
 

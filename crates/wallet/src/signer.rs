@@ -1,6 +1,12 @@
+use bitcoin::Network;
+use bitcoin::bip32::{ChildNumber, DerivationPath, Xpriv};
 use secp256k1::schnorr::Signature;
 use secp256k1::{Keypair, Message, PublicKey, Secp256k1, SecretKey};
 use thiserror::Error;
+
+pub const BIP44_PURPOSE: u32 = 44;
+pub const SCAM_COIN_TYPE: u32 = 1337;
+pub const EXTERNAL_CHANGE: u32 = 0;
 
 #[derive(Clone)]
 pub struct WalletKey {
@@ -18,6 +24,24 @@ impl WalletKey {
     }
 }
 
+pub fn derivation_path(account: u32, index: u32) -> Result<DerivationPath, DeriveKeyError> {
+    let purpose =
+        ChildNumber::from_hardened_idx(BIP44_PURPOSE).map_err(DeriveKeyError::Bip32Path)?;
+    let coin_type =
+        ChildNumber::from_hardened_idx(SCAM_COIN_TYPE).map_err(DeriveKeyError::Bip32Path)?;
+    let account = ChildNumber::from_hardened_idx(account).map_err(DeriveKeyError::Bip32Path)?;
+    let change =
+        ChildNumber::from_normal_idx(EXTERNAL_CHANGE).map_err(DeriveKeyError::Bip32Path)?;
+    let index = ChildNumber::from_normal_idx(index).map_err(DeriveKeyError::Bip32Path)?;
+    Ok(DerivationPath::from(vec![
+        purpose, coin_type, account, change, index,
+    ]))
+}
+
+pub fn derivation_path_string(account: u32, index: u32) -> Result<String, DeriveKeyError> {
+    Ok(format!("m/{}", derivation_path(account, index)?))
+}
+
 pub fn derive_wallet_key(
     seed: &[u8],
     account: u32,
@@ -27,26 +51,21 @@ pub fn derive_wallet_key(
         return Err(DeriveKeyError::EmptySeed);
     }
 
+    let secp_bip32 = bitcoin::secp256k1::Secp256k1::new();
+    let master = Xpriv::new_master(Network::Bitcoin, seed).map_err(DeriveKeyError::Bip32)?;
+    let path = derivation_path(account, index)?;
+    let child = master
+        .derive_priv(&secp_bip32, &path)
+        .map_err(DeriveKeyError::Bip32)?;
+
+    let secret_key = SecretKey::from_slice(&child.private_key.secret_bytes())
+        .map_err(DeriveKeyError::Secp256k1)?;
     let secp = Secp256k1::new();
-    for counter in 0u32..2048 {
-        let mut material = Vec::with_capacity(seed.len() + 32);
-        material.extend_from_slice(seed);
-        material.extend_from_slice(b"SCAM-wallet-v1");
-        material.extend_from_slice(&account.to_le_bytes());
-        material.extend_from_slice(&index.to_le_bytes());
-        material.extend_from_slice(&counter.to_le_bytes());
-
-        let digest = blake3::hash(&material);
-        if let Ok(secret_key) = SecretKey::from_slice(digest.as_bytes()) {
-            let public_key = PublicKey::from_secret_key(&secp, &secret_key);
-            return Ok(WalletKey {
-                secret_key,
-                pubkey_compressed: public_key.serialize(),
-            });
-        }
-    }
-
-    Err(DeriveKeyError::NoValidSecretKey)
+    let public_key = PublicKey::from_secret_key(&secp, &secret_key);
+    Ok(WalletKey {
+        secret_key,
+        pubkey_compressed: public_key.serialize(),
+    })
 }
 
 pub fn sign_digest(wallet_key: &WalletKey, digest32: [u8; 32]) -> Result<[u8; 64], SchnorrError> {
@@ -76,8 +95,12 @@ pub fn verify_digest(
 pub enum DeriveKeyError {
     #[error("seed must not be empty")]
     EmptySeed,
-    #[error("could not derive valid secp256k1 secret key")]
-    NoValidSecretKey,
+    #[error("bip32 derivation failed: {0}")]
+    Bip32(#[source] bitcoin::bip32::Error),
+    #[error("invalid bip32 path component: {0}")]
+    Bip32Path(#[source] bitcoin::bip32::Error),
+    #[error("secp256k1 error: {0}")]
+    Secp256k1(#[source] secp256k1::Error),
 }
 
 #[derive(Debug, Error)]
@@ -88,7 +111,7 @@ pub enum SchnorrError {
 
 #[cfg(test)]
 mod tests {
-    use crate::signer::{derive_wallet_key, sign_digest, verify_digest};
+    use crate::signer::{derivation_path_string, derive_wallet_key, sign_digest, verify_digest};
 
     #[test]
     fn schnorr_sign_verify_roundtrip() {
@@ -111,5 +134,19 @@ mod tests {
         let ok =
             verify_digest(digest_b, signature, key.pubkey_compressed()).expect("verification call");
         assert!(!ok);
+    }
+
+    #[test]
+    fn derivation_path_is_frozen() {
+        let path = derivation_path_string(2, 7).expect("path");
+        assert_eq!(path, "m/44'/1337'/2'/0/7");
+    }
+
+    #[test]
+    fn derivation_changes_with_index() {
+        let seed = [33u8; 64];
+        let key_a = derive_wallet_key(&seed, 0, 0).expect("key a");
+        let key_b = derive_wallet_key(&seed, 0, 1).expect("key b");
+        assert_ne!(key_a.pubkey_compressed(), key_b.pubkey_compressed());
     }
 }

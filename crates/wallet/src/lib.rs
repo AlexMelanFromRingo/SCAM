@@ -9,5 +9,6 @@ pub use address::{
 pub use mnemonic::{MnemonicError, WalletMnemonic, new_mnemonic};
 pub use qr::{QrError, qr_for_payment_uri, qr_for_text};
 pub use signer::{
-    DeriveKeyError, SchnorrError, WalletKey, derive_wallet_key, sign_digest, verify_digest,
+    BIP44_PURPOSE, DeriveKeyError, EXTERNAL_CHANGE, SCAM_COIN_TYPE, SchnorrError, WalletKey,
+    derivation_path, derivation_path_string, derive_wallet_key, sign_digest, verify_digest,
 };
