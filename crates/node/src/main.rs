@@ -291,6 +291,18 @@ enum WalletCommand {
         #[arg(long, default_value = "scd")]
         hrp: String,
     },
+    Restore {
+        #[arg(long)]
+        mnemonic: String,
+        #[arg(long, default_value = "")]
+        passphrase: String,
+        #[arg(long, default_value_t = 0)]
+        account: u32,
+        #[arg(long, default_value_t = 0)]
+        index: u32,
+        #[arg(long, default_value = "scd")]
+        hrp: String,
+    },
     Decode {
         #[arg(long)]
         address: String,
@@ -650,6 +662,26 @@ fn run_hash_visual(args: HashVisualArgs) -> Result<(), NodeError> {
 }
 
 fn run_wallet(command: WalletCommand) -> Result<(), NodeError> {
+    fn derive_and_print_address(
+        mnemonic_phrase: &str,
+        passphrase: &str,
+        account: u32,
+        index: u32,
+        hrp: &str,
+    ) -> Result<(), NodeError> {
+        let mnemonic = WalletMnemonic::parse(mnemonic_phrase)?;
+        let seed = mnemonic.to_seed(passphrase);
+        let key = derive_wallet_key(&seed, account, index)?;
+        let address = to_address(hrp, key.pubkey_compressed())?;
+
+        println!(
+            "PubKey (compressed): {}",
+            hex::encode(key.pubkey_compressed())
+        );
+        println!("Address: {address}");
+        Ok(())
+    }
+
     match command {
         WalletCommand::New {
             words,
@@ -676,18 +708,14 @@ fn run_wallet(command: WalletCommand) -> Result<(), NodeError> {
             account,
             index,
             hrp,
-        } => {
-            let mnemonic = WalletMnemonic::parse(&mnemonic)?;
-            let seed = mnemonic.to_seed(&passphrase);
-            let key = derive_wallet_key(&seed, account, index)?;
-            let address = to_address(&hrp, key.pubkey_compressed())?;
-
-            println!(
-                "PubKey (compressed): {}",
-                hex::encode(key.pubkey_compressed())
-            );
-            println!("Address: {address}");
-        }
+        } => derive_and_print_address(&mnemonic, &passphrase, account, index, &hrp)?,
+        WalletCommand::Restore {
+            mnemonic,
+            passphrase,
+            account,
+            index,
+            hrp,
+        } => derive_and_print_address(&mnemonic, &passphrase, account, index, &hrp)?,
         WalletCommand::Decode { address } => {
             let decoded = parse_address(&address)?;
             println!("HRP: {}", decoded.hrp);

@@ -85,7 +85,7 @@ Status: draft v1 (frozen decisions from user session on 2026-02-11)
 ## 6) Wallet and Key Management TODO
 
 - [ ] Implement BIP39 mnemonic generation (12/24 words).
-- [ ] Implement wallet restore from mnemonic.
+- [x] Implement wallet restore from mnemonic.
 - [ ] Implement BIP32 HD derivation.
 - [ ] Freeze derivation path in config/constants.
 - [ ] Derive compressed pubkeys for address generation.
