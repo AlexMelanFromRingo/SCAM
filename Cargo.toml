@@ -3,6 +3,7 @@ members = [
     "crates/core",
     "crates/consensus",
     "crates/mempool",
+    "crates/wallet",
     "crates/node",
 ]
 resolver = "2"
@@ -15,9 +16,14 @@ license = "MIT OR Apache-2.0"
 [workspace.dependencies]
 blake3 = "1.8"
 clap = { version = "4.5", features = ["derive"] }
+bech32 = "0.9"
+bip39 = { version = "2.2", default-features = true, features = ["rand"] }
 hex = "0.4"
 num-bigint = "0.4"
 num-traits = "0.2"
+qrcodegen = "1.8"
+rand = "0.8"
+secp256k1 = { version = "0.29", features = ["rand-std", "global-context"] }
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "2.0"
 toml = "0.8"

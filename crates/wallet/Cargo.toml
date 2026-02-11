@@ -1,0 +1,16 @@
+[package]
+name = "scam-wallet"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bech32.workspace = true
+bip39.workspace = true
+blake3.workspace = true
+hex.workspace = true
+qrcodegen.workspace = true
+rand.workspace = true
+scam-core = { path = "../core" }
+secp256k1.workspace = true
+thiserror.workspace = true
