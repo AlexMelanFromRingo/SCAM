@@ -374,6 +374,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "scam-chain"
+version = "0.1.0"
+dependencies = [
+ "num-bigint",
+ "scam-consensus",
+ "scam-core",
+ "scam-miner",
+ "thiserror",
+ "toml",
+]
+
+[[package]]
 name = "scam-consensus"
 version = "0.1.0"
 dependencies = [
@@ -417,6 +429,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "hex",
+ "scam-chain",
  "scam-consensus",
  "scam-core",
  "scam-miner",

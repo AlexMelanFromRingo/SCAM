@@ -1,0 +1,15 @@
+[package]
+name = "scam-chain"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+num-bigint.workspace = true
+scam-consensus = { path = "../consensus" }
+scam-core = { path = "../core" }
+thiserror.workspace = true
+
+[dev-dependencies]
+scam-miner = { path = "../miner" }
+toml.workspace = true

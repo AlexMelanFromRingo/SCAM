@@ -1,13 +1,15 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use scam_chain::{ChainError, ChainRuntime};
 use scam_consensus::{TxValidationError, UtxoSet, validate_and_apply_block, validate_block_basic};
 use scam_core::{
     ChainConfig, ChainConfigError, OutPoint, Transaction, TxIn, TxOut, block_meets_pow,
 };
 use scam_miner::{BlockTemplate, mine_block};
-use scam_p2p::{GossipEngine, WireMessage};
+use scam_p2p::{GossipEngine, WireMessage, build_block_locator, select_headers_for_peer};
 use scam_storage::{ChainStateSnapshot, StorageError, load_snapshot, save_snapshot};
 use scam_wallet::{
     AddressError, DeriveKeyError, MnemonicError, QrError, SchnorrError, WalletMnemonic,
@@ -37,6 +39,8 @@ enum Command {
     Node(NodeArgs),
     Wallet(WalletArgs),
     MineOnce(MineOnceArgs),
+    ChainDemo(ChainDemoArgs),
+    SyncDemo(SyncDemoArgs),
     Snapshot(SnapshotArgs),
     P2pDemo,
 }
@@ -64,6 +68,38 @@ struct MineOnceArgs {
     #[arg(long)]
     config: Option<PathBuf>,
     #[arg(long, default_value_t = 50_000)]
+    max_nonce: u64,
+}
+
+#[derive(Debug, Args)]
+struct ChainDemoArgs {
+    #[arg(long, value_enum, default_value_t = Network::Devnet)]
+    network: Network,
+    #[arg(long)]
+    config: Option<PathBuf>,
+    #[arg(long, default_value_t = 25)]
+    blocks: u32,
+    #[arg(long, default_value_t = 200_000)]
+    max_nonce: u64,
+    #[arg(long, default_value_t = 30)]
+    interval_sec: u64,
+}
+
+#[derive(Debug, Args)]
+struct SyncDemoArgs {
+    #[arg(long, value_enum, default_value_t = Network::Devnet)]
+    network: Network,
+    #[arg(long)]
+    config: Option<PathBuf>,
+    #[arg(long, default_value_t = 5)]
+    local_blocks: u32,
+    #[arg(long, default_value_t = 25)]
+    remote_blocks: u32,
+    #[arg(long, default_value_t = 2000)]
+    max_headers: usize,
+    #[arg(long, default_value_t = 30)]
+    interval_sec: u64,
+    #[arg(long, default_value_t = 500_000)]
     max_nonce: u64,
 }
 
@@ -184,6 +220,8 @@ enum NodeError {
     InvalidConfig(#[from] ChainConfigError),
     #[error("block/tx validation failed: {0}")]
     Validation(#[from] TxValidationError),
+    #[error("chain runtime error: {0}")]
+    Chain(#[from] ChainError),
     #[error("storage error: {0}")]
     Storage(#[from] StorageError),
     #[error("mnemonic error: {0}")]
@@ -457,6 +495,83 @@ fn run_snapshot(command: SnapshotCommand) -> Result<(), NodeError> {
     Ok(())
 }
 
+fn build_coinbase_tx(tag: String, subsidy: u64, key_hash20: [u8; 20]) -> Transaction {
+    Transaction {
+        version: 1,
+        inputs: vec![TxIn {
+            prev_out: OutPoint::coinbase(),
+            signature: tag.into_bytes(),
+            pubkey_compressed: vec![],
+            sequence: u32::MAX,
+        }],
+        outputs: vec![TxOut {
+            value: subsidy,
+            key_hash20,
+        }],
+        lock_time: 0,
+    }
+}
+
+#[derive(Clone)]
+struct MiningLoopParams {
+    count: u32,
+    interval_sec: u64,
+    max_nonce: u64,
+    subsidy: u64,
+    miner_key_hash: [u8; 20],
+    label_prefix: &'static str,
+    print_each: bool,
+}
+
+fn mine_blocks_on_runtime(
+    runtime: &mut ChainRuntime,
+    params: &MiningLoopParams,
+) -> Result<(), NodeError> {
+    let mut timestamp = runtime
+        .tip_header()
+        .timestamp
+        .saturating_add(params.interval_sec);
+    for step in 1..=params.count {
+        let expected_target = runtime.expected_target_for_next_block()?;
+        let template = BlockTemplate {
+            version: 1,
+            prev_block: runtime.tip_hash(),
+            timestamp,
+            target: expected_target,
+            transactions: vec![build_coinbase_tx(
+                format!("{}-{step}", params.label_prefix),
+                params.subsidy,
+                params.miner_key_hash,
+            )],
+        };
+
+        let Some(block) = mine_block(&template, params.max_nonce) else {
+            return Err(NodeError::Runtime(format!(
+                "cannot mine height {} in nonce range 0..={}",
+                runtime.tip_height() + 1,
+                params.max_nonce
+            )));
+        };
+
+        let applied = runtime.apply_next_block(block)?;
+        if params.print_each {
+            let tip = runtime.tip_header();
+            println!(
+                "h={} hash={} target={} fees={}",
+                runtime.tip_height(),
+                applied.block_hash,
+                tip.target,
+                applied.total_fees
+            );
+        }
+        timestamp = runtime
+            .tip_header()
+            .timestamp
+            .saturating_add(params.interval_sec);
+    }
+    Ok(())
+}
+
 fn run_mine_once(args: MineOnceArgs) -> Result<(), NodeError> {
     let config_path = args
         .config
@@ -474,20 +589,7 @@ fn run_mine_once(args: MineOnceArgs) -> Result<(), NodeError> {
     )?;
 
     let miner_key_hash = cfg.genesis_reward_key_hash20()?;
-    let coinbase = Transaction {
-        version: 1,
-        inputs: vec![TxIn {
-            prev_out: OutPoint::coinbase(),
-            signature: b"mine-once".to_vec(),
-            pubkey_compressed: vec![],
-            sequence: u32::MAX,
-        }],
-        outputs: vec![TxOut {
-            value: cfg.block_subsidy,
-            key_hash20: miner_key_hash,
-        }],
-        lock_time: 0,
-    };
+    let coinbase = build_coinbase_tx("mine-once".to_owned(), cfg.block_subsidy, miner_key_hash);
     let template = BlockTemplate {
         version: 1,
         prev_block: genesis.header.block_hash(),
@@ -526,12 +628,118 @@ fn run_mine_once(args: MineOnceArgs) -> Result<(), NodeError> {
     Ok(())
 }
 
+fn run_chain_demo(args: ChainDemoArgs) -> Result<(), NodeError> {
+    let config_path = args
+        .config
+        .unwrap_or_else(|| PathBuf::from(format!("config/{}.toml", args.network.as_str())));
+    let cfg = load_chain_config(&config_path)?;
+    let miner_key_hash = cfg.genesis_reward_key_hash20()?;
+    let mut runtime = ChainRuntime::from_config(cfg.clone())?;
+
+    println!("Chain demo start");
+    println!("Network: {}", cfg.network_id);
+    println!(
+        "Start tip: h={} hash={}",
+        runtime.tip_height(),
+        runtime.tip_hash()
+    );
+    println!("Window: {}", cfg.difficulty_adjustment_window);
+    println!("Interval sec per new block: {}", args.interval_sec);
+    let params = MiningLoopParams {
+        count: args.blocks,
+        interval_sec: args.interval_sec,
+        max_nonce: args.max_nonce,
+        subsidy: cfg.block_subsidy,
+        miner_key_hash,
+        label_prefix: "chain-demo",
+        print_each: true,
+    };
+    mine_blocks_on_runtime(&mut runtime, &params)?;
+
+    println!(
+        "Chain demo finished at h={} with utxos={}",
+        runtime.tip_height(),
+        runtime.utxo_len()
+    );
+    Ok(())
+}
+
+fn run_sync_demo(args: SyncDemoArgs) -> Result<(), NodeError> {
+    let config_path = args
+        .config
+        .unwrap_or_else(|| PathBuf::from(format!("config/{}.toml", args.network.as_str())));
+    let cfg = load_chain_config(&config_path)?;
+    let miner_key_hash = cfg.genesis_reward_key_hash20()?;
+
+    let mut local = ChainRuntime::from_config(cfg.clone())?;
+    let mut remote = ChainRuntime::from_config(cfg.clone())?;
+    let local_params = MiningLoopParams {
+        count: args.local_blocks,
+        interval_sec: args.interval_sec,
+        max_nonce: args.max_nonce,
+        subsidy: cfg.block_subsidy,
+        miner_key_hash,
+        label_prefix: "local",
+        print_each: false,
+    };
+    let remote_params = MiningLoopParams {
+        count: args.remote_blocks,
+        interval_sec: args.interval_sec,
+        max_nonce: args.max_nonce,
+        subsidy: cfg.block_subsidy,
+        miner_key_hash,
+        label_prefix: "remote",
+        print_each: false,
+    };
+    mine_blocks_on_runtime(&mut local, &local_params)?;
+    mine_blocks_on_runtime(&mut remote, &remote_params)?;
+
+    let locator = build_block_locator(local.block_hashes());
+    let mut remote_headers = HashMap::new();
+    for hash in remote.block_hashes() {
+        if let Some(header) = remote.header_by_hash(hash) {
+            remote_headers.insert(*hash, header.clone());
+        }
+    }
+
+    let headers = select_headers_for_peer(
+        remote.block_hashes(),
+        &remote_headers,
+        &locator,
+        None,
+        args.max_headers,
+    );
+
+    println!("Headers-first sync demo");
+    println!(
+        "Local tip: h={} hash={}",
+        local.tip_height(),
+        local.tip_hash()
+    );
+    println!(
+        "Remote tip: h={} hash={}",
+        remote.tip_height(),
+        remote.tip_hash()
+    );
+    println!("Locator size sent by local peer: {}", locator.len());
+    println!("Headers returned by remote peer: {}", headers.len());
+    if let Some(first) = headers.first() {
+        println!("First returned header prev: {}", first.prev_block);
+    }
+    if let Some(last) = headers.last() {
+        println!("Last returned header hash: {}", last.block_hash());
+    }
+    Ok(())
+}
+
 fn run() -> Result<(), NodeError> {
     let cli = Cli::parse();
     match cli.command {
         Some(Command::Node(args)) => run_node(args.network, args.config, args.print_genesis),
         Some(Command::Wallet(args)) => run_wallet(args.command),
         Some(Command::MineOnce(args)) => run_mine_once(args),
+        Some(Command::ChainDemo(args)) => run_chain_demo(args),
+        Some(Command::SyncDemo(args)) => run_sync_demo(args),
         Some(Command::Snapshot(args)) => run_snapshot(args.command),
         Some(Command::P2pDemo) => run_p2p_demo(),
         None => run_node(cli.network, cli.config, cli.print_genesis),

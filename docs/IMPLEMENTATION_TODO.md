@@ -2,6 +2,20 @@
 
 Status: draft v1 (frozen decisions from user session on 2026-02-11)
 
+## Progress Snapshot (2026-02-11)
+
+- [x] Workspace crates created: `core`, `consensus`, `mempool`, `wallet`, `p2p`, `miner`, `storage`, `node`.
+- [x] Core block/tx/header structures + deterministic serialization + BLAKE3 hash API.
+- [x] PoW numeric target compare (`hash <= target`) implemented.
+- [x] Dynamic difficulty retarget formula implemented (window/clamp from config).
+- [x] Mempool conflict policy implemented (lower `txid` wins, descendants evicted on replacement).
+- [x] Wallet basics implemented: mnemonic generation/restore, Schnorr sign/verify, Bech32m address, QR output.
+- [x] UTXO block application implemented with signature checks, fee accounting, coinbase maturity.
+- [x] P2P wire messages + gossip dedup engine (`inv/getdata/tx/block`) implemented.
+- [x] Miner template + nonce search loop implemented (`mine-once` CLI).
+- [x] Chainstate snapshot save/load implemented.
+- [ ] Remaining major items: full chain runtime with reorg-safe best-chain handling, socketed p2p sync runtime, RPC surface.
+
 ## 1) Frozen Design Decisions
 
 - Consensus: PoW.
@@ -26,43 +40,43 @@ Status: draft v1 (frozen decisions from user session on 2026-02-11)
 
 ## 3) Repo Structure TODO
 
-- [ ] Create Cargo workspace members:
-- [ ] `crates/core` (types, serialization, hash wrappers).
-- [ ] `crates/consensus` (tx/block validation, PoW, retarget).
-- [ ] `crates/storage` (DB adapters and chainstate).
-- [ ] `crates/mempool` (tx pool, conflict handling).
-- [ ] `crates/p2p` (protocol, peers, sync).
-- [ ] `crates/node` (orchestrator, startup, config).
-- [ ] `crates/miner` (template builder, nonce loop).
-- [ ] `crates/wallet` (mnemonic, HD keys, sign/send).
+- [x] Create Cargo workspace members:
+- [x] `crates/core` (types, serialization, hash wrappers).
+- [x] `crates/consensus` (tx/block validation, PoW, retarget).
+- [x] `crates/storage` (DB adapters and chainstate).
+- [x] `crates/mempool` (tx pool, conflict handling).
+- [x] `crates/p2p` (protocol, peers, sync).
+- [x] `crates/node` (orchestrator, startup, config).
+- [x] `crates/miner` (template builder, nonce loop).
+- [x] `crates/wallet` (mnemonic, HD keys, sign/send).
 - [ ] `crates/rpc` (CLI/RPC surface).
-- [ ] Keep `src/main.rs` as thin bootstrap only.
+- [x] Keep `src/main.rs` as thin bootstrap only.
 
 ## 4) Configuration TODO
 
-- [ ] Add `config/chain.toml`:
-- [ ] `network_id`
-- [ ] `target_block_time_sec = 120`
-- [ ] `difficulty_adjustment_window = 20`
-- [ ] `difficulty_clamp_up` and `difficulty_clamp_down`
-- [ ] `max_block_weight` or `max_block_size`
-- [ ] `max_tx_size`
-- [ ] `max_mempool_txs`
-- [ ] `coinbase_maturity`
-- [ ] `block_subsidy`
-- [ ] `hrp` for addresses
-- [ ] `genesis_*` fields
-- [ ] `genesis_message` (human-readable string embedded in genesis coinbase/script)
-- [ ] Add separate presets: `devnet.toml`, `testnet.toml`, `mainnet.toml`.
+- [x] Add `config/chain.toml`:
+- [x] `network_id`
+- [x] `target_block_time_sec = 120`
+- [x] `difficulty_adjustment_window = 20`
+- [x] `difficulty_clamp_up` and `difficulty_clamp_down`
+- [x] `max_block_weight` or `max_block_size`
+- [x] `max_tx_size`
+- [x] `max_mempool_txs`
+- [x] `coinbase_maturity`
+- [x] `block_subsidy`
+- [x] `hrp` for addresses
+- [x] `genesis_*` fields
+- [x] `genesis_message` (human-readable string embedded in genesis coinbase/script)
+- [x] Add separate presets: `devnet.toml`, `testnet.toml`, `mainnet.toml`.
 
 ## 5) Cryptography TODO
 
-- [ ] Add hash API:
-- [ ] `hash256(data) -> [u8; 32]` using BLAKE3.
-- [ ] Define canonical transaction and block serialization for hashing.
-- [ ] Integrate secp256k1 Schnorr signing and verification.
-- [ ] Enforce canonical signatures and strict pubkey parsing.
-- [ ] Implement compressed pubkey encode/decode (SEC33).
+- [x] Add hash API:
+- [x] `hash256(data) -> [u8; 32]` using BLAKE3.
+- [x] Define canonical transaction and block serialization for hashing.
+- [x] Integrate secp256k1 Schnorr signing and verification.
+- [x] Enforce canonical signatures and strict pubkey parsing.
+- [x] Implement compressed pubkey encode/decode (SEC33).
 - [ ] Add domain-separated signing tags (prevent cross-context replay).
 
 ## 6) Wallet and Key Management TODO
@@ -78,61 +92,61 @@ Status: draft v1 (frozen decisions from user session on 2026-02-11)
 
 ## 7) Address and QR TODO
 
-- [ ] Implement Bech32m address encode/decode with network HRP.
-- [ ] Implement payment URI: `coin:<address>?amount=<n>&label=<text>`.
-- [ ] Implement QR generation for payment URI (PNG + terminal ASCII optional).
-- [ ] Add CLI:
-- [ ] `wallet address`
-- [ ] `wallet address --qr`
-- [ ] `wallet decode <address>`
+- [x] Implement Bech32m address encode/decode with network HRP.
+- [x] Implement payment URI: `coin:<address>?amount=<n>&label=<text>`.
+- [x] Implement QR generation for payment URI (PNG + terminal ASCII optional).
+- [x] Add CLI:
+- [x] `wallet address`
+- [x] `wallet address --qr`
+- [x] `wallet decode <address>`
 
 ## 8) Transaction Model TODO (UTXO)
 
-- [ ] Define tx structures:
-- [ ] `TxIn { prev_out, signature, pubkey_compressed, sequence }`
-- [ ] `TxOut { value, key_hash20 }`
-- [ ] Define `txid = hash256(serialized_tx_without_witness_mutable_fields)` (freeze exact rule).
-- [ ] Validate:
-- [ ] inputs exist in UTXO
-- [ ] signatures valid
-- [ ] `sum(inputs) >= sum(outputs)`
-- [ ] no overflow / no negative amounts
-- [ ] coinbase special rules enforced
+- [x] Define tx structures:
+- [x] `TxIn { prev_out, signature, pubkey_compressed, sequence }`
+- [x] `TxOut { value, key_hash20 }`
+- [x] Define `txid = hash256(serialized_tx_without_witness_mutable_fields)` (freeze exact rule).
+- [x] Validate:
+- [x] inputs exist in UTXO
+- [x] signatures valid
+- [x] `sum(inputs) >= sum(outputs)`
+- [x] no overflow / no negative amounts
+- [x] coinbase special rules enforced
 - [ ] Fee policy:
 - [ ] min relay fee
 - [ ] mempool sorting by fee rate
 
 ## 9) Mempool TODO (Conflict Rule)
 
-- [ ] Keep index `spent_outpoint -> txid`.
-- [ ] On incoming tx:
-- [ ] if no conflict, validate then insert.
-- [ ] if conflict exists, compare numeric `new_txid` vs `old_txid`.
-- [ ] if `new_txid < old_txid`, replace old tx and evict descendants.
-- [ ] else reject new tx.
+- [x] Keep index `spent_outpoint -> txid`.
+- [x] On incoming tx:
+- [x] if no conflict, validate then insert.
+- [x] if conflict exists, compare numeric `new_txid` vs `old_txid`.
+- [x] if `new_txid < old_txid`, replace old tx and evict descendants.
+- [x] else reject new tx.
 - [ ] Broadcast replacement/eviction events to peers as inventory updates.
 - [ ] Add orphan tx pool with size/time limits.
 - [ ] Add eviction policy for full mempool.
 
 ## 10) Block and Chain TODO
 
-- [ ] Define block header:
-- [ ] `version, prev_hash, merkle_root, timestamp, target, nonce`.
-- [ ] Compute and validate merkle root.
-- [ ] Validate PoW with numeric target compare (`hash <= target`).
-- [ ] Validate block tx ordering and coinbase position.
-- [ ] Validate subsidy + fees in coinbase output total.
+- [x] Define block header:
+- [x] `version, prev_hash, merkle_root, timestamp, target, nonce`.
+- [x] Compute and validate merkle root.
+- [x] Validate PoW with numeric target compare (`hash <= target`).
+- [x] Validate block tx ordering and coinbase position.
+- [x] Validate subsidy + fees in coinbase output total.
 - [ ] Implement chain selection by cumulative work (not height only).
 - [ ] Implement reorg: disconnect old branch, connect new branch.
 
 ## 11) Difficulty Retarget TODO
 
-- [ ] Every `N=20` blocks recompute target:
-- [ ] `expected = N * target_block_time_sec`
-- [ ] `actual = time(last) - time(last-N)`
-- [ ] `new_target = old_target * actual / expected`
-- [ ] Clamp change per window (for stability).
-- [ ] Enforce min/max target bounds.
+- [x] Every `N=20` blocks recompute target:
+- [x] `expected = N * target_block_time_sec`
+- [x] `actual = time(last) - time(last-N)`
+- [x] `new_target = old_target * actual / expected`
+- [x] Clamp change per window (for stability).
+- [x] Enforce min/max target bounds.
 - [ ] Add protections for timestamp abuse:
 - [ ] median-time-past check
 - [ ] max future block time
@@ -153,45 +167,45 @@ Status: draft v1 (frozen decisions from user session on 2026-02-11)
 
 ## 13) P2P TODO (Reliable Minimal Gossip)
 
-- [ ] Define protocol messages:
-- [ ] `version`, `verack`
-- [ ] `ping`, `pong`
-- [ ] `inv`, `getdata`, `tx`, `block`
-- [ ] `getheaders`, `headers`
+- [x] Define protocol messages:
+- [x] `version`, `verack`
+- [x] `ping`, `pong`
+- [x] `inv`, `getdata`, `tx`, `block`
+- [x] `getheaders`, `headers`
 - [ ] `getblocks` (optional if headers-first + getdata is enough)
-- [ ] Use inventory-first propagation:
-- [ ] announce hashes via `inv`
-- [ ] request unknown objects via `getdata`
-- [ ] send full object only on request
-- [ ] Maintain per-peer `known_inventory` to avoid duplicate sends.
-- [ ] Keep local dedup cache for recently seen object IDs.
-- [ ] Implement headers-first sync for new nodes.
+- [x] Use inventory-first propagation:
+- [x] announce hashes via `inv`
+- [x] request unknown objects via `getdata`
+- [x] send full object only on request
+- [x] Maintain per-peer `known_inventory` to avoid duplicate sends.
+- [x] Keep local dedup cache for recently seen object IDs.
+- [x] Implement headers-first sync for new nodes.
 - [ ] Implement peer scoring and ban for invalid data spam.
 - [ ] Add rate limits and max message size guards.
 
 ## 14) Mining TODO
 
 - [ ] Build block template from mempool by fee rate.
-- [ ] Insert coinbase with fixed subsidy + collected fees.
-- [ ] Implement nonce search loop.
+- [x] Insert coinbase with fixed subsidy + collected fees.
+- [x] Implement nonce search loop.
 - [ ] Add extra nonce in coinbase to extend search space.
 - [ ] Rebuild template on new best block or mempool updates.
-- [ ] Add CPU miner mode for devnet/testnet.
+- [x] Add CPU miner mode for devnet/testnet.
 
 ## 15) Node and RPC TODO
 
-- [ ] Node CLI:
-- [ ] `node run --network <devnet|testnet|mainnet>`
+- [x] Node CLI:
+- [x] `node run --network <devnet|testnet|mainnet>`
 - [ ] `node status`
 - [ ] `node add-peer <addr>`
 - [ ] `node get-block <hash>`
 - [ ] `node get-tx <txid>`
-- [ ] Wallet CLI:
-- [ ] `wallet new`
-- [ ] `wallet restore`
+- [x] Wallet CLI:
+- [x] `wallet new`
+- [x] `wallet restore`
 - [ ] `wallet balance`
 - [ ] `wallet send`
-- [ ] `wallet address --qr`
+- [x] `wallet address --qr`
 - [ ] Add JSON-RPC or REST facade for automation.
 
 ## 16) Test Plan TODO
