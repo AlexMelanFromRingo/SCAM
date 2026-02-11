@@ -206,7 +206,7 @@ Status: draft v1 (frozen decisions from user session on 2026-02-11)
 - [x] Wallet CLI:
 - [x] `wallet new`
 - [x] `wallet restore`
-- [ ] `wallet balance`
+- [x] `wallet balance`
 - [ ] `wallet send`
 - [x] `wallet address --qr`
 - [x] Add JSON-RPC or REST facade for automation. (`scam-node rpc-serve` supports `/health`, `/status`, `/block/<height>`, `/tx/<height>/<index>`)

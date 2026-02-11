@@ -303,6 +303,26 @@ enum WalletCommand {
         #[arg(long, default_value = "scd")]
         hrp: String,
     },
+    Balance {
+        #[arg(long, value_enum, default_value_t = Network::Devnet)]
+        network: Network,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        mnemonic: String,
+        #[arg(long, default_value = "")]
+        passphrase: String,
+        #[arg(long, default_value_t = 0)]
+        account: u32,
+        #[arg(long, default_value_t = 0)]
+        index: u32,
+        #[arg(long, default_value_t = 0)]
+        mine_blocks: u32,
+        #[arg(long, default_value_t = 120)]
+        interval_sec: u64,
+        #[arg(long, default_value_t = 500_000)]
+        max_nonce: u64,
+    },
     Decode {
         #[arg(long)]
         address: String,
@@ -716,6 +736,68 @@ fn run_wallet(command: WalletCommand) -> Result<(), NodeError> {
             index,
             hrp,
         } => derive_and_print_address(&mnemonic, &passphrase, account, index, &hrp)?,
+        WalletCommand::Balance {
+            network,
+            config,
+            mnemonic,
+            passphrase,
+            account,
+            index,
+            mine_blocks,
+            interval_sec,
+            max_nonce,
+        } => {
+            let (_cfg, runtime) = build_runtime_for_query(
+                network,
+                config,
+                mine_blocks,
+                interval_sec,
+                max_nonce,
+                "wallet-balance",
+            )?;
+
+            let mnemonic = WalletMnemonic::parse(&mnemonic)?;
+            let seed = mnemonic.to_seed(&passphrase);
+            let key = derive_wallet_key(&seed, account, index)?;
+            let mut key_hash20 = [0u8; 20];
+            let digest = scam_core::hash::hash256(&key.pubkey_compressed());
+            key_hash20.copy_from_slice(&digest.0[..20]);
+
+            let mut total: u128 = 0;
+            let mut spendable: u128 = 0;
+            let mut immature: u128 = 0;
+            let mut utxo_count = 0usize;
+            let mut spendable_count = 0usize;
+            let mut immature_count = 0usize;
+
+            let tip_height = runtime.tip_height();
+            let coinbase_maturity = runtime.config().coinbase_maturity as u64;
+            for utxo in runtime.utxo_set().values() {
+                if utxo.key_hash20 != key_hash20 {
+                    continue;
+                }
+                utxo_count += 1;
+                total = total.saturating_add(utxo.value as u128);
+
+                let is_immature_coinbase = utxo.is_coinbase
+                    && tip_height < utxo.created_height.saturating_add(coinbase_maturity);
+                if is_immature_coinbase {
+                    immature_count += 1;
+                    immature = immature.saturating_add(utxo.value as u128);
+                } else {
+                    spendable_count += 1;
+                    spendable = spendable.saturating_add(utxo.value as u128);
+                }
+            }
+
+            println!("Wallet balance:");
+            println!("Tip height: {}", tip_height);
+            println!("Address key hash20: {}", hex::encode(key_hash20));
+            println!("UTXOs: {}", utxo_count);
+            println!("Total: {}", total);
+            println!("Spendable: {} ({} utxos)", spendable, spendable_count);
+            println!("Immature: {} ({} utxos)", immature, immature_count);
+        }
         WalletCommand::Decode { address } => {
             let decoded = parse_address(&address)?;
             println!("HRP: {}", decoded.hrp);
