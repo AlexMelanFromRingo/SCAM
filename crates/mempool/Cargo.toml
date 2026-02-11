@@ -1,0 +1,9 @@
+[package]
+name = "scam-mempool"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+scam-core = { path = "../core" }
+thiserror.workspace = true

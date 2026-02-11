@@ -2,6 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, ValueEnum};
+use scam_consensus::validate_block_basic;
 use scam_core::{ChainConfig, ChainConfigError, block_meets_pow};
 use thiserror::Error;
 
@@ -78,6 +79,10 @@ fn run() -> Result<(), NodeError> {
     println!("Config: {}", config_path.display());
     println!("Genesis hash: {}", genesis_hash);
     println!("Genesis PoW valid: {}", block_meets_pow(&genesis));
+    println!(
+        "Genesis consensus-valid: {}",
+        validate_block_basic(&genesis).is_ok()
+    );
     println!("Block target: {}", genesis.header.target);
 
     if cli.print_genesis {

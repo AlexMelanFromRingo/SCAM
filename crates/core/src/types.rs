@@ -5,7 +5,7 @@ use crate::hash::{Hash256, hash256};
 use crate::merkle::merkle_root;
 use crate::target::Target;
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct OutPoint {
     pub txid: Hash256,
     pub vout: u32,
