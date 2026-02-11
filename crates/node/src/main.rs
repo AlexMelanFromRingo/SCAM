@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 use std::fs;
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use scam_chain::{ChainError, ChainRuntime};
@@ -10,7 +13,11 @@ use scam_core::{
     render_hash_bitmap_16x16,
 };
 use scam_miner::{BlockTemplate, mine_block};
-use scam_p2p::{GossipEngine, WireMessage, build_block_locator, select_headers_for_peer};
+use scam_p2p::{
+    FramingConfig, GossipEngine, LocalHandshake, TransportError, WireMessage, build_block_locator,
+    client_handshake, read_message, request_headers, select_headers_for_peer, send_message,
+    server_handshake,
+};
 use scam_rpc::{StatusResponse, TxResponse, header_to_block_response, to_pretty_json};
 use scam_storage::{ChainStateSnapshot, StorageError, load_snapshot, save_snapshot};
 use scam_wallet::{
@@ -48,6 +55,7 @@ enum Command {
     MineOnce(MineOnceArgs),
     ChainDemo(ChainDemoArgs),
     SyncDemo(SyncDemoArgs),
+    NetDemo(NetDemoArgs),
     Snapshot(SnapshotArgs),
     P2pDemo,
 }
@@ -160,6 +168,24 @@ struct ChainDemoArgs {
 
 #[derive(Debug, Args)]
 struct SyncDemoArgs {
+    #[arg(long, value_enum, default_value_t = Network::Devnet)]
+    network: Network,
+    #[arg(long)]
+    config: Option<PathBuf>,
+    #[arg(long, default_value_t = 5)]
+    local_blocks: u32,
+    #[arg(long, default_value_t = 25)]
+    remote_blocks: u32,
+    #[arg(long, default_value_t = 2000)]
+    max_headers: usize,
+    #[arg(long, default_value_t = 30)]
+    interval_sec: u64,
+    #[arg(long, default_value_t = 500_000)]
+    max_nonce: u64,
+}
+
+#[derive(Debug, Args)]
+struct NetDemoArgs {
     #[arg(long, value_enum, default_value_t = Network::Devnet)]
     network: Network,
     #[arg(long)]
@@ -297,6 +323,8 @@ enum NodeError {
     Chain(#[from] ChainError),
     #[error("storage error: {0}")]
     Storage(#[from] StorageError),
+    #[error("transport error: {0}")]
+    Transport(#[from] TransportError),
     #[error("mnemonic error: {0}")]
     Mnemonic(#[from] MnemonicError),
     #[error("key derivation error: {0}")]
@@ -995,6 +1023,178 @@ fn run_sync_demo(args: SyncDemoArgs) -> Result<(), NodeError> {
     Ok(())
 }
 
+fn configure_stream_timeouts(stream: &TcpStream) -> Result<(), NodeError> {
+    let timeout = Some(Duration::from_secs(5));
+    stream
+        .set_read_timeout(timeout)
+        .map_err(|e| NodeError::Runtime(format!("set read timeout failed: {e}")))?;
+    stream
+        .set_write_timeout(timeout)
+        .map_err(|e| NodeError::Runtime(format!("set write timeout failed: {e}")))?;
+    Ok(())
+}
+
+fn run_net_demo(args: NetDemoArgs) -> Result<(), NodeError> {
+    let config_path = args
+        .config
+        .unwrap_or_else(|| PathBuf::from(format!("config/{}.toml", args.network.as_str())));
+    let cfg = load_chain_config(&config_path)?;
+    let miner_key_hash = cfg.genesis_reward_key_hash20()?;
+
+    let mut local = ChainRuntime::from_config(cfg.clone())?;
+    let mut remote = ChainRuntime::from_config(cfg.clone())?;
+    let local_params = MiningLoopParams {
+        count: args.local_blocks,
+        interval_sec: args.interval_sec,
+        max_nonce: args.max_nonce,
+        subsidy: cfg.block_subsidy,
+        miner_key_hash,
+        label_prefix: "net-local",
+        print_each: false,
+    };
+    let remote_params = MiningLoopParams {
+        count: args.remote_blocks,
+        interval_sec: args.interval_sec,
+        max_nonce: args.max_nonce,
+        subsidy: cfg.block_subsidy,
+        miner_key_hash,
+        label_prefix: "net-remote",
+        print_each: false,
+    };
+    mine_blocks_on_runtime(&mut local, &local_params)?;
+    mine_blocks_on_runtime(&mut remote, &remote_params)?;
+
+    let framing = FramingConfig::default();
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .map_err(|e| NodeError::Runtime(format!("bind failed: {e}")))?;
+    let addr = listener
+        .local_addr()
+        .map_err(|e| NodeError::Runtime(format!("local_addr failed: {e}")))?;
+
+    let network_id = cfg.network_id.clone();
+    let remote_tip = remote.tip_height();
+    let remote_chain = remote.block_hashes().to_vec();
+    let mut remote_headers = HashMap::new();
+    for hash in remote.block_hashes() {
+        if let Some(header) = remote.header_by_hash(hash) {
+            remote_headers.insert(*hash, header.clone());
+        }
+    }
+    let max_headers = args.max_headers;
+    let framing_server = framing.clone();
+    let server = thread::spawn(move || -> Result<(), String> {
+        let (mut stream, _peer) = listener.accept().map_err(|e| e.to_string())?;
+        configure_stream_timeouts(&stream).map_err(|e| e.to_string())?;
+
+        let server_hello = LocalHandshake {
+            protocol_version: 1,
+            network_id: network_id.clone(),
+            user_agent: "scam-node/server".to_owned(),
+            start_height: remote_tip,
+        };
+        let remote_peer = server_handshake(&mut stream, &framing_server, &server_hello)
+            .map_err(|e| e.to_string())?;
+        if remote_peer.network_id != network_id {
+            return Err(format!(
+                "network mismatch from client: expected {}, got {}",
+                network_id, remote_peer.network_id
+            ));
+        }
+
+        let ping = read_message(&mut stream, &framing_server).map_err(|e| e.to_string())?;
+        match ping {
+            WireMessage::Ping { nonce } => {
+                send_message(&mut stream, &WireMessage::Pong { nonce }, &framing_server)
+                    .map_err(|e| e.to_string())?;
+            }
+            other => {
+                return Err(format!("expected ping, got {other:?}"));
+            }
+        }
+
+        let request = read_message(&mut stream, &framing_server).map_err(|e| e.to_string())?;
+        match request {
+            WireMessage::GetHeaders { locator, stop } => {
+                let headers = select_headers_for_peer(
+                    &remote_chain,
+                    &remote_headers,
+                    &locator,
+                    stop,
+                    max_headers,
+                );
+                send_message(
+                    &mut stream,
+                    &WireMessage::Headers { headers },
+                    &framing_server,
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            other => {
+                return Err(format!("expected getheaders, got {other:?}"));
+            }
+        }
+
+        Ok(())
+    });
+
+    let mut client =
+        TcpStream::connect(addr).map_err(|e| NodeError::Runtime(format!("connect failed: {e}")))?;
+    configure_stream_timeouts(&client)?;
+    let client_hello = LocalHandshake {
+        protocol_version: 1,
+        network_id: cfg.network_id.clone(),
+        user_agent: "scam-node/client".to_owned(),
+        start_height: local.tip_height(),
+    };
+    let remote_info = client_handshake(&mut client, &framing, &client_hello)?;
+    if remote_info.network_id != cfg.network_id {
+        return Err(NodeError::Runtime(format!(
+            "network mismatch from server: expected {}, got {}",
+            cfg.network_id, remote_info.network_id
+        )));
+    }
+
+    send_message(&mut client, &WireMessage::Ping { nonce: 7 }, &framing)?;
+    let pong = read_message(&mut client, &framing)?;
+    match pong {
+        WireMessage::Pong { nonce: 7 } => {}
+        other => {
+            return Err(NodeError::Runtime(format!("expected pong, got {other:?}")));
+        }
+    }
+
+    let locator = build_block_locator(local.block_hashes());
+    let headers = request_headers(&mut client, &framing, locator.clone(), None)?;
+
+    let server_result = server
+        .join()
+        .map_err(|_| NodeError::Runtime("server thread panicked".to_owned()))?;
+    if let Err(err) = server_result {
+        return Err(NodeError::Runtime(format!("server error: {err}")));
+    }
+
+    println!("Net demo (TCP + handshake + headers-first)");
+    println!(
+        "Client tip: h={} hash={}",
+        local.tip_height(),
+        local.tip_hash()
+    );
+    println!(
+        "Server tip: h={} hash={}",
+        remote.tip_height(),
+        remote.tip_hash()
+    );
+    println!("Locator sent: {}", locator.len());
+    println!("Headers received: {}", headers.len());
+    if let Some(first) = headers.first() {
+        println!("First header prev: {}", first.prev_block);
+    }
+    if let Some(last) = headers.last() {
+        println!("Last header hash: {}", last.block_hash());
+    }
+    Ok(())
+}
+
 fn run() -> Result<(), NodeError> {
     let cli = Cli::parse();
     match cli.command {
@@ -1008,6 +1208,7 @@ fn run() -> Result<(), NodeError> {
         Some(Command::MineOnce(args)) => run_mine_once(args),
         Some(Command::ChainDemo(args)) => run_chain_demo(args),
         Some(Command::SyncDemo(args)) => run_sync_demo(args),
+        Some(Command::NetDemo(args)) => run_net_demo(args),
         Some(Command::Snapshot(args)) => run_snapshot(args.command),
         Some(Command::P2pDemo) => run_p2p_demo(),
         None => run_node(cli.network, cli.config, cli.print_genesis),

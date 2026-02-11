@@ -12,6 +12,7 @@ Status: draft v1 (frozen decisions from user session on 2026-02-11)
 - [x] Wallet basics implemented: mnemonic generation/restore, Schnorr sign/verify, Bech32m address, QR output.
 - [x] UTXO block application implemented with signature checks, fee accounting, coinbase maturity.
 - [x] P2P wire messages + gossip dedup engine (`inv/getdata/tx/block`) implemented.
+- [x] P2P TCP transport framing + `version/verack` handshake + `ping/pong` + `getheaders/headers` demo implemented.
 - [x] Miner template + nonce search loop implemented (`mine-once` CLI).
 - [x] Chainstate snapshot save/load implemented.
 - [ ] Remaining major items: full chain runtime with reorg-safe best-chain handling, socketed p2p sync runtime, RPC surface.
