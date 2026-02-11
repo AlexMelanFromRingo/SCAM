@@ -3,11 +3,12 @@ use std::collections::{HashMap, HashSet};
 use scam_core::{Block, OutPoint, Transaction, TxSigningError, block_meets_pow};
 use secp256k1::schnorr::Signature;
 use secp256k1::{Message, PublicKey, Secp256k1};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::validate::{BlockValidationError, validate_block_basic};
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct UtxoEntry {
     pub value: u64,
     pub key_hash20: [u8; 20],

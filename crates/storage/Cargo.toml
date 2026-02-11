@@ -1,0 +1,12 @@
+[package]
+name = "scam-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bincode.workspace = true
+scam-consensus = { path = "../consensus" }
+scam-core = { path = "../core" }
+serde.workspace = true
+thiserror.workspace = true

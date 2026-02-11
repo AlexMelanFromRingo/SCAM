@@ -382,6 +382,7 @@ dependencies = [
  "num-traits",
  "scam-core",
  "secp256k1",
+ "serde",
  "thiserror",
 ]
 
@@ -420,6 +421,7 @@ dependencies = [
  "scam-core",
  "scam-miner",
  "scam-p2p",
+ "scam-storage",
  "scam-wallet",
  "thiserror",
  "toml",
@@ -430,6 +432,17 @@ name = "scam-p2p"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "scam-core",
+ "serde",
+ "thiserror",
+]
+
+[[package]]
+name = "scam-storage"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "scam-consensus",
  "scam-core",
  "serde",
  "thiserror",

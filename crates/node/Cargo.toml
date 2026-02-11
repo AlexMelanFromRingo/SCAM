@@ -11,6 +11,7 @@ scam-consensus = { path = "../consensus" }
 scam-core = { path = "../core" }
 scam-miner = { path = "../miner" }
 scam-p2p = { path = "../p2p" }
+scam-storage = { path = "../storage" }
 scam-wallet = { path = "../wallet" }
 thiserror.workspace = true
 toml.workspace = true

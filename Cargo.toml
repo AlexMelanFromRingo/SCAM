@@ -5,6 +5,7 @@ members = [
     "crates/mempool",
     "crates/miner",
     "crates/p2p",
+    "crates/storage",
     "crates/wallet",
     "crates/node",
 ]

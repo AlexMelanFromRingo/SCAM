@@ -8,6 +8,7 @@ use scam_core::{
 };
 use scam_miner::{BlockTemplate, mine_block};
 use scam_p2p::{GossipEngine, WireMessage};
+use scam_storage::{ChainStateSnapshot, StorageError, load_snapshot, save_snapshot};
 use scam_wallet::{
     AddressError, DeriveKeyError, MnemonicError, QrError, SchnorrError, WalletMnemonic,
     derive_wallet_key, new_mnemonic, parse_address, qr_for_payment_uri, sign_digest, to_address,
@@ -36,6 +37,7 @@ enum Command {
     Node(NodeArgs),
     Wallet(WalletArgs),
     MineOnce(MineOnceArgs),
+    Snapshot(SnapshotArgs),
     P2pDemo,
 }
 
@@ -63,6 +65,28 @@ struct MineOnceArgs {
     config: Option<PathBuf>,
     #[arg(long, default_value_t = 50_000)]
     max_nonce: u64,
+}
+
+#[derive(Debug, Args)]
+struct SnapshotArgs {
+    #[command(subcommand)]
+    command: SnapshotCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum SnapshotCommand {
+    SaveGenesis {
+        #[arg(long, value_enum, default_value_t = Network::Devnet)]
+        network: Network,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long, default_value = "data/chain.snapshot")]
+        out: PathBuf,
+    },
+    Show {
+        #[arg(long)]
+        path: PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -160,6 +184,8 @@ enum NodeError {
     InvalidConfig(#[from] ChainConfigError),
     #[error("block/tx validation failed: {0}")]
     Validation(#[from] TxValidationError),
+    #[error("storage error: {0}")]
+    Storage(#[from] StorageError),
     #[error("mnemonic error: {0}")]
     Mnemonic(#[from] MnemonicError),
     #[error("key derivation error: {0}")]
@@ -382,6 +408,55 @@ fn run_p2p_demo() -> Result<(), NodeError> {
     Ok(())
 }
 
+fn run_snapshot(command: SnapshotCommand) -> Result<(), NodeError> {
+    match command {
+        SnapshotCommand::SaveGenesis {
+            network,
+            config,
+            out,
+        } => {
+            let config_path = config
+                .unwrap_or_else(|| PathBuf::from(format!("config/{}.toml", network.as_str())));
+            let cfg = load_chain_config(&config_path)?;
+            let genesis = cfg.build_genesis_block()?;
+            let genesis_hash = genesis.header.block_hash();
+
+            let mut utxos = UtxoSet::new();
+            validate_and_apply_block(
+                &genesis,
+                0,
+                cfg.block_subsidy,
+                cfg.coinbase_maturity as u64,
+                &mut utxos,
+            )?;
+
+            let snapshot = ChainStateSnapshot::from_utxo_set(
+                cfg.network_id.clone(),
+                0,
+                genesis_hash,
+                vec![genesis_hash],
+                &utxos,
+            );
+            save_snapshot(&out, &snapshot)?;
+            println!("Snapshot saved: {}", out.display());
+            println!("Network: {}", snapshot.network_id);
+            println!("Tip height: {}", snapshot.tip_height);
+            println!("Tip hash: {}", snapshot.tip_hash);
+            println!("UTXO count: {}", snapshot.utxos.len());
+        }
+        SnapshotCommand::Show { path } => {
+            let snapshot = load_snapshot(&path)?;
+            println!("Snapshot: {}", path.display());
+            println!("Network: {}", snapshot.network_id);
+            println!("Tip height: {}", snapshot.tip_height);
+            println!("Tip hash: {}", snapshot.tip_hash);
+            println!("Blocks tracked: {}", snapshot.block_hashes_by_height.len());
+            println!("UTXO count: {}", snapshot.utxos.len());
+        }
+    }
+    Ok(())
+}
+
 fn run_mine_once(args: MineOnceArgs) -> Result<(), NodeError> {
     let config_path = args
         .config
@@ -457,6 +532,7 @@ fn run() -> Result<(), NodeError> {
         Some(Command::Node(args)) => run_node(args.network, args.config, args.print_genesis),
         Some(Command::Wallet(args)) => run_wallet(args.command),
         Some(Command::MineOnce(args)) => run_mine_once(args),
+        Some(Command::Snapshot(args)) => run_snapshot(args.command),
         Some(Command::P2pDemo) => run_p2p_demo(),
         None => run_node(cli.network, cli.config, cli.print_genesis),
     }
