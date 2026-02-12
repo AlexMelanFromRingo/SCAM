@@ -315,6 +315,7 @@ pub enum TxValidationError {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
     use secp256k1::{Keypair, Message, Secp256k1, SecretKey};
 
     use super::{TxValidationError, UtxoSet, validate_and_apply_block};
@@ -592,5 +593,177 @@ mod tests {
         let err = validate_and_apply_block(&block1, 1, 50, 1, validation_domain, &mut utxos)
             .expect_err("cross-domain replay must fail");
         assert!(matches!(err, TxValidationError::InvalidSignature { .. }));
+    }
+
+    proptest! {
+        #[test]
+        fn self_transfer_with_positive_fee_applies(
+            input_value in 2u64..1_000_000u64,
+            fee in 1u64..50_000u64,
+            key_seed in 1u8..=240u8
+        ) {
+            prop_assume!(fee < input_value);
+
+            let chain_domain = b"propnet-self";
+            let (sender_pubkey, sender_key_hash, sender_secret) = key_material([key_seed; 32]);
+
+            let genesis_coinbase = Transaction {
+                version: 1,
+                inputs: vec![TxIn {
+                    prev_out: OutPoint::coinbase(),
+                    signature: b"genesis".to_vec(),
+                    pubkey_compressed: vec![],
+                    sequence: u32::MAX,
+                }],
+                outputs: vec![TxOut {
+                    value: input_value,
+                    key_hash20: sender_key_hash,
+                }],
+                lock_time: 0,
+            };
+            let genesis = make_block(
+                Hash256::ZERO,
+                100,
+                Target::MAX,
+                vec![genesis_coinbase.clone()],
+            );
+
+            let mut utxos = UtxoSet::new();
+            validate_and_apply_block(&genesis, 0, input_value, 1, chain_domain, &mut utxos)
+                .expect("genesis applies");
+
+            let mut spend = Transaction {
+                version: 1,
+                inputs: vec![TxIn {
+                    prev_out: OutPoint {
+                        txid: genesis_coinbase.txid(),
+                        vout: 0,
+                    },
+                    signature: vec![],
+                    pubkey_compressed: sender_pubkey.to_vec(),
+                    sequence: 0,
+                }],
+                outputs: vec![TxOut {
+                    value: input_value - fee,
+                    key_hash20: sender_key_hash,
+                }],
+                lock_time: 0,
+            };
+            sign_input(&mut spend, 0, chain_domain, &sender_secret);
+
+            let block1_coinbase = Transaction {
+                version: 1,
+                inputs: vec![TxIn {
+                    prev_out: OutPoint::coinbase(),
+                    signature: b"b1".to_vec(),
+                    pubkey_compressed: vec![],
+                    sequence: u32::MAX,
+                }],
+                outputs: vec![TxOut {
+                    value: input_value + fee,
+                    key_hash20: sender_key_hash,
+                }],
+                lock_time: 0,
+            };
+            let block1 = make_block(
+                genesis.header.block_hash(),
+                220,
+                Target::MAX,
+                vec![block1_coinbase, spend],
+            );
+
+            let applied = validate_and_apply_block(
+                &block1,
+                1,
+                input_value,
+                1,
+                chain_domain,
+                &mut utxos,
+            )
+            .expect("self-transfer spend must be valid");
+            prop_assert_eq!(applied.total_fees, fee as u128);
+        }
+
+        #[test]
+        fn overspend_is_rejected(
+            input_value in 1u64..1_000_000u64,
+            overspend_delta in 1u64..50_000u64,
+            key_seed in 1u8..=240u8,
+            receiver_seed in 1u8..=240u8
+        ) {
+            prop_assume!(key_seed != receiver_seed);
+            let chain_domain = b"propnet-overspend";
+            let (sender_pubkey, sender_key_hash, sender_secret) = key_material([key_seed; 32]);
+            let (_, receiver_key_hash, _) = key_material([receiver_seed; 32]);
+
+            let genesis_coinbase = Transaction {
+                version: 1,
+                inputs: vec![TxIn {
+                    prev_out: OutPoint::coinbase(),
+                    signature: b"genesis".to_vec(),
+                    pubkey_compressed: vec![],
+                    sequence: u32::MAX,
+                }],
+                outputs: vec![TxOut {
+                    value: input_value,
+                    key_hash20: sender_key_hash,
+                }],
+                lock_time: 0,
+            };
+            let genesis = make_block(
+                Hash256::ZERO,
+                100,
+                Target::MAX,
+                vec![genesis_coinbase.clone()],
+            );
+
+            let mut utxos = UtxoSet::new();
+            validate_and_apply_block(&genesis, 0, input_value, 1, chain_domain, &mut utxos)
+                .expect("genesis applies");
+
+            let mut spend = Transaction {
+                version: 1,
+                inputs: vec![TxIn {
+                    prev_out: OutPoint {
+                        txid: genesis_coinbase.txid(),
+                        vout: 0,
+                    },
+                    signature: vec![],
+                    pubkey_compressed: sender_pubkey.to_vec(),
+                    sequence: 0,
+                }],
+                outputs: vec![TxOut {
+                    value: input_value.saturating_add(overspend_delta),
+                    key_hash20: receiver_key_hash,
+                }],
+                lock_time: 0,
+            };
+            sign_input(&mut spend, 0, chain_domain, &sender_secret);
+
+            let block1_coinbase = Transaction {
+                version: 1,
+                inputs: vec![TxIn {
+                    prev_out: OutPoint::coinbase(),
+                    signature: b"b1".to_vec(),
+                    pubkey_compressed: vec![],
+                    sequence: u32::MAX,
+                }],
+                outputs: vec![TxOut {
+                    value: input_value,
+                    key_hash20: receiver_key_hash,
+                }],
+                lock_time: 0,
+            };
+            let block1 = make_block(
+                genesis.header.block_hash(),
+                220,
+                Target::MAX,
+                vec![block1_coinbase, spend],
+            );
+
+            let err = validate_and_apply_block(&block1, 1, input_value, 1, chain_domain, &mut utxos)
+                .expect_err("overspend must fail");
+            assert!(matches!(err, TxValidationError::Overspend { .. }));
+        }
     }
 }

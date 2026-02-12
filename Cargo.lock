@@ -857,6 +857,7 @@ version = "0.1.0"
 dependencies = [
  "num-bigint",
  "num-traits",
+ "proptest",
  "scam-core",
  "secp256k1",
  "serde",

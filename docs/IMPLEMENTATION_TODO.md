@@ -20,6 +20,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] Net demo upgraded to perform `getdata` block download and apply downloaded blocks to local runtime.
 - [x] Added one-shot socketed sync command `sync-peer` (headers -> inv -> getdata -> block validation -> DB persistence).
 - [x] Property-based tests baseline added with `proptest` (hash/target invariants in `scam-core`).
+- [x] Property-based tests expanded to tx/UTXO invariants in `scam-consensus` (self-transfer fee accounting + overspend rejection).
 - [x] Miner template + nonce search loop implemented (`mine-once` CLI).
 - [x] Chainstate snapshot save/load implemented.
 - [x] redb-backed snapshot persistence implemented (`snapshot save-genesis-db` / `snapshot show-db`).
@@ -252,7 +253,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [ ] fork + reorg correctness
 - [ ] difficulty update every 20 blocks
 - [x] wallet mnemonic restore and deterministic addresses
-- [ ] Property-based testing (`proptest`) for tx/utxo/serialization invariants. (baseline in `scam-core` done; expand to tx/utxo invariants next)
+- [x] Property-based testing (`proptest`) for tx/utxo/serialization invariants. (`scam-core` hash/target invariants + `scam-consensus` tx/UTXO properties).
 - [ ] Fuzzing (`cargo-fuzz`) for wire codec, parser, and block/tx decode paths.
 - [ ] Mutation testing (tooling + baseline score gate).
 - [ ] Soak test:

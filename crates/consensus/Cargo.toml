@@ -11,3 +11,6 @@ scam-core = { path = "../core" }
 secp256k1.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
