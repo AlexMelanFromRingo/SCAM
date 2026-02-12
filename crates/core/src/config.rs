@@ -18,6 +18,12 @@ pub struct ChainConfig {
     pub max_block_size: u32,
     pub max_tx_size: u32,
     pub max_mempool_txs: u32,
+    #[serde(default = "default_min_relay_fee_per_kb")]
+    pub min_relay_fee_per_kb: u64,
+    #[serde(default = "default_max_orphan_txs")]
+    pub max_orphan_txs: u32,
+    #[serde(default = "default_orphan_ttl_sec")]
+    pub orphan_ttl_sec: u64,
     pub coinbase_maturity: u32,
     pub block_subsidy: u64,
     pub hrp: String,
@@ -68,6 +74,16 @@ impl ChainConfig {
         if self.max_mempool_txs == 0 {
             return Err(ChainConfigError::InvalidField(
                 "max_mempool_txs must be > 0".to_owned(),
+            ));
+        }
+        if self.max_orphan_txs == 0 {
+            return Err(ChainConfigError::InvalidField(
+                "max_orphan_txs must be > 0".to_owned(),
+            ));
+        }
+        if self.orphan_ttl_sec == 0 {
+            return Err(ChainConfigError::InvalidField(
+                "orphan_ttl_sec must be > 0".to_owned(),
             ));
         }
         if self.hrp.trim().is_empty() {
@@ -136,6 +152,18 @@ impl ChainConfig {
     }
 }
 
+const fn default_min_relay_fee_per_kb() -> u64 {
+    1_000
+}
+
+const fn default_max_orphan_txs() -> u32 {
+    5_000
+}
+
+const fn default_orphan_ttl_sec() -> u64 {
+    20 * 60
+}
+
 #[derive(Debug, Error)]
 pub enum ChainConfigError {
     #[error("{0}")]
@@ -159,6 +187,9 @@ mod tests {
             max_block_size: 1_000_000,
             max_tx_size: 100_000,
             max_mempool_txs: 1_000,
+            min_relay_fee_per_kb: 1_000,
+            max_orphan_txs: 5_000,
+            orphan_ttl_sec: 1_200,
             coinbase_maturity: 100,
             block_subsidy: 5_000_000_000,
             hrp: "sd".to_owned(),
@@ -186,6 +217,9 @@ mod tests {
             max_block_size: 1_000_000,
             max_tx_size: 100_000,
             max_mempool_txs: 1_000,
+            min_relay_fee_per_kb: 1_000,
+            max_orphan_txs: 5_000,
+            orphan_ttl_sec: 1_200,
             coinbase_maturity: 100,
             block_subsidy: 5_000_000_000,
             hrp: "sd".to_owned(),
@@ -199,5 +233,32 @@ mod tests {
         cfg.hrp = "x".to_owned();
         let err = cfg.validate().expect_err("invalid hrp prefix must fail");
         assert!(matches!(err, super::ChainConfigError::InvalidField(_)));
+    }
+
+    #[test]
+    fn config_applies_defaults_for_mempool_policy_fields() {
+        let raw = r#"
+network_id = "devnet"
+target_block_time_sec = 120
+difficulty_adjustment_window = 20
+difficulty_clamp_up = 4.0
+difficulty_clamp_down = 0.25
+max_block_size = 1_000_000
+max_tx_size = 100_000
+max_mempool_txs = 1_000
+coinbase_maturity = 100
+block_subsidy = 5_000_000_000
+hrp = "sd"
+genesis_message = "SCAM genesis"
+genesis_timestamp = 1_770_763_200
+genesis_target = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+genesis_nonce = 0
+genesis_reward_key_hash20 = "0000000000000000000000000000000000000000"
+"#;
+        let cfg: ChainConfig = toml::from_str(raw).expect("config parse");
+        assert_eq!(cfg.min_relay_fee_per_kb, 1_000);
+        assert_eq!(cfg.max_orphan_txs, 5_000);
+        assert_eq!(cfg.orphan_ttl_sec, 1_200);
+        cfg.validate().expect("validate");
     }
 }

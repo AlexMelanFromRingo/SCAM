@@ -35,6 +35,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] Added mutation testing runner baseline (`scripts/mutation-baseline.sh`) and testing strategy doc.
 - [x] Added durable atomic DB replacement helper (`rename + fsync file/dir`) for runtime storage writes.
 - [x] Added long-run soak harness command (`scam-node soak`) for repeatable devnet stability runs.
+- [x] Config now explicitly freezes relay/orphan policy constants across network preset files.
 - [x] Miner template + nonce search loop implemented (`mine-once` CLI).
 - [x] Chainstate snapshot save/load implemented.
 - [x] redb-backed snapshot persistence implemented (`snapshot save-genesis-db` / `snapshot show-db`).
@@ -151,7 +152,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] `sum(inputs) >= sum(outputs)`
 - [x] no overflow / no negative amounts
 - [x] coinbase special rules enforced
-- [ ] Fee policy:
+- [x] Fee policy:
 - [x] min relay fee
 - [x] mempool sorting by fee rate
 
@@ -192,7 +193,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 ## 12) Storage TODO
 
 - [x] Pick DB engine (`redb` embedded backend added in `scam-storage`).
-- [ ] Buckets/tables:
+- [x] Buckets/tables:
 - [x] blocks by hash
 - [x] headers by hash
 - [x] block index (height, work, parent)
@@ -254,13 +255,13 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 
 ## 16) Test Plan TODO
 
-- [ ] Unit tests:
+- [x] Unit tests:
 - [x] hash determinism and serialization compatibility
 - [x] signature verification and pubkey parsing
 - [x] merkle root generation
 - [x] target math and retarget formula
 - [x] mempool replacement policy edge cases (after policy redesign).
-- [ ] Integration tests:
+- [x] Integration tests:
 - [x] 3+ node tx propagation via inv/getdata
 - [x] block propagation and dedup behavior
 - [x] initial sync from genesis to tip (real runtime, not demo).
@@ -284,11 +285,11 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 
 ## 18) Open Constants to Revisit Later
 
-- [ ] `coinbase_maturity` (suggest `100`).
-- [ ] `min_relay_fee` baseline.
-- [ ] `max_block_size`.
-- [ ] retarget clamp factors.
-- [ ] mempool max size and orphan limits.
+- [x] `coinbase_maturity` (set to `100` in network configs).
+- [x] `min_relay_fee` baseline (set to `1000` sat/kB-equivalent policy unit).
+- [x] `max_block_size` (set to `1_000_000` bytes in network configs).
+- [x] retarget clamp factors (`up=4.0`, `down=0.25` in network configs).
+- [x] mempool max size and orphan limits (`max_mempool_txs=50_000`, `max_orphan_txs=5_000`, `orphan_ttl_sec=1_200`).
 
 ## 19) Optional Utility: 16x16 Hash Visualizer
 
