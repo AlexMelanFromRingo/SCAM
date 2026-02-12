@@ -30,6 +30,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] Added peer discovery hardening baseline (outbound diversity + rotation candidate selector in `scam-p2p`).
 - [x] Added miner `TemplateManager` cache/rebuild flow keyed by tip hash + mempool revision.
 - [x] Added mempool inventory delta API + gossip hook for replacement/eviction-style tx announcements.
+- [x] Added explicit mempool double-spend threat model document (`docs/MEMPOOL_THREAT_MODEL.md`).
 - [x] Miner template + nonce search loop implemented (`mine-once` CLI).
 - [x] Chainstate snapshot save/load implemented.
 - [x] redb-backed snapshot persistence implemented (`snapshot save-genesis-db` / `snapshot show-db`).
@@ -156,7 +157,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] On incoming tx without conflict: validate then insert.
 - [x] Replace current `txid`-based conflict rule with final anti-grinding policy (`fee-rate RBF` or `first-seen` + explicit replacement gate).
 - [x] Add replacement anti-DoS rules (rate limits, minimum delta fee, descendant limits).
-- [ ] Re-run threat model for double-spend race after new policy is chosen.
+- [x] Re-run threat model for double-spend race after new policy is chosen.
 - [x] Broadcast replacement/eviction events to peers as inventory updates.
 - [x] Add orphan tx pool with size/time limits.
 - [x] Add eviction policy for full mempool.
