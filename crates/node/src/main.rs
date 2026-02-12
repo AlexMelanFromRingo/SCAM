@@ -15,9 +15,10 @@ use scam_core::{
 };
 use scam_miner::{BlockTemplate, mine_block};
 use scam_p2p::{
-    FramingConfig, GossipEngine, InventoryItem, LocalHandshake, TransportError, WireMessage,
-    build_block_locator, client_handshake, read_message, request_blocks, request_headers,
-    select_block_hashes_for_peer, select_headers_for_peer, send_message, server_handshake,
+    FramingConfig, GossipEngine, InventoryItem, LocalHandshake, PeerCandidate, TransportError,
+    WireMessage, build_block_locator, client_handshake, read_message, request_blocks,
+    request_headers, select_block_hashes_for_peer, select_headers_for_peer, select_outbound_peers,
+    send_message, server_handshake,
 };
 use scam_rpc::{StatusResponse, TxResponse, header_to_block_response, to_pretty_json};
 use scam_storage::{
@@ -65,6 +66,7 @@ enum Command {
     SyncDemo(SyncDemoArgs),
     NetDemo(NetDemoArgs),
     SyncPeer(SyncPeerArgs),
+    SyncBook(SyncBookArgs),
     ReindexRuntime(ReindexRuntimeArgs),
     Soak(SoakArgs),
     ReorgDemo(ReorgDemoArgs),
@@ -229,6 +231,24 @@ struct SyncPeerArgs {
     peer: String,
     #[arg(long, default_value_t = 16)]
     max_batches: u32,
+}
+
+#[derive(Debug, Args)]
+struct SyncBookArgs {
+    #[arg(long, value_enum, default_value_t = Network::Devnet)]
+    network: Network,
+    #[arg(long)]
+    config: Option<PathBuf>,
+    #[arg(long)]
+    runtime_db: Option<PathBuf>,
+    #[arg(long, default_value = "data/peers")]
+    peers_dir: PathBuf,
+    #[arg(long, default_value_t = 8)]
+    max_peers: usize,
+    #[arg(long, default_value_t = 16)]
+    max_batches_per_peer: u32,
+    #[arg(long, default_value_t = 6 * 60 * 60)]
+    rotate_after_sec: u64,
 }
 
 #[derive(Debug, Args)]
@@ -886,16 +906,20 @@ fn run_get_tx(args: GetTxArgs) -> Result<(), NodeError> {
     Ok(())
 }
 
-fn run_add_peer(args: AddPeerArgs) -> Result<(), NodeError> {
-    let network_name = args.network.as_str();
-    let peers_db_path = args.peers_dir.join(format!("{network_name}.redb"));
-    let legacy_txt_path = args.peers_dir.join(format!("{network_name}.txt"));
-    if let Some(parent) = peers_db_path.parent() {
-        fs::create_dir_all(parent).map_err(|e| NodeError::Runtime(e.to_string()))?;
-    }
+fn peer_book_paths(peers_dir: &Path, network_name: &str) -> (PathBuf, PathBuf) {
+    (
+        peers_dir.join(format!("{network_name}.redb")),
+        peers_dir.join(format!("{network_name}.txt")),
+    )
+}
 
-    let mut peer_book = if peers_db_path.exists() {
-        let loaded = load_peer_book_db(&peers_db_path)?;
+fn load_or_init_peer_book(
+    network_name: &str,
+    peers_db_path: &Path,
+    legacy_txt_path: &Path,
+) -> Result<PeerAddressBook, NodeError> {
+    if peers_db_path.exists() {
+        let loaded = load_peer_book_db(peers_db_path)?;
         if loaded.network_id != network_name {
             return Err(NodeError::Runtime(format!(
                 "peer book network mismatch in {}: expected '{}', got '{}'",
@@ -904,9 +928,11 @@ fn run_add_peer(args: AddPeerArgs) -> Result<(), NodeError> {
                 loaded.network_id
             )));
         }
-        loaded
-    } else if legacy_txt_path.exists() {
-        let mut peers = fs::read_to_string(&legacy_txt_path)
+        return Ok(loaded);
+    }
+
+    if legacy_txt_path.exists() {
+        let mut peers = fs::read_to_string(legacy_txt_path)
             .map_err(|e| NodeError::Runtime(e.to_string()))?
             .lines()
             .map(str::trim)
@@ -919,16 +945,35 @@ fn run_add_peer(args: AddPeerArgs) -> Result<(), NodeError> {
             .collect::<Vec<_>>();
         peers.sort_by(|a, b| a.address.cmp(&b.address));
         peers.dedup_by(|a, b| a.address == b.address);
-        PeerAddressBook {
+        return Ok(PeerAddressBook {
             network_id: network_name.to_owned(),
             peers,
-        }
-    } else {
-        PeerAddressBook {
-            network_id: network_name.to_owned(),
-            peers: Vec::new(),
-        }
-    };
+        });
+    }
+
+    Ok(PeerAddressBook {
+        network_id: network_name.to_owned(),
+        peers: Vec::new(),
+    })
+}
+
+fn current_unix_sec() -> Result<u64, NodeError> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| NodeError::Runtime(format!("system clock error: {e}")))?;
+    Ok(now.as_secs())
+}
+
+fn run_add_peer(args: AddPeerArgs) -> Result<(), NodeError> {
+    let network_name = args.network.as_str();
+    let (peers_db_path, legacy_txt_path) = peer_book_paths(&args.peers_dir, network_name);
+    if let Some(parent) = peers_db_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| NodeError::Runtime(e.to_string()))?;
+    }
+
+    let mut peer_book = load_or_init_peer_book(network_name, &peers_db_path, &legacy_txt_path)?;
 
     if !peer_book
         .peers
@@ -2257,26 +2302,29 @@ fn run_net_demo(args: NetDemoArgs) -> Result<(), NodeError> {
     Ok(())
 }
 
-fn run_sync_peer(args: SyncPeerArgs) -> Result<(), NodeError> {
-    let config_path = args
-        .config
-        .unwrap_or_else(|| PathBuf::from(format!("config/{}.toml", args.network.as_str())));
-    let cfg = load_chain_config(&config_path)?;
-    let runtime_db_path = args
-        .runtime_db
-        .unwrap_or_else(|| default_runtime_db_path(args.network));
-    let (mut runtime, source) = load_runtime_from_db_or_genesis(&cfg, &runtime_db_path)?;
-    let start_height = runtime.tip_height();
-    let start_hash = runtime.tip_hash();
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct PeerSyncStats {
+    headers_received: usize,
+    blocks_announced: usize,
+    blocks_downloaded: usize,
+    blocks_applied: usize,
+}
 
-    let mut stream = TcpStream::connect(&args.peer)
-        .map_err(|e| NodeError::Runtime(format!("connect to {} failed: {e}", args.peer)))?;
+fn sync_runtime_with_peer(
+    cfg: &ChainConfig,
+    runtime: &mut ChainRuntime,
+    peer: &str,
+    max_batches: u32,
+    user_agent: &str,
+) -> Result<PeerSyncStats, NodeError> {
+    let mut stream = TcpStream::connect(peer)
+        .map_err(|e| NodeError::Runtime(format!("connect to {peer} failed: {e}")))?;
     configure_stream_timeouts(&stream)?;
     let framing = FramingConfig::default();
     let local_hello = LocalHandshake {
         protocol_version: 1,
         network_id: cfg.network_id.clone(),
-        user_agent: "scam-node/sync-peer".to_owned(),
+        user_agent: user_agent.to_owned(),
         start_height: runtime.tip_height(),
     };
     let remote = client_handshake(&mut stream, &framing, &local_hello)?;
@@ -2287,23 +2335,20 @@ fn run_sync_peer(args: SyncPeerArgs) -> Result<(), NodeError> {
         )));
     }
 
-    let mut total_headers = 0usize;
-    let mut total_announced_blocks = 0usize;
-    let mut total_downloaded = 0usize;
-    let mut total_applied = 0usize;
-    for _ in 0..args.max_batches {
+    let mut stats = PeerSyncStats::default();
+    for _ in 0..max_batches {
         let locator = build_block_locator(runtime.block_hashes());
         let headers = request_headers(&mut stream, &framing, locator.clone(), None)?;
         if headers.is_empty() {
             break;
         }
-        total_headers = total_headers.saturating_add(headers.len());
+        stats.headers_received = stats.headers_received.saturating_add(headers.len());
 
         let announced = request_blocks(&mut stream, &framing, locator, None)?;
         if announced.is_empty() {
             break;
         }
-        total_announced_blocks = total_announced_blocks.saturating_add(announced.len());
+        stats.blocks_announced = stats.blocks_announced.saturating_add(announced.len());
         let unknown_hashes = announced
             .iter()
             .copied()
@@ -2331,14 +2376,14 @@ fn run_sync_peer(args: SyncPeerArgs) -> Result<(), NodeError> {
                             expected_hash, got_hash
                         )));
                     }
-                    total_downloaded = total_downloaded.saturating_add(1);
+                    stats.blocks_downloaded = stats.blocks_downloaded.saturating_add(1);
                     let outcome = runtime.submit_block(block)?;
                     if matches!(
                         outcome,
                         BlockSubmissionOutcome::ExtendedTip { .. }
                             | BlockSubmissionOutcome::Reorged { .. }
                     ) {
-                        total_applied = total_applied.saturating_add(1);
+                        stats.blocks_applied = stats.blocks_applied.saturating_add(1);
                     }
                 }
                 WireMessage::NotFound { items } => {
@@ -2356,6 +2401,28 @@ fn run_sync_peer(args: SyncPeerArgs) -> Result<(), NodeError> {
             }
         }
     }
+    Ok(stats)
+}
+
+fn run_sync_peer(args: SyncPeerArgs) -> Result<(), NodeError> {
+    let config_path = args
+        .config
+        .unwrap_or_else(|| PathBuf::from(format!("config/{}.toml", args.network.as_str())));
+    let cfg = load_chain_config(&config_path)?;
+    let runtime_db_path = args
+        .runtime_db
+        .unwrap_or_else(|| default_runtime_db_path(args.network));
+    let (mut runtime, source) = load_runtime_from_db_or_genesis(&cfg, &runtime_db_path)?;
+    let start_height = runtime.tip_height();
+    let start_hash = runtime.tip_hash();
+
+    let stats = sync_runtime_with_peer(
+        &cfg,
+        &mut runtime,
+        &args.peer,
+        args.max_batches,
+        "scam-node/sync-peer",
+    )?;
     persist_runtime_db(&runtime, &runtime_db_path)?;
 
     println!("Sync peer result:");
@@ -2369,8 +2436,131 @@ fn run_sync_peer(args: SyncPeerArgs) -> Result<(), NodeError> {
         runtime.tip_height(),
         runtime.tip_hash()
     );
+    println!("Headers received: {}", stats.headers_received);
+    println!("Blocks announced: {}", stats.blocks_announced);
+    println!("Blocks downloaded: {}", stats.blocks_downloaded);
+    println!("Blocks applied: {}", stats.blocks_applied);
+    Ok(())
+}
+
+fn run_sync_book(args: SyncBookArgs) -> Result<(), NodeError> {
+    let config_path = args
+        .config
+        .unwrap_or_else(|| PathBuf::from(format!("config/{}.toml", args.network.as_str())));
+    let cfg = load_chain_config(&config_path)?;
+    let runtime_db_path = args
+        .runtime_db
+        .unwrap_or_else(|| default_runtime_db_path(args.network));
+    let (mut runtime, source) = load_runtime_from_db_or_genesis(&cfg, &runtime_db_path)?;
+
+    let network_name = args.network.as_str();
+    let (peers_db_path, legacy_txt_path) = peer_book_paths(&args.peers_dir, network_name);
+    if let Some(parent) = peers_db_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| NodeError::Runtime(e.to_string()))?;
+    }
+    let mut peer_book = load_or_init_peer_book(network_name, &peers_db_path, &legacy_txt_path)?;
+    if peer_book.peers.is_empty() {
+        return Err(NodeError::Runtime(format!(
+            "no peers available in {}",
+            peers_db_path.display()
+        )));
+    }
+
+    let now = current_unix_sec()?;
+    let mut candidates = Vec::<PeerCandidate>::new();
+    for peer in &peer_book.peers {
+        let Ok(addr) = peer.address.parse() else {
+            continue;
+        };
+        candidates.push(PeerCandidate {
+            addr,
+            last_connected_unix_sec: peer.last_seen_unix_sec,
+            failure_count: peer.ban_score,
+        });
+    }
+    if candidates.is_empty() {
+        return Err(NodeError::Runtime(
+            "peer book has no parseable socket addresses".to_owned(),
+        ));
+    }
+
+    let selected = select_outbound_peers(&candidates, args.max_peers, args.rotate_after_sec, now);
+    if selected.is_empty() {
+        return Err(NodeError::Runtime(
+            "peer selection produced zero candidates".to_owned(),
+        ));
+    }
+
+    let start_height = runtime.tip_height();
+    let start_hash = runtime.tip_hash();
+    let mut success_count = 0u32;
+    let mut total_headers = 0usize;
+    let mut total_announced = 0usize;
+    let mut total_downloaded = 0usize;
+    let mut total_applied = 0usize;
+
+    for addr in selected {
+        let addr_string = addr.to_string();
+        let attempt_now = current_unix_sec()?;
+        let attempt = sync_runtime_with_peer(
+            &cfg,
+            &mut runtime,
+            &addr_string,
+            args.max_batches_per_peer,
+            "scam-node/sync-book",
+        );
+        match attempt {
+            Ok(stats) => {
+                success_count = success_count.saturating_add(1);
+                total_headers = total_headers.saturating_add(stats.headers_received);
+                total_announced = total_announced.saturating_add(stats.blocks_announced);
+                total_downloaded = total_downloaded.saturating_add(stats.blocks_downloaded);
+                total_applied = total_applied.saturating_add(stats.blocks_applied);
+                if let Some(peer) = peer_book
+                    .peers
+                    .iter_mut()
+                    .find(|peer| peer.address == addr_string)
+                {
+                    peer.last_seen_unix_sec = attempt_now;
+                    peer.ban_score = peer.ban_score.saturating_sub(1);
+                }
+            }
+            Err(err) => {
+                if let Some(peer) = peer_book
+                    .peers
+                    .iter_mut()
+                    .find(|peer| peer.address == addr_string)
+                {
+                    peer.ban_score = peer.ban_score.saturating_add(1);
+                }
+                println!("Sync peer failed: {} ({err})", addr_string);
+            }
+        }
+    }
+
+    save_peer_book_db(&peers_db_path, &peer_book)?;
+    persist_runtime_db(&runtime, &runtime_db_path)?;
+    if success_count == 0 {
+        return Err(NodeError::Runtime(
+            "sync-book finished without successful peers".to_owned(),
+        ));
+    }
+
+    println!("Sync book result:");
+    println!("Config: {}", config_path.display());
+    println!("Runtime DB: {}", runtime_db_path.display());
+    println!("Peer book: {}", peers_db_path.display());
+    println!("Runtime source: {}", source);
+    println!("Start tip: h={} hash={}", start_height, start_hash);
+    println!(
+        "End tip: h={} hash={}",
+        runtime.tip_height(),
+        runtime.tip_hash()
+    );
+    println!("Peers tried: {}", peer_book.peers.len());
+    println!("Peers succeeded: {}", success_count);
     println!("Headers received: {}", total_headers);
-    println!("Blocks announced: {}", total_announced_blocks);
+    println!("Blocks announced: {}", total_announced);
     println!("Blocks downloaded: {}", total_downloaded);
     println!("Blocks applied: {}", total_applied);
     Ok(())
@@ -2930,6 +3120,7 @@ fn run() -> Result<(), NodeError> {
         Some(Command::SyncDemo(args)) => run_sync_demo(args),
         Some(Command::NetDemo(args)) => run_net_demo(args),
         Some(Command::SyncPeer(args)) => run_sync_peer(args),
+        Some(Command::SyncBook(args)) => run_sync_book(args),
         Some(Command::ReindexRuntime(args)) => run_reindex_runtime(args),
         Some(Command::Soak(args)) => run_soak(args),
         Some(Command::ReorgDemo(args)) => run_reorg_demo(args),
@@ -2960,11 +3151,11 @@ mod tests {
     use scam_wallet::{WalletMnemonic, derive_wallet_key};
 
     use super::{
-        AddPeerArgs, Network, ReindexRuntimeArgs, SOAK_FLOW_MNEMONIC, SpendableUtxo,
+        AddPeerArgs, Network, ReindexRuntimeArgs, SOAK_FLOW_MNEMONIC, SpendableUtxo, SyncBookArgs,
         accepted_hrps_for_network, build_coinbase_tx, build_signed_transfer_tx,
         execute_soak_rounds, load_chain_config, mine_block_with_transactions,
         mine_blocks_on_runtime, persist_runtime_db, run_add_peer, run_reindex_runtime,
-        select_utxos_for_amount,
+        run_sync_book, select_utxos_for_amount,
     };
 
     fn utxo(seed: u8, value: u64) -> SpendableUtxo {
@@ -3089,6 +3280,34 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(peers_dir);
+    }
+
+    #[test]
+    fn sync_book_requires_non_empty_peer_book() {
+        let work_dir = temp_dir("test-sync-book-empty");
+        let peers_dir = work_dir.join("peers");
+        fs::create_dir_all(&peers_dir).expect("mkdir peers");
+        let config_path = work_dir.join("devnet.toml");
+        fs::write(&config_path, include_str!("../../../config/devnet.toml")).expect("write config");
+        let runtime_db = work_dir.join("runtime.redb");
+
+        let err = run_sync_book(SyncBookArgs {
+            network: Network::Devnet,
+            config: Some(config_path),
+            runtime_db: Some(runtime_db),
+            peers_dir: peers_dir.clone(),
+            max_peers: 4,
+            max_batches_per_peer: 1,
+            rotate_after_sec: 60,
+        })
+        .expect_err("sync-book must fail when peer book is empty");
+        let message = err.to_string();
+        assert!(
+            message.contains("no peers") || message.contains("peer book"),
+            "unexpected sync-book error: {message}"
+        );
+
+        let _ = fs::remove_dir_all(work_dir);
     }
 
     #[test]

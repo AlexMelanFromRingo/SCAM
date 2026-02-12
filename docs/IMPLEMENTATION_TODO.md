@@ -19,6 +19,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] P2P TCP transport framing + `version/verack` handshake + `ping/pong` + `getheaders/headers` demo implemented.
 - [x] Net demo upgraded to perform `getdata` block download and apply downloaded blocks to local runtime.
 - [x] Added one-shot socketed sync command `sync-peer` (headers -> inv -> getdata -> block validation -> DB persistence).
+- [x] Added peer-book sync command `sync-book` (discovery-ordered multi-peer sync with peer health score updates).
 - [x] Property-based tests baseline added with `proptest` (hash/target invariants in `scam-core`).
 - [x] Property-based tests expanded to tx/UTXO invariants in `scam-consensus` (self-transfer fee accounting + overspend rejection).
 - [x] Added orphan tx pool primitive with bounded size + TTL expiry + dependency resolution hooks.
@@ -243,6 +244,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] `node get-block <hash>`
 - [x] `node get-tx <txid>`
 - [x] `node sync-peer --peer <addr>`
+- [x] `node sync-book` (sync from persisted peer book with discovery-based peer ordering)
 - [x] Wallet CLI:
 - [x] `wallet new`
 - [x] `wallet restore`
