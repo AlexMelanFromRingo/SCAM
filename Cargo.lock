@@ -847,6 +847,7 @@ dependencies = [
  "scam-consensus",
  "scam-core",
  "scam-miner",
+ "scam-p2p",
  "thiserror",
  "toml",
 ]

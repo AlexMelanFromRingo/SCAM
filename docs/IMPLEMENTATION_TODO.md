@@ -253,9 +253,9 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [ ] Integration tests:
 - [x] 3+ node tx propagation via inv/getdata
 - [x] block propagation and dedup behavior
-- [ ] initial sync from genesis to tip (real runtime, not demo).
-- [ ] fork + reorg correctness
-- [ ] difficulty update every 20 blocks
+- [x] initial sync from genesis to tip (real runtime, not demo).
+- [x] fork + reorg correctness
+- [x] difficulty update every 20 blocks
 - [x] wallet mnemonic restore and deterministic addresses
 - [x] Property-based testing (`proptest`) for tx/utxo/serialization invariants. (`scam-core` hash/target invariants + `scam-consensus` tx/UTXO properties).
 - [ ] Fuzzing (`cargo-fuzz`) for wire codec, parser, and block/tx decode paths.
