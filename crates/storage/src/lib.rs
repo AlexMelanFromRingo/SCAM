@@ -12,6 +12,7 @@ const UTXO_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("utxos");
 const BLOCK_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("blocks_by_hash");
 const HEADER_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("headers_by_hash");
 const BLOCK_INDEX_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("block_index");
+const PEER_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("peers");
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChainStateSnapshot {
@@ -32,6 +33,19 @@ pub struct UtxoRecord {
 pub struct ChainArchive {
     pub network_id: String,
     pub blocks_by_height: Vec<Block>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct PeerAddressBook {
+    pub network_id: String,
+    pub peers: Vec<PeerAddressRecord>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct PeerAddressRecord {
+    pub address: String,
+    pub last_seen_unix_sec: u64,
+    pub ban_score: u32,
 }
 
 impl ChainStateSnapshot {
@@ -402,6 +416,108 @@ pub fn load_chain_archive_db(path: &Path) -> Result<ChainArchive, StorageError> 
     })
 }
 
+pub fn save_peer_book_db(path: &Path, peer_book: &PeerAddressBook) -> Result<(), StorageError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|source| StorageError::CreateDir {
+            path: parent.display().to_string(),
+            source,
+        })?;
+    }
+    let tmp_path = temp_db_path(path);
+    if tmp_path.exists() {
+        fs::remove_file(&tmp_path).map_err(|source| StorageError::Write {
+            path: tmp_path.display().to_string(),
+            source,
+        })?;
+    }
+
+    let mut dedup = std::collections::HashMap::<String, PeerAddressRecord>::new();
+    for record in &peer_book.peers {
+        if record.address.trim().is_empty() {
+            return Err(StorageError::InvalidPeerBook(
+                "peer address cannot be empty".to_owned(),
+            ));
+        }
+        dedup.insert(record.address.clone(), record.clone());
+    }
+    let mut peers = dedup.into_values().collect::<Vec<_>>();
+    peers.sort_by(|a, b| a.address.cmp(&b.address));
+
+    let db = Database::create(&tmp_path).map_err(|e| StorageError::Db(e.to_string()))?;
+    let write_txn = db
+        .begin_write()
+        .map_err(|e| StorageError::Db(e.to_string()))?;
+    {
+        let mut meta = write_txn
+            .open_table(META_TABLE)
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+        meta.insert("network_id", peer_book.network_id.as_bytes())
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+    }
+    {
+        let mut peer_table = write_txn
+            .open_table(PEER_TABLE)
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+        for record in peers {
+            let value = bincode::serialize(&record).map_err(StorageError::Encode)?;
+            peer_table
+                .insert(record.address.as_str(), value.as_slice())
+                .map_err(|e| StorageError::Db(e.to_string()))?;
+        }
+    }
+    write_txn
+        .commit()
+        .map_err(|e| StorageError::Db(e.to_string()))?;
+    fs::rename(&tmp_path, path).map_err(|source| StorageError::Write {
+        path: path.display().to_string(),
+        source,
+    })?;
+    Ok(())
+}
+
+pub fn load_peer_book_db(path: &Path) -> Result<PeerAddressBook, StorageError> {
+    let db = Database::open(path).map_err(|e| StorageError::Db(e.to_string()))?;
+    let read_txn = db
+        .begin_read()
+        .map_err(|e| StorageError::Db(e.to_string()))?;
+    let network_id = {
+        let meta = read_txn
+            .open_table(META_TABLE)
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+        let network_id_raw = meta
+            .get("network_id")
+            .map_err(|e| StorageError::Db(e.to_string()))?
+            .ok_or_else(|| StorageError::MissingMeta("network_id".to_owned()))?;
+        std::str::from_utf8(network_id_raw.value())
+            .map_err(StorageError::InvalidUtf8)?
+            .to_owned()
+    };
+
+    let peer_table = read_txn
+        .open_table(PEER_TABLE)
+        .map_err(|e| StorageError::Db(e.to_string()))?;
+    let mut peers = Vec::<PeerAddressRecord>::new();
+    for row in peer_table
+        .iter()
+        .map_err(|e| StorageError::Db(e.to_string()))?
+    {
+        let (key, value) = row.map_err(|e| StorageError::Db(e.to_string()))?;
+        let key_address = key.value().to_owned();
+        let record: PeerAddressRecord =
+            bincode::deserialize(value.value()).map_err(StorageError::Decode)?;
+        if record.address != key_address {
+            return Err(StorageError::InvalidPeerBook(format!(
+                "peer key mismatch: key={key_address}, record={}",
+                record.address
+            )));
+        }
+        peers.push(record);
+    }
+    peers.sort_by(|a, b| a.address.cmp(&b.address));
+
+    Ok(PeerAddressBook { network_id, peers })
+}
+
 fn bytes_to_hash(raw: &[u8], context: &str) -> Result<Hash256, StorageError> {
     if raw.len() != 32 {
         return Err(StorageError::InvalidMetaFormat {
@@ -456,6 +572,8 @@ pub enum StorageError {
     MissingArchiveRecord { table: &'static str, key: String },
     #[error("invalid chain archive: {0}")]
     InvalidArchive(String),
+    #[error("invalid peer book: {0}")]
+    InvalidPeerBook(String),
 }
 
 #[cfg(test)]
@@ -466,8 +584,9 @@ mod tests {
     use scam_core::{Block, BlockHeader, Hash256, OutPoint, Target};
 
     use crate::{
-        ChainArchive, ChainStateSnapshot, UtxoRecord, load_chain_archive_db, load_snapshot,
-        load_snapshot_db, save_chain_archive_db, save_snapshot, save_snapshot_db,
+        ChainArchive, ChainStateSnapshot, PeerAddressBook, PeerAddressRecord, UtxoRecord,
+        load_chain_archive_db, load_peer_book_db, load_snapshot, load_snapshot_db,
+        save_chain_archive_db, save_peer_book_db, save_snapshot, save_snapshot_db,
     };
 
     #[test]
@@ -618,5 +737,55 @@ mod tests {
         assert_eq!(loaded.blocks_by_height[0], genesis);
         assert_eq!(loaded.blocks_by_height[1], block1);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn peer_book_db_roundtrip() {
+        let peer_book = PeerAddressBook {
+            network_id: "devnet".to_owned(),
+            peers: vec![
+                PeerAddressRecord {
+                    address: "127.0.0.1:8333".to_owned(),
+                    last_seen_unix_sec: 1_770_763_200,
+                    ban_score: 0,
+                },
+                PeerAddressRecord {
+                    address: "192.168.1.10:8333".to_owned(),
+                    last_seen_unix_sec: 1_770_763_210,
+                    ban_score: 2,
+                },
+                // Duplicate address should be deduplicated by save path.
+                PeerAddressRecord {
+                    address: "127.0.0.1:8333".to_owned(),
+                    last_seen_unix_sec: 1_770_763_300,
+                    ban_score: 5,
+                },
+            ],
+        };
+
+        let path = PathBuf::from("target/test-peer-book.redb");
+        save_peer_book_db(&path, &peer_book).expect("save peer book");
+        let loaded = load_peer_book_db(&path).expect("load peer book");
+        assert_eq!(loaded.network_id, "devnet");
+        assert_eq!(loaded.peers.len(), 2);
+        assert_eq!(loaded.peers[0].address, "127.0.0.1:8333");
+        assert_eq!(loaded.peers[0].ban_score, 5);
+        assert_eq!(loaded.peers[1].address, "192.168.1.10:8333");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn peer_book_rejects_empty_address() {
+        let peer_book = PeerAddressBook {
+            network_id: "devnet".to_owned(),
+            peers: vec![PeerAddressRecord {
+                address: "   ".to_owned(),
+                last_seen_unix_sec: 0,
+                ban_score: 0,
+            }],
+        };
+        let path = PathBuf::from("target/test-peer-book-invalid.redb");
+        let err = save_peer_book_db(&path, &peer_book).expect_err("must reject empty address");
+        assert!(matches!(err, crate::StorageError::InvalidPeerBook(_)));
     }
 }

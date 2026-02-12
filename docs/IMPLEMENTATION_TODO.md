@@ -23,6 +23,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] Property-based tests expanded to tx/UTXO invariants in `scam-consensus` (self-transfer fee accounting + overspend rejection).
 - [x] Added orphan tx pool primitive with bounded size + TTL expiry + dependency resolution hooks.
 - [x] Added P2P integration tests for 3-peer inv/getdata propagation and dedup behavior.
+- [x] Added redb-backed peer address book persistence with roundtrip/validation tests.
 - [x] Miner template + nonce search loop implemented (`mine-once` CLI).
 - [x] Chainstate snapshot save/load implemented.
 - [x] redb-backed snapshot persistence implemented (`snapshot save-genesis-db` / `snapshot show-db`).
@@ -187,7 +188,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] UTXO set
 - [x] chain tip metadata
 - [ ] mempool persistence (optional, bounded)
-- [ ] peer address book
+- [x] peer address book
 - [ ] Atomic crash-consistent commit for block connect/disconnect state updates.
 - [ ] Recovery and reindex mode.
 - [x] Node startup path that restores live chain runtime from DB (not snapshot-only utilities).
