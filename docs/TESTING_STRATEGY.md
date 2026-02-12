@@ -36,3 +36,18 @@ scripts/mutation-baseline.sh
 ```
 
 This invokes `cargo-mutants` for the workspace and writes report artifacts into `target/mutants`.
+
+## Soak Harness
+
+Long-run devnet soak command:
+
+```bash
+cargo run -p scam-node -- soak \
+  --network devnet \
+  --rounds 17280 \
+  --blocks-per-round 1 \
+  --interval-sec 120 \
+  --persist-every-rounds 60
+```
+
+This approximates a 24h run at 2-minute block cadence.

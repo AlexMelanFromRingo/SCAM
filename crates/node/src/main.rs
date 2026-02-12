@@ -4,7 +4,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use scam_chain::{BlockSubmissionOutcome, ChainError, ChainRuntime};
@@ -66,6 +66,7 @@ enum Command {
     NetDemo(NetDemoArgs),
     SyncPeer(SyncPeerArgs),
     ReindexRuntime(ReindexRuntimeArgs),
+    Soak(SoakArgs),
     ReorgDemo(ReorgDemoArgs),
     RpcServe(RpcServeArgs),
     Snapshot(SnapshotArgs),
@@ -238,6 +239,26 @@ struct ReindexRuntimeArgs {
     config: Option<PathBuf>,
     #[arg(long)]
     runtime_db: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct SoakArgs {
+    #[arg(long, value_enum, default_value_t = Network::Devnet)]
+    network: Network,
+    #[arg(long)]
+    config: Option<PathBuf>,
+    #[arg(long)]
+    runtime_db: Option<PathBuf>,
+    #[arg(long, default_value_t = 60)]
+    rounds: u32,
+    #[arg(long, default_value_t = 5)]
+    blocks_per_round: u32,
+    #[arg(long, default_value_t = 30)]
+    interval_sec: u64,
+    #[arg(long, default_value_t = 500_000)]
+    max_nonce: u64,
+    #[arg(long, default_value_t = 10)]
+    persist_every_rounds: u32,
 }
 
 #[derive(Debug, Args)]
@@ -2314,6 +2335,99 @@ fn run_reindex_runtime(args: ReindexRuntimeArgs) -> Result<(), NodeError> {
     Ok(())
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SoakSummary {
+    rounds: u32,
+    blocks_mined: u64,
+    start_height: u64,
+    end_height: u64,
+    elapsed_sec: u64,
+}
+
+fn execute_soak_rounds<F>(
+    runtime: &mut ChainRuntime,
+    cfg: &ChainConfig,
+    rounds: u32,
+    blocks_per_round: u32,
+    interval_sec: u64,
+    max_nonce: u64,
+    mut on_round_end: F,
+) -> Result<SoakSummary, NodeError>
+where
+    F: FnMut(u32, &ChainRuntime) -> Result<(), NodeError>,
+{
+    let start_height = runtime.tip_height();
+    let start = Instant::now();
+    let miner_key_hash = cfg.genesis_reward_key_hash20()?;
+
+    for round in 1..=rounds {
+        let params = MiningLoopParams {
+            count: blocks_per_round,
+            interval_sec,
+            max_nonce,
+            subsidy: cfg.block_subsidy,
+            miner_key_hash,
+            label_prefix: "soak",
+            print_each: false,
+        };
+        mine_blocks_on_runtime(runtime, &params)?;
+        on_round_end(round, runtime)?;
+    }
+
+    Ok(SoakSummary {
+        rounds,
+        blocks_mined: (rounds as u64).saturating_mul(blocks_per_round as u64),
+        start_height,
+        end_height: runtime.tip_height(),
+        elapsed_sec: start.elapsed().as_secs(),
+    })
+}
+
+fn run_soak(args: SoakArgs) -> Result<(), NodeError> {
+    let config_path = args
+        .config
+        .unwrap_or_else(|| PathBuf::from(format!("config/{}.toml", args.network.as_str())));
+    let cfg = load_chain_config(&config_path)?;
+    let runtime_db_path = args
+        .runtime_db
+        .unwrap_or_else(|| default_runtime_db_path(args.network));
+    let (mut runtime, source) = load_runtime_from_db_or_genesis(&cfg, &runtime_db_path)?;
+
+    let persist_every_rounds = args.persist_every_rounds.max(1);
+    let summary = execute_soak_rounds(
+        &mut runtime,
+        &cfg,
+        args.rounds,
+        args.blocks_per_round,
+        args.interval_sec,
+        args.max_nonce,
+        |round, runtime| {
+            if round % persist_every_rounds == 0 {
+                persist_runtime_db(runtime, &runtime_db_path)?;
+            }
+            Ok(())
+        },
+    )?;
+    persist_runtime_db(&runtime, &runtime_db_path)?;
+
+    let blocks_per_sec = if summary.elapsed_sec == 0 {
+        summary.blocks_mined as f64
+    } else {
+        summary.blocks_mined as f64 / summary.elapsed_sec as f64
+    };
+    println!("Soak run complete");
+    println!("Network: {}", cfg.network_id);
+    println!("Config: {}", config_path.display());
+    println!("Runtime source: {}", source);
+    println!("Runtime DB: {}", runtime_db_path.display());
+    println!("Rounds: {}", summary.rounds);
+    println!("Blocks mined: {}", summary.blocks_mined);
+    println!("Height: {} -> {}", summary.start_height, summary.end_height);
+    println!("Elapsed sec: {}", summary.elapsed_sec);
+    println!("Blocks/sec: {:.2}", blocks_per_sec);
+    Ok(())
+}
+
 fn run_reorg_demo(args: ReorgDemoArgs) -> Result<(), NodeError> {
     let config_path = args
         .config
@@ -2644,6 +2758,7 @@ fn run() -> Result<(), NodeError> {
         Some(Command::NetDemo(args)) => run_net_demo(args),
         Some(Command::SyncPeer(args)) => run_sync_peer(args),
         Some(Command::ReindexRuntime(args)) => run_reindex_runtime(args),
+        Some(Command::Soak(args)) => run_soak(args),
         Some(Command::ReorgDemo(args)) => run_reorg_demo(args),
         Some(Command::RpcServe(args)) => run_rpc_serve(args),
         Some(Command::Snapshot(args)) => run_snapshot(args.command),
@@ -2666,14 +2781,14 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use scam_chain::ChainRuntime;
-    use scam_core::{Hash256, OutPoint};
+    use scam_core::{ChainConfig, Hash256, OutPoint};
     use scam_miner::{BlockTemplate, mine_block};
     use scam_storage::{load_chain_archive_db, load_peer_book_db};
 
     use super::{
         AddPeerArgs, Network, ReindexRuntimeArgs, SpendableUtxo, accepted_hrps_for_network,
-        build_coinbase_tx, load_chain_config, persist_runtime_db, run_add_peer,
-        run_reindex_runtime, select_utxos_for_amount,
+        build_coinbase_tx, execute_soak_rounds, load_chain_config, persist_runtime_db,
+        run_add_peer, run_reindex_runtime, select_utxos_for_amount,
     };
 
     fn utxo(seed: u8, value: u64) -> SpendableUtxo {
@@ -2841,5 +2956,24 @@ mod tests {
         assert_eq!(archive.blocks_by_height.len(), 2);
 
         let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
+    fn soak_rounds_mine_expected_block_count() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        cfg.validate().expect("config validate");
+        let mut runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let start_height = runtime.tip_height();
+
+        let summary =
+            execute_soak_rounds(&mut runtime, &cfg, 3, 2, 30, 500_000, |_round, _rt| Ok(()))
+                .expect("soak rounds");
+
+        assert_eq!(summary.rounds, 3);
+        assert_eq!(summary.blocks_mined, 6);
+        assert_eq!(summary.start_height, start_height);
+        assert_eq!(summary.end_height, start_height + 6);
+        assert_eq!(runtime.tip_height(), start_height + 6);
     }
 }

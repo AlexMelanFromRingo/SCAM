@@ -34,6 +34,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] Added fuzzing harness package (`fuzz/`) with wire/block/tx decode targets.
 - [x] Added mutation testing runner baseline (`scripts/mutation-baseline.sh`) and testing strategy doc.
 - [x] Added durable atomic DB replacement helper (`rename + fsync file/dir`) for runtime storage writes.
+- [x] Added long-run soak harness command (`scam-node soak`) for repeatable devnet stability runs.
 - [x] Miner template + nonce search loop implemented (`mine-once` CLI).
 - [x] Chainstate snapshot save/load implemented.
 - [x] redb-backed snapshot persistence implemented (`snapshot save-genesis-db` / `snapshot show-db`).
@@ -269,7 +270,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] Property-based testing (`proptest`) for tx/utxo/serialization invariants. (`scam-core` hash/target invariants + `scam-consensus` tx/UTXO properties).
 - [x] Fuzzing (`cargo-fuzz`) for wire codec, parser, and block/tx decode paths.
 - [x] Mutation testing (tooling + baseline score gate).
-- [ ] Soak test:
+- [x] Soak test:
 - [ ] local devnet running for 24h with mining and tx flow.
 
 ## 17) Launch Strategy TODO
