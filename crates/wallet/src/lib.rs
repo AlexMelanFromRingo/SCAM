@@ -1,6 +1,7 @@
 pub mod address;
 pub mod mnemonic;
 pub mod qr;
+pub mod rescan;
 pub mod signer;
 pub mod vault;
 
@@ -9,6 +10,10 @@ pub use address::{
 };
 pub use mnemonic::{MnemonicError, WalletMnemonic, new_mnemonic};
 pub use qr::{QrError, qr_for_payment_uri, qr_for_text};
+pub use rescan::{
+    OwnedUtxo, RescanBalance, RescanError, RescanReport, WatchedKey, derive_watched_keys,
+    rescan_blocks,
+};
 pub use signer::{
     BIP44_PURPOSE, DeriveKeyError, EXTERNAL_CHANGE, SCAM_COIN_TYPE, SchnorrError, WalletKey,
     derivation_path, derivation_path_string, derive_wallet_key, sign_digest, verify_digest,

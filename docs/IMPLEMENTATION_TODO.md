@@ -13,6 +13,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] Address payload migrated to `RIPEMD160(BLAKE3(pubkey_compressed))`; network HRPs moved to `sd`/`st`/`s` with legacy alias compatibility for send-path validation.
 - [x] Tx sighash replay protection now includes chain domain (`network_id`) in signature digest flow.
 - [x] Encrypted-at-rest wallet vault implemented (`Argon2id + XChaCha20Poly1305`) with CLI for secure create/restore/address derivation.
+- [x] Wallet rescan implemented (scan full active chain for a derived key range and rebuild wallet-owned UTXO view).
 - [x] UTXO block application implemented with signature checks, fee accounting, coinbase maturity.
 - [x] P2P wire messages + gossip dedup engine (`inv/getdata/tx/block`) implemented.
 - [x] P2P TCP transport framing + `version/verack` handshake + `ping/pong` + `getheaders/headers` demo implemented.
@@ -21,7 +22,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] redb-backed snapshot persistence implemented (`snapshot save-genesis-db` / `snapshot show-db`).
 - [x] Reorg-safe best-chain selection by cumulative work implemented in chain runtime.
 - [x] Minimal HTTP JSON RPC transport implemented (`scam-node rpc-serve`).
-- [ ] Remaining major items: socketed p2p sync runtime beyond demo mode, crash-consistent DB-backed node runtime, wallet rescan, stronger test matrix.
+- [ ] Remaining major items: socketed p2p sync runtime beyond demo mode, crash-consistent DB-backed node runtime, stronger test matrix.
 
 ## 1) Frozen Design Decisions
 
@@ -106,7 +107,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] Derive compressed pubkeys for address generation.
 - [x] Migrate address payload derivation to stronger collision-resistant scheme (Bitcoin-like `HASH160` style, exact hash stack to freeze).
 - [x] Add encrypted at-rest key storage.
-- [ ] Add wallet rescan (rebuild UTXO ownership from chain).
+- [x] Add wallet rescan (rebuild UTXO ownership from chain).
 
 ## 7) Address and QR TODO
 
@@ -228,6 +229,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] `wallet send`
 - [x] `wallet address --qr`
 - [x] `wallet secure-new`, `wallet secure-restore`, `wallet secure-address`
+- [x] `wallet rescan`, `wallet secure-rescan`
 - [x] Add JSON-RPC or REST facade for automation. (`scam-node rpc-serve` supports `/health`, `/status`, `/block/<height>`, `/tx/<height>/<index>`)
 
 ## 16) Test Plan TODO

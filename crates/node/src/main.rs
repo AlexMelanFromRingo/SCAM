@@ -25,10 +25,10 @@ use scam_storage::{
     save_snapshot_db,
 };
 use scam_wallet::{
-    AddressError, DeriveKeyError, MnemonicError, QrError, SchnorrError, WalletMnemonic,
-    WalletVaultError, decrypt_wallet_vault, derive_wallet_key, load_wallet_vault,
-    new_encrypted_wallet_vault, new_mnemonic, parse_address, qr_for_payment_uri, save_wallet_vault,
-    sign_digest, to_address, verify_digest,
+    AddressError, DeriveKeyError, MnemonicError, QrError, RescanError, SchnorrError,
+    WalletMnemonic, WalletVaultError, decrypt_wallet_vault, derive_wallet_key, derive_watched_keys,
+    load_wallet_vault, new_encrypted_wallet_vault, new_mnemonic, parse_address, qr_for_payment_uri,
+    rescan_blocks, save_wallet_vault, sign_digest, to_address, verify_digest,
 };
 use thiserror::Error;
 
@@ -363,6 +363,50 @@ enum WalletCommand {
         #[arg(long, default_value = "sd")]
         hrp: String,
     },
+    Rescan {
+        #[arg(long, value_enum, default_value_t = Network::Devnet)]
+        network: Network,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        mnemonic: String,
+        #[arg(long, default_value = "")]
+        passphrase: String,
+        #[arg(long, default_value_t = 0)]
+        account: u32,
+        #[arg(long, default_value_t = 0)]
+        start_index: u32,
+        #[arg(long, default_value_t = 20)]
+        end_index: u32,
+        #[arg(long, default_value_t = 0)]
+        mine_blocks: u32,
+        #[arg(long, default_value_t = 120)]
+        interval_sec: u64,
+        #[arg(long, default_value_t = 500_000)]
+        max_nonce: u64,
+    },
+    SecureRescan {
+        #[arg(long, value_enum, default_value_t = Network::Devnet)]
+        network: Network,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        wallet: PathBuf,
+        #[arg(long)]
+        password: String,
+        #[arg(long, default_value_t = 0)]
+        account: u32,
+        #[arg(long, default_value_t = 0)]
+        start_index: u32,
+        #[arg(long, default_value_t = 20)]
+        end_index: u32,
+        #[arg(long, default_value_t = 0)]
+        mine_blocks: u32,
+        #[arg(long, default_value_t = 120)]
+        interval_sec: u64,
+        #[arg(long, default_value_t = 500_000)]
+        max_nonce: u64,
+    },
     Balance {
         #[arg(long, value_enum, default_value_t = Network::Devnet)]
         network: Network,
@@ -507,6 +551,8 @@ enum NodeError {
     Address(#[from] AddressError),
     #[error("schnorr error: {0}")]
     Schnorr(#[from] SchnorrError),
+    #[error("wallet rescan error: {0}")]
+    Rescan(#[from] RescanError),
     #[error("qr error: {0}")]
     Qr(#[from] QrError),
     #[error("wallet vault error: {0}")]
@@ -832,6 +878,70 @@ fn run_wallet(command: WalletCommand) -> Result<(), NodeError> {
         Ok(())
     }
 
+    fn run_rescan_for_seed(
+        runtime: &ChainRuntime,
+        seed: &[u8],
+        account: u32,
+        start_index: u32,
+        end_index: u32,
+    ) -> Result<(), NodeError> {
+        let watched = derive_watched_keys(seed, account, start_index, end_index)?;
+        let mut address_by_key = HashMap::<(u32, u32, [u8; 20]), String>::new();
+        for key in &watched {
+            let address = to_address(&runtime.config().hrp, key.pubkey_compressed)?;
+            address_by_key.insert((key.account, key.index, key.key_hash20), address);
+        }
+
+        let blocks = (0..=runtime.tip_height()).filter_map(|height| {
+            runtime
+                .block_hash_at_height(height)
+                .and_then(|hash| runtime.block_by_hash(&hash).map(|block| (height, block)))
+        });
+        let report = rescan_blocks(&watched, blocks, runtime.config().coinbase_maturity as u64);
+
+        println!("Wallet rescan report:");
+        println!("Network: {}", runtime.config().network_id);
+        println!("Scanned blocks: {}", report.scanned_blocks);
+        println!("Tip height: {}", report.tip_height);
+        println!("Watched keys: {}", report.watched_keys);
+        println!("Total received: {}", report.total_received);
+        println!("Total spent: {}", report.total_spent);
+        println!("Unspent total: {}", report.unspent_total);
+        println!("Spendable total: {}", report.spendable_total);
+        println!("Immature total: {}", report.immature_total);
+        println!("Unspent outputs: {}", report.unspent_count);
+
+        let non_empty_balances = report
+            .balances
+            .iter()
+            .filter(|entry| entry.total > 0)
+            .collect::<Vec<_>>();
+        if non_empty_balances.is_empty() {
+            println!("No funds found in watched derivation range.");
+            return Ok(());
+        }
+
+        println!("Balances by derived address:");
+        for balance in non_empty_balances {
+            let key = (balance.account, balance.index, balance.key_hash20);
+            let address = address_by_key
+                .get(&key)
+                .cloned()
+                .unwrap_or_else(|| "<address-unavailable>".to_owned());
+            println!(
+                "{} [{}:{}] total={} spendable={} immature={} utxos={}",
+                address,
+                balance.account,
+                balance.index,
+                balance.total,
+                balance.spendable,
+                balance.immature,
+                balance.unspent_count
+            );
+        }
+        Ok(())
+    }
+
     match command {
         WalletCommand::New {
             words,
@@ -923,6 +1033,55 @@ fn run_wallet(command: WalletCommand) -> Result<(), NodeError> {
             index,
             hrp,
         } => derive_and_print_address_from_vault(&wallet, &password, account, index, &hrp)?,
+        WalletCommand::Rescan {
+            network,
+            config,
+            mnemonic,
+            passphrase,
+            account,
+            start_index,
+            end_index,
+            mine_blocks,
+            interval_sec,
+            max_nonce,
+        } => {
+            let (_cfg, runtime) = build_runtime_for_query(
+                network,
+                config,
+                mine_blocks,
+                interval_sec,
+                max_nonce,
+                "wallet-rescan",
+            )?;
+            let mnemonic = WalletMnemonic::parse(&mnemonic)?;
+            let seed = mnemonic.to_seed(&passphrase);
+            run_rescan_for_seed(&runtime, &seed, account, start_index, end_index)?;
+        }
+        WalletCommand::SecureRescan {
+            network,
+            config,
+            wallet,
+            password,
+            account,
+            start_index,
+            end_index,
+            mine_blocks,
+            interval_sec,
+            max_nonce,
+        } => {
+            let (_cfg, runtime) = build_runtime_for_query(
+                network,
+                config,
+                mine_blocks,
+                interval_sec,
+                max_nonce,
+                "wallet-secure-rescan",
+            )?;
+            let vault = load_wallet_vault(&wallet)?;
+            let secret = decrypt_wallet_vault(&vault, &password)?;
+            let seed = secret.mnemonic.to_seed(&secret.bip39_passphrase);
+            run_rescan_for_seed(&runtime, &seed, account, start_index, end_index)?;
+        }
         WalletCommand::Balance {
             network,
             config,
