@@ -181,10 +181,7 @@ pub fn save_snapshot_db(path: &Path, snapshot: &ChainStateSnapshot) -> Result<()
     write_txn
         .commit()
         .map_err(|e| StorageError::Db(e.to_string()))?;
-    fs::rename(&tmp_path, path).map_err(|source| StorageError::Write {
-        path: path.display().to_string(),
-        source,
-    })?;
+    atomic_replace_file(&tmp_path, path)?;
     Ok(())
 }
 
@@ -348,10 +345,7 @@ pub fn save_chain_archive_db(path: &Path, archive: &ChainArchive) -> Result<(), 
     write_txn
         .commit()
         .map_err(|e| StorageError::Db(e.to_string()))?;
-    fs::rename(&tmp_path, path).map_err(|source| StorageError::Write {
-        path: path.display().to_string(),
-        source,
-    })?;
+    atomic_replace_file(&tmp_path, path)?;
     Ok(())
 }
 
@@ -488,10 +482,7 @@ pub fn save_peer_book_db(path: &Path, peer_book: &PeerAddressBook) -> Result<(),
     write_txn
         .commit()
         .map_err(|e| StorageError::Db(e.to_string()))?;
-    fs::rename(&tmp_path, path).map_err(|source| StorageError::Write {
-        path: path.display().to_string(),
-        source,
-    })?;
+    atomic_replace_file(&tmp_path, path)?;
     Ok(())
 }
 
@@ -599,10 +590,7 @@ pub fn save_mempool_db(path: &Path, snapshot: &MempoolSnapshot) -> Result<(), St
     write_txn
         .commit()
         .map_err(|e| StorageError::Db(e.to_string()))?;
-    fs::rename(&tmp_path, path).map_err(|source| StorageError::Write {
-        path: path.display().to_string(),
-        source,
-    })?;
+    atomic_replace_file(&tmp_path, path)?;
     Ok(())
 }
 
@@ -652,6 +640,35 @@ pub fn load_mempool_db(path: &Path) -> Result<MempoolSnapshot, StorageError> {
         network_id,
         entries,
     })
+}
+
+fn atomic_replace_file(tmp_path: &Path, final_path: &Path) -> Result<(), StorageError> {
+    fs::rename(tmp_path, final_path).map_err(|source| StorageError::Write {
+        path: final_path.display().to_string(),
+        source,
+    })?;
+
+    let file = fs::File::open(final_path).map_err(|source| StorageError::Write {
+        path: final_path.display().to_string(),
+        source,
+    })?;
+    file.sync_all().map_err(|source| StorageError::Write {
+        path: final_path.display().to_string(),
+        source,
+    })?;
+
+    if let Some(parent) = final_path.parent() {
+        let dir = fs::File::open(parent).map_err(|source| StorageError::Write {
+            path: parent.display().to_string(),
+            source,
+        })?;
+        dir.sync_all().map_err(|source| StorageError::Write {
+            path: parent.display().to_string(),
+            source,
+        })?;
+    }
+
+    Ok(())
 }
 
 fn bytes_to_hash(raw: &[u8], context: &str) -> Result<Hash256, StorageError> {

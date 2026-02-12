@@ -33,6 +33,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] Added explicit mempool double-spend threat model document (`docs/MEMPOOL_THREAT_MODEL.md`).
 - [x] Added fuzzing harness package (`fuzz/`) with wire/block/tx decode targets.
 - [x] Added mutation testing runner baseline (`scripts/mutation-baseline.sh`) and testing strategy doc.
+- [x] Added durable atomic DB replacement helper (`rename + fsync file/dir`) for runtime storage writes.
 - [x] Miner template + nonce search loop implemented (`mine-once` CLI).
 - [x] Chainstate snapshot save/load implemented.
 - [x] redb-backed snapshot persistence implemented (`snapshot save-genesis-db` / `snapshot show-db`).
@@ -198,7 +199,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] chain tip metadata
 - [x] mempool persistence (optional, bounded)
 - [x] peer address book
-- [ ] Atomic crash-consistent commit for block connect/disconnect state updates.
+- [x] Atomic crash-consistent commit for block connect/disconnect state updates.
 - [x] Recovery and reindex mode.
 - [x] Node startup path that restores live chain runtime from DB (not snapshot-only utilities).
 
