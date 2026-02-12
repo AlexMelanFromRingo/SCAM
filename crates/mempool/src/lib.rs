@@ -3,10 +3,15 @@ use std::collections::{HashMap, HashSet};
 use scam_core::{Hash256, OutPoint, Transaction};
 use thiserror::Error;
 
+const DEFAULT_MIN_REPLACEMENT_FEE_DELTA: u64 = 1;
+const DEFAULT_MAX_REPLACEMENT_DESCENDANTS: usize = 25;
+
 #[derive(Debug, Clone)]
 pub struct Mempool {
     max_txs: usize,
     min_relay_fee_per_kb: u64,
+    min_replacement_fee_delta: u64,
+    max_replacement_descendants: usize,
     txs: HashMap<Hash256, MempoolEntry>,
     spent_outpoints: HashMap<OutPoint, Hash256>,
 }
@@ -24,15 +29,36 @@ impl Mempool {
     }
 
     pub fn with_policy(max_txs: usize, min_relay_fee_per_kb: u64) -> Result<Self, MempoolError> {
+        Self::with_policy_and_replacement(
+            max_txs,
+            min_relay_fee_per_kb,
+            DEFAULT_MIN_REPLACEMENT_FEE_DELTA,
+            DEFAULT_MAX_REPLACEMENT_DESCENDANTS,
+        )
+    }
+
+    pub fn with_policy_and_replacement(
+        max_txs: usize,
+        min_relay_fee_per_kb: u64,
+        min_replacement_fee_delta: u64,
+        max_replacement_descendants: usize,
+    ) -> Result<Self, MempoolError> {
         if max_txs == 0 {
             return Err(MempoolError::InvalidLimit(
                 "max_txs must be greater than 0".to_owned(),
+            ));
+        }
+        if max_replacement_descendants == 0 {
+            return Err(MempoolError::InvalidLimit(
+                "max_replacement_descendants must be greater than 0".to_owned(),
             ));
         }
 
         Ok(Self {
             max_txs,
             min_relay_fee_per_kb,
+            min_replacement_fee_delta,
+            max_replacement_descendants,
             txs: HashMap::new(),
             spent_outpoints: HashMap::new(),
         })
@@ -106,34 +132,82 @@ impl Mempool {
             });
         }
 
-        let mut conflict_txid: Option<Hash256> = None;
+        let mut conflict_txids = HashSet::<Hash256>::new();
         for input in &tx.inputs {
             if let Some(existing_txid) = self.spent_outpoints.get(&input.prev_out) {
-                conflict_txid = Some(*existing_txid);
-                break;
+                conflict_txids.insert(*existing_txid);
             }
         }
 
-        if let Some(existing_txid) = conflict_txid {
-            if txid < existing_txid {
-                let removed = self.remove_with_descendants(existing_txid);
-                self.txs.insert(
-                    txid,
-                    MempoolEntry {
-                        tx,
-                        fee,
-                        serialized_size,
-                    },
-                );
-                self.rebuild_spent_outpoints();
-                return Ok(InsertOutcome::Replaced {
-                    inserted: txid,
-                    removed,
+        if !conflict_txids.is_empty() {
+            if conflict_txids.len() > 1 {
+                let mut conflicts = conflict_txids.into_iter().collect::<Vec<_>>();
+                conflicts.sort_unstable();
+                return Err(MempoolError::MultipleConflicts {
+                    incoming: txid,
+                    conflicts,
                 });
             }
-            return Ok(InsertOutcome::RejectedHigherHash {
+            let existing_txid = *conflict_txids
+                .iter()
+                .next()
+                .expect("non-empty set by branch");
+            let existing = self
+                .txs
+                .get(&existing_txid)
+                .expect("spent_outpoints must point to mempool tx");
+            let existing_rate = feerate_key(existing.fee, existing.serialized_size);
+            let incoming_rate = feerate_key(fee, serialized_size);
+            if incoming_rate <= existing_rate {
+                return Ok(InsertOutcome::RejectedConflictInsufficientFeerate {
+                    inserted: txid,
+                    existing: existing_txid,
+                    incoming_feerate: incoming_rate,
+                    existing_feerate: existing_rate,
+                });
+            }
+
+            let required_fee = existing
+                .fee
+                .checked_add(self.min_replacement_fee_delta)
+                .ok_or_else(|| {
+                    MempoolError::InvalidLimit(
+                        "replacement required fee overflow in mempool policy".to_owned(),
+                    )
+                })?;
+            if fee < required_fee {
+                return Ok(InsertOutcome::RejectedConflictInsufficientFee {
+                    inserted: txid,
+                    existing: existing_txid,
+                    incoming_fee: fee,
+                    required_fee,
+                });
+            }
+
+            let replacement_set = self.collect_replacement_set(existing_txid);
+            let descendant_count = replacement_set.len().saturating_sub(1);
+            if descendant_count > self.max_replacement_descendants {
+                return Err(MempoolError::ReplacementTooManyDescendants {
+                    incoming: txid,
+                    existing: existing_txid,
+                    descendants: descendant_count,
+                    limit: self.max_replacement_descendants,
+                });
+            }
+
+            let removed = self.remove_txids(replacement_set);
+            self.txs.insert(
+                txid,
+                MempoolEntry {
+                    tx,
+                    fee,
+                    serialized_size,
+                },
+            );
+            self.rebuild_spent_outpoints();
+            return Ok(InsertOutcome::Replaced {
                 inserted: txid,
-                existing: existing_txid,
+                removed,
             });
         }
 
@@ -189,7 +263,7 @@ impl Mempool {
             })
     }
 
-    fn remove_with_descendants(&mut self, root_txid: Hash256) -> Vec<Hash256> {
+    fn collect_replacement_set(&self, root_txid: Hash256) -> Vec<Hash256> {
         let mut to_remove = HashSet::<Hash256>::new();
         to_remove.insert(root_txid);
 
@@ -216,10 +290,19 @@ impl Mempool {
 
         let mut removed = to_remove.into_iter().collect::<Vec<_>>();
         removed.sort_unstable();
-        for txid in &removed {
+        removed
+    }
+
+    fn remove_txids(&mut self, txids: Vec<Hash256>) -> Vec<Hash256> {
+        for txid in &txids {
             self.txs.remove(txid);
         }
-        removed
+        txids
+    }
+
+    fn remove_with_descendants(&mut self, root_txid: Hash256) -> Vec<Hash256> {
+        let removed = self.collect_replacement_set(root_txid);
+        self.remove_txids(removed)
     }
 
     fn rebuild_spent_outpoints(&mut self) {
@@ -270,9 +353,17 @@ pub enum InsertOutcome {
         inserted: Hash256,
         removed: Vec<Hash256>,
     },
-    RejectedHigherHash {
+    RejectedConflictInsufficientFee {
         inserted: Hash256,
         existing: Hash256,
+        incoming_fee: u64,
+        required_fee: u64,
+    },
+    RejectedConflictInsufficientFeerate {
+        inserted: Hash256,
+        existing: Hash256,
+        incoming_feerate: u128,
+        existing_feerate: u128,
     },
 }
 
@@ -291,6 +382,20 @@ pub enum MempoolError {
         required_fee: u64,
         size_bytes: usize,
         min_relay_fee_per_kb: u64,
+    },
+    #[error("incoming tx {incoming} conflicts with multiple mempool txs: {conflicts:?}")]
+    MultipleConflicts {
+        incoming: Hash256,
+        conflicts: Vec<Hash256>,
+    },
+    #[error(
+        "replacement for {existing} rejected: descendants={descendants} exceeds limit={limit} (incoming={incoming})"
+    )]
+    ReplacementTooManyDescendants {
+        incoming: Hash256,
+        existing: Hash256,
+        descendants: usize,
+        limit: usize,
     },
 }
 
@@ -326,41 +431,35 @@ mod tests {
     }
 
     #[test]
-    fn conflicting_tx_keeps_lower_hash() {
-        let mut mempool = Mempool::new(100).expect("mempool must initialize");
+    fn conflicting_tx_prefers_higher_feerate() {
+        let mut mempool =
+            Mempool::with_policy_and_replacement(100, 0, 1, 25).expect("mempool must initialize");
         let parent = [9u8; 32];
+        let tx_low_fee = mk_tx(parent, 0, b"same-size-a", 1);
+        let tx_high_fee = mk_tx(parent, 0, b"same-size-b", 2);
+        let low_id = tx_low_fee.txid();
+        let high_id = tx_high_fee.txid();
 
-        // Build two conflicts and force ordering by txid.
-        let tx_a = mk_tx(parent, 0, b"A", 1);
-        let tx_b = mk_tx(parent, 0, b"BBBBBBBBBBBBBBBBBBBBBBBB", 2);
-
-        let a_id = tx_a.txid();
-        let b_id = tx_b.txid();
-
-        let (low, high) = if a_id < b_id {
-            (tx_a, tx_b)
-        } else {
-            (tx_b, tx_a)
-        };
-
-        let low_id = low.txid();
-        let high_id = high.txid();
-
-        let first = mempool.insert(high).expect("insert should succeed");
+        let first = mempool
+            .insert_with_fee(tx_low_fee, 10)
+            .expect("insert should succeed");
         assert!(matches!(first, InsertOutcome::Accepted { .. }));
 
-        let second = mempool.insert(low).expect("insert should succeed");
+        let second = mempool
+            .insert_with_fee(tx_high_fee, 50)
+            .expect("insert should succeed");
         assert!(matches!(
             second,
-            InsertOutcome::Replaced { inserted, .. } if inserted == low_id
+            InsertOutcome::Replaced { inserted, .. } if inserted == high_id
         ));
-        assert!(mempool.contains(&low_id));
-        assert!(!mempool.contains(&high_id));
+        assert!(mempool.contains(&high_id));
+        assert!(!mempool.contains(&low_id));
     }
 
     #[test]
     fn replacement_removes_descendants() {
-        let mut mempool = Mempool::new(100).expect("mempool must initialize");
+        let mut mempool =
+            Mempool::with_policy_and_replacement(100, 0, 1, 25).expect("mempool must initialize");
         let root = [7u8; 32];
         let parent_old = mk_tx(root, 0, b"parent-old", 10);
         let parent_new = mk_tx(root, 0, b"parent-new-replacement", 11);
@@ -374,26 +473,97 @@ mod tests {
         mempool.insert(parent_old).expect("insert parent old");
         mempool.insert(child).expect("insert child");
 
-        let (winner, loser) = if parent_new_id < parent_old_id {
-            (parent_new_id, parent_old_id)
-        } else {
-            (parent_old_id, parent_new_id)
-        };
+        let outcome = mempool
+            .insert_with_fee(parent_new, 100)
+            .expect("insert replacement");
+        assert!(matches!(outcome, InsertOutcome::Replaced { .. }));
+        assert!(mempool.contains(&parent_new_id));
+        assert!(!mempool.contains(&parent_old_id));
+        assert!(!mempool.contains(&child_id));
+    }
 
-        // If generated ids do not match replacement direction, invert insertion order.
-        if winner == parent_new_id {
-            let outcome = mempool.insert(parent_new).expect("insert replacement");
-            assert!(matches!(outcome, InsertOutcome::Replaced { .. }));
-            assert!(mempool.contains(&parent_new_id));
-            assert!(!mempool.contains(&loser));
-            assert!(!mempool.contains(&child_id));
-        } else {
-            // In this case the new txid was not lower; expect rejection and existing graph intact.
-            let outcome = mempool.insert(parent_new).expect("insert replacement");
-            assert!(matches!(outcome, InsertOutcome::RejectedHigherHash { .. }));
-            assert!(mempool.contains(&parent_old_id));
-            assert!(mempool.contains(&child_id));
-        }
+    #[test]
+    fn replacement_rejects_if_fee_delta_too_small() {
+        let mut mempool = Mempool::with_policy_and_replacement(100, 0, 10, 25).expect("mempool");
+        let root = [31u8; 32];
+        let old_tx = mk_tx(root, 0, b"same-size-a", 1);
+        let new_tx = mk_tx(root, 0, b"same-size-b", 2);
+        let old_id = old_tx.txid();
+        let new_id = new_tx.txid();
+
+        mempool.insert_with_fee(old_tx, 100).expect("insert old");
+        let outcome = mempool
+            .insert_with_fee(new_tx, 105)
+            .expect("replacement evaluation");
+        assert!(matches!(
+            outcome,
+            InsertOutcome::RejectedConflictInsufficientFee {
+                inserted,
+                existing,
+                incoming_fee: 105,
+                required_fee: 110
+            } if inserted == new_id && existing == old_id
+        ));
+        assert!(mempool.contains(&old_id));
+        assert!(!mempool.contains(&new_id));
+    }
+
+    #[test]
+    fn replacement_rejects_if_feerate_not_higher() {
+        let mut mempool = Mempool::with_policy_and_replacement(100, 0, 1, 25).expect("mempool");
+        let root = [41u8; 32];
+        let old_tx = mk_tx(root, 0, b"same-size-a", 1);
+        let new_tx = mk_tx(root, 0, b"same-size-b", 2);
+        let old_id = old_tx.txid();
+        let new_id = new_tx.txid();
+
+        mempool.insert_with_fee(old_tx, 100).expect("insert old");
+        let outcome = mempool
+            .insert_with_fee(new_tx, 99)
+            .expect("replacement evaluation");
+        assert!(matches!(
+            outcome,
+            InsertOutcome::RejectedConflictInsufficientFeerate {
+                inserted,
+                existing,
+                ..
+            } if inserted == new_id && existing == old_id
+        ));
+        assert!(mempool.contains(&old_id));
+        assert!(!mempool.contains(&new_id));
+    }
+
+    #[test]
+    fn replacement_rejects_when_descendant_limit_exceeded() {
+        let mut mempool = Mempool::with_policy_and_replacement(100, 0, 1, 1).expect("mempool");
+        let root = [51u8; 32];
+        let parent_old = mk_tx(root, 0, b"parent-old", 1);
+        let parent_old_id = parent_old.txid();
+        let child_1 = mk_tx(parent_old_id.0, 0, b"child-1", 2);
+        let child_1_id = child_1.txid();
+        let child_2 = mk_tx(child_1_id.0, 0, b"child-2", 3);
+        let parent_new = mk_tx(root, 0, b"parent-new", 4);
+        let parent_new_id = parent_new.txid();
+
+        mempool
+            .insert_with_fee(parent_old, 10)
+            .expect("insert parent");
+        mempool.insert_with_fee(child_1, 10).expect("insert child1");
+        mempool.insert_with_fee(child_2, 10).expect("insert child2");
+
+        let err = mempool
+            .insert_with_fee(parent_new, 100)
+            .expect_err("replacement should fail due to descendant limit");
+        assert!(matches!(
+            err,
+            MempoolError::ReplacementTooManyDescendants {
+                incoming,
+                descendants: 2,
+                limit: 1,
+                ..
+            } if incoming == parent_new_id
+        ));
+        assert!(mempool.contains(&parent_old_id));
     }
 
     #[test]

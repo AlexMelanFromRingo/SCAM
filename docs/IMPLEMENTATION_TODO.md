@@ -8,7 +8,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] Core block/tx/header structures + deterministic serialization + BLAKE3 hash API.
 - [x] PoW numeric target compare (`hash <= target`) implemented.
 - [x] Dynamic difficulty retarget formula implemented (window/clamp from config).
-- [ ] Mempool conflict policy is under redesign (current `txid`-based replacement is temporary and does not satisfy new requirements).
+- [x] Mempool conflict policy migrated to fee-aware replacement (with minimum fee delta + descendant cap baseline anti-DoS rules).
 - [x] Wallet basics implemented: mnemonic generation/restore, Schnorr sign/verify, Bech32m address, QR output.
 - [x] UTXO block application implemented with signature checks, fee accounting, coinbase maturity.
 - [x] P2P wire messages + gossip dedup engine (`inv/getdata/tx/block`) implemented.
@@ -18,7 +18,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] redb-backed snapshot persistence implemented (`snapshot save-genesis-db` / `snapshot show-db`).
 - [x] Reorg-safe best-chain selection by cumulative work implemented in chain runtime.
 - [x] Minimal HTTP JSON RPC transport implemented (`scam-node rpc-serve`).
-- [ ] Remaining major items: conflict policy redesign for mempool/RBF, socketed p2p sync runtime beyond demo mode, crash-consistent DB-backed node runtime, wallet security/rescan, stronger test matrix.
+- [ ] Remaining major items: socketed p2p sync runtime beyond demo mode, crash-consistent DB-backed node runtime, wallet security/rescan, stronger test matrix.
 
 ## 1) Frozen Design Decisions
 
@@ -28,7 +28,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - Target block time: `120` seconds.
 - Difficulty adjustment window: `20` blocks (configurable constant).
 - Reward model: fixed block subsidy (no hard cap by default).
-- Double-spend mempool policy: `TBD` (current `txid`-based replacement is deprecated in plan and must be replaced with anti-grinding policy, likely fee-aware).
+- Double-spend mempool policy: fee-aware replacement for conflicting spends (higher feerate + minimum absolute fee delta), with descendant-limit checks for anti-DoS baseline.
 - Public key format at interfaces: compressed secp256k1 pubkey (33 bytes, `02/03 + x`).
 - Signature scheme: Schnorr over secp256k1 (BIP340 style, x-only verification key internally).
 - Address format target: Bech32m with HRP starting with `s`; payload hashing upgraded to stronger Bitcoin-like `HASH160`-style construction (exact hash stack to freeze in implementation step).
@@ -136,8 +136,8 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 
 - [x] Keep index `spent_outpoint -> txid`.
 - [x] On incoming tx without conflict: validate then insert.
-- [ ] Replace current `txid`-based conflict rule with final anti-grinding policy (`fee-rate RBF` or `first-seen` + explicit replacement gate).
-- [ ] Add replacement anti-DoS rules (rate limits, minimum delta fee, descendant limits).
+- [x] Replace current `txid`-based conflict rule with final anti-grinding policy (`fee-rate RBF` or `first-seen` + explicit replacement gate).
+- [x] Add replacement anti-DoS rules (rate limits, minimum delta fee, descendant limits).
 - [ ] Re-run threat model for double-spend race after new policy is chosen.
 - [ ] Broadcast replacement/eviction events to peers as inventory updates.
 - [ ] Add orphan tx pool with size/time limits.
@@ -233,7 +233,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] signature verification and pubkey parsing
 - [x] merkle root generation
 - [x] target math and retarget formula
-- [ ] mempool replacement policy edge cases (after policy redesign).
+- [x] mempool replacement policy edge cases (after policy redesign).
 - [ ] Integration tests:
 - [ ] 3+ node tx propagation via inv/getdata
 - [ ] block propagation and dedup behavior
