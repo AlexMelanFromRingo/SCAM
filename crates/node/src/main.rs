@@ -461,7 +461,7 @@ enum WalletCommand {
         index: u32,
         #[arg(long)]
         to: String,
-        #[arg(long)]
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
         amount: u64,
         #[arg(long, default_value_t = 1)]
         fee: u64,
@@ -1246,7 +1246,7 @@ fn run_wallet(command: WalletCommand) -> Result<(), NodeError> {
 
             let tip_height = runtime.tip_height();
             let coinbase_maturity = runtime.config().coinbase_maturity as u64;
-            let mut selected: Option<(OutPoint, u64)> = None;
+            let mut spendable = Vec::<SpendableUtxo>::new();
             let mut spendable_total = 0u128;
             for (outpoint, utxo) in runtime.utxo_set() {
                 if utxo.key_hash20 != sender_key_hash20 {
@@ -1258,36 +1258,34 @@ fn run_wallet(command: WalletCommand) -> Result<(), NodeError> {
                     continue;
                 }
                 spendable_total = spendable_total.saturating_add(utxo.value as u128);
-                if utxo.value < needed {
-                    continue;
-                }
-                let should_replace = selected
-                    .as_ref()
-                    .map(|(_, value)| utxo.value < *value)
-                    .unwrap_or(true);
-                if should_replace {
-                    selected = Some((outpoint.clone(), utxo.value));
-                }
+                spendable.push(SpendableUtxo {
+                    outpoint: outpoint.clone(),
+                    value: utxo.value,
+                });
             }
 
-            let (selected_outpoint, selected_value) = selected.ok_or_else(|| {
-                NodeError::Runtime(format!(
-                    "no spendable UTXO with value >= {} for this wallet (spendable total: {})",
-                    needed, spendable_total
-                ))
-            })?;
-            let change_value = selected_value.checked_sub(needed).ok_or_else(|| {
+            let (selected, selected_total) = select_utxos_for_amount(&spendable, needed)
+                .ok_or_else(|| {
+                    NodeError::Runtime(format!(
+                        "insufficient spendable funds for amount+fee={} (spendable total: {})",
+                        needed, spendable_total
+                    ))
+                })?;
+            let change_value = selected_total.checked_sub(needed).ok_or_else(|| {
                 NodeError::Runtime("selected UTXO is smaller than needed".to_owned())
             })?;
 
             let mut tx = Transaction {
                 version: 1,
-                inputs: vec![TxIn {
-                    prev_out: selected_outpoint,
-                    signature: vec![],
-                    pubkey_compressed: sender_pubkey.to_vec(),
-                    sequence: 0,
-                }],
+                inputs: selected
+                    .iter()
+                    .map(|utxo| TxIn {
+                        prev_out: utxo.outpoint.clone(),
+                        signature: vec![],
+                        pubkey_compressed: sender_pubkey.to_vec(),
+                        sequence: 0,
+                    })
+                    .collect(),
                 outputs: vec![TxOut {
                     value: amount,
                     key_hash20: recipient.key_hash20,
@@ -1301,25 +1299,32 @@ fn run_wallet(command: WalletCommand) -> Result<(), NodeError> {
                 });
             }
 
-            let digest = tx
-                .signing_digest_with_chain_domain(0, cfg.network_id.as_bytes())
-                .map_err(|e| NodeError::Runtime(format!("signing digest failed: {e}")))?;
-            let signature = sign_digest(&key, digest.0)?;
-            tx.inputs[0].signature = signature.to_vec();
+            for input_index in 0..tx.inputs.len() {
+                let digest = tx
+                    .signing_digest_with_chain_domain(input_index, cfg.network_id.as_bytes())
+                    .map_err(|e| NodeError::Runtime(format!("signing digest failed: {e}")))?;
+                let signature = sign_digest(&key, digest.0)?;
+                tx.inputs[input_index].signature = signature.to_vec();
 
-            let sig_ok = verify_digest(digest.0, signature, sender_pubkey)?;
-            if !sig_ok {
-                return Err(NodeError::Runtime(
-                    "internal signature self-check failed".to_owned(),
-                ));
+                let sig_ok = verify_digest(digest.0, signature, sender_pubkey)?;
+                if !sig_ok {
+                    return Err(NodeError::Runtime(format!(
+                        "internal signature self-check failed for input #{}",
+                        input_index
+                    )));
+                }
             }
 
             println!("Transaction created and signed:");
             println!("Txid: {}", tx.txid());
-            println!(
-                "Input: {}:{} (value={})",
-                tx.inputs[0].prev_out.txid, tx.inputs[0].prev_out.vout, selected_value
-            );
+            println!("Input count: {}", tx.inputs.len());
+            for (idx, utxo) in selected.iter().enumerate() {
+                println!(
+                    "Input #{idx}: {}:{} (value={})",
+                    utxo.outpoint.txid, utxo.outpoint.vout, utxo.value
+                );
+            }
+            println!("Input total: {}", selected_total);
             println!("To key-hash20: {}", hex::encode(recipient.key_hash20));
             println!("Amount: {}", amount);
             println!("Fee: {}", fee);
@@ -1509,6 +1514,61 @@ fn run_snapshot(command: SnapshotCommand) -> Result<(), NodeError> {
         }
     }
     Ok(())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SpendableUtxo {
+    outpoint: OutPoint,
+    value: u64,
+}
+
+fn select_utxos_for_amount(
+    candidates: &[SpendableUtxo],
+    needed: u64,
+) -> Option<(Vec<SpendableUtxo>, u64)> {
+    if needed == 0 {
+        return Some((Vec::new(), 0));
+    }
+
+    // Prefer a single input (smaller tx size) when possible.
+    let single = candidates
+        .iter()
+        .filter(|utxo| utxo.value >= needed)
+        .min_by(|a, b| {
+            a.value
+                .cmp(&b.value)
+                .then_with(|| a.outpoint.txid.cmp(&b.outpoint.txid))
+                .then_with(|| a.outpoint.vout.cmp(&b.outpoint.vout))
+        })
+        .cloned();
+    if let Some(best) = single {
+        return Some((vec![best.clone()], best.value));
+    }
+
+    // Fallback: accumulate largest-first until covered.
+    let mut ordered = candidates.to_vec();
+    ordered.sort_unstable_by(|a, b| {
+        b.value
+            .cmp(&a.value)
+            .then_with(|| a.outpoint.txid.cmp(&b.outpoint.txid))
+            .then_with(|| a.outpoint.vout.cmp(&b.outpoint.vout))
+    });
+
+    let mut selected = Vec::new();
+    let mut total = 0u64;
+    for utxo in ordered {
+        if total >= needed {
+            break;
+        }
+        total = total.saturating_add(utxo.value);
+        selected.push(utxo);
+    }
+
+    if total >= needed {
+        Some((selected, total))
+    } else {
+        None
+    }
 }
 
 fn build_coinbase_tx(tag: String, subsidy: u64, key_hash20: [u8; 20]) -> Transaction {
@@ -2519,7 +2579,19 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{Network, accepted_hrps_for_network};
+    use scam_core::{Hash256, OutPoint};
+
+    use super::{Network, SpendableUtxo, accepted_hrps_for_network, select_utxos_for_amount};
+
+    fn utxo(seed: u8, value: u64) -> SpendableUtxo {
+        SpendableUtxo {
+            outpoint: OutPoint {
+                txid: Hash256([seed; 32]),
+                vout: seed as u32,
+            },
+            value,
+        }
+    }
 
     #[test]
     fn accepted_hrps_include_legacy_aliases() {
@@ -2534,5 +2606,30 @@ mod tests {
         let mainnet = accepted_hrps_for_network(Network::Mainnet, "s");
         assert!(mainnet.iter().any(|hrp| hrp == "s"));
         assert!(mainnet.iter().any(|hrp| hrp == "sc"));
+    }
+
+    #[test]
+    fn coin_selection_prefers_smallest_single_input_covering_target() {
+        let candidates = vec![utxo(1, 10), utxo(2, 5), utxo(3, 8), utxo(4, 12)];
+        let (selected, total) = select_utxos_for_amount(&candidates, 7).expect("selection");
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].value, 8);
+        assert_eq!(total, 8);
+    }
+
+    #[test]
+    fn coin_selection_accumulates_multiple_inputs_if_needed() {
+        let candidates = vec![utxo(1, 3), utxo(2, 4), utxo(3, 5)];
+        let (selected, total) = select_utxos_for_amount(&candidates, 9).expect("selection");
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].value, 5);
+        assert_eq!(selected[1].value, 4);
+        assert_eq!(total, 9);
+    }
+
+    #[test]
+    fn coin_selection_returns_none_for_insufficient_funds() {
+        let candidates = vec![utxo(1, 3), utxo(2, 4)];
+        assert!(select_utxos_for_amount(&candidates, 10).is_none());
     }
 }
