@@ -40,7 +40,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] redb chain archive persistence implemented (`blocks/headers/block-index`) with runtime restore path in `node run`.
 - [x] Reorg-safe best-chain selection by cumulative work implemented in chain runtime.
 - [x] Minimal HTTP JSON RPC transport implemented (`scam-node rpc-serve`).
-- [ ] Remaining major items: crash-consistent DB-backed node runtime hardening and stronger test matrix.
+- [ ] Remaining major items: extended long-run validation (soak/perf) and final launch hardening.
 
 ## 1) Frozen Design Decisions
 
