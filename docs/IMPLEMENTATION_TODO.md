@@ -27,6 +27,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] `node add-peer` migrated to redb peer-book backend with legacy `.txt` migration path.
 - [x] Added `node reindex-runtime` command to replay persisted block archive and rebuild runtime DB.
 - [x] Added redb-backed optional mempool snapshot persistence API with validation tests.
+- [x] Added peer discovery hardening baseline (outbound diversity + rotation candidate selector in `scam-p2p`).
 - [x] Miner template + nonce search loop implemented (`mine-once` CLI).
 - [x] Chainstate snapshot save/load implemented.
 - [x] redb-backed snapshot persistence implemented (`snapshot save-genesis-db` / `snapshot show-db`).
@@ -214,7 +215,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] Implement peer scoring and ban for invalid data spam.
 - [x] Add rate limits and max message size guards.
 - [x] Implement real socketed sync runtime (IBD): headers pipeline -> block inventory/download -> validation -> persistence.
-- [ ] Add peer discovery hardening: outbound diversity, rotation, and basic eclipse-risk mitigation.
+- [x] Add peer discovery hardening: outbound diversity, rotation, and basic eclipse-risk mitigation.
 
 ## 14) Mining TODO
 

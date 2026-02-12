@@ -1,8 +1,10 @@
+pub mod discovery;
 pub mod gossip;
 pub mod sync;
 pub mod transport;
 pub mod wire;
 
+pub use discovery::{PeerCandidate, select_outbound_peers};
 pub use gossip::{GossipEngine, GossipError, OutboundMessage, PeerId};
 pub use sync::{build_block_locator, select_block_hashes_for_peer, select_headers_for_peer};
 pub use transport::{
