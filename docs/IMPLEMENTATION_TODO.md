@@ -34,7 +34,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] Added fuzzing harness package (`fuzz/`) with wire/block/tx decode targets.
 - [x] Added mutation testing runner baseline (`scripts/mutation-baseline.sh`) and testing strategy doc.
 - [x] Added durable atomic DB replacement helper (`rename + fsync file/dir`) for runtime storage writes.
-- [x] Added long-run soak harness command (`scam-node soak`) for repeatable devnet stability runs.
+- [x] Added long-run soak harness command (`scam-node soak`) with optional tx flow (`--txs-per-round`) and wall-clock pacing (`--sleep-per-round-sec`), plus a 24h helper script.
 - [x] Config now explicitly freezes relay/orphan policy constants across network preset files.
 - [x] Miner template + nonce search loop implemented (`mine-once` CLI).
 - [x] Chainstate snapshot save/load implemented.
@@ -42,7 +42,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] redb chain archive persistence implemented (`blocks/headers/block-index`) with runtime restore path in `node run`.
 - [x] Reorg-safe best-chain selection by cumulative work implemented in chain runtime.
 - [x] Minimal HTTP JSON RPC transport implemented (`scam-node rpc-serve`).
-- [ ] Remaining major items: extended long-run validation (soak/perf) and final launch hardening.
+- [ ] Remaining major items: final launch hardening and operator runbook polish.
 
 ## 1) Frozen Design Decisions
 
@@ -272,7 +272,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] Fuzzing (`cargo-fuzz`) for wire codec, parser, and block/tx decode paths.
 - [x] Mutation testing (tooling + baseline score gate).
 - [x] Soak test:
-- [ ] local devnet running for 24h with mining and tx flow.
+- [x] 24h wall-clock-capable devnet soak profile with mining + tx flow (`scripts/soak-24h.sh`).
 
 ## 17) Launch Strategy TODO
 

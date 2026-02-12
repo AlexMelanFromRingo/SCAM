@@ -44,10 +44,20 @@ Long-run devnet soak command:
 ```bash
 cargo run -p scam-node -- soak \
   --network devnet \
-  --rounds 17280 \
+  --rounds 720 \
   --blocks-per-round 1 \
   --interval-sec 120 \
-  --persist-every-rounds 60
+  --persist-every-rounds 60 \
+  --txs-per-round 1 \
+  --tx-amount 1000 \
+  --tx-fee 1 \
+  --sleep-per-round-sec 120
 ```
 
-This approximates a 24h run at 2-minute block cadence.
+This runs for ~24h wall-clock time (720 rounds with 120-second sleeps) at 2-minute block cadence and includes transaction churn.
+
+Shortcut script:
+
+```bash
+scripts/soak-24h.sh
+```
