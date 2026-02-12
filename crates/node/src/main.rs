@@ -15,9 +15,9 @@ use scam_core::{
 };
 use scam_miner::{BlockTemplate, mine_block};
 use scam_p2p::{
-    FramingConfig, GossipEngine, LocalHandshake, TransportError, WireMessage, build_block_locator,
-    client_handshake, read_message, request_blocks, request_headers, select_block_hashes_for_peer,
-    select_headers_for_peer, send_message, server_handshake,
+    FramingConfig, GossipEngine, InventoryItem, LocalHandshake, TransportError, WireMessage,
+    build_block_locator, client_handshake, read_message, request_blocks, request_headers,
+    select_block_hashes_for_peer, select_headers_for_peer, send_message, server_handshake,
 };
 use scam_rpc::{StatusResponse, TxResponse, header_to_block_response, to_pretty_json};
 use scam_storage::{
@@ -1776,9 +1776,13 @@ fn run_net_demo(args: NetDemoArgs) -> Result<(), NodeError> {
     let remote_tip = remote.tip_height();
     let remote_chain = remote.block_hashes().to_vec();
     let mut remote_headers = HashMap::new();
+    let mut remote_blocks = HashMap::new();
     for hash in remote.block_hashes() {
         if let Some(header) = remote.header_by_hash(hash) {
             remote_headers.insert(*hash, header.clone());
+        }
+        if let Some(block) = remote.block_by_hash(hash) {
+            remote_blocks.insert(*hash, block.clone());
         }
     }
     let max_headers = args.max_headers;
@@ -1840,15 +1844,56 @@ fn run_net_demo(args: NetDemoArgs) -> Result<(), NodeError> {
             WireMessage::GetBlocks { locator, stop } => {
                 let hashes =
                     select_block_hashes_for_peer(&remote_chain, &locator, stop, max_headers);
-                let items = hashes
-                    .into_iter()
-                    .map(scam_p2p::InventoryItem::Block)
-                    .collect();
+                let items = hashes.into_iter().map(InventoryItem::Block).collect();
                 send_message(&mut stream, &WireMessage::Inv { items }, &framing_server)
                     .map_err(|e| e.to_string())?;
             }
             other => {
                 return Err(format!("expected getblocks, got {other:?}"));
+            }
+        }
+
+        let request = read_message(&mut stream, &framing_server).map_err(|e| e.to_string())?;
+        match request {
+            WireMessage::GetData { items } => {
+                for item in items {
+                    match item {
+                        InventoryItem::Block(hash) => {
+                            let Some(block) = remote_blocks.get(&hash) else {
+                                send_message(
+                                    &mut stream,
+                                    &WireMessage::NotFound {
+                                        items: vec![InventoryItem::Block(hash)],
+                                    },
+                                    &framing_server,
+                                )
+                                .map_err(|e| e.to_string())?;
+                                continue;
+                            };
+                            send_message(
+                                &mut stream,
+                                &WireMessage::Block {
+                                    block: block.clone(),
+                                },
+                                &framing_server,
+                            )
+                            .map_err(|e| e.to_string())?;
+                        }
+                        InventoryItem::Tx(hash) => {
+                            send_message(
+                                &mut stream,
+                                &WireMessage::NotFound {
+                                    items: vec![InventoryItem::Tx(hash)],
+                                },
+                                &framing_server,
+                            )
+                            .map_err(|e| e.to_string())?;
+                        }
+                    }
+                }
+            }
+            other => {
+                return Err(format!("expected getdata, got {other:?}"));
             }
         }
 
@@ -1881,9 +1926,67 @@ fn run_net_demo(args: NetDemoArgs) -> Result<(), NodeError> {
         }
     }
 
+    let client_tip_before_height = local.tip_height();
+    let client_tip_before_hash = local.tip_hash();
     let locator = build_block_locator(local.block_hashes());
     let headers = request_headers(&mut client, &framing, locator.clone(), None)?;
     let block_hashes = request_blocks(&mut client, &framing, locator.clone(), None)?;
+    let unknown_hashes = block_hashes
+        .iter()
+        .copied()
+        .filter(|hash| local.block_by_hash(hash).is_none())
+        .collect::<Vec<_>>();
+
+    if !unknown_hashes.is_empty() {
+        let items = unknown_hashes
+            .iter()
+            .copied()
+            .map(InventoryItem::Block)
+            .collect::<Vec<_>>();
+        send_message(&mut client, &WireMessage::GetData { items }, &framing)?;
+    }
+
+    let mut downloaded_blocks = 0usize;
+    let mut applied_blocks = 0usize;
+    let mut ignored_blocks = 0usize;
+    for expected_hash in &unknown_hashes {
+        let message = read_message(&mut client, &framing)?;
+        match message {
+            WireMessage::Block { block } => {
+                let got_hash = block.header.block_hash();
+                if got_hash != *expected_hash {
+                    return Err(NodeError::Runtime(format!(
+                        "unexpected block order from peer: expected {}, got {}",
+                        expected_hash, got_hash
+                    )));
+                }
+                downloaded_blocks = downloaded_blocks.saturating_add(1);
+                let outcome = local.submit_block(block)?;
+                match outcome {
+                    BlockSubmissionOutcome::AlreadyKnown { .. }
+                    | BlockSubmissionOutcome::StoredSideBranch { .. } => {
+                        ignored_blocks = ignored_blocks.saturating_add(1);
+                    }
+                    BlockSubmissionOutcome::ExtendedTip { .. }
+                    | BlockSubmissionOutcome::Reorged { .. } => {
+                        applied_blocks = applied_blocks.saturating_add(1);
+                    }
+                }
+            }
+            WireMessage::NotFound { items } => {
+                return Err(NodeError::Runtime(format!(
+                    "peer did not have requested block {} (notfound: {:?})",
+                    expected_hash, items
+                )));
+            }
+            other => {
+                return Err(NodeError::Runtime(format!(
+                    "expected block/notfound for {}, got {other:?}",
+                    expected_hash
+                )));
+            }
+        }
+    }
 
     let server_result = server
         .join()
@@ -1892,11 +1995,10 @@ fn run_net_demo(args: NetDemoArgs) -> Result<(), NodeError> {
         return Err(NodeError::Runtime(format!("server error: {err}")));
     }
 
-    println!("Net demo (TCP + handshake + headers/getblocks)");
+    println!("Net demo (TCP + handshake + headers/getblocks/getdata/block)");
     println!(
-        "Client tip: h={} hash={}",
-        local.tip_height(),
-        local.tip_hash()
+        "Client tip before sync: h={} hash={}",
+        client_tip_before_height, client_tip_before_hash
     );
     println!(
         "Server tip: h={} hash={}",
@@ -1906,6 +2008,14 @@ fn run_net_demo(args: NetDemoArgs) -> Result<(), NodeError> {
     println!("Locator sent: {}", locator.len());
     println!("Headers received: {}", headers.len());
     println!("Block hashes received: {}", block_hashes.len());
+    println!("Blocks downloaded: {}", downloaded_blocks);
+    println!("Blocks applied: {}", applied_blocks);
+    println!("Blocks ignored: {}", ignored_blocks);
+    println!(
+        "Client tip after sync: h={} hash={}",
+        local.tip_height(),
+        local.tip_hash()
+    );
     if let Some(first) = headers.first() {
         println!("First header prev: {}", first.prev_block);
     }

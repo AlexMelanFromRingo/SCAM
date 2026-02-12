@@ -17,6 +17,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] UTXO block application implemented with signature checks, fee accounting, coinbase maturity.
 - [x] P2P wire messages + gossip dedup engine (`inv/getdata/tx/block`) implemented.
 - [x] P2P TCP transport framing + `version/verack` handshake + `ping/pong` + `getheaders/headers` demo implemented.
+- [x] Net demo upgraded to perform `getdata` block download and apply downloaded blocks to local runtime.
 - [x] Miner template + nonce search loop implemented (`mine-once` CLI).
 - [x] Chainstate snapshot save/load implemented.
 - [x] redb-backed snapshot persistence implemented (`snapshot save-genesis-db` / `snapshot show-db`).
