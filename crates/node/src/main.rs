@@ -21,8 +21,9 @@ use scam_p2p::{
 };
 use scam_rpc::{StatusResponse, TxResponse, header_to_block_response, to_pretty_json};
 use scam_storage::{
-    ChainArchive, ChainStateSnapshot, StorageError, load_chain_archive_db, load_snapshot,
-    load_snapshot_db, save_chain_archive_db, save_snapshot, save_snapshot_db,
+    ChainArchive, ChainStateSnapshot, PeerAddressBook, PeerAddressRecord, StorageError,
+    load_chain_archive_db, load_peer_book_db, load_snapshot, load_snapshot_db,
+    save_chain_archive_db, save_peer_book_db, save_snapshot, save_snapshot_db,
 };
 use scam_wallet::{
     AddressError, DeriveKeyError, MnemonicError, QrError, RescanError, SchnorrError,
@@ -843,35 +844,67 @@ fn run_get_tx(args: GetTxArgs) -> Result<(), NodeError> {
 
 fn run_add_peer(args: AddPeerArgs) -> Result<(), NodeError> {
     let network_name = args.network.as_str();
-    let peers_path = args.peers_dir.join(format!("{network_name}.txt"));
-    if let Some(parent) = peers_path.parent() {
+    let peers_db_path = args.peers_dir.join(format!("{network_name}.redb"));
+    let legacy_txt_path = args.peers_dir.join(format!("{network_name}.txt"));
+    if let Some(parent) = peers_db_path.parent() {
         fs::create_dir_all(parent).map_err(|e| NodeError::Runtime(e.to_string()))?;
     }
 
-    let mut existing = if peers_path.exists() {
-        fs::read_to_string(&peers_path)
+    let mut peer_book = if peers_db_path.exists() {
+        let loaded = load_peer_book_db(&peers_db_path)?;
+        if loaded.network_id != network_name {
+            return Err(NodeError::Runtime(format!(
+                "peer book network mismatch in {}: expected '{}', got '{}'",
+                peers_db_path.display(),
+                network_name,
+                loaded.network_id
+            )));
+        }
+        loaded
+    } else if legacy_txt_path.exists() {
+        let mut peers = fs::read_to_string(&legacy_txt_path)
             .map_err(|e| NodeError::Runtime(e.to_string()))?
             .lines()
             .map(str::trim)
             .filter(|line| !line.is_empty())
-            .map(ToOwned::to_owned)
-            .collect::<Vec<_>>()
+            .map(|address| PeerAddressRecord {
+                address: address.to_owned(),
+                last_seen_unix_sec: 0,
+                ban_score: 0,
+            })
+            .collect::<Vec<_>>();
+        peers.sort_by(|a, b| a.address.cmp(&b.address));
+        peers.dedup_by(|a, b| a.address == b.address);
+        PeerAddressBook {
+            network_id: network_name.to_owned(),
+            peers,
+        }
     } else {
-        Vec::new()
+        PeerAddressBook {
+            network_id: network_name.to_owned(),
+            peers: Vec::new(),
+        }
     };
 
-    if !existing.iter().any(|entry| entry == &args.peer) {
-        existing.push(args.peer.clone());
-        existing.sort();
-        existing.dedup();
-        let content = format!("{}\n", existing.join("\n"));
-        fs::write(&peers_path, content).map_err(|e| NodeError::Runtime(e.to_string()))?;
+    if !peer_book
+        .peers
+        .iter()
+        .any(|entry| entry.address == args.peer)
+    {
+        peer_book.peers.push(PeerAddressRecord {
+            address: args.peer.clone(),
+            last_seen_unix_sec: 0,
+            ban_score: 0,
+        });
+        peer_book.peers.sort_by(|a, b| a.address.cmp(&b.address));
+        peer_book.peers.dedup_by(|a, b| a.address == b.address);
+        save_peer_book_db(&peers_db_path, &peer_book)?;
         println!("Peer added for {}: {}", network_name, args.peer);
     } else {
         println!("Peer already exists for {}: {}", network_name, args.peer);
     }
-    println!("Peer book: {}", peers_path.display());
-    println!("Total peers: {}", existing.len());
+    println!("Peer book: {}", peers_db_path.display());
+    println!("Total peers: {}", peer_book.peers.len());
     Ok(())
 }
 
@@ -2579,9 +2612,17 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use scam_core::{Hash256, OutPoint};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{Network, SpendableUtxo, accepted_hrps_for_network, select_utxos_for_amount};
+    use scam_core::{Hash256, OutPoint};
+    use scam_storage::load_peer_book_db;
+
+    use super::{
+        AddPeerArgs, Network, SpendableUtxo, accepted_hrps_for_network, run_add_peer,
+        select_utxos_for_amount,
+    };
 
     fn utxo(seed: u8, value: u64) -> SpendableUtxo {
         SpendableUtxo {
@@ -2631,5 +2672,79 @@ mod tests {
     fn coin_selection_returns_none_for_insufficient_funds() {
         let candidates = vec![utxo(1, 3), utxo(2, 4)];
         assert!(select_utxos_for_amount(&candidates, 10).is_none());
+    }
+
+    fn temp_dir(prefix: &str) -> PathBuf {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        PathBuf::from(format!("target/{prefix}-{ts}"))
+    }
+
+    #[test]
+    fn add_peer_uses_redb_peer_book_and_deduplicates() {
+        let peers_dir = temp_dir("test-peer-book");
+        fs::create_dir_all(&peers_dir).expect("mkdir");
+
+        let args = AddPeerArgs {
+            network: Network::Devnet,
+            peer: "127.0.0.1:8333".to_owned(),
+            peers_dir: peers_dir.clone(),
+        };
+        run_add_peer(args).expect("first add");
+        run_add_peer(AddPeerArgs {
+            network: Network::Devnet,
+            peer: "127.0.0.1:8333".to_owned(),
+            peers_dir: peers_dir.clone(),
+        })
+        .expect("duplicate add");
+
+        let peer_book_path = peers_dir.join("devnet.redb");
+        let book = load_peer_book_db(&peer_book_path).expect("load peer book");
+        assert_eq!(book.network_id, "devnet");
+        assert_eq!(book.peers.len(), 1);
+        assert_eq!(book.peers[0].address, "127.0.0.1:8333");
+
+        let _ = fs::remove_dir_all(peers_dir);
+    }
+
+    #[test]
+    fn add_peer_migrates_legacy_txt_file() {
+        let peers_dir = temp_dir("test-peer-book-legacy");
+        fs::create_dir_all(&peers_dir).expect("mkdir");
+        fs::write(
+            peers_dir.join("devnet.txt"),
+            "192.168.1.10:8333\n192.168.1.10:8333\n10.0.0.7:8333\n",
+        )
+        .expect("write legacy file");
+
+        run_add_peer(AddPeerArgs {
+            network: Network::Devnet,
+            peer: "127.0.0.1:8333".to_owned(),
+            peers_dir: peers_dir.clone(),
+        })
+        .expect("add and migrate");
+
+        let peer_book_path = peers_dir.join("devnet.redb");
+        let book = load_peer_book_db(&peer_book_path).expect("load peer book");
+        assert_eq!(book.peers.len(), 3);
+        assert!(
+            book.peers
+                .iter()
+                .any(|peer| peer.address == "192.168.1.10:8333")
+        );
+        assert!(
+            book.peers
+                .iter()
+                .any(|peer| peer.address == "10.0.0.7:8333")
+        );
+        assert!(
+            book.peers
+                .iter()
+                .any(|peer| peer.address == "127.0.0.1:8333")
+        );
+
+        let _ = fs::remove_dir_all(peers_dir);
     }
 }

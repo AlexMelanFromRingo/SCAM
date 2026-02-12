@@ -24,6 +24,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] Added orphan tx pool primitive with bounded size + TTL expiry + dependency resolution hooks.
 - [x] Added P2P integration tests for 3-peer inv/getdata propagation and dedup behavior.
 - [x] Added redb-backed peer address book persistence with roundtrip/validation tests.
+- [x] `node add-peer` migrated to redb peer-book backend with legacy `.txt` migration path.
 - [x] Miner template + nonce search loop implemented (`mine-once` CLI).
 - [x] Chainstate snapshot save/load implemented.
 - [x] redb-backed snapshot persistence implemented (`snapshot save-genesis-db` / `snapshot show-db`).
