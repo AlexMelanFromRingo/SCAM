@@ -1,6 +1,6 @@
 # SCAM Implementation TODO (MVP but Production-Style Base)
 
-Status: draft v1 (frozen decisions from user session on 2026-02-11)
+Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 
 ## Progress Snapshot (2026-02-11)
 
@@ -8,7 +8,7 @@ Status: draft v1 (frozen decisions from user session on 2026-02-11)
 - [x] Core block/tx/header structures + deterministic serialization + BLAKE3 hash API.
 - [x] PoW numeric target compare (`hash <= target`) implemented.
 - [x] Dynamic difficulty retarget formula implemented (window/clamp from config).
-- [x] Mempool conflict policy implemented (lower `txid` wins, descendants evicted on replacement).
+- [ ] Mempool conflict policy is under redesign (current `txid`-based replacement is temporary and does not satisfy new requirements).
 - [x] Wallet basics implemented: mnemonic generation/restore, Schnorr sign/verify, Bech32m address, QR output.
 - [x] UTXO block application implemented with signature checks, fee accounting, coinbase maturity.
 - [x] P2P wire messages + gossip dedup engine (`inv/getdata/tx/block`) implemented.
@@ -18,7 +18,7 @@ Status: draft v1 (frozen decisions from user session on 2026-02-11)
 - [x] redb-backed snapshot persistence implemented (`snapshot save-genesis-db` / `snapshot show-db`).
 - [x] Reorg-safe best-chain selection by cumulative work implemented in chain runtime.
 - [x] Minimal HTTP JSON RPC transport implemented (`scam-node rpc-serve`).
-- [ ] Remaining major items: socketed p2p sync runtime beyond demo mode, persistent DB-backed node runtime.
+- [ ] Remaining major items: conflict policy redesign for mempool/RBF, socketed p2p sync runtime beyond demo mode, crash-consistent DB-backed node runtime, wallet security/rescan, stronger test matrix.
 
 ## 1) Frozen Design Decisions
 
@@ -28,10 +28,10 @@ Status: draft v1 (frozen decisions from user session on 2026-02-11)
 - Target block time: `120` seconds.
 - Difficulty adjustment window: `20` blocks (configurable constant).
 - Reward model: fixed block subsidy (no hard cap by default).
-- Double-spend mempool policy: for conflicting tx spending same outpoint, keep tx with lower numeric `txid` (BLAKE3 hash).
+- Double-spend mempool policy: `TBD` (current `txid`-based replacement is deprecated in plan and must be replaced with anti-grinding policy, likely fee-aware).
 - Public key format at interfaces: compressed secp256k1 pubkey (33 bytes, `02/03 + x`).
 - Signature scheme: Schnorr over secp256k1 (BIP340 style, x-only verification key internally).
-- Address format: Bech32m, payload is `blake3(compressed_pubkey)[0..20]` (20-byte key hash), HRP by network.
+- Address format target: Bech32m with HRP starting with `s`; payload hashing upgraded to stronger Bitcoin-like `HASH160`-style construction (exact hash stack to freeze in implementation step).
 - Genesis message/string is network-configurable (`genesis_message`), so new networks can be generated from config.
 - Smart contracts: not included.
 
@@ -41,6 +41,16 @@ Status: draft v1 (frozen decisions from user session on 2026-02-11)
 - Fixed subsidy means perpetual emission (inflation never goes to zero). Difficulty does not set price directly; market demand does.
 - "Leading zeros" and "hash <= target" are equivalent views; this project uses explicit numeric target comparison only.
 - BLAKE3 256-bit hash can also be visualized as a 16x16 bitmap (256 bits), optional utility.
+- Retarget window and block interval remain config-driven knobs for this project; no redesign request is attached to those parameters right now.
+
+## 2.1) Review Alignment (2026-02-11)
+
+- [x] Accept: rethink mempool conflict/RBF policy (remove txid-grinding-friendly rule).
+- [x] Accept: prioritize real P2P sync runtime (non-demo IBD path).
+- [x] Accept: prioritize wallet security (`encrypted at rest`) and wallet rescan.
+- [x] Accept: prioritize crash-consistent DB runtime path.
+- [x] Accept: extend testing strategy with property-based, fuzzing, and mutation testing tracks.
+- [x] Keep as-is: block interval and retarget window remain configurable; no mandatory redesign now.
 
 ## 3) Repo Structure TODO
 
@@ -82,6 +92,7 @@ Status: draft v1 (frozen decisions from user session on 2026-02-11)
 - [x] Enforce canonical signatures and strict pubkey parsing.
 - [x] Implement compressed pubkey encode/decode (SEC33).
 - [x] Add domain-separated signing tags for tx signing digest (`SCAM-tx-signing-v1`).
+- [ ] Add explicit network replay protection in signing digest (e.g., include `network_id`/chain-domain in tx sighash).
 
 ## 6) Wallet and Key Management TODO
 
@@ -90,15 +101,16 @@ Status: draft v1 (frozen decisions from user session on 2026-02-11)
 - [x] Implement BIP32 HD derivation.
 - [x] Freeze derivation path in config/constants.
 - [x] Derive compressed pubkeys for address generation.
-- [x] Derive address payload from `blake3(pubkey_compressed)[0..20]`.
+- [ ] Migrate address payload derivation to stronger collision-resistant scheme (Bitcoin-like `HASH160` style, exact hash stack to freeze).
 - [ ] Add encrypted at-rest key storage.
 - [ ] Add wallet rescan (rebuild UTXO ownership from chain).
 
 ## 7) Address and QR TODO
 
-- [x] Implement Bech32m address encode/decode with network HRP.
+- [ ] Update Bech32m HRP/prefix policy so user-facing addresses start with `s` (and keep per-network clarity).
 - [x] Implement payment URI: `coin:<address>?amount=<n>&label=<text>`.
 - [x] Implement QR generation for payment URI (PNG + terminal ASCII optional).
+- [ ] Add compatibility plan for legacy `scd...` addresses during migration.
 - [x] Add CLI:
 - [x] `wallet address`
 - [x] `wallet address --qr`
@@ -123,11 +135,10 @@ Status: draft v1 (frozen decisions from user session on 2026-02-11)
 ## 9) Mempool TODO (Conflict Rule)
 
 - [x] Keep index `spent_outpoint -> txid`.
-- [x] On incoming tx:
-- [x] if no conflict, validate then insert.
-- [x] if conflict exists, compare numeric `new_txid` vs `old_txid`.
-- [x] if `new_txid < old_txid`, replace old tx and evict descendants.
-- [x] else reject new tx.
+- [x] On incoming tx without conflict: validate then insert.
+- [ ] Replace current `txid`-based conflict rule with final anti-grinding policy (`fee-rate RBF` or `first-seen` + explicit replacement gate).
+- [ ] Add replacement anti-DoS rules (rate limits, minimum delta fee, descendant limits).
+- [ ] Re-run threat model for double-spend race after new policy is chosen.
 - [ ] Broadcast replacement/eviction events to peers as inventory updates.
 - [ ] Add orphan tx pool with size/time limits.
 - [x] Add eviction policy for full mempool.
@@ -166,8 +177,9 @@ Status: draft v1 (frozen decisions from user session on 2026-02-11)
 - [x] chain tip metadata
 - [ ] mempool persistence (optional, bounded)
 - [ ] peer address book
-- [ ] Atomic commit for block connect/disconnect state updates.
+- [ ] Atomic crash-consistent commit for block connect/disconnect state updates.
 - [ ] Recovery and reindex mode.
+- [ ] Node startup path that restores live chain runtime from DB (not snapshot-only utilities).
 
 ## 13) P2P TODO (Reliable Minimal Gossip)
 
@@ -186,6 +198,8 @@ Status: draft v1 (frozen decisions from user session on 2026-02-11)
 - [x] Implement headers-first sync for new nodes.
 - [x] Implement peer scoring and ban for invalid data spam.
 - [x] Add rate limits and max message size guards.
+- [ ] Implement real socketed sync runtime (IBD): headers pipeline -> block inventory/download -> validation -> persistence.
+- [ ] Add peer discovery hardening: outbound diversity, rotation, and basic eclipse-risk mitigation.
 
 ## 14) Mining TODO
 
@@ -215,20 +229,23 @@ Status: draft v1 (frozen decisions from user session on 2026-02-11)
 ## 16) Test Plan TODO
 
 - [ ] Unit tests:
-- [ ] hash determinism and serialization compatibility
-- [ ] signature verification and pubkey parsing
-- [ ] merkle root generation
-- [ ] target math and retarget formula
-- [ ] mempool replacement by lower txid rule
+- [x] hash determinism and serialization compatibility
+- [x] signature verification and pubkey parsing
+- [x] merkle root generation
+- [x] target math and retarget formula
+- [ ] mempool replacement policy edge cases (after policy redesign).
 - [ ] Integration tests:
 - [ ] 3+ node tx propagation via inv/getdata
 - [ ] block propagation and dedup behavior
-- [ ] initial sync from genesis to tip
+- [ ] initial sync from genesis to tip (real runtime, not demo).
 - [ ] fork + reorg correctness
 - [ ] difficulty update every 20 blocks
 - [x] wallet mnemonic restore and deterministic addresses
+- [ ] Property-based testing (`proptest`) for tx/utxo/serialization invariants.
+- [ ] Fuzzing (`cargo-fuzz`) for wire codec, parser, and block/tx decode paths.
+- [ ] Mutation testing (tooling + baseline score gate).
 - [ ] Soak test:
-- [ ] local devnet running for 24h with mining and tx flow
+- [ ] local devnet running for 24h with mining and tx flow.
 
 ## 17) Launch Strategy TODO
 
