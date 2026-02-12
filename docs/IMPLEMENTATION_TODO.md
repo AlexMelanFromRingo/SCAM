@@ -22,6 +22,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] Property-based tests baseline added with `proptest` (hash/target invariants in `scam-core`).
 - [x] Property-based tests expanded to tx/UTXO invariants in `scam-consensus` (self-transfer fee accounting + overspend rejection).
 - [x] Added orphan tx pool primitive with bounded size + TTL expiry + dependency resolution hooks.
+- [x] Added P2P integration tests for 3-peer inv/getdata propagation and dedup behavior.
 - [x] Miner template + nonce search loop implemented (`mine-once` CLI).
 - [x] Chainstate snapshot save/load implemented.
 - [x] redb-backed snapshot persistence implemented (`snapshot save-genesis-db` / `snapshot show-db`).
@@ -248,8 +249,8 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] target math and retarget formula
 - [x] mempool replacement policy edge cases (after policy redesign).
 - [ ] Integration tests:
-- [ ] 3+ node tx propagation via inv/getdata
-- [ ] block propagation and dedup behavior
+- [x] 3+ node tx propagation via inv/getdata
+- [x] block propagation and dedup behavior
 - [ ] initial sync from genesis to tip (real runtime, not demo).
 - [ ] fork + reorg correctness
 - [ ] difficulty update every 20 blocks
