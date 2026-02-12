@@ -117,6 +117,7 @@ impl Mempool {
         fee: u64,
     ) -> Result<InsertOutcome, MempoolError> {
         let txid = tx.txid();
+        validate_transaction_for_mempool(&tx, txid)?;
         if self.txs.contains_key(&txid) {
             return Ok(InsertOutcome::AlreadyPresent { txid });
         }
@@ -315,6 +316,58 @@ impl Mempool {
     }
 }
 
+fn validate_transaction_for_mempool(tx: &Transaction, txid: Hash256) -> Result<(), MempoolError> {
+    if tx.is_coinbase() {
+        return Err(MempoolError::CoinbaseNotAllowed { txid });
+    }
+    if tx.inputs.is_empty() {
+        return Err(MempoolError::NoInputs { txid });
+    }
+    if tx.outputs.is_empty() {
+        return Err(MempoolError::NoOutputs { txid });
+    }
+
+    let mut seen_inputs = HashSet::<OutPoint>::new();
+    for (input_index, input) in tx.inputs.iter().enumerate() {
+        if input.prev_out.is_coinbase() {
+            return Err(MempoolError::CoinbasePrevoutInRegularTx { txid, input_index });
+        }
+        if !seen_inputs.insert(input.prev_out.clone()) {
+            return Err(MempoolError::DuplicateInput {
+                txid,
+                outpoint: input.prev_out.clone(),
+            });
+        }
+        if input.signature.is_empty() {
+            return Err(MempoolError::EmptySignature { txid, input_index });
+        }
+        let pubkey_len = input.pubkey_compressed.len();
+        if pubkey_len != 33 {
+            return Err(MempoolError::InvalidPubkeyLength {
+                txid,
+                input_index,
+                len: pubkey_len,
+            });
+        }
+        let prefix = input.pubkey_compressed[0];
+        if prefix != 0x02 && prefix != 0x03 {
+            return Err(MempoolError::InvalidPubkeyPrefix {
+                txid,
+                input_index,
+                prefix,
+            });
+        }
+    }
+
+    for (output_index, output) in tx.outputs.iter().enumerate() {
+        if output.value == 0 {
+            return Err(MempoolError::ZeroValueOutput { txid, output_index });
+        }
+    }
+
+    Ok(())
+}
+
 fn required_fee_for_size(
     size_bytes: usize,
     min_relay_fee_per_kb: u64,
@@ -371,6 +424,32 @@ pub enum InsertOutcome {
 pub enum MempoolError {
     #[error("{0}")]
     InvalidLimit(String),
+    #[error("coinbase transaction {txid} cannot enter mempool")]
+    CoinbaseNotAllowed { txid: Hash256 },
+    #[error("transaction {txid} has no inputs")]
+    NoInputs { txid: Hash256 },
+    #[error("transaction {txid} has no outputs")]
+    NoOutputs { txid: Hash256 },
+    #[error("transaction {txid} has coinbase prevout in input #{input_index}")]
+    CoinbasePrevoutInRegularTx { txid: Hash256, input_index: usize },
+    #[error("transaction {txid} has duplicate input {outpoint:?}")]
+    DuplicateInput { txid: Hash256, outpoint: OutPoint },
+    #[error("transaction {txid} has empty signature in input #{input_index}")]
+    EmptySignature { txid: Hash256, input_index: usize },
+    #[error("transaction {txid} has invalid pubkey length {len} in input #{input_index}")]
+    InvalidPubkeyLength {
+        txid: Hash256,
+        input_index: usize,
+        len: usize,
+    },
+    #[error("transaction {txid} has invalid pubkey prefix 0x{prefix:02x} in input #{input_index}")]
+    InvalidPubkeyPrefix {
+        txid: Hash256,
+        input_index: usize,
+        prefix: u8,
+    },
+    #[error("transaction {txid} has zero-value output at index #{output_index}")]
+    ZeroValueOutput { txid: Hash256, output_index: usize },
     #[error("mempool full (limit={limit}), incoming txid={incoming}")]
     Full { limit: usize, incoming: Hash256 },
     #[error(
@@ -649,5 +728,109 @@ mod tests {
         assert!(mempool.contains(&a_id));
         assert!(mempool.contains(&b_id));
         assert!(!mempool.contains(&c_id));
+    }
+
+    #[test]
+    fn coinbase_transaction_is_rejected() {
+        let mut mempool = Mempool::with_policy(10, 0).expect("mempool");
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: OutPoint::coinbase(),
+                signature: b"coinbase".to_vec(),
+                pubkey_compressed: vec![],
+                sequence: u32::MAX,
+            }],
+            outputs: vec![TxOut {
+                value: 1,
+                key_hash20: [9u8; 20],
+            }],
+            lock_time: 0,
+        };
+        let txid = tx.txid();
+        let err = mempool
+            .insert(tx)
+            .expect_err("coinbase tx must be rejected");
+        assert!(matches!(err, MempoolError::CoinbaseNotAllowed { txid: got } if got == txid));
+    }
+
+    #[test]
+    fn zero_value_output_is_rejected() {
+        let mut mempool = Mempool::with_policy(10, 0).expect("mempool");
+        let mut tx = mk_tx([61u8; 32], 0, b"sig", 7);
+        tx.outputs[0].value = 0;
+        let txid = tx.txid();
+        let err = mempool
+            .insert(tx)
+            .expect_err("zero output must be rejected");
+        assert!(matches!(
+            err,
+            MempoolError::ZeroValueOutput {
+                txid: got,
+                output_index: 0
+            } if got == txid
+        ));
+    }
+
+    #[test]
+    fn duplicate_inputs_are_rejected() {
+        let mut mempool = Mempool::with_policy(10, 0).expect("mempool");
+        let prev_out = OutPoint {
+            txid: scam_core::Hash256([71u8; 32]),
+            vout: 0,
+        };
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![
+                TxIn {
+                    prev_out: prev_out.clone(),
+                    signature: b"a".to_vec(),
+                    pubkey_compressed: vec![2u8; 33],
+                    sequence: 0,
+                },
+                TxIn {
+                    prev_out: prev_out.clone(),
+                    signature: b"b".to_vec(),
+                    pubkey_compressed: vec![3u8; 33],
+                    sequence: 0,
+                },
+            ],
+            outputs: vec![TxOut {
+                value: 1,
+                key_hash20: [1u8; 20],
+            }],
+            lock_time: 0,
+        };
+        let txid = tx.txid();
+        let err = mempool
+            .insert(tx)
+            .expect_err("duplicate inputs must be rejected");
+        assert!(matches!(
+            err,
+            MempoolError::DuplicateInput {
+                txid: got,
+                outpoint
+            } if got == txid && outpoint == prev_out
+        ));
+    }
+
+    #[test]
+    fn invalid_pubkey_prefix_is_rejected() {
+        let mut mempool = Mempool::with_policy(10, 0).expect("mempool");
+        let mut tx = mk_tx([81u8; 32], 0, b"sig", 2);
+        tx.inputs[0].pubkey_compressed = vec![4u8; 33];
+        let txid = tx.txid();
+
+        let err = mempool
+            .insert(tx)
+            .expect_err("invalid pubkey prefix must be rejected");
+        assert!(matches!(
+            err,
+            MempoolError::InvalidPubkeyPrefix {
+                txid: got,
+                input_index: 0,
+                prefix: 4
+            } if got == txid
+        ));
     }
 }
