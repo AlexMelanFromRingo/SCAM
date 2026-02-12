@@ -21,6 +21,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] Added one-shot socketed sync command `sync-peer` (headers -> inv -> getdata -> block validation -> DB persistence).
 - [x] Property-based tests baseline added with `proptest` (hash/target invariants in `scam-core`).
 - [x] Property-based tests expanded to tx/UTXO invariants in `scam-consensus` (self-transfer fee accounting + overspend rejection).
+- [x] Added orphan tx pool primitive with bounded size + TTL expiry + dependency resolution hooks.
 - [x] Miner template + nonce search loop implemented (`mine-once` CLI).
 - [x] Chainstate snapshot save/load implemented.
 - [x] redb-backed snapshot persistence implemented (`snapshot save-genesis-db` / `snapshot show-db`).
@@ -149,7 +150,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] Add replacement anti-DoS rules (rate limits, minimum delta fee, descendant limits).
 - [ ] Re-run threat model for double-spend race after new policy is chosen.
 - [ ] Broadcast replacement/eviction events to peers as inventory updates.
-- [ ] Add orphan tx pool with size/time limits.
+- [x] Add orphan tx pool with size/time limits.
 - [x] Add eviction policy for full mempool.
 
 ## 10) Block and Chain TODO

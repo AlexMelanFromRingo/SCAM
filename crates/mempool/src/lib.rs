@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use scam_core::{Hash256, OutPoint, Transaction};
 use thiserror::Error;
@@ -21,6 +21,37 @@ struct MempoolEntry {
     tx: Transaction,
     fee: u64,
     serialized_size: usize,
+}
+
+#[derive(Clone, Debug)]
+struct OrphanEntry {
+    tx: Transaction,
+    fee: u64,
+    missing_outpoints: HashSet<OutPoint>,
+    added_at: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReadyOrphanTx {
+    pub txid: Hash256,
+    pub tx: Transaction,
+    pub fee: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OrphanInsertOutcome {
+    Accepted { txid: Hash256 },
+    AlreadyPresent { txid: Hash256 },
+    AcceptedWithEviction { inserted: Hash256, evicted: Hash256 },
+}
+
+#[derive(Clone, Debug)]
+pub struct OrphanPool {
+    max_txs: usize,
+    ttl_secs: u64,
+    entries: HashMap<Hash256, OrphanEntry>,
+    by_missing_outpoint: HashMap<OutPoint, HashSet<Hash256>>,
+    insertion_order: VecDeque<Hash256>,
 }
 
 impl Mempool {
@@ -316,6 +347,161 @@ impl Mempool {
     }
 }
 
+impl OrphanPool {
+    pub fn new(max_txs: usize, ttl_secs: u64) -> Result<Self, MempoolError> {
+        if max_txs == 0 {
+            return Err(MempoolError::InvalidLimit(
+                "orphan pool max_txs must be greater than 0".to_owned(),
+            ));
+        }
+        if ttl_secs == 0 {
+            return Err(MempoolError::InvalidLimit(
+                "orphan pool ttl_secs must be greater than 0".to_owned(),
+            ));
+        }
+        Ok(Self {
+            max_txs,
+            ttl_secs,
+            entries: HashMap::new(),
+            by_missing_outpoint: HashMap::new(),
+            insertion_order: VecDeque::new(),
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn contains(&self, txid: &Hash256) -> bool {
+        self.entries.contains_key(txid)
+    }
+
+    pub fn insert(
+        &mut self,
+        tx: Transaction,
+        fee: u64,
+        missing_outpoints: Vec<OutPoint>,
+        now_unix_sec: u64,
+    ) -> Result<OrphanInsertOutcome, MempoolError> {
+        let txid = tx.txid();
+        validate_transaction_for_mempool(&tx, txid)?;
+        if missing_outpoints.is_empty() {
+            return Err(MempoolError::OrphanMissingOutpoints { txid });
+        }
+
+        if self.entries.contains_key(&txid) {
+            return Ok(OrphanInsertOutcome::AlreadyPresent { txid });
+        }
+
+        let missing_set = missing_outpoints.into_iter().collect::<HashSet<_>>();
+        let mut evicted = None;
+        if self.entries.len() >= self.max_txs {
+            while let Some(oldest) = self.insertion_order.pop_front() {
+                if self.remove_entry(oldest).is_some() {
+                    evicted = Some(oldest);
+                    break;
+                }
+            }
+        }
+
+        self.entries.insert(
+            txid,
+            OrphanEntry {
+                tx,
+                fee,
+                missing_outpoints: missing_set.clone(),
+                added_at: now_unix_sec,
+            },
+        );
+        self.insertion_order.push_back(txid);
+        for outpoint in missing_set {
+            self.by_missing_outpoint
+                .entry(outpoint)
+                .or_default()
+                .insert(txid);
+        }
+
+        if let Some(evicted) = evicted {
+            return Ok(OrphanInsertOutcome::AcceptedWithEviction {
+                inserted: txid,
+                evicted,
+            });
+        }
+        Ok(OrphanInsertOutcome::Accepted { txid })
+    }
+
+    pub fn expire(&mut self, now_unix_sec: u64) -> usize {
+        let expired = self
+            .entries
+            .iter()
+            .filter_map(|(txid, entry)| {
+                let deadline = entry.added_at.saturating_add(self.ttl_secs);
+                if now_unix_sec >= deadline {
+                    Some(*txid)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        for txid in &expired {
+            self.remove_entry(*txid);
+        }
+        expired.len()
+    }
+
+    pub fn resolve_outpoint(&mut self, outpoint: &OutPoint) -> Vec<ReadyOrphanTx> {
+        let waiting = self
+            .by_missing_outpoint
+            .remove(outpoint)
+            .unwrap_or_default();
+        if waiting.is_empty() {
+            return Vec::new();
+        }
+
+        let mut ready_txids = Vec::<Hash256>::new();
+        for txid in waiting {
+            if let Some(entry) = self.entries.get_mut(&txid) {
+                entry.missing_outpoints.remove(outpoint);
+                if entry.missing_outpoints.is_empty() {
+                    ready_txids.push(txid);
+                }
+            }
+        }
+
+        let mut ready = Vec::<ReadyOrphanTx>::new();
+        for txid in ready_txids {
+            if let Some(entry) = self.remove_entry(txid) {
+                ready.push(ReadyOrphanTx {
+                    txid,
+                    tx: entry.tx,
+                    fee: entry.fee,
+                });
+            }
+        }
+        ready.sort_unstable_by(|a, b| a.txid.cmp(&b.txid));
+        ready
+    }
+
+    fn remove_entry(&mut self, txid: Hash256) -> Option<OrphanEntry> {
+        let entry = self.entries.remove(&txid)?;
+        for outpoint in &entry.missing_outpoints {
+            let mut should_remove_key = false;
+            if let Some(waiters) = self.by_missing_outpoint.get_mut(outpoint) {
+                waiters.remove(&txid);
+                should_remove_key = waiters.is_empty();
+            }
+            if should_remove_key {
+                self.by_missing_outpoint.remove(outpoint);
+            }
+        }
+        Some(entry)
+    }
+}
+
 fn validate_transaction_for_mempool(tx: &Transaction, txid: Hash256) -> Result<(), MempoolError> {
     if tx.is_coinbase() {
         return Err(MempoolError::CoinbaseNotAllowed { txid });
@@ -450,6 +636,8 @@ pub enum MempoolError {
     },
     #[error("transaction {txid} has zero-value output at index #{output_index}")]
     ZeroValueOutput { txid: Hash256, output_index: usize },
+    #[error("orphan transaction {txid} must include at least one missing outpoint")]
+    OrphanMissingOutpoints { txid: Hash256 },
     #[error("mempool full (limit={limit}), incoming txid={incoming}")]
     Full { limit: usize, incoming: Hash256 },
     #[error(
@@ -482,7 +670,7 @@ pub enum MempoolError {
 mod tests {
     use scam_core::{OutPoint, Transaction, TxIn, TxOut};
 
-    use crate::{InsertOutcome, Mempool, MempoolError};
+    use crate::{InsertOutcome, Mempool, MempoolError, OrphanInsertOutcome, OrphanPool};
 
     fn mk_tx(
         spends_txid: [u8; 32],
@@ -832,5 +1020,117 @@ mod tests {
                 prefix: 4
             } if got == txid
         ));
+    }
+
+    #[test]
+    fn orphan_pool_promotes_tx_when_all_dependencies_resolved() {
+        let mut pool = OrphanPool::new(10, 60).expect("pool");
+        let dep_a = OutPoint {
+            txid: scam_core::Hash256([91u8; 32]),
+            vout: 0,
+        };
+        let dep_b = OutPoint {
+            txid: scam_core::Hash256([92u8; 32]),
+            vout: 1,
+        };
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![
+                TxIn {
+                    prev_out: dep_a.clone(),
+                    signature: b"a".to_vec(),
+                    pubkey_compressed: vec![2u8; 33],
+                    sequence: 0,
+                },
+                TxIn {
+                    prev_out: dep_b.clone(),
+                    signature: b"b".to_vec(),
+                    pubkey_compressed: vec![3u8; 33],
+                    sequence: 0,
+                },
+            ],
+            outputs: vec![TxOut {
+                value: 1,
+                key_hash20: [4u8; 20],
+            }],
+            lock_time: 0,
+        };
+        let txid = tx.txid();
+        let insert = pool
+            .insert(tx, 7, vec![dep_a.clone(), dep_b.clone()], 100)
+            .expect("insert orphan");
+        assert!(matches!(insert, OrphanInsertOutcome::Accepted { txid: got } if got == txid));
+
+        let first = pool.resolve_outpoint(&dep_a);
+        assert!(first.is_empty(), "still missing one input");
+        assert!(pool.contains(&txid));
+
+        let second = pool.resolve_outpoint(&dep_b);
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].txid, txid);
+        assert_eq!(second[0].fee, 7);
+        assert!(pool.is_empty());
+    }
+
+    #[test]
+    fn orphan_pool_evicts_oldest_entry_when_full() {
+        let mut pool = OrphanPool::new(1, 60).expect("pool");
+        let dep_a = OutPoint {
+            txid: scam_core::Hash256([101u8; 32]),
+            vout: 0,
+        };
+        let dep_b = OutPoint {
+            txid: scam_core::Hash256([102u8; 32]),
+            vout: 0,
+        };
+        let tx_a = mk_tx([111u8; 32], 0, b"a", 1);
+        let tx_b = mk_tx([112u8; 32], 0, b"b", 2);
+        let tx_a_id = tx_a.txid();
+        let tx_b_id = tx_b.txid();
+
+        pool.insert(tx_a, 1, vec![dep_a], 10).expect("insert a");
+        let outcome = pool
+            .insert(tx_b, 1, vec![dep_b], 11)
+            .expect("insert b with eviction");
+        assert!(matches!(
+            outcome,
+            OrphanInsertOutcome::AcceptedWithEviction {
+                inserted,
+                evicted
+            } if inserted == tx_b_id && evicted == tx_a_id
+        ));
+        assert!(!pool.contains(&tx_a_id));
+        assert!(pool.contains(&tx_b_id));
+    }
+
+    #[test]
+    fn orphan_pool_expires_old_entries() {
+        let mut pool = OrphanPool::new(10, 5).expect("pool");
+        let dep = OutPoint {
+            txid: scam_core::Hash256([121u8; 32]),
+            vout: 0,
+        };
+        let tx = mk_tx([122u8; 32], 0, b"a", 1);
+        let txid = tx.txid();
+        pool.insert(tx, 1, vec![dep], 100).expect("insert");
+
+        let removed_before = pool.expire(104);
+        assert_eq!(removed_before, 0);
+        assert!(pool.contains(&txid));
+
+        let removed_after = pool.expire(105);
+        assert_eq!(removed_after, 1);
+        assert!(!pool.contains(&txid));
+    }
+
+    #[test]
+    fn orphan_pool_rejects_empty_missing_dependency_list() {
+        let mut pool = OrphanPool::new(10, 60).expect("pool");
+        let tx = mk_tx([131u8; 32], 0, b"a", 1);
+        let txid = tx.txid();
+        let err = pool
+            .insert(tx, 1, Vec::new(), 0)
+            .expect_err("must reject empty dependency list");
+        assert!(matches!(err, MempoolError::OrphanMissingOutpoints { txid: got } if got == txid));
     }
 }
