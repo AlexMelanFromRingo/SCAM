@@ -1,0 +1,38 @@
+[package]
+name = "scam-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bincode = "1.3"
+scam-core = { path = "../crates/core" }
+scam-p2p = { path = "../crates/p2p" }
+
+[[bin]]
+name = "wire_decode"
+path = "fuzz_targets/wire_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "block_decode"
+path = "fuzz_targets/block_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tx_decode"
+path = "fuzz_targets/tx_decode.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

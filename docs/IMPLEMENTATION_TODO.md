@@ -31,6 +31,8 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] Added miner `TemplateManager` cache/rebuild flow keyed by tip hash + mempool revision.
 - [x] Added mempool inventory delta API + gossip hook for replacement/eviction-style tx announcements.
 - [x] Added explicit mempool double-spend threat model document (`docs/MEMPOOL_THREAT_MODEL.md`).
+- [x] Added fuzzing harness package (`fuzz/`) with wire/block/tx decode targets.
+- [x] Added mutation testing runner baseline (`scripts/mutation-baseline.sh`) and testing strategy doc.
 - [x] Miner template + nonce search loop implemented (`mine-once` CLI).
 - [x] Chainstate snapshot save/load implemented.
 - [x] redb-backed snapshot persistence implemented (`snapshot save-genesis-db` / `snapshot show-db`).
@@ -264,8 +266,8 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] difficulty update every 20 blocks
 - [x] wallet mnemonic restore and deterministic addresses
 - [x] Property-based testing (`proptest`) for tx/utxo/serialization invariants. (`scam-core` hash/target invariants + `scam-consensus` tx/UTXO properties).
-- [ ] Fuzzing (`cargo-fuzz`) for wire codec, parser, and block/tx decode paths.
-- [ ] Mutation testing (tooling + baseline score gate).
+- [x] Fuzzing (`cargo-fuzz`) for wire codec, parser, and block/tx decode paths.
+- [x] Mutation testing (tooling + baseline score gate).
 - [ ] Soak test:
 - [ ] local devnet running for 24h with mining and tx flow.
 
