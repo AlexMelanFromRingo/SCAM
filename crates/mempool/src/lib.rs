@@ -12,6 +12,7 @@ pub struct Mempool {
     min_relay_fee_per_kb: u64,
     min_replacement_fee_delta: u64,
     max_replacement_descendants: usize,
+    revision: u64,
     txs: HashMap<Hash256, MempoolEntry>,
     spent_outpoints: HashMap<OutPoint, Hash256>,
 }
@@ -90,6 +91,7 @@ impl Mempool {
             min_relay_fee_per_kb,
             min_replacement_fee_delta,
             max_replacement_descendants,
+            revision: 0,
             txs: HashMap::new(),
             spent_outpoints: HashMap::new(),
         })
@@ -101,6 +103,10 @@ impl Mempool {
 
     pub fn is_empty(&self) -> bool {
         self.txs.is_empty()
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     pub fn get(&self, txid: &Hash256) -> Option<&Transaction> {
@@ -237,6 +243,7 @@ impl Mempool {
                 },
             );
             self.rebuild_spent_outpoints();
+            self.bump_revision();
             return Ok(InsertOutcome::Replaced {
                 inserted: txid,
                 removed,
@@ -268,6 +275,7 @@ impl Mempool {
                 },
             );
             self.rebuild_spent_outpoints();
+            self.bump_revision();
             return Ok(InsertOutcome::AcceptedWithEviction {
                 inserted: txid,
                 removed,
@@ -283,6 +291,7 @@ impl Mempool {
             },
         );
         self.rebuild_spent_outpoints();
+        self.bump_revision();
         Ok(InsertOutcome::Accepted { txid })
     }
 
@@ -344,6 +353,10 @@ impl Mempool {
                 self.spent_outpoints.insert(input.prev_out.clone(), *txid);
             }
         }
+    }
+
+    fn bump_revision(&mut self) {
+        self.revision = self.revision.saturating_add(1);
     }
 }
 
@@ -1132,5 +1145,41 @@ mod tests {
             .insert(tx, 1, Vec::new(), 0)
             .expect_err("must reject empty dependency list");
         assert!(matches!(err, MempoolError::OrphanMissingOutpoints { txid: got } if got == txid));
+    }
+
+    #[test]
+    fn mempool_revision_increments_only_on_state_change() {
+        let mut mempool = Mempool::with_policy_and_replacement(100, 0, 1, 25).expect("mempool");
+        let start = mempool.revision();
+        let tx_a = mk_tx([141u8; 32], 0, b"a", 1);
+        let tx_b = mk_tx([141u8; 32], 0, b"b", 2);
+
+        mempool.insert_with_fee(tx_a, 10).expect("insert a");
+        assert!(mempool.revision() > start);
+        let after_insert = mempool.revision();
+
+        // Already present -> no state change.
+        let existing = mempool
+            .insert_with_fee(mk_tx([141u8; 32], 0, b"a", 1), 10)
+            .expect("already present");
+        assert!(matches!(existing, InsertOutcome::AlreadyPresent { .. }));
+        assert_eq!(mempool.revision(), after_insert);
+
+        // Rejected replacement (lower fee) -> no state change.
+        let rejected = mempool
+            .insert_with_fee(tx_b.clone(), 5)
+            .expect("replacement check");
+        assert!(matches!(
+            rejected,
+            InsertOutcome::RejectedConflictInsufficientFeerate { .. }
+        ));
+        assert_eq!(mempool.revision(), after_insert);
+
+        // Accepted replacement -> revision bump.
+        let replaced = mempool
+            .insert_with_fee(tx_b, 100)
+            .expect("replacement accepted");
+        assert!(matches!(replaced, InsertOutcome::Replaced { .. }));
+        assert!(mempool.revision() > after_insert);
     }
 }

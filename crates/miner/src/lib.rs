@@ -6,7 +6,7 @@ use scam_core::{
 use scam_mempool::Mempool;
 use thiserror::Error;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BlockTemplate {
     pub version: u32,
     pub prev_block: Hash256,
@@ -37,6 +37,25 @@ pub struct TemplateBuildSummary {
 pub struct MinedBlock {
     pub block: Block,
     pub extra_nonce: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TemplateRefresh {
+    Rebuilt,
+    Cached,
+}
+
+#[derive(Default)]
+pub struct TemplateManager {
+    cached: Option<CachedTemplate>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CachedTemplate {
+    tip_hash: Hash256,
+    mempool_revision: u64,
+    template: BlockTemplate,
+    summary: TemplateBuildSummary,
 }
 
 impl BlockTemplate {
@@ -153,6 +172,44 @@ pub fn build_template_from_mempool(
     Ok((template, summary))
 }
 
+impl TemplateManager {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn build_or_reuse(
+        &mut self,
+        params: &MempoolTemplateParams,
+        mempool: &Mempool,
+    ) -> Result<(TemplateRefresh, BlockTemplate, TemplateBuildSummary), MinerError> {
+        let tip_hash = params.prev_block;
+        let mempool_revision = mempool.revision();
+        if let Some(cached) = &self.cached
+            && cached.tip_hash == tip_hash
+            && cached.mempool_revision == mempool_revision
+        {
+            return Ok((
+                TemplateRefresh::Cached,
+                cached.template.clone(),
+                cached.summary.clone(),
+            ));
+        }
+
+        let (template, summary) = build_template_from_mempool(params, mempool)?;
+        self.cached = Some(CachedTemplate {
+            tip_hash,
+            mempool_revision,
+            template: template.clone(),
+            summary: summary.clone(),
+        });
+        Ok((TemplateRefresh::Rebuilt, template, summary))
+    }
+
+    pub fn invalidate(&mut self) {
+        self.cached = None;
+    }
+}
+
 fn build_coinbase_tx(tag: &str, value: u64, key_hash20: [u8; 20]) -> Transaction {
     Transaction {
         version: 1,
@@ -217,8 +274,9 @@ mod tests {
     use scam_mempool::Mempool;
 
     use crate::{
-        BlockTemplate, MempoolTemplateParams, build_template_from_mempool, mine_block,
-        mine_block_with_extra_nonce, template_with_extra_nonce,
+        BlockTemplate, MempoolTemplateParams, TemplateManager, TemplateRefresh,
+        build_template_from_mempool, mine_block, mine_block_with_extra_nonce,
+        template_with_extra_nonce,
     };
 
     fn coinbase() -> Transaction {
@@ -372,5 +430,51 @@ mod tests {
         let mined = mine_block_with_extra_nonce(&template, 0, 10).expect("extra nonce mining");
         assert_eq!(legacy.header.block_hash(), mined.block.header.block_hash());
         assert_eq!(mined.extra_nonce, 0);
+    }
+
+    #[test]
+    fn template_manager_rebuilds_on_tip_or_mempool_change() {
+        let mut mempool = Mempool::with_policy(100, 0).expect("mempool");
+        let tx_low = spend_tx([31u8; 32], 0, b"same-size-a", 1);
+        let tx_high = spend_tx([32u8; 32], 0, b"same-size-b", 2);
+        mempool.insert_with_fee(tx_low, 10).expect("insert low");
+
+        let mut manager = TemplateManager::new();
+        let params = MempoolTemplateParams {
+            version: 1,
+            prev_block: scam_core::Hash256::ZERO,
+            timestamp: 1_770_763_200,
+            target: Target::MAX,
+            block_subsidy: 50,
+            miner_key_hash20: [5u8; 20],
+            coinbase_tag: "mgr".to_owned(),
+            max_txs: 100,
+        };
+
+        let (refresh_a, _template_a, summary_a) = manager
+            .build_or_reuse(&params, &mempool)
+            .expect("first build");
+        assert_eq!(refresh_a, TemplateRefresh::Rebuilt);
+        assert_eq!(summary_a.included_txids.len(), 1);
+
+        let (refresh_b, _template_b, summary_b) = manager
+            .build_or_reuse(&params, &mempool)
+            .expect("second build");
+        assert_eq!(refresh_b, TemplateRefresh::Cached);
+        assert_eq!(summary_b.included_txids.len(), 1);
+
+        mempool.insert_with_fee(tx_high, 50).expect("insert high");
+        let (refresh_c, _template_c, summary_c) = manager
+            .build_or_reuse(&params, &mempool)
+            .expect("rebuild on mempool change");
+        assert_eq!(refresh_c, TemplateRefresh::Rebuilt);
+        assert_eq!(summary_c.included_txids.len(), 2);
+
+        let mut next_tip_params = params.clone();
+        next_tip_params.prev_block = scam_core::hash::hash256(b"new-tip");
+        let (refresh_d, _template_d, _summary_d) = manager
+            .build_or_reuse(&next_tip_params, &mempool)
+            .expect("rebuild on tip change");
+        assert_eq!(refresh_d, TemplateRefresh::Rebuilt);
     }
 }

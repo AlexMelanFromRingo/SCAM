@@ -28,6 +28,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] Added `node reindex-runtime` command to replay persisted block archive and rebuild runtime DB.
 - [x] Added redb-backed optional mempool snapshot persistence API with validation tests.
 - [x] Added peer discovery hardening baseline (outbound diversity + rotation candidate selector in `scam-p2p`).
+- [x] Added miner `TemplateManager` cache/rebuild flow keyed by tip hash + mempool revision.
 - [x] Miner template + nonce search loop implemented (`mine-once` CLI).
 - [x] Chainstate snapshot save/load implemented.
 - [x] redb-backed snapshot persistence implemented (`snapshot save-genesis-db` / `snapshot show-db`).
@@ -223,7 +224,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] Insert coinbase with fixed subsidy + collected fees.
 - [x] Implement nonce search loop.
 - [x] Add extra nonce in coinbase to extend search space.
-- [ ] Rebuild template on new best block or mempool updates.
+- [x] Rebuild template on new best block or mempool updates.
 - [x] Add CPU miner mode for devnet/testnet.
 
 ## 15) Node and RPC TODO
