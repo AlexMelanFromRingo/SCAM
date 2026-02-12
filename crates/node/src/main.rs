@@ -65,6 +65,7 @@ enum Command {
     SyncDemo(SyncDemoArgs),
     NetDemo(NetDemoArgs),
     SyncPeer(SyncPeerArgs),
+    ReindexRuntime(ReindexRuntimeArgs),
     ReorgDemo(ReorgDemoArgs),
     RpcServe(RpcServeArgs),
     Snapshot(SnapshotArgs),
@@ -227,6 +228,16 @@ struct SyncPeerArgs {
     peer: String,
     #[arg(long, default_value_t = 16)]
     max_batches: u32,
+}
+
+#[derive(Debug, Args)]
+struct ReindexRuntimeArgs {
+    #[arg(long, value_enum, default_value_t = Network::Devnet)]
+    network: Network,
+    #[arg(long)]
+    config: Option<PathBuf>,
+    #[arg(long)]
+    runtime_db: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -2266,6 +2277,43 @@ fn run_sync_peer(args: SyncPeerArgs) -> Result<(), NodeError> {
     Ok(())
 }
 
+fn run_reindex_runtime(args: ReindexRuntimeArgs) -> Result<(), NodeError> {
+    let config_path = args
+        .config
+        .unwrap_or_else(|| PathBuf::from(format!("config/{}.toml", args.network.as_str())));
+    let cfg = load_chain_config(&config_path)?;
+    let runtime_db_path = args
+        .runtime_db
+        .unwrap_or_else(|| default_runtime_db_path(args.network));
+
+    if !runtime_db_path.exists() {
+        return Err(NodeError::Runtime(format!(
+            "runtime db does not exist: {}",
+            runtime_db_path.display()
+        )));
+    }
+
+    let archive = load_chain_archive_db(&runtime_db_path)?;
+    if archive.network_id != cfg.network_id {
+        return Err(NodeError::Runtime(format!(
+            "runtime db network mismatch: db='{}', config='{}'",
+            archive.network_id, cfg.network_id
+        )));
+    }
+
+    let runtime = ChainRuntime::from_ordered_blocks(cfg.clone(), archive.blocks_by_height)?;
+    persist_runtime_db(&runtime, &runtime_db_path)?;
+
+    println!("Runtime reindex complete");
+    println!("Network: {}", cfg.network_id);
+    println!("Config: {}", config_path.display());
+    println!("Runtime DB: {}", runtime_db_path.display());
+    println!("Tip height: {}", runtime.tip_height());
+    println!("Tip hash: {}", runtime.tip_hash());
+    println!("UTXO count: {}", runtime.utxo_len());
+    Ok(())
+}
+
 fn run_reorg_demo(args: ReorgDemoArgs) -> Result<(), NodeError> {
     let config_path = args
         .config
@@ -2595,6 +2643,7 @@ fn run() -> Result<(), NodeError> {
         Some(Command::SyncDemo(args)) => run_sync_demo(args),
         Some(Command::NetDemo(args)) => run_net_demo(args),
         Some(Command::SyncPeer(args)) => run_sync_peer(args),
+        Some(Command::ReindexRuntime(args)) => run_reindex_runtime(args),
         Some(Command::ReorgDemo(args)) => run_reorg_demo(args),
         Some(Command::RpcServe(args)) => run_rpc_serve(args),
         Some(Command::Snapshot(args)) => run_snapshot(args.command),
@@ -2616,12 +2665,15 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use scam_chain::ChainRuntime;
     use scam_core::{Hash256, OutPoint};
-    use scam_storage::load_peer_book_db;
+    use scam_miner::{BlockTemplate, mine_block};
+    use scam_storage::{load_chain_archive_db, load_peer_book_db};
 
     use super::{
-        AddPeerArgs, Network, SpendableUtxo, accepted_hrps_for_network, run_add_peer,
-        select_utxos_for_amount,
+        AddPeerArgs, Network, ReindexRuntimeArgs, SpendableUtxo, accepted_hrps_for_network,
+        build_coinbase_tx, load_chain_config, persist_runtime_db, run_add_peer,
+        run_reindex_runtime, select_utxos_for_amount,
     };
 
     fn utxo(seed: u8, value: u64) -> SpendableUtxo {
@@ -2746,5 +2798,48 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(peers_dir);
+    }
+
+    #[test]
+    fn reindex_runtime_rebuilds_archive_from_blocks() {
+        let work_dir = temp_dir("test-reindex-runtime");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+
+        let config_path = work_dir.join("devnet.toml");
+        fs::write(&config_path, include_str!("../../../config/devnet.toml")).expect("write config");
+        let cfg = load_chain_config(&config_path).expect("load config");
+        let runtime_db_path = work_dir.join("runtime.redb");
+
+        let mut runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let template = BlockTemplate {
+            version: 1,
+            prev_block: runtime.tip_hash(),
+            timestamp: runtime
+                .tip_header()
+                .timestamp
+                .saturating_add(cfg.target_block_time_sec),
+            target: runtime.expected_target_for_next_block().expect("target"),
+            transactions: vec![build_coinbase_tx(
+                "reindex-test".to_owned(),
+                cfg.block_subsidy,
+                cfg.genesis_reward_key_hash20().expect("key hash"),
+            )],
+        };
+        let block = mine_block(&template, 500_000).expect("mine block");
+        runtime.apply_next_block(block).expect("apply block");
+        persist_runtime_db(&runtime, &runtime_db_path).expect("persist runtime");
+
+        run_reindex_runtime(ReindexRuntimeArgs {
+            network: Network::Devnet,
+            config: Some(config_path.clone()),
+            runtime_db: Some(runtime_db_path.clone()),
+        })
+        .expect("reindex runtime");
+
+        let archive = load_chain_archive_db(&runtime_db_path).expect("load archive");
+        assert_eq!(archive.network_id, "devnet");
+        assert_eq!(archive.blocks_by_height.len(), 2);
+
+        let _ = fs::remove_dir_all(work_dir);
     }
 }
