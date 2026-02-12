@@ -63,6 +63,7 @@ enum Command {
     ChainDemo(ChainDemoArgs),
     SyncDemo(SyncDemoArgs),
     NetDemo(NetDemoArgs),
+    SyncPeer(SyncPeerArgs),
     ReorgDemo(ReorgDemoArgs),
     RpcServe(RpcServeArgs),
     Snapshot(SnapshotArgs),
@@ -211,6 +212,20 @@ struct NetDemoArgs {
     interval_sec: u64,
     #[arg(long, default_value_t = 500_000)]
     max_nonce: u64,
+}
+
+#[derive(Debug, Args)]
+struct SyncPeerArgs {
+    #[arg(long, value_enum, default_value_t = Network::Devnet)]
+    network: Network,
+    #[arg(long)]
+    config: Option<PathBuf>,
+    #[arg(long)]
+    runtime_db: Option<PathBuf>,
+    #[arg(long)]
+    peer: String,
+    #[arg(long, default_value_t = 16)]
+    max_batches: u32,
 }
 
 #[derive(Debug, Args)]
@@ -601,6 +616,33 @@ fn runtime_to_archive(runtime: &ChainRuntime) -> Result<ChainArchive, NodeError>
     })
 }
 
+fn load_runtime_from_db_or_genesis(
+    cfg: &ChainConfig,
+    runtime_db_path: &Path,
+) -> Result<(ChainRuntime, &'static str), NodeError> {
+    if runtime_db_path.exists() {
+        let archive = load_chain_archive_db(runtime_db_path)?;
+        if archive.network_id != cfg.network_id {
+            return Err(NodeError::Runtime(format!(
+                "runtime db network mismatch: db='{}', config='{}'",
+                archive.network_id, cfg.network_id
+            )));
+        }
+        Ok((
+            ChainRuntime::from_ordered_blocks(cfg.clone(), archive.blocks_by_height)?,
+            "db",
+        ))
+    } else {
+        Ok((ChainRuntime::from_config(cfg.clone())?, "genesis"))
+    }
+}
+
+fn persist_runtime_db(runtime: &ChainRuntime, runtime_db_path: &Path) -> Result<(), NodeError> {
+    let archive = runtime_to_archive(runtime)?;
+    save_chain_archive_db(runtime_db_path, &archive)?;
+    Ok(())
+}
+
 fn run_node(
     network: Network,
     config: Option<PathBuf>,
@@ -611,24 +653,8 @@ fn run_node(
         config.unwrap_or_else(|| PathBuf::from(format!("config/{}.toml", network.as_str())));
     let cfg = load_chain_config(&config_path)?;
     let runtime_db_path = runtime_db.unwrap_or_else(|| default_runtime_db_path(network));
-
-    let (runtime, source) = if runtime_db_path.exists() {
-        let archive = load_chain_archive_db(&runtime_db_path)?;
-        if archive.network_id != cfg.network_id {
-            return Err(NodeError::Runtime(format!(
-                "runtime db network mismatch: db='{}', config='{}'",
-                archive.network_id, cfg.network_id
-            )));
-        }
-        (
-            ChainRuntime::from_ordered_blocks(cfg.clone(), archive.blocks_by_height)?,
-            "db",
-        )
-    } else {
-        (ChainRuntime::from_config(cfg.clone())?, "genesis")
-    };
-    let archive = runtime_to_archive(&runtime)?;
-    save_chain_archive_db(&runtime_db_path, &archive)?;
+    let (runtime, source) = load_runtime_from_db_or_genesis(&cfg, &runtime_db_path)?;
+    persist_runtime_db(&runtime, &runtime_db_path)?;
     let genesis_hash = cfg.build_genesis_block()?.header.block_hash();
 
     println!("Project: SCAM (Smart Computing Alternative Money)");
@@ -2028,6 +2054,125 @@ fn run_net_demo(args: NetDemoArgs) -> Result<(), NodeError> {
     Ok(())
 }
 
+fn run_sync_peer(args: SyncPeerArgs) -> Result<(), NodeError> {
+    let config_path = args
+        .config
+        .unwrap_or_else(|| PathBuf::from(format!("config/{}.toml", args.network.as_str())));
+    let cfg = load_chain_config(&config_path)?;
+    let runtime_db_path = args
+        .runtime_db
+        .unwrap_or_else(|| default_runtime_db_path(args.network));
+    let (mut runtime, source) = load_runtime_from_db_or_genesis(&cfg, &runtime_db_path)?;
+    let start_height = runtime.tip_height();
+    let start_hash = runtime.tip_hash();
+
+    let mut stream = TcpStream::connect(&args.peer)
+        .map_err(|e| NodeError::Runtime(format!("connect to {} failed: {e}", args.peer)))?;
+    configure_stream_timeouts(&stream)?;
+    let framing = FramingConfig::default();
+    let local_hello = LocalHandshake {
+        protocol_version: 1,
+        network_id: cfg.network_id.clone(),
+        user_agent: "scam-node/sync-peer".to_owned(),
+        start_height: runtime.tip_height(),
+    };
+    let remote = client_handshake(&mut stream, &framing, &local_hello)?;
+    if remote.network_id != cfg.network_id {
+        return Err(NodeError::Runtime(format!(
+            "network mismatch from peer: expected {}, got {}",
+            cfg.network_id, remote.network_id
+        )));
+    }
+
+    let mut total_headers = 0usize;
+    let mut total_announced_blocks = 0usize;
+    let mut total_downloaded = 0usize;
+    let mut total_applied = 0usize;
+    for _ in 0..args.max_batches {
+        let locator = build_block_locator(runtime.block_hashes());
+        let headers = request_headers(&mut stream, &framing, locator.clone(), None)?;
+        if headers.is_empty() {
+            break;
+        }
+        total_headers = total_headers.saturating_add(headers.len());
+
+        let announced = request_blocks(&mut stream, &framing, locator, None)?;
+        if announced.is_empty() {
+            break;
+        }
+        total_announced_blocks = total_announced_blocks.saturating_add(announced.len());
+        let unknown_hashes = announced
+            .iter()
+            .copied()
+            .filter(|hash| runtime.block_by_hash(hash).is_none())
+            .collect::<Vec<_>>();
+        if unknown_hashes.is_empty() {
+            break;
+        }
+
+        let items = unknown_hashes
+            .iter()
+            .copied()
+            .map(InventoryItem::Block)
+            .collect::<Vec<_>>();
+        send_message(&mut stream, &WireMessage::GetData { items }, &framing)?;
+
+        for expected_hash in unknown_hashes {
+            let response = read_message(&mut stream, &framing)?;
+            match response {
+                WireMessage::Block { block } => {
+                    let got_hash = block.header.block_hash();
+                    if got_hash != expected_hash {
+                        return Err(NodeError::Runtime(format!(
+                            "unexpected block from peer: expected {}, got {}",
+                            expected_hash, got_hash
+                        )));
+                    }
+                    total_downloaded = total_downloaded.saturating_add(1);
+                    let outcome = runtime.submit_block(block)?;
+                    if matches!(
+                        outcome,
+                        BlockSubmissionOutcome::ExtendedTip { .. }
+                            | BlockSubmissionOutcome::Reorged { .. }
+                    ) {
+                        total_applied = total_applied.saturating_add(1);
+                    }
+                }
+                WireMessage::NotFound { items } => {
+                    return Err(NodeError::Runtime(format!(
+                        "peer missing requested block {} ({items:?})",
+                        expected_hash
+                    )));
+                }
+                other => {
+                    return Err(NodeError::Runtime(format!(
+                        "unexpected message while syncing {}: {other:?}",
+                        expected_hash
+                    )));
+                }
+            }
+        }
+    }
+    persist_runtime_db(&runtime, &runtime_db_path)?;
+
+    println!("Sync peer result:");
+    println!("Peer: {}", args.peer);
+    println!("Config: {}", config_path.display());
+    println!("Runtime DB: {}", runtime_db_path.display());
+    println!("Runtime source: {}", source);
+    println!("Start tip: h={} hash={}", start_height, start_hash);
+    println!(
+        "End tip: h={} hash={}",
+        runtime.tip_height(),
+        runtime.tip_hash()
+    );
+    println!("Headers received: {}", total_headers);
+    println!("Blocks announced: {}", total_announced_blocks);
+    println!("Blocks downloaded: {}", total_downloaded);
+    println!("Blocks applied: {}", total_applied);
+    Ok(())
+}
+
 fn run_reorg_demo(args: ReorgDemoArgs) -> Result<(), NodeError> {
     let config_path = args
         .config
@@ -2356,6 +2501,7 @@ fn run() -> Result<(), NodeError> {
         Some(Command::ChainDemo(args)) => run_chain_demo(args),
         Some(Command::SyncDemo(args)) => run_sync_demo(args),
         Some(Command::NetDemo(args)) => run_net_demo(args),
+        Some(Command::SyncPeer(args)) => run_sync_peer(args),
         Some(Command::ReorgDemo(args)) => run_reorg_demo(args),
         Some(Command::RpcServe(args)) => run_rpc_serve(args),
         Some(Command::Snapshot(args)) => run_snapshot(args.command),

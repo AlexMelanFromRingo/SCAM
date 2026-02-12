@@ -18,6 +18,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] P2P wire messages + gossip dedup engine (`inv/getdata/tx/block`) implemented.
 - [x] P2P TCP transport framing + `version/verack` handshake + `ping/pong` + `getheaders/headers` demo implemented.
 - [x] Net demo upgraded to perform `getdata` block download and apply downloaded blocks to local runtime.
+- [x] Added one-shot socketed sync command `sync-peer` (headers -> inv -> getdata -> block validation -> DB persistence).
 - [x] Property-based tests baseline added with `proptest` (hash/target invariants in `scam-core`).
 - [x] Miner template + nonce search loop implemented (`mine-once` CLI).
 - [x] Chainstate snapshot save/load implemented.
@@ -25,7 +26,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] redb chain archive persistence implemented (`blocks/headers/block-index`) with runtime restore path in `node run`.
 - [x] Reorg-safe best-chain selection by cumulative work implemented in chain runtime.
 - [x] Minimal HTTP JSON RPC transport implemented (`scam-node rpc-serve`).
-- [ ] Remaining major items: socketed p2p sync runtime beyond demo mode, crash-consistent DB-backed node runtime, stronger test matrix.
+- [ ] Remaining major items: crash-consistent DB-backed node runtime hardening and stronger test matrix.
 
 ## 1) Frozen Design Decisions
 
@@ -205,7 +206,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] Implement headers-first sync for new nodes.
 - [x] Implement peer scoring and ban for invalid data spam.
 - [x] Add rate limits and max message size guards.
-- [ ] Implement real socketed sync runtime (IBD): headers pipeline -> block inventory/download -> validation -> persistence.
+- [x] Implement real socketed sync runtime (IBD): headers pipeline -> block inventory/download -> validation -> persistence.
 - [ ] Add peer discovery hardening: outbound diversity, rotation, and basic eclipse-risk mitigation.
 
 ## 14) Mining TODO
@@ -225,6 +226,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] `node add-peer <addr>`
 - [x] `node get-block <hash>`
 - [x] `node get-tx <txid>`
+- [x] `node sync-peer --peer <addr>`
 - [x] Wallet CLI:
 - [x] `wallet new`
 - [x] `wallet restore`
