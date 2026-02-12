@@ -26,8 +26,9 @@ use scam_storage::{
 };
 use scam_wallet::{
     AddressError, DeriveKeyError, MnemonicError, QrError, SchnorrError, WalletMnemonic,
-    derive_wallet_key, new_mnemonic, parse_address, qr_for_payment_uri, sign_digest, to_address,
-    verify_digest,
+    WalletVaultError, decrypt_wallet_vault, derive_wallet_key, load_wallet_vault,
+    new_encrypted_wallet_vault, new_mnemonic, parse_address, qr_for_payment_uri, save_wallet_vault,
+    sign_digest, to_address, verify_digest,
 };
 use thiserror::Error;
 
@@ -318,6 +319,50 @@ enum WalletCommand {
         #[arg(long, default_value = "sd")]
         hrp: String,
     },
+    SecureNew {
+        #[arg(long, default_value_t = 12)]
+        words: usize,
+        #[arg(long, default_value = "")]
+        passphrase: String,
+        #[arg(long)]
+        password: String,
+        #[arg(long, default_value = "data/wallets/default.vault.json")]
+        out: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        account: u32,
+        #[arg(long, default_value_t = 0)]
+        index: u32,
+        #[arg(long, default_value = "sd")]
+        hrp: String,
+    },
+    SecureRestore {
+        #[arg(long)]
+        mnemonic: String,
+        #[arg(long, default_value = "")]
+        passphrase: String,
+        #[arg(long)]
+        password: String,
+        #[arg(long, default_value = "data/wallets/default.vault.json")]
+        out: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        account: u32,
+        #[arg(long, default_value_t = 0)]
+        index: u32,
+        #[arg(long, default_value = "sd")]
+        hrp: String,
+    },
+    SecureAddress {
+        #[arg(long)]
+        wallet: PathBuf,
+        #[arg(long)]
+        password: String,
+        #[arg(long, default_value_t = 0)]
+        account: u32,
+        #[arg(long, default_value_t = 0)]
+        index: u32,
+        #[arg(long, default_value = "sd")]
+        hrp: String,
+    },
     Balance {
         #[arg(long, value_enum, default_value_t = Network::Devnet)]
         network: Network,
@@ -464,6 +509,8 @@ enum NodeError {
     Schnorr(#[from] SchnorrError),
     #[error("qr error: {0}")]
     Qr(#[from] QrError),
+    #[error("wallet vault error: {0}")]
+    Vault(#[from] WalletVaultError),
     #[error("invalid hex in {field}: {source}")]
     InvalidHex {
         field: &'static str,
@@ -763,6 +810,28 @@ fn run_wallet(command: WalletCommand) -> Result<(), NodeError> {
         Ok(())
     }
 
+    fn derive_and_print_address_from_vault(
+        wallet_path: &Path,
+        password: &str,
+        account: u32,
+        index: u32,
+        hrp: &str,
+    ) -> Result<(), NodeError> {
+        let vault = load_wallet_vault(wallet_path)?;
+        let secret = decrypt_wallet_vault(&vault, password)?;
+        let seed = secret.mnemonic.to_seed(&secret.bip39_passphrase);
+        let key = derive_wallet_key(&seed, account, index)?;
+        let address = to_address(hrp, key.pubkey_compressed())?;
+
+        println!("Wallet file: {}", wallet_path.display());
+        println!(
+            "PubKey (compressed): {}",
+            hex::encode(key.pubkey_compressed())
+        );
+        println!("Address: {address}");
+        Ok(())
+    }
+
     match command {
         WalletCommand::New {
             words,
@@ -797,6 +866,63 @@ fn run_wallet(command: WalletCommand) -> Result<(), NodeError> {
             index,
             hrp,
         } => derive_and_print_address(&mnemonic, &passphrase, account, index, &hrp)?,
+        WalletCommand::SecureNew {
+            words,
+            passphrase,
+            password,
+            out,
+            account,
+            index,
+            hrp,
+        } => {
+            let mnemonic = new_mnemonic(words)?;
+            let vault = new_encrypted_wallet_vault(mnemonic.phrase(), &passphrase, &password)?;
+            save_wallet_vault(&out, &vault)?;
+
+            let seed = mnemonic.to_seed(&passphrase);
+            let key = derive_wallet_key(&seed, account, index)?;
+            let address = to_address(&hrp, key.pubkey_compressed())?;
+
+            println!("Mnemonic (backup this offline): {}", mnemonic.phrase());
+            println!("Wallet file: {}", out.display());
+            println!(
+                "PubKey (compressed): {}",
+                hex::encode(key.pubkey_compressed())
+            );
+            println!("Address: {address}");
+        }
+        WalletCommand::SecureRestore {
+            mnemonic,
+            passphrase,
+            password,
+            out,
+            account,
+            index,
+            hrp,
+        } => {
+            let parsed = WalletMnemonic::parse(&mnemonic)?;
+            let vault = new_encrypted_wallet_vault(parsed.phrase(), &passphrase, &password)?;
+            save_wallet_vault(&out, &vault)?;
+
+            let seed = parsed.to_seed(&passphrase);
+            let key = derive_wallet_key(&seed, account, index)?;
+            let address = to_address(&hrp, key.pubkey_compressed())?;
+
+            println!("Wallet restored and encrypted at rest.");
+            println!("Wallet file: {}", out.display());
+            println!(
+                "PubKey (compressed): {}",
+                hex::encode(key.pubkey_compressed())
+            );
+            println!("Address: {address}");
+        }
+        WalletCommand::SecureAddress {
+            wallet,
+            password,
+            account,
+            index,
+            hrp,
+        } => derive_and_print_address_from_vault(&wallet, &password, account, index, &hrp)?,
         WalletCommand::Balance {
             network,
             config,
