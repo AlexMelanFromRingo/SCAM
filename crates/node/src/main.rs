@@ -26,7 +26,7 @@ use scam_storage::{
     save_chain_archive_db, save_peer_book_db, save_snapshot, save_snapshot_db,
 };
 use scam_wallet::{
-    AddressError, DeriveKeyError, MnemonicError, QrError, RescanError, SchnorrError,
+    AddressError, DeriveKeyError, MnemonicError, QrError, RescanError, SchnorrError, WalletKey,
     WalletMnemonic, WalletVaultError, decrypt_wallet_vault, derive_wallet_key, derive_watched_keys,
     load_wallet_vault, new_encrypted_wallet_vault, new_mnemonic, parse_address, qr_for_payment_uri,
     rescan_blocks, save_wallet_vault, sign_digest, to_address, verify_digest,
@@ -259,6 +259,14 @@ struct SoakArgs {
     max_nonce: u64,
     #[arg(long, default_value_t = 10)]
     persist_every_rounds: u32,
+    #[arg(long, default_value_t = 0)]
+    txs_per_round: u32,
+    #[arg(long, default_value_t = 1_000)]
+    tx_amount: u64,
+    #[arg(long, default_value_t = 1)]
+    tx_fee: u64,
+    #[arg(long, default_value_t = 0)]
+    sleep_per_round_sec: u64,
 }
 
 #[derive(Debug, Args)]
@@ -620,6 +628,10 @@ enum NodeError {
         expected: usize,
         got: usize,
     },
+    #[error(
+        "insufficient spendable funds for amount+fee={needed} (spendable total: {spendable_total})"
+    )]
+    InsufficientFunds { needed: u64, spendable_total: u128 },
     #[error("{0}")]
     Runtime(String),
 }
@@ -1298,104 +1310,35 @@ fn run_wallet(command: WalletCommand) -> Result<(), NodeError> {
                     accepted_hrps.join(", ")
                 )));
             }
-            let needed = amount
-                .checked_add(fee)
-                .ok_or_else(|| NodeError::Runtime("amount + fee overflow".to_owned()))?;
 
             let mnemonic = WalletMnemonic::parse(&mnemonic)?;
             let seed = mnemonic.to_seed(&passphrase);
             let key = derive_wallet_key(&seed, account, index)?;
-            let sender_pubkey = key.pubkey_compressed();
-            let sender_key_hash20 = key_hash20_from_pubkey(sender_pubkey);
-            let is_self_transfer = recipient.key_hash20 == sender_key_hash20;
-
-            let tip_height = runtime.tip_height();
-            let coinbase_maturity = runtime.config().coinbase_maturity as u64;
-            let mut spendable = Vec::<SpendableUtxo>::new();
-            let mut spendable_total = 0u128;
-            for (outpoint, utxo) in runtime.utxo_set() {
-                if utxo.key_hash20 != sender_key_hash20 {
-                    continue;
-                }
-                let is_immature_coinbase = utxo.is_coinbase
-                    && tip_height < utxo.created_height.saturating_add(coinbase_maturity);
-                if is_immature_coinbase {
-                    continue;
-                }
-                spendable_total = spendable_total.saturating_add(utxo.value as u128);
-                spendable.push(SpendableUtxo {
-                    outpoint: outpoint.clone(),
-                    value: utxo.value,
-                });
-            }
-
-            let (selected, selected_total) = select_utxos_for_amount(&spendable, needed)
-                .ok_or_else(|| {
-                    NodeError::Runtime(format!(
-                        "insufficient spendable funds for amount+fee={} (spendable total: {})",
-                        needed, spendable_total
-                    ))
-                })?;
-            let change_value = selected_total.checked_sub(needed).ok_or_else(|| {
-                NodeError::Runtime("selected UTXO is smaller than needed".to_owned())
-            })?;
-
-            let mut tx = Transaction {
-                version: 1,
-                inputs: selected
-                    .iter()
-                    .map(|utxo| TxIn {
-                        prev_out: utxo.outpoint.clone(),
-                        signature: vec![],
-                        pubkey_compressed: sender_pubkey.to_vec(),
-                        sequence: 0,
-                    })
-                    .collect(),
-                outputs: vec![TxOut {
-                    value: amount,
-                    key_hash20: recipient.key_hash20,
-                }],
-                lock_time: 0,
-            };
-            if change_value > 0 {
-                tx.outputs.push(TxOut {
-                    value: change_value,
-                    key_hash20: sender_key_hash20,
-                });
-            }
-
-            for input_index in 0..tx.inputs.len() {
-                let digest = tx
-                    .signing_digest_with_chain_domain(input_index, cfg.network_id.as_bytes())
-                    .map_err(|e| NodeError::Runtime(format!("signing digest failed: {e}")))?;
-                let signature = sign_digest(&key, digest.0)?;
-                tx.inputs[input_index].signature = signature.to_vec();
-
-                let sig_ok = verify_digest(digest.0, signature, sender_pubkey)?;
-                if !sig_ok {
-                    return Err(NodeError::Runtime(format!(
-                        "internal signature self-check failed for input #{}",
-                        input_index
-                    )));
-                }
-            }
+            let signed = build_signed_transfer_tx(
+                &runtime,
+                &cfg.network_id,
+                &key,
+                recipient.key_hash20,
+                amount,
+                fee,
+            )?;
 
             println!("Transaction created and signed:");
-            println!("Txid: {}", tx.txid());
-            println!("Input count: {}", tx.inputs.len());
-            for (idx, utxo) in selected.iter().enumerate() {
+            println!("Txid: {}", signed.tx.txid());
+            println!("Input count: {}", signed.tx.inputs.len());
+            for (idx, utxo) in signed.selected_inputs.iter().enumerate() {
                 println!(
                     "Input #{idx}: {}:{} (value={})",
                     utxo.outpoint.txid, utxo.outpoint.vout, utxo.value
                 );
             }
-            println!("Input total: {}", selected_total);
+            println!("Input total: {}", signed.input_total);
             println!("To key-hash20: {}", hex::encode(recipient.key_hash20));
             println!("Amount: {}", amount);
             println!("Fee: {}", fee);
-            println!("Change: {}", change_value);
-            println!("Self-transfer: {}", is_self_transfer);
-            println!("RawTx (hex): {}", hex::encode(tx.encode_for_hash()));
+            println!("Change: {}", signed.change_value);
+            println!("Self-transfer: {}", signed.is_self_transfer);
+            println!("RawTx (hex): {}", hex::encode(signed.tx.encode_for_hash()));
         }
         WalletCommand::Decode { address } => {
             let decoded = parse_address(&address)?;
@@ -1636,6 +1579,125 @@ fn select_utxos_for_amount(
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SignedTransferTx {
+    tx: Transaction,
+    selected_inputs: Vec<SpendableUtxo>,
+    input_total: u64,
+    change_value: u64,
+    sender_key_hash20: [u8; 20],
+    is_self_transfer: bool,
+}
+
+fn collect_spendable_utxos(
+    runtime: &ChainRuntime,
+    owner_key_hash20: [u8; 20],
+) -> (Vec<SpendableUtxo>, u128) {
+    let tip_height = runtime.tip_height();
+    let coinbase_maturity = runtime.config().coinbase_maturity as u64;
+    let mut spendable = Vec::<SpendableUtxo>::new();
+    let mut spendable_total = 0u128;
+
+    for (outpoint, utxo) in runtime.utxo_set() {
+        if utxo.key_hash20 != owner_key_hash20 {
+            continue;
+        }
+        let is_immature_coinbase =
+            utxo.is_coinbase && tip_height < utxo.created_height.saturating_add(coinbase_maturity);
+        if is_immature_coinbase {
+            continue;
+        }
+        spendable_total = spendable_total.saturating_add(utxo.value as u128);
+        spendable.push(SpendableUtxo {
+            outpoint: outpoint.clone(),
+            value: utxo.value,
+        });
+    }
+
+    (spendable, spendable_total)
+}
+
+fn build_signed_transfer_tx(
+    runtime: &ChainRuntime,
+    network_id: &str,
+    sender_key: &WalletKey,
+    recipient_key_hash20: [u8; 20],
+    amount: u64,
+    fee: u64,
+) -> Result<SignedTransferTx, NodeError> {
+    if amount == 0 {
+        return Err(NodeError::Runtime(
+            "amount must be > 0 (zero-value outputs are invalid)".to_owned(),
+        ));
+    }
+
+    let needed = amount
+        .checked_add(fee)
+        .ok_or_else(|| NodeError::Runtime("amount + fee overflow".to_owned()))?;
+    let sender_pubkey = sender_key.pubkey_compressed();
+    let sender_key_hash20 = scam_core::hash160_blake3(&sender_pubkey);
+    let is_self_transfer = recipient_key_hash20 == sender_key_hash20;
+
+    let (spendable, spendable_total) = collect_spendable_utxos(runtime, sender_key_hash20);
+    let (selected, selected_total) =
+        select_utxos_for_amount(&spendable, needed).ok_or(NodeError::InsufficientFunds {
+            needed,
+            spendable_total,
+        })?;
+    let change_value = selected_total.checked_sub(needed).ok_or_else(|| {
+        NodeError::Runtime("selected UTXO total is smaller than needed amount".to_owned())
+    })?;
+
+    let mut tx = Transaction {
+        version: 1,
+        inputs: selected
+            .iter()
+            .map(|utxo| TxIn {
+                prev_out: utxo.outpoint.clone(),
+                signature: vec![],
+                pubkey_compressed: sender_pubkey.to_vec(),
+                sequence: 0,
+            })
+            .collect(),
+        outputs: vec![TxOut {
+            value: amount,
+            key_hash20: recipient_key_hash20,
+        }],
+        lock_time: 0,
+    };
+    if change_value > 0 {
+        tx.outputs.push(TxOut {
+            value: change_value,
+            key_hash20: sender_key_hash20,
+        });
+    }
+
+    for input_index in 0..tx.inputs.len() {
+        let digest = tx
+            .signing_digest_with_chain_domain(input_index, network_id.as_bytes())
+            .map_err(|e| NodeError::Runtime(format!("signing digest failed: {e}")))?;
+        let signature = sign_digest(sender_key, digest.0)?;
+        tx.inputs[input_index].signature = signature.to_vec();
+
+        let sig_ok = verify_digest(digest.0, signature, sender_pubkey)?;
+        if !sig_ok {
+            return Err(NodeError::Runtime(format!(
+                "internal signature self-check failed for input #{}",
+                input_index
+            )));
+        }
+    }
+
+    Ok(SignedTransferTx {
+        tx,
+        selected_inputs: selected,
+        input_total: selected_total,
+        change_value,
+        sender_key_hash20,
+        is_self_transfer,
+    })
+}
+
 fn build_coinbase_tx(tag: String, subsidy: u64, key_hash20: [u8; 20]) -> Transaction {
     Transaction {
         version: 1,
@@ -1664,51 +1726,67 @@ struct MiningLoopParams {
     print_each: bool,
 }
 
+fn mine_block_with_transactions(
+    runtime: &mut ChainRuntime,
+    interval_sec: u64,
+    max_nonce: u64,
+    subsidy: u64,
+    miner_key_hash: [u8; 20],
+    coinbase_tag: String,
+    mut transactions: Vec<Transaction>,
+) -> Result<(Hash256, scam_core::Target, u128), NodeError> {
+    let expected_target = runtime.expected_target_for_next_block()?;
+    let timestamp = runtime.tip_header().timestamp.saturating_add(interval_sec);
+    let mut block_txs = Vec::with_capacity(transactions.len() + 1);
+    block_txs.push(build_coinbase_tx(coinbase_tag, subsidy, miner_key_hash));
+    block_txs.append(&mut transactions);
+    let template = BlockTemplate {
+        version: 1,
+        prev_block: runtime.tip_hash(),
+        timestamp,
+        target: expected_target,
+        transactions: block_txs,
+    };
+
+    let Some(block) = mine_block(&template, max_nonce) else {
+        return Err(NodeError::Runtime(format!(
+            "cannot mine height {} in nonce range 0..={}",
+            runtime.tip_height() + 1,
+            max_nonce
+        )));
+    };
+
+    let applied = runtime.apply_next_block(block)?;
+    Ok((
+        applied.block_hash,
+        runtime.tip_header().target,
+        applied.total_fees,
+    ))
+}
+
 fn mine_blocks_on_runtime(
     runtime: &mut ChainRuntime,
     params: &MiningLoopParams,
 ) -> Result<(), NodeError> {
-    let mut timestamp = runtime
-        .tip_header()
-        .timestamp
-        .saturating_add(params.interval_sec);
     for step in 1..=params.count {
-        let expected_target = runtime.expected_target_for_next_block()?;
-        let template = BlockTemplate {
-            version: 1,
-            prev_block: runtime.tip_hash(),
-            timestamp,
-            target: expected_target,
-            transactions: vec![build_coinbase_tx(
-                format!("{}-{step}", params.label_prefix),
-                params.subsidy,
-                params.miner_key_hash,
-            )],
-        };
-
-        let Some(block) = mine_block(&template, params.max_nonce) else {
-            return Err(NodeError::Runtime(format!(
-                "cannot mine height {} in nonce range 0..={}",
-                runtime.tip_height() + 1,
-                params.max_nonce
-            )));
-        };
-
-        let applied = runtime.apply_next_block(block)?;
+        let (block_hash, target, total_fees) = mine_block_with_transactions(
+            runtime,
+            params.interval_sec,
+            params.max_nonce,
+            params.subsidy,
+            params.miner_key_hash,
+            format!("{}-{step}", params.label_prefix),
+            Vec::new(),
+        )?;
         if params.print_each {
-            let tip = runtime.tip_header();
             println!(
                 "h={} hash={} target={} fees={}",
                 runtime.tip_height(),
-                applied.block_hash,
-                tip.target,
-                applied.total_fees
+                block_hash,
+                target,
+                total_fees
             );
         }
-        timestamp = runtime
-            .tip_header()
-            .timestamp
-            .saturating_add(params.interval_sec);
     }
     Ok(())
 }
@@ -2344,41 +2422,63 @@ struct SoakSummary {
     elapsed_sec: u64,
 }
 
-fn execute_soak_rounds<F>(
-    runtime: &mut ChainRuntime,
-    cfg: &ChainConfig,
+#[derive(Clone, Copy, Debug)]
+struct SoakExecutionParams {
     rounds: u32,
     blocks_per_round: u32,
     interval_sec: u64,
     max_nonce: u64,
+    miner_key_hash: [u8; 20],
+    sleep_per_round_sec: u64,
+}
+
+const SOAK_FLOW_MNEMONIC: &str =
+    "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+fn derive_soak_flow_keys() -> Result<(WalletKey, [u8; 20]), NodeError> {
+    let mnemonic = WalletMnemonic::parse(SOAK_FLOW_MNEMONIC)?;
+    let seed = mnemonic.to_seed("");
+    let sender_key = derive_wallet_key(&seed, 0, 0)?;
+    let recipient_key = derive_wallet_key(&seed, 0, 1)?;
+    let recipient_key_hash20 = scam_core::hash160_blake3(&recipient_key.pubkey_compressed());
+    Ok((sender_key, recipient_key_hash20))
+}
+
+fn execute_soak_rounds<F>(
+    runtime: &mut ChainRuntime,
+    cfg: &ChainConfig,
+    params: SoakExecutionParams,
     mut on_round_end: F,
 ) -> Result<SoakSummary, NodeError>
 where
-    F: FnMut(u32, &ChainRuntime) -> Result<(), NodeError>,
+    F: FnMut(u32, &mut ChainRuntime) -> Result<(), NodeError>,
 {
     let start_height = runtime.tip_height();
     let start = Instant::now();
-    let miner_key_hash = cfg.genesis_reward_key_hash20()?;
 
-    for round in 1..=rounds {
-        let params = MiningLoopParams {
-            count: blocks_per_round,
-            interval_sec,
-            max_nonce,
+    for round in 1..=params.rounds {
+        let mining_params = MiningLoopParams {
+            count: params.blocks_per_round,
+            interval_sec: params.interval_sec,
+            max_nonce: params.max_nonce,
             subsidy: cfg.block_subsidy,
-            miner_key_hash,
+            miner_key_hash: params.miner_key_hash,
             label_prefix: "soak",
             print_each: false,
         };
-        mine_blocks_on_runtime(runtime, &params)?;
+        mine_blocks_on_runtime(runtime, &mining_params)?;
         on_round_end(round, runtime)?;
+        if params.sleep_per_round_sec > 0 {
+            thread::sleep(Duration::from_secs(params.sleep_per_round_sec));
+        }
     }
 
+    let end_height = runtime.tip_height();
     Ok(SoakSummary {
-        rounds,
-        blocks_mined: (rounds as u64).saturating_mul(blocks_per_round as u64),
+        rounds: params.rounds,
+        blocks_mined: end_height.saturating_sub(start_height),
         start_height,
-        end_height: runtime.tip_height(),
+        end_height,
         elapsed_sec: start.elapsed().as_secs(),
     })
 }
@@ -2393,21 +2493,79 @@ fn run_soak(args: SoakArgs) -> Result<(), NodeError> {
         .unwrap_or_else(|| default_runtime_db_path(args.network));
     let (mut runtime, source) = load_runtime_from_db_or_genesis(&cfg, &runtime_db_path)?;
 
+    if args.txs_per_round > 0 && args.tx_amount == 0 {
+        return Err(NodeError::Runtime(
+            "tx_amount must be > 0 when txs_per_round is enabled".to_owned(),
+        ));
+    }
+
+    let tx_flow_enabled = args.txs_per_round > 0;
+    let (soak_sender_key, soak_recipient_key_hash20, miner_key_hash) = if tx_flow_enabled {
+        let (sender_key, recipient_key_hash20) = derive_soak_flow_keys()?;
+        let miner_key_hash = scam_core::hash160_blake3(&sender_key.pubkey_compressed());
+        (Some(sender_key), recipient_key_hash20, miner_key_hash)
+    } else {
+        (None, [0u8; 20], cfg.genesis_reward_key_hash20()?)
+    };
+
+    let mut tx_blocks_mined = 0u64;
+    let mut txs_included = 0u64;
     let persist_every_rounds = args.persist_every_rounds.max(1);
-    let summary = execute_soak_rounds(
-        &mut runtime,
-        &cfg,
-        args.rounds,
-        args.blocks_per_round,
-        args.interval_sec,
-        args.max_nonce,
-        |round, runtime| {
-            if round % persist_every_rounds == 0 {
-                persist_runtime_db(runtime, &runtime_db_path)?;
+    let execution = SoakExecutionParams {
+        rounds: args.rounds,
+        blocks_per_round: args.blocks_per_round,
+        interval_sec: args.interval_sec,
+        max_nonce: args.max_nonce,
+        miner_key_hash,
+        sleep_per_round_sec: args.sleep_per_round_sec,
+    };
+    let summary = execute_soak_rounds(&mut runtime, &cfg, execution, |round, runtime| {
+        if tx_flow_enabled {
+            let sender_key = soak_sender_key
+                .as_ref()
+                .expect("tx flow enabled means sender key is present");
+            let mut round_txs = Vec::<Transaction>::new();
+            for tx_index in 0..args.txs_per_round {
+                let recipient_key_hash20 = if tx_index % 2 == 0 {
+                    soak_recipient_key_hash20
+                } else {
+                    miner_key_hash
+                };
+                match build_signed_transfer_tx(
+                    runtime,
+                    &cfg.network_id,
+                    sender_key,
+                    recipient_key_hash20,
+                    args.tx_amount,
+                    args.tx_fee,
+                ) {
+                    Ok(signed) => round_txs.push(signed.tx),
+                    Err(NodeError::InsufficientFunds { .. }) => break,
+                    Err(other) => return Err(other),
+                }
             }
-            Ok(())
-        },
-    )?;
+
+            if !round_txs.is_empty() {
+                let tx_count = round_txs.len() as u64;
+                mine_block_with_transactions(
+                    runtime,
+                    args.interval_sec,
+                    args.max_nonce,
+                    cfg.block_subsidy,
+                    miner_key_hash,
+                    format!("soak-tx-{round}"),
+                    round_txs,
+                )?;
+                tx_blocks_mined = tx_blocks_mined.saturating_add(1);
+                txs_included = txs_included.saturating_add(tx_count);
+            }
+        }
+
+        if round % persist_every_rounds == 0 {
+            persist_runtime_db(runtime, &runtime_db_path)?;
+        }
+        Ok(())
+    })?;
     persist_runtime_db(&runtime, &runtime_db_path)?;
 
     let blocks_per_sec = if summary.elapsed_sec == 0 {
@@ -2425,6 +2583,21 @@ fn run_soak(args: SoakArgs) -> Result<(), NodeError> {
     println!("Height: {} -> {}", summary.start_height, summary.end_height);
     println!("Elapsed sec: {}", summary.elapsed_sec);
     println!("Blocks/sec: {:.2}", blocks_per_sec);
+    println!("TX flow enabled: {}", tx_flow_enabled);
+    if tx_flow_enabled {
+        let projected_wall_clock_sec =
+            (args.rounds as u64).saturating_mul(args.sleep_per_round_sec);
+        println!("TXs/round target: {}", args.txs_per_round);
+        println!("TX amount: {}", args.tx_amount);
+        println!("TX fee: {}", args.tx_fee);
+        println!("TX blocks mined: {}", tx_blocks_mined);
+        println!("TXs included: {}", txs_included);
+        println!("Round sleep sec: {}", args.sleep_per_round_sec);
+        println!(
+            "Projected wall-clock sec (round sleeps): {}",
+            projected_wall_clock_sec
+        );
+    }
     Ok(())
 }
 
@@ -2784,11 +2957,14 @@ mod tests {
     use scam_core::{ChainConfig, Hash256, OutPoint};
     use scam_miner::{BlockTemplate, mine_block};
     use scam_storage::{load_chain_archive_db, load_peer_book_db};
+    use scam_wallet::{WalletMnemonic, derive_wallet_key};
 
     use super::{
-        AddPeerArgs, Network, ReindexRuntimeArgs, SpendableUtxo, accepted_hrps_for_network,
-        build_coinbase_tx, execute_soak_rounds, load_chain_config, persist_runtime_db,
-        run_add_peer, run_reindex_runtime, select_utxos_for_amount,
+        AddPeerArgs, Network, ReindexRuntimeArgs, SOAK_FLOW_MNEMONIC, SpendableUtxo,
+        accepted_hrps_for_network, build_coinbase_tx, build_signed_transfer_tx,
+        execute_soak_rounds, load_chain_config, mine_block_with_transactions,
+        mine_blocks_on_runtime, persist_runtime_db, run_add_peer, run_reindex_runtime,
+        select_utxos_for_amount,
     };
 
     fn utxo(seed: u8, value: u64) -> SpendableUtxo {
@@ -2965,15 +3141,97 @@ mod tests {
         cfg.validate().expect("config validate");
         let mut runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
         let start_height = runtime.tip_height();
+        let miner_key_hash = cfg.genesis_reward_key_hash20().expect("key hash");
+        let params = super::SoakExecutionParams {
+            rounds: 3,
+            blocks_per_round: 2,
+            interval_sec: 30,
+            max_nonce: 500_000,
+            miner_key_hash,
+            sleep_per_round_sec: 0,
+        };
 
-        let summary =
-            execute_soak_rounds(&mut runtime, &cfg, 3, 2, 30, 500_000, |_round, _rt| Ok(()))
-                .expect("soak rounds");
+        let summary = execute_soak_rounds(&mut runtime, &cfg, params, |_round, _rt| Ok(()))
+            .expect("soak rounds");
 
         assert_eq!(summary.rounds, 3);
         assert_eq!(summary.blocks_mined, 6);
         assert_eq!(summary.start_height, start_height);
         assert_eq!(summary.end_height, start_height + 6);
         assert_eq!(runtime.tip_height(), start_height + 6);
+    }
+
+    #[test]
+    fn soak_round_callback_can_mine_extra_blocks() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        cfg.validate().expect("config validate");
+        let mut runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let start_height = runtime.tip_height();
+        let miner_key_hash = cfg.genesis_reward_key_hash20().expect("key hash");
+        let params = super::SoakExecutionParams {
+            rounds: 2,
+            blocks_per_round: 1,
+            interval_sec: 30,
+            max_nonce: 500_000,
+            miner_key_hash,
+            sleep_per_round_sec: 0,
+        };
+
+        let summary = execute_soak_rounds(&mut runtime, &cfg, params, |_round, runtime| {
+            mine_block_with_transactions(
+                runtime,
+                30,
+                500_000,
+                cfg.block_subsidy,
+                miner_key_hash,
+                "extra".to_owned(),
+                Vec::new(),
+            )?;
+            Ok(())
+        })
+        .expect("soak with extra mining");
+
+        assert_eq!(summary.blocks_mined, 4);
+        assert_eq!(summary.start_height, start_height);
+        assert_eq!(summary.end_height, start_height + 4);
+    }
+
+    #[test]
+    fn build_signed_transfer_tx_allows_self_transfer_after_maturity() {
+        let mut cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        cfg.coinbase_maturity = 2;
+        cfg.validate().expect("config validate");
+
+        let mut runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let mnemonic = WalletMnemonic::parse(SOAK_FLOW_MNEMONIC).expect("mnemonic");
+        let seed = mnemonic.to_seed("");
+        let sender_key = derive_wallet_key(&seed, 0, 0).expect("sender key");
+        let sender_key_hash20 = scam_core::hash160_blake3(&sender_key.pubkey_compressed());
+        let params = super::MiningLoopParams {
+            count: 3,
+            interval_sec: 30,
+            max_nonce: 500_000,
+            subsidy: cfg.block_subsidy,
+            miner_key_hash: sender_key_hash20,
+            label_prefix: "self-send",
+            print_each: false,
+        };
+        mine_blocks_on_runtime(&mut runtime, &params).expect("mine blocks");
+
+        let signed = build_signed_transfer_tx(
+            &runtime,
+            &cfg.network_id,
+            &sender_key,
+            sender_key_hash20,
+            1_000,
+            1,
+        )
+        .expect("signed tx");
+
+        assert!(signed.is_self_transfer);
+        assert!(!signed.selected_inputs.is_empty());
+        assert_eq!(signed.tx.outputs[0].value, 1_000);
     }
 }
