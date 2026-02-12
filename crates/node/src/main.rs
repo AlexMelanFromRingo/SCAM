@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use scam_chain::{BlockSubmissionOutcome, ChainError, ChainRuntime};
-use scam_consensus::{TxValidationError, UtxoSet, validate_and_apply_block, validate_block_basic};
+use scam_consensus::{TxValidationError, UtxoSet, validate_and_apply_block};
 use scam_core::{
     ChainConfig, ChainConfigError, Hash256, OutPoint, Transaction, TxIn, TxOut, block_meets_pow,
     render_hash_bitmap_16x16,
@@ -21,8 +21,8 @@ use scam_p2p::{
 };
 use scam_rpc::{StatusResponse, TxResponse, header_to_block_response, to_pretty_json};
 use scam_storage::{
-    ChainStateSnapshot, StorageError, load_snapshot, load_snapshot_db, save_snapshot,
-    save_snapshot_db,
+    ChainArchive, ChainStateSnapshot, StorageError, load_chain_archive_db, load_snapshot,
+    load_snapshot_db, save_chain_archive_db, save_snapshot, save_snapshot_db,
 };
 use scam_wallet::{
     AddressError, DeriveKeyError, MnemonicError, QrError, RescanError, SchnorrError,
@@ -44,6 +44,8 @@ struct Cli {
     network: Network,
     #[arg(long)]
     config: Option<PathBuf>,
+    #[arg(long)]
+    runtime_db: Option<PathBuf>,
     #[arg(long, default_value_t = false)]
     print_genesis: bool,
 }
@@ -73,6 +75,8 @@ struct NodeArgs {
     network: Network,
     #[arg(long)]
     config: Option<PathBuf>,
+    #[arg(long)]
+    runtime_db: Option<PathBuf>,
     #[arg(long, default_value_t = false)]
     print_genesis: bool,
 }
@@ -585,40 +589,64 @@ fn load_chain_config(path: &Path) -> Result<ChainConfig, NodeError> {
     Ok(cfg)
 }
 
+fn default_runtime_db_path(network: Network) -> PathBuf {
+    PathBuf::from(format!("data/{}.runtime.redb", network.as_str()))
+}
+
+fn runtime_to_archive(runtime: &ChainRuntime) -> Result<ChainArchive, NodeError> {
+    let blocks_by_height = runtime.main_chain_blocks()?;
+    Ok(ChainArchive {
+        network_id: runtime.config().network_id.clone(),
+        blocks_by_height,
+    })
+}
+
 fn run_node(
     network: Network,
     config: Option<PathBuf>,
+    runtime_db: Option<PathBuf>,
     print_genesis: bool,
 ) -> Result<(), NodeError> {
     let config_path =
         config.unwrap_or_else(|| PathBuf::from(format!("config/{}.toml", network.as_str())));
-
     let cfg = load_chain_config(&config_path)?;
-    let genesis = cfg.build_genesis_block()?;
-    let genesis_hash = genesis.header.block_hash();
+    let runtime_db_path = runtime_db.unwrap_or_else(|| default_runtime_db_path(network));
+
+    let (runtime, source) = if runtime_db_path.exists() {
+        let archive = load_chain_archive_db(&runtime_db_path)?;
+        if archive.network_id != cfg.network_id {
+            return Err(NodeError::Runtime(format!(
+                "runtime db network mismatch: db='{}', config='{}'",
+                archive.network_id, cfg.network_id
+            )));
+        }
+        (
+            ChainRuntime::from_ordered_blocks(cfg.clone(), archive.blocks_by_height)?,
+            "db",
+        )
+    } else {
+        (ChainRuntime::from_config(cfg.clone())?, "genesis")
+    };
+    let archive = runtime_to_archive(&runtime)?;
+    save_chain_archive_db(&runtime_db_path, &archive)?;
+    let genesis_hash = cfg.build_genesis_block()?.header.block_hash();
 
     println!("Project: SCAM (Smart Computing Alternative Money)");
     println!("Network: {}", cfg.network_id);
     println!("Config: {}", config_path.display());
+    println!("Runtime DB: {}", runtime_db_path.display());
+    println!("Runtime source: {}", source);
     println!("Genesis hash: {}", genesis_hash);
-    println!("Genesis PoW valid: {}", block_meets_pow(&genesis));
-    println!(
-        "Genesis consensus-valid: {}",
-        validate_block_basic(&genesis).is_ok()
-    );
-    let mut utxos = UtxoSet::new();
-    let applied = validate_and_apply_block(
-        &genesis,
-        0,
-        cfg.block_subsidy,
-        cfg.coinbase_maturity as u64,
-        cfg.network_id.as_bytes(),
-        &mut utxos,
-    );
-    println!("Genesis UTXO-apply valid: {}", applied.is_ok());
-    println!("Block target: {}", genesis.header.target);
+    println!("Tip height: {}", runtime.tip_height());
+    println!("Tip hash: {}", runtime.tip_hash());
+    println!("UTXO count: {}", runtime.utxo_len());
+    println!("Chainwork: {}", runtime.cumulative_work().to_str_radix(10));
+    println!("Block target: {}", runtime.tip_header().target);
 
     if print_genesis {
+        let genesis = runtime
+            .block_by_hash(&runtime.block_hashes()[0])
+            .expect("genesis must exist");
         println!("{genesis:#?}");
     }
     Ok(())
@@ -2202,7 +2230,12 @@ fn run_rpc_serve(args: RpcServeArgs) -> Result<(), NodeError> {
 fn run() -> Result<(), NodeError> {
     let cli = Cli::parse();
     match cli.command {
-        Some(Command::Node(args)) => run_node(args.network, args.config, args.print_genesis),
+        Some(Command::Node(args)) => run_node(
+            args.network,
+            args.config,
+            args.runtime_db,
+            args.print_genesis,
+        ),
         Some(Command::Status(args)) => run_status(args),
         Some(Command::GetBlock(args)) => run_get_block(args),
         Some(Command::GetTx(args)) => run_get_tx(args),
@@ -2217,7 +2250,7 @@ fn run() -> Result<(), NodeError> {
         Some(Command::RpcServe(args)) => run_rpc_serve(args),
         Some(Command::Snapshot(args)) => run_snapshot(args.command),
         Some(Command::P2pDemo) => run_p2p_demo(),
-        None => run_node(cli.network, cli.config, cli.print_genesis),
+        None => run_node(cli.network, cli.config, cli.runtime_db, cli.print_genesis),
     }
 }
 

@@ -20,6 +20,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] Miner template + nonce search loop implemented (`mine-once` CLI).
 - [x] Chainstate snapshot save/load implemented.
 - [x] redb-backed snapshot persistence implemented (`snapshot save-genesis-db` / `snapshot show-db`).
+- [x] redb chain archive persistence implemented (`blocks/headers/block-index`) with runtime restore path in `node run`.
 - [x] Reorg-safe best-chain selection by cumulative work implemented in chain runtime.
 - [x] Minimal HTTP JSON RPC transport implemented (`scam-node rpc-serve`).
 - [ ] Remaining major items: socketed p2p sync runtime beyond demo mode, crash-consistent DB-backed node runtime, stronger test matrix.
@@ -174,16 +175,16 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 
 - [x] Pick DB engine (`redb` embedded backend added in `scam-storage`).
 - [ ] Buckets/tables:
-- [ ] blocks by hash
-- [ ] headers by hash
-- [ ] block index (height, work, parent)
+- [x] blocks by hash
+- [x] headers by hash
+- [x] block index (height, work, parent)
 - [x] UTXO set
 - [x] chain tip metadata
 - [ ] mempool persistence (optional, bounded)
 - [ ] peer address book
 - [ ] Atomic crash-consistent commit for block connect/disconnect state updates.
 - [ ] Recovery and reindex mode.
-- [ ] Node startup path that restores live chain runtime from DB (not snapshot-only utilities).
+- [x] Node startup path that restores live chain runtime from DB (not snapshot-only utilities).
 
 ## 13) P2P TODO (Reliable Minimal Gossip)
 

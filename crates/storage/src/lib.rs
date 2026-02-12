@@ -3,12 +3,15 @@ use std::path::Path;
 
 use redb::{Database, ReadableTable, TableDefinition};
 use scam_consensus::{UtxoEntry, UtxoSet};
-use scam_core::{Hash256, OutPoint};
+use scam_core::{Block, BlockHeader, Hash256, OutPoint};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("chain_meta");
 const UTXO_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("utxos");
+const BLOCK_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("blocks_by_hash");
+const HEADER_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("headers_by_hash");
+const BLOCK_INDEX_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("block_index");
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChainStateSnapshot {
@@ -23,6 +26,12 @@ pub struct ChainStateSnapshot {
 pub struct UtxoRecord {
     pub outpoint: OutPoint,
     pub entry: UtxoEntry,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ChainArchive {
+    pub network_id: String,
+    pub blocks_by_height: Vec<Block>,
 }
 
 impl ChainStateSnapshot {
@@ -228,6 +237,173 @@ pub fn load_snapshot_db(path: &Path) -> Result<ChainStateSnapshot, StorageError>
     })
 }
 
+pub fn save_chain_archive_db(path: &Path, archive: &ChainArchive) -> Result<(), StorageError> {
+    if archive.blocks_by_height.is_empty() {
+        return Err(StorageError::InvalidArchive(
+            "blocks_by_height cannot be empty".to_owned(),
+        ));
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|source| StorageError::CreateDir {
+            path: parent.display().to_string(),
+            source,
+        })?;
+    }
+    if path.exists() {
+        fs::remove_file(path).map_err(|source| StorageError::Write {
+            path: path.display().to_string(),
+            source,
+        })?;
+    }
+
+    let db = Database::create(path).map_err(|e| StorageError::Db(e.to_string()))?;
+    let write_txn = db
+        .begin_write()
+        .map_err(|e| StorageError::Db(e.to_string()))?;
+    {
+        let mut meta = write_txn
+            .open_table(META_TABLE)
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+        let tip_height = (archive.blocks_by_height.len() as u64).saturating_sub(1);
+        meta.insert("network_id", archive.network_id.as_bytes())
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+        meta.insert("tip_height", tip_height.to_le_bytes().as_slice())
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+        let tip_hash = archive
+            .blocks_by_height
+            .last()
+            .expect("non-empty")
+            .header
+            .block_hash();
+        meta.insert("tip_hash", tip_hash.0.as_slice())
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+    }
+    {
+        let mut blocks_table = write_txn
+            .open_table(BLOCK_TABLE)
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+        let mut headers_table = write_txn
+            .open_table(HEADER_TABLE)
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+        let mut index_table = write_txn
+            .open_table(BLOCK_INDEX_TABLE)
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+
+        for (height, block) in archive.blocks_by_height.iter().enumerate() {
+            let hash = block.header.block_hash();
+            let block_bytes = bincode::serialize(block).map_err(StorageError::Encode)?;
+            let header_bytes = bincode::serialize(&block.header).map_err(StorageError::Encode)?;
+
+            blocks_table
+                .insert(hash.0.as_slice(), block_bytes.as_slice())
+                .map_err(|e| StorageError::Db(e.to_string()))?;
+            headers_table
+                .insert(hash.0.as_slice(), header_bytes.as_slice())
+                .map_err(|e| StorageError::Db(e.to_string()))?;
+            index_table
+                .insert(height as u64, hash.0.as_slice())
+                .map_err(|e| StorageError::Db(e.to_string()))?;
+        }
+    }
+    write_txn
+        .commit()
+        .map_err(|e| StorageError::Db(e.to_string()))?;
+    Ok(())
+}
+
+pub fn load_chain_archive_db(path: &Path) -> Result<ChainArchive, StorageError> {
+    let db = Database::open(path).map_err(|e| StorageError::Db(e.to_string()))?;
+    let read_txn = db
+        .begin_read()
+        .map_err(|e| StorageError::Db(e.to_string()))?;
+    let network_id = {
+        let meta = read_txn
+            .open_table(META_TABLE)
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+        let network_id_raw = meta
+            .get("network_id")
+            .map_err(|e| StorageError::Db(e.to_string()))?
+            .ok_or_else(|| StorageError::MissingMeta("network_id".to_owned()))?;
+        std::str::from_utf8(network_id_raw.value())
+            .map_err(StorageError::InvalidUtf8)?
+            .to_owned()
+    };
+
+    let index_table = read_txn
+        .open_table(BLOCK_INDEX_TABLE)
+        .map_err(|e| StorageError::Db(e.to_string()))?;
+    let blocks_table = read_txn
+        .open_table(BLOCK_TABLE)
+        .map_err(|e| StorageError::Db(e.to_string()))?;
+    let headers_table = read_txn
+        .open_table(HEADER_TABLE)
+        .map_err(|e| StorageError::Db(e.to_string()))?;
+
+    let mut blocks_by_height = Vec::<Block>::new();
+    for row in index_table
+        .iter()
+        .map_err(|e| StorageError::Db(e.to_string()))?
+    {
+        let (height_key, hash_bytes) = row.map_err(|e| StorageError::Db(e.to_string()))?;
+        let expected_height = blocks_by_height.len() as u64;
+        if height_key.value() != expected_height {
+            return Err(StorageError::InvalidArchive(format!(
+                "block index gap: expected height {}, got {}",
+                expected_height,
+                height_key.value()
+            )));
+        }
+
+        let hash = bytes_to_hash(hash_bytes.value(), "block_index hash")?;
+        let block_raw = blocks_table
+            .get(hash.0.as_slice())
+            .map_err(|e| StorageError::Db(e.to_string()))?
+            .ok_or_else(|| StorageError::MissingArchiveRecord {
+                table: "blocks_by_hash",
+                key: hash.to_string(),
+            })?;
+        let header_raw = headers_table
+            .get(hash.0.as_slice())
+            .map_err(|e| StorageError::Db(e.to_string()))?
+            .ok_or_else(|| StorageError::MissingArchiveRecord {
+                table: "headers_by_hash",
+                key: hash.to_string(),
+            })?;
+
+        let block: Block = bincode::deserialize(block_raw.value()).map_err(StorageError::Decode)?;
+        let header: BlockHeader =
+            bincode::deserialize(header_raw.value()).map_err(StorageError::Decode)?;
+        if block.header != header {
+            return Err(StorageError::InvalidArchive(format!(
+                "header mismatch for block {}",
+                hash
+            )));
+        }
+        blocks_by_height.push(block);
+    }
+    if blocks_by_height.is_empty() {
+        return Err(StorageError::InvalidArchive(
+            "archive contains no indexed blocks".to_owned(),
+        ));
+    }
+    Ok(ChainArchive {
+        network_id,
+        blocks_by_height,
+    })
+}
+
+fn bytes_to_hash(raw: &[u8], context: &str) -> Result<Hash256, StorageError> {
+    if raw.len() != 32 {
+        return Err(StorageError::InvalidMetaFormat {
+            key: context.to_owned(),
+            details: format!("expected 32 bytes, got {}", raw.len()),
+        });
+    }
+    let mut buf = [0u8; 32];
+    buf.copy_from_slice(raw);
+    Ok(Hash256(buf))
+}
+
 #[derive(Debug, Error)]
 pub enum StorageError {
     #[error("cannot create directory {path}: {source}")]
@@ -257,6 +433,10 @@ pub enum StorageError {
     InvalidMetaFormat { key: String, details: String },
     #[error("invalid utf8 in metadata: {0}")]
     InvalidUtf8(#[from] std::str::Utf8Error),
+    #[error("missing archive record in {table} for key {key}")]
+    MissingArchiveRecord { table: &'static str, key: String },
+    #[error("invalid chain archive: {0}")]
+    InvalidArchive(String),
 }
 
 #[cfg(test)]
@@ -264,11 +444,11 @@ mod tests {
     use std::path::PathBuf;
 
     use scam_consensus::UtxoSet;
-    use scam_core::{Hash256, OutPoint};
+    use scam_core::{Block, BlockHeader, Hash256, OutPoint, Target};
 
     use crate::{
-        ChainStateSnapshot, UtxoRecord, load_snapshot, load_snapshot_db, save_snapshot,
-        save_snapshot_db,
+        ChainArchive, ChainStateSnapshot, UtxoRecord, load_chain_archive_db, load_snapshot,
+        load_snapshot_db, save_chain_archive_db, save_snapshot, save_snapshot_db,
     };
 
     #[test]
@@ -374,5 +554,50 @@ mod tests {
                 is_coinbase: false,
             },
         };
+    }
+
+    #[test]
+    fn chain_archive_db_roundtrip() {
+        let genesis = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_block: Hash256::ZERO,
+                merkle_root: Hash256::from_hex(
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                )
+                .expect("hash"),
+                timestamp: 1_770_763_200,
+                target: Target::MAX,
+                nonce: 1,
+            },
+            transactions: vec![],
+        };
+        let block1 = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_block: genesis.header.block_hash(),
+                merkle_root: Hash256::from_hex(
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                )
+                .expect("hash"),
+                timestamp: 1_770_763_320,
+                target: Target::MAX,
+                nonce: 2,
+            },
+            transactions: vec![],
+        };
+        let archive = ChainArchive {
+            network_id: "devnet".to_owned(),
+            blocks_by_height: vec![genesis.clone(), block1.clone()],
+        };
+
+        let path = PathBuf::from("target/test-chain-archive.redb");
+        save_chain_archive_db(&path, &archive).expect("save archive");
+        let loaded = load_chain_archive_db(&path).expect("load archive");
+        assert_eq!(loaded.network_id, "devnet");
+        assert_eq!(loaded.blocks_by_height.len(), 2);
+        assert_eq!(loaded.blocks_by_height[0], genesis);
+        assert_eq!(loaded.blocks_by_height[1], block1);
+        let _ = std::fs::remove_file(path);
     }
 }

@@ -47,6 +47,33 @@ impl ChainRuntime {
         Self::new(config, genesis)
     }
 
+    pub fn from_ordered_blocks(
+        config: ChainConfig,
+        blocks_by_height: Vec<Block>,
+    ) -> Result<Self, ChainError> {
+        let Some(first) = blocks_by_height.first() else {
+            return Err(ChainError::InvalidRuntime(
+                "ordered chain blocks cannot be empty".to_owned(),
+            ));
+        };
+        config.validate()?;
+        let expected_genesis = config.build_genesis_block()?;
+        let expected_hash = expected_genesis.header.block_hash();
+        let got_hash = first.header.block_hash();
+        if got_hash != expected_hash {
+            return Err(ChainError::UnexpectedGenesis {
+                expected: expected_hash,
+                got: got_hash,
+            });
+        }
+
+        let mut runtime = Self::new(config, first.clone())?;
+        for block in blocks_by_height.into_iter().skip(1) {
+            runtime.apply_next_block(block)?;
+        }
+        Ok(runtime)
+    }
+
     pub fn new(config: ChainConfig, genesis: Block) -> Result<Self, ChainError> {
         let mut utxos = UtxoSet::new();
         let applied = validate_and_apply_block(
@@ -105,6 +132,18 @@ impl ChainRuntime {
 
     pub fn block_by_hash(&self, hash: &Hash256) -> Option<&Block> {
         self.blocks.get(hash)
+    }
+
+    pub fn main_chain_blocks(&self) -> Result<Vec<Block>, ChainError> {
+        let mut blocks = Vec::with_capacity(self.main_chain.len());
+        for hash in &self.main_chain {
+            let block = self
+                .blocks
+                .get(hash)
+                .ok_or(ChainError::MissingBlock { block_hash: *hash })?;
+            blocks.push(block.clone());
+        }
+        Ok(blocks)
     }
 
     pub fn utxo_set(&self) -> &UtxoSet {
@@ -420,6 +459,8 @@ pub enum ChainError {
     MissingBlock { block_hash: Hash256 },
     #[error("unexpected block target: expected {expected}, got {got}")]
     UnexpectedTarget { expected: Target, got: Target },
+    #[error("unexpected genesis block hash: expected {expected}, got {got}")]
+    UnexpectedGenesis { expected: Hash256, got: Hash256 },
     #[error("block {block_hash} timestamp too old: got={got}, median-time-past={median_time_past}")]
     TimestampTooOld {
         block_hash: Hash256,
@@ -627,5 +668,32 @@ mod tests {
         let block = mine_block(&template, 200_000).expect("mine");
         let err = runtime.apply_next_block(block).expect_err("must reject");
         assert!(matches!(err, ChainError::TimestampTooFarInFuture { .. }));
+    }
+
+    #[test]
+    fn runtime_can_restore_from_ordered_blocks() {
+        let config: scam_core::ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let mut runtime = ChainRuntime::from_config(config.clone()).expect("runtime");
+
+        let template = BlockTemplate {
+            version: 1,
+            prev_block: runtime.tip_hash(),
+            timestamp: runtime.tip_header().timestamp + 30,
+            target: runtime.expected_target_for_next_block().expect("target"),
+            transactions: vec![coinbase(
+                config.block_subsidy,
+                config.genesis_reward_key_hash20().expect("key"),
+                b"restore-1",
+            )],
+        };
+        let block = mine_block(&template, 200_000).expect("mine");
+        runtime.apply_next_block(block).expect("apply");
+
+        let ordered = runtime.main_chain_blocks().expect("export");
+        let restored = ChainRuntime::from_ordered_blocks(config, ordered).expect("restore");
+        assert_eq!(restored.tip_height(), runtime.tip_height());
+        assert_eq!(restored.tip_hash(), runtime.tip_hash());
+        assert_eq!(restored.utxo_len(), runtime.utxo_len());
     }
 }
