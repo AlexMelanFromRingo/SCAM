@@ -104,14 +104,15 @@ pub fn save_snapshot_db(path: &Path, snapshot: &ChainStateSnapshot) -> Result<()
             source,
         })?;
     }
-    if path.exists() {
-        fs::remove_file(path).map_err(|source| StorageError::Write {
-            path: path.display().to_string(),
+    let tmp_path = temp_db_path(path);
+    if tmp_path.exists() {
+        fs::remove_file(&tmp_path).map_err(|source| StorageError::Write {
+            path: tmp_path.display().to_string(),
             source,
         })?;
     }
 
-    let db = Database::create(path).map_err(|e| StorageError::Db(e.to_string()))?;
+    let db = Database::create(&tmp_path).map_err(|e| StorageError::Db(e.to_string()))?;
     let write_txn = db
         .begin_write()
         .map_err(|e| StorageError::Db(e.to_string()))?;
@@ -146,6 +147,10 @@ pub fn save_snapshot_db(path: &Path, snapshot: &ChainStateSnapshot) -> Result<()
     write_txn
         .commit()
         .map_err(|e| StorageError::Db(e.to_string()))?;
+    fs::rename(&tmp_path, path).map_err(|source| StorageError::Write {
+        path: path.display().to_string(),
+        source,
+    })?;
     Ok(())
 }
 
@@ -249,14 +254,15 @@ pub fn save_chain_archive_db(path: &Path, archive: &ChainArchive) -> Result<(), 
             source,
         })?;
     }
-    if path.exists() {
-        fs::remove_file(path).map_err(|source| StorageError::Write {
-            path: path.display().to_string(),
+    let tmp_path = temp_db_path(path);
+    if tmp_path.exists() {
+        fs::remove_file(&tmp_path).map_err(|source| StorageError::Write {
+            path: tmp_path.display().to_string(),
             source,
         })?;
     }
 
-    let db = Database::create(path).map_err(|e| StorageError::Db(e.to_string()))?;
+    let db = Database::create(&tmp_path).map_err(|e| StorageError::Db(e.to_string()))?;
     let write_txn = db
         .begin_write()
         .map_err(|e| StorageError::Db(e.to_string()))?;
@@ -308,6 +314,10 @@ pub fn save_chain_archive_db(path: &Path, archive: &ChainArchive) -> Result<(), 
     write_txn
         .commit()
         .map_err(|e| StorageError::Db(e.to_string()))?;
+    fs::rename(&tmp_path, path).map_err(|source| StorageError::Write {
+        path: path.display().to_string(),
+        source,
+    })?;
     Ok(())
 }
 
@@ -402,6 +412,15 @@ fn bytes_to_hash(raw: &[u8], context: &str) -> Result<Hash256, StorageError> {
     let mut buf = [0u8; 32];
     buf.copy_from_slice(raw);
     Ok(Hash256(buf))
+}
+
+fn temp_db_path(path: &Path) -> std::path::PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| format!("{name}.tmp"))
+        .unwrap_or_else(|| "chain.tmp".to_owned());
+    path.with_file_name(file_name)
 }
 
 #[derive(Debug, Error)]
