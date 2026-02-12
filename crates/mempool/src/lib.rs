@@ -619,6 +619,37 @@ pub enum InsertOutcome {
     },
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct MempoolInventoryDelta {
+    pub announced_txids: Vec<Hash256>,
+    pub removed_txids: Vec<Hash256>,
+}
+
+impl InsertOutcome {
+    pub fn inventory_delta(&self) -> MempoolInventoryDelta {
+        match self {
+            InsertOutcome::Accepted { txid } => MempoolInventoryDelta {
+                announced_txids: vec![*txid],
+                removed_txids: Vec::new(),
+            },
+            InsertOutcome::Replaced { inserted, removed } => MempoolInventoryDelta {
+                announced_txids: vec![*inserted],
+                removed_txids: removed.clone(),
+            },
+            InsertOutcome::AcceptedWithEviction { inserted, removed } => MempoolInventoryDelta {
+                announced_txids: vec![*inserted],
+                removed_txids: removed.clone(),
+            },
+            InsertOutcome::AlreadyPresent { .. }
+            | InsertOutcome::RejectedConflictInsufficientFee { .. }
+            | InsertOutcome::RejectedConflictInsufficientFeerate { .. } => MempoolInventoryDelta {
+                announced_txids: Vec::new(),
+                removed_txids: Vec::new(),
+            },
+        }
+    }
+}
+
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum MempoolError {
     #[error("{0}")]
@@ -683,7 +714,10 @@ pub enum MempoolError {
 mod tests {
     use scam_core::{OutPoint, Transaction, TxIn, TxOut};
 
-    use crate::{InsertOutcome, Mempool, MempoolError, OrphanInsertOutcome, OrphanPool};
+    use crate::{
+        InsertOutcome, Mempool, MempoolError, MempoolInventoryDelta, OrphanInsertOutcome,
+        OrphanPool,
+    };
 
     fn mk_tx(
         spends_txid: [u8; 32],
@@ -1181,5 +1215,45 @@ mod tests {
             .expect("replacement accepted");
         assert!(matches!(replaced, InsertOutcome::Replaced { .. }));
         assert!(mempool.revision() > after_insert);
+    }
+
+    #[test]
+    fn inventory_delta_reflects_insert_replace_and_reject_paths() {
+        let accepted = InsertOutcome::Accepted {
+            txid: scam_core::Hash256([1u8; 32]),
+        };
+        assert_eq!(
+            accepted.inventory_delta(),
+            MempoolInventoryDelta {
+                announced_txids: vec![scam_core::Hash256([1u8; 32])],
+                removed_txids: Vec::new()
+            }
+        );
+
+        let replaced = InsertOutcome::Replaced {
+            inserted: scam_core::Hash256([2u8; 32]),
+            removed: vec![scam_core::Hash256([3u8; 32]), scam_core::Hash256([4u8; 32])],
+        };
+        assert_eq!(
+            replaced.inventory_delta(),
+            MempoolInventoryDelta {
+                announced_txids: vec![scam_core::Hash256([2u8; 32])],
+                removed_txids: vec![scam_core::Hash256([3u8; 32]), scam_core::Hash256([4u8; 32])]
+            }
+        );
+
+        let rejected = InsertOutcome::RejectedConflictInsufficientFeerate {
+            inserted: scam_core::Hash256([5u8; 32]),
+            existing: scam_core::Hash256([6u8; 32]),
+            incoming_feerate: 10,
+            existing_feerate: 11,
+        };
+        assert_eq!(
+            rejected.inventory_delta(),
+            MempoolInventoryDelta {
+                announced_txids: Vec::new(),
+                removed_txids: Vec::new()
+            }
+        );
     }
 }

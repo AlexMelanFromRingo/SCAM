@@ -99,6 +99,22 @@ impl GossipEngine {
         self.fanout_inv(None, item)
     }
 
+    pub fn apply_mempool_inventory_delta(
+        &mut self,
+        announced_txs: Vec<Transaction>,
+        removed_txids: &[Hash256],
+    ) -> Vec<OutboundMessage> {
+        for txid in removed_txids {
+            self.forget_tx(*txid);
+        }
+
+        let mut outbound = Vec::<OutboundMessage>::new();
+        for tx in announced_txs {
+            outbound.extend(self.announce_tx(tx));
+        }
+        outbound
+    }
+
     pub fn on_message(
         &mut self,
         from_peer: PeerId,
@@ -281,6 +297,15 @@ impl GossipEngine {
         out
     }
 
+    fn forget_tx(&mut self, txid: Hash256) {
+        self.tx_store.remove(&txid);
+        let item = InventoryItem::Tx(txid);
+        self.local_inventory.remove(&item);
+        for peer in self.peers.values_mut() {
+            peer.known_inventory.remove(&item);
+        }
+    }
+
     fn penalize_peer(&mut self, peer_id: PeerId, penalty: u32) {
         if let Some(state) = self.peers.get_mut(&peer_id) {
             state.score = state.score.saturating_add(penalty);
@@ -428,5 +453,62 @@ mod tests {
             err,
             super::GossipError::BannedPeer { peer_id: 42 }
         ));
+    }
+
+    #[test]
+    fn mempool_delta_broadcasts_announced_txs() {
+        let mut engine = GossipEngine::new(256).expect("engine");
+        engine.connect_peer(1);
+        engine.connect_peer(2);
+
+        let tx = sample_tx(77);
+        let txid = tx.txid();
+        let outbound = engine.apply_mempool_inventory_delta(vec![tx], &[]);
+
+        assert_eq!(outbound.len(), 2);
+        for msg in outbound {
+            match msg {
+                OutboundMessage {
+                    peer_id: 1 | 2,
+                    message: WireMessage::Inv { items },
+                } => assert_eq!(items, vec![InventoryItem::Tx(txid)]),
+                _ => panic!("unexpected outbound message"),
+            }
+        }
+    }
+
+    #[test]
+    fn mempool_delta_forgets_removed_txs_from_store() {
+        let mut engine = GossipEngine::new(256).expect("engine");
+        engine.connect_peer(1);
+        engine.connect_peer(2);
+
+        let tx = sample_tx(88);
+        let txid = tx.txid();
+        let _ = engine
+            .on_message(1, WireMessage::Tx { tx })
+            .expect("insert tx");
+        assert!(engine.has_inventory(&InventoryItem::Tx(txid)));
+
+        let _ = engine.apply_mempool_inventory_delta(vec![], &[txid]);
+        assert!(!engine.has_inventory(&InventoryItem::Tx(txid)));
+
+        let response = engine
+            .on_message(
+                2,
+                WireMessage::GetData {
+                    items: vec![InventoryItem::Tx(txid)],
+                },
+            )
+            .expect("handle getdata");
+        assert_eq!(
+            response,
+            vec![OutboundMessage {
+                peer_id: 2,
+                message: WireMessage::NotFound {
+                    items: vec![InventoryItem::Tx(txid)],
+                },
+            }]
+        );
     }
 }
