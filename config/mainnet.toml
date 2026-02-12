@@ -8,7 +8,7 @@ max_tx_size = 100_000
 max_mempool_txs = 50_000
 coinbase_maturity = 100
 block_subsidy = 5_000_000_000
-hrp = "sc"
+hrp = "s"
 
 genesis_message = "SCAM mainnet genesis block 2026-02-11"
 genesis_timestamp = 1_770_763_200

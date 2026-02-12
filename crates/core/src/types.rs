@@ -61,16 +61,24 @@ impl Transaction {
     }
 
     pub fn signing_digest(&self, input_index: usize) -> Result<Hash256, TxSigningError> {
+        self.signing_digest_with_chain_domain(input_index, &[])
+    }
+
+    pub fn signing_digest_with_chain_domain(
+        &self,
+        input_index: usize,
+        chain_domain: &[u8],
+    ) -> Result<Hash256, TxSigningError> {
         if input_index >= self.inputs.len() {
             return Err(TxSigningError::InputOutOfBounds {
                 index: input_index,
                 total_inputs: self.inputs.len(),
             });
         }
-        Ok(tagged_hash256(
-            TX_SIGNING_TAG,
-            &self.encode_for_signing(input_index),
-        ))
+        let mut enc = Encoder::with_capacity(64 + self.inputs.len() * 40 + self.outputs.len() * 32);
+        enc.write_len_prefixed_bytes(chain_domain);
+        enc.write_bytes(&self.encode_for_signing(input_index));
+        Ok(tagged_hash256(TX_SIGNING_TAG, &enc.into_bytes()))
     }
 
     pub fn encode_for_hash(&self) -> Vec<u8> {
@@ -248,8 +256,12 @@ mod tests {
             lock_time: 0,
         };
 
-        let first = tx.signing_digest(0).expect("digest");
-        let second = tx.signing_digest(0).expect("digest");
+        let first = tx
+            .signing_digest_with_chain_domain(0, b"scam-devnet")
+            .expect("digest");
+        let second = tx
+            .signing_digest_with_chain_domain(0, b"scam-devnet")
+            .expect("digest");
         assert_eq!(first, second);
     }
 
@@ -276,5 +288,34 @@ mod tests {
         let tagged = tx.signing_digest(0).expect("digest");
         let untagged = crate::hash::hash256(&tx.encode_for_signing(0));
         assert_ne!(tagged, untagged);
+    }
+
+    #[test]
+    fn signing_digest_changes_with_chain_domain() {
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: OutPoint {
+                    txid: crate::hash::hash256(b"prev"),
+                    vout: 0,
+                },
+                signature: vec![],
+                pubkey_compressed: vec![3u8; 33],
+                sequence: 1,
+            }],
+            outputs: vec![TxOut {
+                value: 42,
+                key_hash20: [8u8; 20],
+            }],
+            lock_time: 0,
+        };
+
+        let devnet = tx
+            .signing_digest_with_chain_domain(0, b"scam-devnet")
+            .expect("digest");
+        let mainnet = tx
+            .signing_digest_with_chain_domain(0, b"scam-mainnet")
+            .expect("digest");
+        assert_ne!(devnet, mainnet);
     }
 }

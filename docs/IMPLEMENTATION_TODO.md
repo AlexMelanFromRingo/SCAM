@@ -10,6 +10,8 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] Dynamic difficulty retarget formula implemented (window/clamp from config).
 - [x] Mempool conflict policy migrated to fee-aware replacement (with minimum fee delta + descendant cap baseline anti-DoS rules).
 - [x] Wallet basics implemented: mnemonic generation/restore, Schnorr sign/verify, Bech32m address, QR output.
+- [x] Address payload migrated to `RIPEMD160(BLAKE3(pubkey_compressed))`; network HRPs moved to `sd`/`st`/`s` with legacy alias compatibility for send-path validation.
+- [x] Tx sighash replay protection now includes chain domain (`network_id`) in signature digest flow.
 - [x] UTXO block application implemented with signature checks, fee accounting, coinbase maturity.
 - [x] P2P wire messages + gossip dedup engine (`inv/getdata/tx/block`) implemented.
 - [x] P2P TCP transport framing + `version/verack` handshake + `ping/pong` + `getheaders/headers` demo implemented.
@@ -31,7 +33,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - Double-spend mempool policy: fee-aware replacement for conflicting spends (higher feerate + minimum absolute fee delta), with descendant-limit checks for anti-DoS baseline.
 - Public key format at interfaces: compressed secp256k1 pubkey (33 bytes, `02/03 + x`).
 - Signature scheme: Schnorr over secp256k1 (BIP340 style, x-only verification key internally).
-- Address format target: Bech32m with HRP starting with `s`; payload hashing upgraded to stronger Bitcoin-like `HASH160`-style construction (exact hash stack to freeze in implementation step).
+- Address format target: Bech32m with HRP starting with `s`; payload hash is frozen as `RIPEMD160(BLAKE3(pubkey_compressed))`.
 - Genesis message/string is network-configurable (`genesis_message`), so new networks can be generated from config.
 - Smart contracts: not included.
 
@@ -92,7 +94,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] Enforce canonical signatures and strict pubkey parsing.
 - [x] Implement compressed pubkey encode/decode (SEC33).
 - [x] Add domain-separated signing tags for tx signing digest (`SCAM-tx-signing-v1`).
-- [ ] Add explicit network replay protection in signing digest (e.g., include `network_id`/chain-domain in tx sighash).
+- [x] Add explicit network replay protection in signing digest (e.g., include `network_id`/chain-domain in tx sighash).
 
 ## 6) Wallet and Key Management TODO
 
@@ -101,16 +103,16 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] Implement BIP32 HD derivation.
 - [x] Freeze derivation path in config/constants.
 - [x] Derive compressed pubkeys for address generation.
-- [ ] Migrate address payload derivation to stronger collision-resistant scheme (Bitcoin-like `HASH160` style, exact hash stack to freeze).
+- [x] Migrate address payload derivation to stronger collision-resistant scheme (Bitcoin-like `HASH160` style, exact hash stack to freeze).
 - [ ] Add encrypted at-rest key storage.
 - [ ] Add wallet rescan (rebuild UTXO ownership from chain).
 
 ## 7) Address and QR TODO
 
-- [ ] Update Bech32m HRP/prefix policy so user-facing addresses start with `s` (and keep per-network clarity).
+- [x] Update Bech32m HRP/prefix policy so user-facing addresses start with `s` (and keep per-network clarity).
 - [x] Implement payment URI: `coin:<address>?amount=<n>&label=<text>`.
 - [x] Implement QR generation for payment URI (PNG + terminal ASCII optional).
-- [ ] Add compatibility plan for legacy `scd...` addresses during migration.
+- [x] Add compatibility plan for legacy `scd...` addresses during migration.
 - [x] Add CLI:
 - [x] `wallet address`
 - [x] `wallet address --qr`

@@ -75,6 +75,11 @@ impl ChainConfig {
                 "hrp must not be empty".to_owned(),
             ));
         }
+        if !self.hrp.starts_with('s') {
+            return Err(ChainConfigError::InvalidField(
+                "hrp must start with 's'".to_owned(),
+            ));
+        }
         if self.genesis_message.trim().is_empty() {
             return Err(ChainConfigError::InvalidField(
                 "genesis_message must not be empty".to_owned(),
@@ -156,7 +161,7 @@ mod tests {
             max_mempool_txs: 1_000,
             coinbase_maturity: 100,
             block_subsidy: 5_000_000_000,
-            hrp: "scd".to_owned(),
+            hrp: "sd".to_owned(),
             genesis_message: "SCAM genesis".to_owned(),
             genesis_timestamp: 1_770_763_200,
             genesis_target: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
@@ -168,5 +173,31 @@ mod tests {
         cfg.validate().expect("config should validate");
         let genesis = cfg.build_genesis_block().expect("genesis should build");
         assert!(genesis.transactions[0].is_coinbase());
+    }
+
+    #[test]
+    fn config_rejects_non_s_address_prefix() {
+        let mut cfg = ChainConfig {
+            network_id: "devnet".to_owned(),
+            target_block_time_sec: 120,
+            difficulty_adjustment_window: 20,
+            difficulty_clamp_up: 4.0,
+            difficulty_clamp_down: 0.25,
+            max_block_size: 1_000_000,
+            max_tx_size: 100_000,
+            max_mempool_txs: 1_000,
+            coinbase_maturity: 100,
+            block_subsidy: 5_000_000_000,
+            hrp: "sd".to_owned(),
+            genesis_message: "SCAM genesis".to_owned(),
+            genesis_timestamp: 1_770_763_200,
+            genesis_target: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                .to_owned(),
+            genesis_nonce: 0,
+            genesis_reward_key_hash20: "0000000000000000000000000000000000000000".to_owned(),
+        };
+        cfg.hrp = "x".to_owned();
+        let err = cfg.validate().expect_err("invalid hrp prefix must fail");
+        assert!(matches!(err, super::ChainConfigError::InvalidField(_)));
     }
 }

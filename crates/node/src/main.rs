@@ -291,7 +291,7 @@ enum WalletCommand {
         account: u32,
         #[arg(long, default_value_t = 0)]
         index: u32,
-        #[arg(long, default_value = "scd")]
+        #[arg(long, default_value = "sd")]
         hrp: String,
     },
     Address {
@@ -303,7 +303,7 @@ enum WalletCommand {
         account: u32,
         #[arg(long, default_value_t = 0)]
         index: u32,
-        #[arg(long, default_value = "scd")]
+        #[arg(long, default_value = "sd")]
         hrp: String,
     },
     Restore {
@@ -315,7 +315,7 @@ enum WalletCommand {
         account: u32,
         #[arg(long, default_value_t = 0)]
         index: u32,
-        #[arg(long, default_value = "scd")]
+        #[arg(long, default_value = "sd")]
         hrp: String,
     },
     Balance {
@@ -379,7 +379,7 @@ enum WalletCommand {
         account: u32,
         #[arg(long, default_value_t = 0)]
         index: u32,
-        #[arg(long, default_value = "scd")]
+        #[arg(long, default_value = "sd")]
         hrp: String,
     },
     Verify {
@@ -415,6 +415,21 @@ impl Network {
             Self::Mainnet => "mainnet",
         }
     }
+}
+
+fn accepted_hrps_for_network(network: Network, configured_hrp: &str) -> Vec<String> {
+    let mut out = vec![configured_hrp.to_owned()];
+    let legacy_and_defaults: &[&str] = match network {
+        Network::Devnet => &["sd", "scd"],
+        Network::Testnet => &["st", "sct"],
+        Network::Mainnet => &["s", "sc"],
+    };
+    for hrp in legacy_and_defaults {
+        if !out.iter().any(|existing| existing == hrp) {
+            out.push((*hrp).to_owned());
+        }
+    }
+    out
 }
 
 #[derive(Debug, Error)]
@@ -504,6 +519,7 @@ fn run_node(
         0,
         cfg.block_subsidy,
         cfg.coinbase_maturity as u64,
+        cfg.network_id.as_bytes(),
         &mut utxos,
     );
     println!("Genesis UTXO-apply valid: {}", applied.is_ok());
@@ -724,10 +740,7 @@ fn run_hash_visual(args: HashVisualArgs) -> Result<(), NodeError> {
 
 fn run_wallet(command: WalletCommand) -> Result<(), NodeError> {
     fn key_hash20_from_pubkey(pubkey_compressed: [u8; 33]) -> [u8; 20] {
-        let digest = scam_core::hash::hash256(&pubkey_compressed);
-        let mut key_hash20 = [0u8; 20];
-        key_hash20.copy_from_slice(&digest.0[..20]);
-        key_hash20
+        scam_core::hash160_blake3(&pubkey_compressed)
     }
 
     fn derive_and_print_address(
@@ -858,7 +871,7 @@ fn run_wallet(command: WalletCommand) -> Result<(), NodeError> {
             interval_sec,
             max_nonce,
         } => {
-            let (_cfg, runtime) = build_runtime_for_query(
+            let (cfg, runtime) = build_runtime_for_query(
                 network,
                 config,
                 mine_blocks,
@@ -867,6 +880,15 @@ fn run_wallet(command: WalletCommand) -> Result<(), NodeError> {
                 "wallet-send",
             )?;
             let recipient = parse_address(&to)?;
+            let accepted_hrps = accepted_hrps_for_network(network, &cfg.hrp);
+            if !accepted_hrps.iter().any(|hrp| hrp == &recipient.hrp) {
+                return Err(NodeError::Runtime(format!(
+                    "address hrp '{}' is not valid for network '{}' (accepted: {})",
+                    recipient.hrp,
+                    cfg.network_id,
+                    accepted_hrps.join(", ")
+                )));
+            }
             let needed = amount
                 .checked_add(fee)
                 .ok_or_else(|| NodeError::Runtime("amount + fee overflow".to_owned()))?;
@@ -935,7 +957,7 @@ fn run_wallet(command: WalletCommand) -> Result<(), NodeError> {
             }
 
             let digest = tx
-                .signing_digest(0)
+                .signing_digest_with_chain_domain(0, cfg.network_id.as_bytes())
                 .map_err(|e| NodeError::Runtime(format!("signing digest failed: {e}")))?;
             let signature = sign_digest(&key, digest.0)?;
             tx.inputs[0].signature = signature.to_vec();
@@ -1068,6 +1090,7 @@ fn run_snapshot(command: SnapshotCommand) -> Result<(), NodeError> {
                 0,
                 cfg.block_subsidy,
                 cfg.coinbase_maturity as u64,
+                cfg.network_id.as_bytes(),
                 &mut utxos,
             )?;
 
@@ -1102,6 +1125,7 @@ fn run_snapshot(command: SnapshotCommand) -> Result<(), NodeError> {
                 0,
                 cfg.block_subsidy,
                 cfg.coinbase_maturity as u64,
+                cfg.network_id.as_bytes(),
                 &mut utxos,
             )?;
 
@@ -1231,6 +1255,7 @@ fn run_mine_once(args: MineOnceArgs) -> Result<(), NodeError> {
         0,
         cfg.block_subsidy,
         cfg.coinbase_maturity as u64,
+        cfg.network_id.as_bytes(),
         &mut utxos,
     )?;
 
@@ -1260,6 +1285,7 @@ fn run_mine_once(args: MineOnceArgs) -> Result<(), NodeError> {
         1,
         cfg.block_subsidy,
         cfg.coinbase_maturity as u64,
+        cfg.network_id.as_bytes(),
         &mut utxos,
     )?;
 
@@ -1907,5 +1933,25 @@ fn main() {
     if let Err(err) = run() {
         eprintln!("error: {err}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Network, accepted_hrps_for_network};
+
+    #[test]
+    fn accepted_hrps_include_legacy_aliases() {
+        let devnet = accepted_hrps_for_network(Network::Devnet, "sd");
+        assert!(devnet.iter().any(|hrp| hrp == "sd"));
+        assert!(devnet.iter().any(|hrp| hrp == "scd"));
+
+        let testnet = accepted_hrps_for_network(Network::Testnet, "st");
+        assert!(testnet.iter().any(|hrp| hrp == "st"));
+        assert!(testnet.iter().any(|hrp| hrp == "sct"));
+
+        let mainnet = accepted_hrps_for_network(Network::Mainnet, "s");
+        assert!(mainnet.iter().any(|hrp| hrp == "s"));
+        assert!(mainnet.iter().any(|hrp| hrp == "sc"));
     }
 }

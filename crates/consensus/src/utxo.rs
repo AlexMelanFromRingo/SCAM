@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use scam_core::{Block, OutPoint, Transaction, TxSigningError, block_meets_pow};
+use scam_core::{Block, OutPoint, Transaction, TxSigningError, block_meets_pow, hash160_blake3};
 use secp256k1::schnorr::Signature;
 use secp256k1::{Message, PublicKey, Secp256k1};
 use serde::{Deserialize, Serialize};
@@ -33,6 +33,7 @@ pub fn validate_and_apply_block(
     current_height: u64,
     block_subsidy: u64,
     coinbase_maturity: u64,
+    chain_domain: &[u8],
     utxos: &mut UtxoSet,
 ) -> Result<BlockApplySummary, TxValidationError> {
     validate_block_basic(block).map_err(TxValidationError::InvalidBlockStructure)?;
@@ -55,6 +56,7 @@ pub fn validate_and_apply_block(
             tx_index,
             current_height,
             coinbase_maturity,
+            chain_domain,
             &mut spent_in_block,
             &staged,
         )?;
@@ -139,6 +141,7 @@ fn validate_non_coinbase_tx(
     tx_index: usize,
     current_height: u64,
     coinbase_maturity: u64,
+    chain_domain: &[u8],
     spent_in_block: &mut HashSet<OutPoint>,
     utxos: &UtxoSet,
 ) -> Result<(u128, u128), TxValidationError> {
@@ -201,7 +204,7 @@ fn validate_non_coinbase_tx(
         }
 
         let digest = tx
-            .signing_digest(input_index)
+            .signing_digest_with_chain_domain(input_index, chain_domain)
             .map_err(|source| TxValidationError::SigningDigest { tx_index, source })?;
         let message = Message::from_digest_slice(&digest.0).map_err(|_| {
             TxValidationError::SigningDigest {
@@ -251,10 +254,7 @@ fn key_hash20_from_pubkey(pubkey_compressed: &[u8]) -> Option<[u8; 20]> {
     if pubkey_compressed.len() != 33 {
         return None;
     }
-    let digest = blake3::hash(pubkey_compressed);
-    let mut key_hash20 = [0u8; 20];
-    key_hash20.copy_from_slice(&digest.as_bytes()[..20]);
-    Some(key_hash20)
+    Some(hash160_blake3(pubkey_compressed))
 }
 
 #[derive(Debug, Error)]
@@ -324,10 +324,7 @@ mod tests {
         let secp = Secp256k1::new();
         let secret = SecretKey::from_slice(&seed).expect("valid secret");
         let pubkey = secp256k1::PublicKey::from_secret_key(&secp, &secret).serialize();
-        let digest = blake3::hash(&pubkey);
-        let mut key_hash20 = [0u8; 20];
-        key_hash20.copy_from_slice(&digest.as_bytes()[..20]);
-        (pubkey, key_hash20, secret)
+        (pubkey, scam_core::hash160_blake3(&pubkey), secret)
     }
 
     fn make_block(prev: Hash256, timestamp: u64, target: Target, txs: Vec<Transaction>) -> Block {
@@ -346,8 +343,15 @@ mod tests {
         }
     }
 
-    fn sign_input(tx: &mut Transaction, input_index: usize, secret: &SecretKey) {
-        let digest = tx.signing_digest(input_index).expect("digest");
+    fn sign_input(
+        tx: &mut Transaction,
+        input_index: usize,
+        chain_domain: &[u8],
+        secret: &SecretKey,
+    ) {
+        let digest = tx
+            .signing_digest_with_chain_domain(input_index, chain_domain)
+            .expect("digest");
         let message = Message::from_digest_slice(&digest.0).expect("msg");
         let secp = Secp256k1::new();
         let keypair = Keypair::from_secret_key(&secp, secret);
@@ -357,6 +361,7 @@ mod tests {
 
     #[test]
     fn valid_block_with_signed_spend_applies() {
+        let chain_domain = b"devnet";
         let (miner_pubkey, miner_key_hash, miner_secret) = key_material([2u8; 32]);
         let (_, receiver_key_hash, _) = key_material([3u8; 32]);
 
@@ -383,7 +388,8 @@ mod tests {
 
         let mut utxos = UtxoSet::new();
         let applied_genesis =
-            validate_and_apply_block(&genesis, 0, 50, 1, &mut utxos).expect("genesis must apply");
+            validate_and_apply_block(&genesis, 0, 50, 1, chain_domain, &mut utxos)
+                .expect("genesis must apply");
         assert_eq!(applied_genesis.coinbase_value, 50);
         assert_eq!(utxos.len(), 1);
 
@@ -405,7 +411,7 @@ mod tests {
             }],
             lock_time: 0,
         };
-        sign_input(&mut spend, 0, &miner_secret);
+        sign_input(&mut spend, 0, chain_domain, &miner_secret);
 
         let block1_coinbase = Transaction {
             version: 1,
@@ -428,14 +434,15 @@ mod tests {
             vec![block1_coinbase, spend],
         );
 
-        let applied =
-            validate_and_apply_block(&block1, 1, 50, 1, &mut utxos).expect("block1 must apply");
+        let applied = validate_and_apply_block(&block1, 1, 50, 1, chain_domain, &mut utxos)
+            .expect("block1 must apply");
         assert_eq!(applied.total_fees, 10);
         assert_eq!(utxos.len(), 2);
     }
 
     #[test]
     fn immature_coinbase_spend_is_rejected() {
+        let chain_domain = b"devnet";
         let (miner_pubkey, miner_key_hash, miner_secret) = key_material([4u8; 32]);
         let (_, receiver_key_hash, _) = key_material([5u8; 32]);
 
@@ -460,7 +467,8 @@ mod tests {
             vec![genesis_coinbase.clone()],
         );
         let mut utxos = UtxoSet::new();
-        validate_and_apply_block(&genesis, 0, 50, 10, &mut utxos).expect("genesis applies");
+        validate_and_apply_block(&genesis, 0, 50, 10, chain_domain, &mut utxos)
+            .expect("genesis applies");
 
         let mut spend = Transaction {
             version: 1,
@@ -479,7 +487,7 @@ mod tests {
             }],
             lock_time: 0,
         };
-        sign_input(&mut spend, 0, &miner_secret);
+        sign_input(&mut spend, 0, chain_domain, &miner_secret);
 
         let block1_coinbase = Transaction {
             version: 1,
@@ -502,10 +510,87 @@ mod tests {
             vec![block1_coinbase, spend],
         );
 
-        let err = validate_and_apply_block(&block1, 1, 50, 10, &mut utxos).expect_err("reject");
+        let err = validate_and_apply_block(&block1, 1, 50, 10, chain_domain, &mut utxos)
+            .expect_err("reject");
         assert!(matches!(
             err,
             TxValidationError::ImmatureCoinbaseSpend { .. }
         ));
+    }
+
+    #[test]
+    fn signature_replay_across_chain_domains_is_rejected() {
+        let signing_domain = b"devnet";
+        let validation_domain = b"mainnet";
+        let (miner_pubkey, miner_key_hash, miner_secret) = key_material([6u8; 32]);
+        let (_, receiver_key_hash, _) = key_material([7u8; 32]);
+
+        let genesis_coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: OutPoint::coinbase(),
+                signature: b"genesis".to_vec(),
+                pubkey_compressed: vec![],
+                sequence: u32::MAX,
+            }],
+            outputs: vec![TxOut {
+                value: 50,
+                key_hash20: miner_key_hash,
+            }],
+            lock_time: 0,
+        };
+        let genesis = make_block(
+            Hash256::ZERO,
+            100,
+            Target::MAX,
+            vec![genesis_coinbase.clone()],
+        );
+        let mut utxos = UtxoSet::new();
+        validate_and_apply_block(&genesis, 0, 50, 1, signing_domain, &mut utxos)
+            .expect("genesis applies");
+
+        let mut spend = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: OutPoint {
+                    txid: genesis_coinbase.txid(),
+                    vout: 0,
+                },
+                signature: vec![],
+                pubkey_compressed: miner_pubkey.to_vec(),
+                sequence: 0,
+            }],
+            outputs: vec![TxOut {
+                value: 49,
+                key_hash20: receiver_key_hash,
+            }],
+            lock_time: 0,
+        };
+        sign_input(&mut spend, 0, signing_domain, &miner_secret);
+
+        let block1_coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: OutPoint::coinbase(),
+                signature: b"b1".to_vec(),
+                pubkey_compressed: vec![],
+                sequence: u32::MAX,
+            }],
+            outputs: vec![TxOut {
+                value: 51,
+                key_hash20: receiver_key_hash,
+            }],
+            lock_time: 0,
+        };
+        let block1 = make_block(
+            genesis.header.block_hash(),
+            220,
+            Target::MAX,
+            vec![block1_coinbase, spend],
+        );
+
+        let err = validate_and_apply_block(&block1, 1, 50, 1, validation_domain, &mut utxos)
+            .expect_err("cross-domain replay must fail");
+        assert!(matches!(err, TxValidationError::InvalidSignature { .. }));
     }
 }

@@ -54,6 +54,7 @@ impl ChainRuntime {
             0,
             config.block_subsidy,
             config.coinbase_maturity as u64,
+            config.network_id.as_bytes(),
             &mut utxos,
         )?;
 
@@ -240,6 +241,7 @@ impl ChainRuntime {
             height,
             self.config.block_subsidy,
             self.config.coinbase_maturity as u64,
+            self.config.network_id.as_bytes(),
             &mut self.utxos,
         )?;
         let block_hash = summary.block_hash;

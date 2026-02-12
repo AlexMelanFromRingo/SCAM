@@ -1,5 +1,6 @@
 use std::fmt;
 
+use ripemd::{Digest, Ripemd160};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -38,6 +39,17 @@ pub fn tagged_hash256(tag: &[u8], data: &[u8]) -> Hash256 {
     Hash256(*hasher.finalize().as_bytes())
 }
 
+pub fn hash160_blake3(data: &[u8]) -> [u8; 20] {
+    let digest = blake3::hash(data);
+    let mut ripemd160 = Ripemd160::new();
+    ripemd160.update(digest.as_bytes());
+    let reduced = ripemd160.finalize();
+
+    let mut out = [0u8; 20];
+    out.copy_from_slice(&reduced);
+    out
+}
+
 pub fn decode_hex_array<const N: usize>(raw: &str) -> Result<[u8; N], ParseHexError> {
     let normalized = raw.strip_prefix("0x").unwrap_or(raw);
     let decoded = hex::decode(normalized)?;
@@ -66,7 +78,7 @@ pub enum ParseHexError {
 
 #[cfg(test)]
 mod tests {
-    use super::{Hash256, hash256, tagged_hash256};
+    use super::{Hash256, hash160_blake3, hash256, tagged_hash256};
 
     #[test]
     fn hash_is_stable_for_same_input() {
@@ -87,5 +99,12 @@ mod tests {
         let a = tagged_hash256(b"scam-tag-a", b"payload");
         let b = tagged_hash256(b"scam-tag-b", b"payload");
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn hash160_blake3_is_stable() {
+        let a = hash160_blake3(b"payload");
+        let b = hash160_blake3(b"payload");
+        assert_eq!(a, b);
     }
 }
