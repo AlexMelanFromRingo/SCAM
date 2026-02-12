@@ -79,6 +79,7 @@ pub enum ParseHexError {
 #[cfg(test)]
 mod tests {
     use super::{Hash256, hash160_blake3, hash256, tagged_hash256};
+    use proptest::prelude::*;
 
     #[test]
     fn hash_is_stable_for_same_input() {
@@ -106,5 +107,15 @@ mod tests {
         let a = hash160_blake3(b"payload");
         let b = hash160_blake3(b"payload");
         assert_eq!(a, b);
+    }
+
+    proptest! {
+        #[test]
+        fn hash256_hex_roundtrip_proptest(raw in prop::array::uniform32(any::<u8>())) {
+            let hash = Hash256(raw);
+            let encoded = hash.to_hex();
+            let decoded = Hash256::from_hex(&encoded).expect("hex roundtrip");
+            prop_assert_eq!(decoded, hash);
+        }
     }
 }

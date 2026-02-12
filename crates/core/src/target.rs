@@ -39,6 +39,7 @@ impl fmt::Display for Target {
 #[cfg(test)]
 mod tests {
     use crate::{Hash256, Target};
+    use proptest::prelude::*;
 
     #[test]
     fn numeric_compare_is_hash_lte_target() {
@@ -54,5 +55,17 @@ mod tests {
 
         assert!(target.allows_hash(&lower));
         assert!(!target.allows_hash(&higher));
+    }
+
+    proptest! {
+        #[test]
+        fn allows_hash_matches_numeric_compare(
+            target_raw in prop::array::uniform32(any::<u8>()),
+            hash_raw in prop::array::uniform32(any::<u8>())
+        ) {
+            let target = Target(target_raw);
+            let hash = Hash256(hash_raw);
+            prop_assert_eq!(target.allows_hash(&hash), hash_raw <= target_raw);
+        }
     }
 }

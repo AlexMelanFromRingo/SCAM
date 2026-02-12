@@ -18,6 +18,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] P2P wire messages + gossip dedup engine (`inv/getdata/tx/block`) implemented.
 - [x] P2P TCP transport framing + `version/verack` handshake + `ping/pong` + `getheaders/headers` demo implemented.
 - [x] Net demo upgraded to perform `getdata` block download and apply downloaded blocks to local runtime.
+- [x] Property-based tests baseline added with `proptest` (hash/target invariants in `scam-core`).
 - [x] Miner template + nonce search loop implemented (`mine-once` CLI).
 - [x] Chainstate snapshot save/load implemented.
 - [x] redb-backed snapshot persistence implemented (`snapshot save-genesis-db` / `snapshot show-db`).
@@ -249,7 +250,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [ ] fork + reorg correctness
 - [ ] difficulty update every 20 blocks
 - [x] wallet mnemonic restore and deterministic addresses
-- [ ] Property-based testing (`proptest`) for tx/utxo/serialization invariants.
+- [ ] Property-based testing (`proptest`) for tx/utxo/serialization invariants. (baseline in `scam-core` done; expand to tx/utxo invariants next)
 - [ ] Fuzzing (`cargo-fuzz`) for wire codec, parser, and block/tx decode paths.
 - [ ] Mutation testing (tooling + baseline score gate).
 - [ ] Soak test:
