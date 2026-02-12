@@ -1164,6 +1164,11 @@ fn run_wallet(command: WalletCommand) -> Result<(), NodeError> {
                 max_nonce,
                 "wallet-send",
             )?;
+            if amount == 0 {
+                return Err(NodeError::Runtime(
+                    "amount must be > 0 (zero-value outputs are invalid)".to_owned(),
+                ));
+            }
             let recipient = parse_address(&to)?;
             let accepted_hrps = accepted_hrps_for_network(network, &cfg.hrp);
             if !accepted_hrps.iter().any(|hrp| hrp == &recipient.hrp) {
@@ -1183,6 +1188,7 @@ fn run_wallet(command: WalletCommand) -> Result<(), NodeError> {
             let key = derive_wallet_key(&seed, account, index)?;
             let sender_pubkey = key.pubkey_compressed();
             let sender_key_hash20 = key_hash20_from_pubkey(sender_pubkey);
+            let is_self_transfer = recipient.key_hash20 == sender_key_hash20;
 
             let tip_height = runtime.tip_height();
             let coinbase_maturity = runtime.config().coinbase_maturity as u64;
@@ -1264,6 +1270,7 @@ fn run_wallet(command: WalletCommand) -> Result<(), NodeError> {
             println!("Amount: {}", amount);
             println!("Fee: {}", fee);
             println!("Change: {}", change_value);
+            println!("Self-transfer: {}", is_self_transfer);
             println!("RawTx (hex): {}", hex::encode(tx.encode_for_hash()));
         }
         WalletCommand::Decode { address } => {
