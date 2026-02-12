@@ -3,7 +3,7 @@ use std::path::Path;
 
 use redb::{Database, ReadableTable, TableDefinition};
 use scam_consensus::{UtxoEntry, UtxoSet};
-use scam_core::{Block, BlockHeader, Hash256, OutPoint};
+use scam_core::{Block, BlockHeader, Hash256, OutPoint, Transaction};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -13,6 +13,7 @@ const BLOCK_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("blocks_
 const HEADER_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("headers_by_hash");
 const BLOCK_INDEX_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("block_index");
 const PEER_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("peers");
+const MEMPOOL_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("mempool_by_txid");
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChainStateSnapshot {
@@ -46,6 +47,25 @@ pub struct PeerAddressRecord {
     pub address: String,
     pub last_seen_unix_sec: u64,
     pub ban_score: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct MempoolSnapshot {
+    pub network_id: String,
+    pub entries: Vec<MempoolTxRecord>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct MempoolTxRecord {
+    pub txid: Hash256,
+    pub tx: Transaction,
+    pub fee: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+struct MempoolStoredValue {
+    tx: Transaction,
+    fee: u64,
 }
 
 impl ChainStateSnapshot {
@@ -518,6 +538,122 @@ pub fn load_peer_book_db(path: &Path) -> Result<PeerAddressBook, StorageError> {
     Ok(PeerAddressBook { network_id, peers })
 }
 
+pub fn save_mempool_db(path: &Path, snapshot: &MempoolSnapshot) -> Result<(), StorageError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|source| StorageError::CreateDir {
+            path: parent.display().to_string(),
+            source,
+        })?;
+    }
+    let tmp_path = temp_db_path(path);
+    if tmp_path.exists() {
+        fs::remove_file(&tmp_path).map_err(|source| StorageError::Write {
+            path: tmp_path.display().to_string(),
+            source,
+        })?;
+    }
+
+    let mut dedup = std::collections::HashMap::<Hash256, MempoolTxRecord>::new();
+    for entry in &snapshot.entries {
+        let computed = entry.tx.txid();
+        if computed != entry.txid {
+            return Err(StorageError::InvalidMempool(format!(
+                "txid mismatch in mempool snapshot: provided={}, computed={}",
+                entry.txid, computed
+            )));
+        }
+        dedup.insert(entry.txid, entry.clone());
+    }
+    let mut entries = dedup.into_values().collect::<Vec<_>>();
+    entries.sort_by(|a, b| a.txid.cmp(&b.txid));
+
+    let db = Database::create(&tmp_path).map_err(|e| StorageError::Db(e.to_string()))?;
+    let write_txn = db
+        .begin_write()
+        .map_err(|e| StorageError::Db(e.to_string()))?;
+    {
+        let mut meta = write_txn
+            .open_table(META_TABLE)
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+        meta.insert("network_id", snapshot.network_id.as_bytes())
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+        let count = entries.len() as u64;
+        meta.insert("tx_count", count.to_le_bytes().as_slice())
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+    }
+    {
+        let mut table = write_txn
+            .open_table(MEMPOOL_TABLE)
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+        for entry in entries {
+            let value = MempoolStoredValue {
+                tx: entry.tx,
+                fee: entry.fee,
+            };
+            let value_bytes = bincode::serialize(&value).map_err(StorageError::Encode)?;
+            table
+                .insert(entry.txid.0.as_slice(), value_bytes.as_slice())
+                .map_err(|e| StorageError::Db(e.to_string()))?;
+        }
+    }
+    write_txn
+        .commit()
+        .map_err(|e| StorageError::Db(e.to_string()))?;
+    fs::rename(&tmp_path, path).map_err(|source| StorageError::Write {
+        path: path.display().to_string(),
+        source,
+    })?;
+    Ok(())
+}
+
+pub fn load_mempool_db(path: &Path) -> Result<MempoolSnapshot, StorageError> {
+    let db = Database::open(path).map_err(|e| StorageError::Db(e.to_string()))?;
+    let read_txn = db
+        .begin_read()
+        .map_err(|e| StorageError::Db(e.to_string()))?;
+
+    let network_id = {
+        let meta = read_txn
+            .open_table(META_TABLE)
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+        let network_id_raw = meta
+            .get("network_id")
+            .map_err(|e| StorageError::Db(e.to_string()))?
+            .ok_or_else(|| StorageError::MissingMeta("network_id".to_owned()))?;
+        std::str::from_utf8(network_id_raw.value())
+            .map_err(StorageError::InvalidUtf8)?
+            .to_owned()
+    };
+
+    let table = read_txn
+        .open_table(MEMPOOL_TABLE)
+        .map_err(|e| StorageError::Db(e.to_string()))?;
+    let mut entries = Vec::<MempoolTxRecord>::new();
+    for row in table.iter().map_err(|e| StorageError::Db(e.to_string()))? {
+        let (key, value) = row.map_err(|e| StorageError::Db(e.to_string()))?;
+        let txid = bytes_to_hash(key.value(), "mempool txid")?;
+        let stored: MempoolStoredValue =
+            bincode::deserialize(value.value()).map_err(StorageError::Decode)?;
+        let computed = stored.tx.txid();
+        if computed != txid {
+            return Err(StorageError::InvalidMempool(format!(
+                "mempool record txid mismatch: key={}, computed={}",
+                txid, computed
+            )));
+        }
+        entries.push(MempoolTxRecord {
+            txid,
+            tx: stored.tx,
+            fee: stored.fee,
+        });
+    }
+    entries.sort_by(|a, b| a.txid.cmp(&b.txid));
+    Ok(MempoolSnapshot {
+        network_id,
+        entries,
+    })
+}
+
 fn bytes_to_hash(raw: &[u8], context: &str) -> Result<Hash256, StorageError> {
     if raw.len() != 32 {
         return Err(StorageError::InvalidMetaFormat {
@@ -574,6 +710,8 @@ pub enum StorageError {
     InvalidArchive(String),
     #[error("invalid peer book: {0}")]
     InvalidPeerBook(String),
+    #[error("invalid mempool snapshot: {0}")]
+    InvalidMempool(String),
 }
 
 #[cfg(test)]
@@ -581,12 +719,13 @@ mod tests {
     use std::path::PathBuf;
 
     use scam_consensus::UtxoSet;
-    use scam_core::{Block, BlockHeader, Hash256, OutPoint, Target};
+    use scam_core::{Block, BlockHeader, Hash256, OutPoint, Target, Transaction, TxIn, TxOut};
 
     use crate::{
-        ChainArchive, ChainStateSnapshot, PeerAddressBook, PeerAddressRecord, UtxoRecord,
-        load_chain_archive_db, load_peer_book_db, load_snapshot, load_snapshot_db,
-        save_chain_archive_db, save_peer_book_db, save_snapshot, save_snapshot_db,
+        ChainArchive, ChainStateSnapshot, MempoolSnapshot, MempoolTxRecord, PeerAddressBook,
+        PeerAddressRecord, UtxoRecord, load_chain_archive_db, load_mempool_db, load_peer_book_db,
+        load_snapshot, load_snapshot_db, save_chain_archive_db, save_mempool_db, save_peer_book_db,
+        save_snapshot, save_snapshot_db,
     };
 
     #[test]
@@ -787,5 +926,81 @@ mod tests {
         let path = PathBuf::from("target/test-peer-book-invalid.redb");
         let err = save_peer_book_db(&path, &peer_book).expect_err("must reject empty address");
         assert!(matches!(err, crate::StorageError::InvalidPeerBook(_)));
+    }
+
+    fn sample_tx(seed: u8) -> Transaction {
+        Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: OutPoint {
+                    txid: Hash256([seed; 32]),
+                    vout: seed as u32,
+                },
+                signature: vec![seed; 64],
+                pubkey_compressed: vec![2u8; 33],
+                sequence: 0,
+            }],
+            outputs: vec![TxOut {
+                value: 1,
+                key_hash20: [seed; 20],
+            }],
+            lock_time: 0,
+        }
+    }
+
+    #[test]
+    fn mempool_snapshot_db_roundtrip() {
+        let tx_a = sample_tx(1);
+        let tx_b = sample_tx(2);
+        let snapshot = MempoolSnapshot {
+            network_id: "devnet".to_owned(),
+            entries: vec![
+                MempoolTxRecord {
+                    txid: tx_a.txid(),
+                    tx: tx_a.clone(),
+                    fee: 10,
+                },
+                MempoolTxRecord {
+                    txid: tx_b.txid(),
+                    tx: tx_b.clone(),
+                    fee: 20,
+                },
+                // Duplicate txid should be deduped by save path (last one wins).
+                MempoolTxRecord {
+                    txid: tx_a.txid(),
+                    tx: tx_a,
+                    fee: 50,
+                },
+            ],
+        };
+
+        let path = PathBuf::from("target/test-mempool.redb");
+        save_mempool_db(&path, &snapshot).expect("save mempool");
+        let loaded = load_mempool_db(&path).expect("load mempool");
+        assert_eq!(loaded.network_id, "devnet");
+        assert_eq!(loaded.entries.len(), 2);
+        let entry_a = loaded
+            .entries
+            .iter()
+            .find(|entry| entry.txid == sample_tx(1).txid())
+            .expect("tx a");
+        assert_eq!(entry_a.fee, 50);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mempool_snapshot_rejects_txid_mismatch() {
+        let tx = sample_tx(9);
+        let snapshot = MempoolSnapshot {
+            network_id: "devnet".to_owned(),
+            entries: vec![MempoolTxRecord {
+                txid: Hash256([0u8; 32]),
+                tx,
+                fee: 1,
+            }],
+        };
+        let path = PathBuf::from("target/test-mempool-invalid.redb");
+        let err = save_mempool_db(&path, &snapshot).expect_err("must reject mismatch");
+        assert!(matches!(err, crate::StorageError::InvalidMempool(_)));
     }
 }

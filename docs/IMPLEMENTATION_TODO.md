@@ -26,6 +26,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] Added redb-backed peer address book persistence with roundtrip/validation tests.
 - [x] `node add-peer` migrated to redb peer-book backend with legacy `.txt` migration path.
 - [x] Added `node reindex-runtime` command to replay persisted block archive and rebuild runtime DB.
+- [x] Added redb-backed optional mempool snapshot persistence API with validation tests.
 - [x] Miner template + nonce search loop implemented (`mine-once` CLI).
 - [x] Chainstate snapshot save/load implemented.
 - [x] redb-backed snapshot persistence implemented (`snapshot save-genesis-db` / `snapshot show-db`).
@@ -189,7 +190,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] block index (height, work, parent)
 - [x] UTXO set
 - [x] chain tip metadata
-- [ ] mempool persistence (optional, bounded)
+- [x] mempool persistence (optional, bounded)
 - [x] peer address book
 - [ ] Atomic crash-consistent commit for block connect/disconnect state updates.
 - [x] Recovery and reindex mode.
