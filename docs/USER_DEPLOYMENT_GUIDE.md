@@ -80,6 +80,29 @@ If you have peer book + seeds:
 scam-node sync-book --network devnet --config config/devnet.toml --runtime-db data/devnet.runtime.redb
 ```
 
+### 5.1 Web Console (Explorer + Wallet GUI)
+
+Run RPC server against runtime DB and serve UI files:
+
+```bash
+scam-node rpc-serve \
+  --network devnet \
+  --config config/devnet.toml \
+  --runtime-db data/devnet.runtime.redb \
+  --bind 127.0.0.1:18080 \
+  --ui-dir web \
+  --relay-telemetry data/relay.telemetry.jsonl
+```
+
+Open:
+
+```text
+http://127.0.0.1:18080/
+```
+
+Wallet actions in the web UI call RPC endpoints (`/wallet/*`).
+Mining operations should still use Stratum/SV2 commands.
+
 ## 6) Create Wallet (Secure Recommended)
 
 Create encrypted vault:
@@ -261,4 +284,3 @@ scripts/soak-24h.sh
 scripts/chaos-crash-loop.sh
 scripts/testnet-dress-rehearsal.sh
 ```
-

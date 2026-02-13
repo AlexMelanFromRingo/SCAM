@@ -252,6 +252,30 @@ cargo run -p scam-node -- relay-serve \
   --telemetry-out data/relay.telemetry.jsonl
 ```
 
+### 6.6 RPC + Web Console (Explorer + Wallet UI)
+
+Start RPC against persisted runtime state and serve web UI assets:
+
+```bash
+cargo run -p scam-node -- rpc-serve \
+  --network devnet \
+  --config config/devnet.toml \
+  --runtime-db data/devnet.runtime.redb \
+  --bind 127.0.0.1:18080 \
+  --ui-dir web \
+  --relay-telemetry data/relay.telemetry.jsonl
+```
+
+Then open:
+
+```text
+http://127.0.0.1:18080/
+```
+
+RPC endpoints used by the console:
+- GET: `/health`, `/status`, `/block/<height>`, `/tx/<height>/<index>`, `/mempool`
+- POST: `/wallet/new`, `/wallet/address`, `/wallet/decode`, `/wallet/balance`, `/wallet/send-preview`, `/wallet/qr`
+
 ---
 
 ## 7) Wallet User Flows
@@ -544,6 +568,7 @@ python3 scripts/sv2-conformance-report.py \
   - infra hardening (monitoring, key custody, incident drills),
   - external peer ecosystem validation,
   - change-management discipline for protocol/config updates.
+- Mining control/data plane should use Stratum/SV2; RPC is intentionally operator/wallet-facing API and web-console transport.
 - Always run `testnet` + rehearsal workflows before any mainnet-facing change.
 
 ---
@@ -562,3 +587,4 @@ python3 scripts/sv2-conformance-report.py \
 - `docs/MEMPOOL_THREAT_MODEL.md`
 - `docs/TESTING_STRATEGY.md`
 - `docs/FORKING_GUIDE.md`
+- `docs/WEB_CONSOLE.md`

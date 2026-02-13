@@ -648,8 +648,14 @@ struct RpcServeArgs {
     network: Network,
     #[arg(long)]
     config: Option<PathBuf>,
+    #[arg(long)]
+    runtime_db: Option<PathBuf>,
     #[arg(long, default_value = "127.0.0.1:18080")]
     bind: String,
+    #[arg(long, default_value = "web")]
+    ui_dir: PathBuf,
+    #[arg(long)]
+    relay_telemetry: Option<PathBuf>,
     #[arg(long, default_value_t = 0)]
     mine_blocks: u32,
     #[arg(long, default_value_t = 120)]
@@ -1123,6 +1129,7 @@ fn run_node(
 fn build_runtime_for_query(
     network: Network,
     config: Option<PathBuf>,
+    runtime_db: Option<PathBuf>,
     mine_blocks: u32,
     interval_sec: u64,
     max_nonce: u64,
@@ -1131,7 +1138,8 @@ fn build_runtime_for_query(
     let config_path =
         config.unwrap_or_else(|| PathBuf::from(format!("config/{}.toml", network.as_str())));
     let cfg = load_chain_config(&config_path)?;
-    let mut runtime = ChainRuntime::from_config(cfg.clone())?;
+    let runtime_db_path = runtime_db.unwrap_or_else(|| default_runtime_db_path(network));
+    let (mut runtime, _) = load_runtime_from_db_or_genesis(&cfg, &runtime_db_path)?;
     if mine_blocks > 0 {
         let params = MiningLoopParams {
             count: mine_blocks,
@@ -1178,6 +1186,7 @@ fn run_status(args: StatusArgs) -> Result<(), NodeError> {
     let (cfg, runtime) = build_runtime_for_query(
         args.network,
         args.config,
+        None,
         args.mine_blocks,
         args.interval_sec,
         args.max_nonce,
@@ -1214,6 +1223,7 @@ fn run_get_block(args: GetBlockArgs) -> Result<(), NodeError> {
     let (_cfg, runtime) = build_runtime_for_query(
         args.network,
         args.config,
+        None,
         mine_blocks,
         args.interval_sec,
         args.max_nonce,
@@ -1254,6 +1264,7 @@ fn run_get_tx(args: GetTxArgs) -> Result<(), NodeError> {
     let (_cfg, runtime) = build_runtime_for_query(
         args.network,
         args.config,
+        None,
         mine_blocks,
         args.interval_sec,
         args.max_nonce,
@@ -1746,6 +1757,7 @@ fn run_wallet(command: WalletCommand) -> Result<(), NodeError> {
             let (_cfg, runtime) = build_runtime_for_query(
                 network,
                 config,
+                None,
                 mine_blocks,
                 interval_sec,
                 max_nonce,
@@ -1770,6 +1782,7 @@ fn run_wallet(command: WalletCommand) -> Result<(), NodeError> {
             let (_cfg, runtime) = build_runtime_for_query(
                 network,
                 config,
+                None,
                 mine_blocks,
                 interval_sec,
                 max_nonce,
@@ -1794,6 +1807,7 @@ fn run_wallet(command: WalletCommand) -> Result<(), NodeError> {
             let (_cfg, runtime) = build_runtime_for_query(
                 network,
                 config,
+                None,
                 mine_blocks,
                 interval_sec,
                 max_nonce,
@@ -1857,6 +1871,7 @@ fn run_wallet(command: WalletCommand) -> Result<(), NodeError> {
             let (cfg, runtime) = build_runtime_for_query(
                 network,
                 config,
+                None,
                 mine_blocks,
                 interval_sec,
                 max_nonce,
@@ -3118,7 +3133,7 @@ struct RelayServerState {
     relay: RelayAdmissionState,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct RelayServerTelemetrySnapshot {
     timestamp_unix_sec: u64,
     active_peers: usize,
@@ -6058,17 +6073,244 @@ fn json_error_body(message: &str) -> String {
     format!("{{\"error\":\"{escaped}\"}}")
 }
 
-fn write_http_json_response(
+#[derive(Debug)]
+struct HttpRequest {
+    method: String,
+    path: String,
+    body: Vec<u8>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+struct WalletNewRpcRequest {
+    words: usize,
+    passphrase: String,
+    account: u32,
+    index: u32,
+    hrp: Option<String>,
+}
+
+impl Default for WalletNewRpcRequest {
+    fn default() -> Self {
+        Self {
+            words: 12,
+            passphrase: String::new(),
+            account: 0,
+            index: 0,
+            hrp: None,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+struct WalletAddressRpcRequest {
+    mnemonic: String,
+    passphrase: String,
+    account: u32,
+    index: u32,
+    hrp: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WalletDecodeRpcRequest {
+    address: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+struct WalletBalanceRpcRequest {
+    mnemonic: String,
+    passphrase: String,
+    account: u32,
+    index: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+struct WalletSendPreviewRpcRequest {
+    mnemonic: String,
+    passphrase: String,
+    account: u32,
+    index: u32,
+    to: String,
+    amount: u64,
+    fee: u64,
+}
+
+impl Default for WalletSendPreviewRpcRequest {
+    fn default() -> Self {
+        Self {
+            mnemonic: String::new(),
+            passphrase: String::new(),
+            account: 0,
+            index: 0,
+            to: String::new(),
+            amount: 0,
+            fee: 1,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+struct WalletQrRpcRequest {
+    address: String,
+    amount: Option<u64>,
+    label: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct WalletAddressRpcResponse {
+    network_id: String,
+    hrp: String,
+    account: u32,
+    index: u32,
+    address: String,
+    pubkey_compressed_hex: String,
+    key_hash20_hex: String,
+}
+
+#[derive(Debug, Serialize)]
+struct WalletBalanceRpcResponse {
+    network_id: String,
+    account: u32,
+    index: u32,
+    address: String,
+    key_hash20_hex: String,
+    tip_height: u64,
+    utxo_count: usize,
+    spendable_utxo_count: usize,
+    immature_utxo_count: usize,
+    total: u128,
+    spendable: u128,
+    immature: u128,
+}
+
+#[derive(Debug, Serialize)]
+struct WalletSendPreviewInput {
+    txid: String,
+    vout: u32,
+    value: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct WalletSendPreviewRpcResponse {
+    network_id: String,
+    txid: String,
+    raw_tx_hex: String,
+    amount: u64,
+    fee: u64,
+    input_total: u64,
+    change: u64,
+    is_self_transfer: bool,
+    selected_inputs: Vec<WalletSendPreviewInput>,
+}
+
+#[derive(Debug, Serialize)]
+struct WalletDecodeRpcResponse {
+    hrp: String,
+    key_hash20_hex: String,
+}
+
+#[derive(Debug, Serialize)]
+struct WalletQrRpcResponse {
+    ascii: String,
+}
+
+#[derive(Debug, Serialize)]
+struct MempoolSummaryRpcResponse {
+    available: bool,
+    source: String,
+    snapshot: Option<RelayServerTelemetrySnapshot>,
+}
+
+fn wallet_address_response(
+    cfg: &ChainConfig,
+    account: u32,
+    index: u32,
+    hrp: &str,
+    key: &WalletKey,
+) -> Result<WalletAddressRpcResponse, NodeError> {
+    let pubkey = key.pubkey_compressed();
+    let address = to_address(hrp, pubkey)?;
+    let key_hash20 = scam_core::hash160_blake3(&pubkey);
+    Ok(WalletAddressRpcResponse {
+        network_id: cfg.network_id.clone(),
+        hrp: hrp.to_owned(),
+        account,
+        index,
+        address,
+        pubkey_compressed_hex: hex::encode(pubkey),
+        key_hash20_hex: hex::encode(key_hash20),
+    })
+}
+
+fn wallet_balance_response(
+    runtime: &ChainRuntime,
+    cfg: &ChainConfig,
+    account: u32,
+    index: u32,
+    address: String,
+    key_hash20: [u8; 20],
+) -> WalletBalanceRpcResponse {
+    let mut total: u128 = 0;
+    let mut spendable: u128 = 0;
+    let mut immature: u128 = 0;
+    let mut utxo_count = 0usize;
+    let mut spendable_count = 0usize;
+    let mut immature_count = 0usize;
+
+    let tip_height = runtime.tip_height();
+    let coinbase_maturity = runtime.config().coinbase_maturity as u64;
+    for utxo in runtime.utxo_set().values() {
+        if utxo.key_hash20 != key_hash20 {
+            continue;
+        }
+        utxo_count += 1;
+        total = total.saturating_add(utxo.value as u128);
+        let is_immature_coinbase =
+            utxo.is_coinbase && tip_height < utxo.created_height.saturating_add(coinbase_maturity);
+        if is_immature_coinbase {
+            immature_count += 1;
+            immature = immature.saturating_add(utxo.value as u128);
+        } else {
+            spendable_count += 1;
+            spendable = spendable.saturating_add(utxo.value as u128);
+        }
+    }
+
+    WalletBalanceRpcResponse {
+        network_id: cfg.network_id.clone(),
+        account,
+        index,
+        address,
+        key_hash20_hex: hex::encode(key_hash20),
+        tip_height,
+        utxo_count,
+        spendable_utxo_count: spendable_count,
+        immature_utxo_count: immature_count,
+        total,
+        spendable,
+        immature,
+    }
+}
+
+fn write_http_response(
     stream: &mut TcpStream,
     status_line: &str,
-    body: &str,
+    content_type: &str,
+    body: &[u8],
 ) -> Result<(), NodeError> {
-    let response = format!(
-        "HTTP/1.1 {status_line}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+    let headers = format!(
+        "HTTP/1.1 {status_line}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     stream
-        .write_all(response.as_bytes())
+        .write_all(headers.as_bytes())
+        .map_err(|e| NodeError::Runtime(format!("http write failed: {e}")))?;
+    stream
+        .write_all(body)
         .map_err(|e| NodeError::Runtime(format!("http write failed: {e}")))?;
     stream
         .flush()
@@ -6076,53 +6318,262 @@ fn write_http_json_response(
     Ok(())
 }
 
-fn read_http_get_path(stream: &mut TcpStream) -> Result<Option<String>, NodeError> {
-    let mut buffer = [0u8; 4096];
-    let read = stream
-        .read(&mut buffer)
-        .map_err(|e| NodeError::Runtime(format!("http read failed: {e}")))?;
-    if read == 0 {
-        return Ok(None);
+fn write_http_json_response(
+    stream: &mut TcpStream,
+    status_line: &str,
+    body: &str,
+) -> Result<(), NodeError> {
+    write_http_response(
+        stream,
+        status_line,
+        "application/json; charset=utf-8",
+        body.as_bytes(),
+    )
+}
+
+fn find_http_header_terminator(buffer: &[u8]) -> Option<usize> {
+    buffer.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+fn parse_content_length(headers: &str) -> Result<usize, NodeError> {
+    for line in headers.lines().skip(1) {
+        let mut parts = line.splitn(2, ':');
+        let Some(name) = parts.next() else {
+            continue;
+        };
+        let Some(value) = parts.next() else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("content-length") {
+            return value.trim().parse::<usize>().map_err(|e| {
+                NodeError::Runtime(format!(
+                    "invalid Content-Length header '{}': {e}",
+                    value.trim()
+                ))
+            });
+        }
     }
-    let raw = std::str::from_utf8(&buffer[..read])
+    Ok(0)
+}
+
+fn read_http_request(stream: &mut TcpStream) -> Result<Option<HttpRequest>, NodeError> {
+    let mut buffer = Vec::<u8>::with_capacity(4096);
+    let mut chunk = [0u8; 4096];
+    let mut header_end = None::<usize>;
+    let mut content_length = 0usize;
+
+    loop {
+        let read = stream
+            .read(&mut chunk)
+            .map_err(|e| NodeError::Runtime(format!("http read failed: {e}")))?;
+        if read == 0 {
+            if buffer.is_empty() {
+                return Ok(None);
+            }
+            break;
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+
+        if buffer.len() > 2 * 1024 * 1024 {
+            return Err(NodeError::Runtime(
+                "http request too large (max 2 MiB)".to_owned(),
+            ));
+        }
+
+        if header_end.is_none()
+            && let Some(pos) = find_http_header_terminator(&buffer)
+        {
+            let end = pos + 4;
+            let headers = std::str::from_utf8(&buffer[..end])
+                .map_err(|e| NodeError::Runtime(format!("invalid utf8 in request headers: {e}")))?;
+            content_length = parse_content_length(headers)?;
+            header_end = Some(end);
+        }
+
+        if let Some(end) = header_end
+            && buffer.len() >= end.saturating_add(content_length)
+        {
+            break;
+        }
+    }
+
+    let Some(end) = header_end else {
+        return Err(NodeError::Runtime(
+            "malformed http request: missing header terminator".to_owned(),
+        ));
+    };
+
+    let headers = std::str::from_utf8(&buffer[..end])
         .map_err(|e| NodeError::Runtime(format!("invalid utf8 in request: {e}")))?;
-    let Some(line) = raw.lines().next() else {
+    let Some(line) = headers.lines().next() else {
         return Ok(None);
     };
     let mut parts = line.split_whitespace();
-    let method = parts.next().unwrap_or_default();
+    let method = parts.next().unwrap_or_default().to_owned();
     let raw_target = parts.next().unwrap_or("/");
-    if method != "GET" {
+    let path = raw_target.split('?').next().unwrap_or("/");
+
+    let available_body = buffer.len().saturating_sub(end);
+    if available_body < content_length {
         return Err(NodeError::Runtime(format!(
-            "unsupported method {method}, only GET is allowed"
+            "malformed http request: expected body length {}, got {}",
+            content_length, available_body
         )));
     }
-    let path = raw_target.split('?').next().unwrap_or("/");
-    Ok(Some(path.to_owned()))
+    let body = if content_length == 0 {
+        Vec::new()
+    } else {
+        buffer[end..end + content_length].to_vec()
+    };
+
+    Ok(Some(HttpRequest {
+        method,
+        path: path.to_owned(),
+        body,
+    }))
+}
+
+fn parse_json_body<T: DeserializeOwned>(request: &HttpRequest) -> Result<T, NodeError> {
+    if request.body.is_empty() {
+        return serde_json::from_str("{}")
+            .map_err(|e| NodeError::Runtime(format!("invalid json body: {e}")));
+    }
+    serde_json::from_slice::<T>(&request.body)
+        .map_err(|e| NodeError::Runtime(format!("invalid json body: {e}")))
+}
+
+fn load_latest_jsonl_record<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, NodeError> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let file = fs::File::open(path).map_err(|e| {
+        NodeError::Runtime(format!("cannot open telemetry {}: {e}", path.display()))
+    })?;
+    let reader = BufReader::new(file);
+    let mut last = None::<String>;
+    for line in reader.lines() {
+        let line =
+            line.map_err(|e| NodeError::Runtime(format!("cannot read telemetry line: {e}")))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        last = Some(line);
+    }
+    let Some(line) = last else {
+        return Ok(None);
+    };
+    let parsed = serde_json::from_str::<T>(line.trim_end())
+        .map_err(|e| NodeError::Runtime(format!("invalid telemetry json record: {e}")))?;
+    Ok(Some(parsed))
+}
+
+fn sanitize_ui_path(path: &str) -> Option<PathBuf> {
+    let normalized = path.trim_start_matches('/');
+    if normalized.is_empty() {
+        return Some(PathBuf::from("index.html"));
+    }
+    let candidate = PathBuf::from(normalized);
+    if candidate
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return None;
+    }
+    Some(candidate)
+}
+
+fn guess_content_type(path: &Path) -> &'static str {
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some("html") => "text/html; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("js") => "text/javascript; charset=utf-8",
+        Some("json") => "application/json; charset=utf-8",
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("ico") => "image/x-icon",
+        _ => "application/octet-stream",
+    }
+}
+
+fn try_serve_ui_asset(
+    stream: &mut TcpStream,
+    ui_dir: &Path,
+    request_path: &str,
+) -> Result<bool, NodeError> {
+    if !ui_dir.exists() || !ui_dir.is_dir() {
+        return Ok(false);
+    }
+    let Some(relative) = sanitize_ui_path(request_path) else {
+        write_http_json_response(
+            stream,
+            "400 Bad Request",
+            &json_error_body("invalid asset path"),
+        )?;
+        return Ok(true);
+    };
+    let candidate = ui_dir.join(relative);
+    let asset_path = if candidate.exists() && candidate.is_file() {
+        candidate
+    } else {
+        let index = ui_dir.join("index.html");
+        if index.exists() && index.is_file() {
+            index
+        } else {
+            return Ok(false);
+        }
+    };
+    let body = fs::read(&asset_path).map_err(|e| {
+        NodeError::Runtime(format!(
+            "cannot read ui asset {}: {e}",
+            asset_path.display()
+        ))
+    })?;
+    write_http_response(stream, "200 OK", guess_content_type(&asset_path), &body)?;
+    Ok(true)
 }
 
 fn run_rpc_serve(args: RpcServeArgs) -> Result<(), NodeError> {
+    let RpcServeArgs {
+        network,
+        config,
+        runtime_db,
+        bind,
+        ui_dir,
+        relay_telemetry,
+        mine_blocks,
+        interval_sec,
+        max_nonce,
+        max_requests,
+    } = args;
     let (cfg, runtime) = build_runtime_for_query(
-        args.network,
-        args.config,
-        args.mine_blocks,
-        args.interval_sec,
-        args.max_nonce,
+        network,
+        config,
+        runtime_db,
+        mine_blocks,
+        interval_sec,
+        max_nonce,
         "rpc-serve",
     )?;
 
-    let listener = TcpListener::bind(&args.bind)
-        .map_err(|e| NodeError::Runtime(format!("rpc bind failed on {}: {e}", args.bind)))?;
+    let listener = TcpListener::bind(&bind)
+        .map_err(|e| NodeError::Runtime(format!("rpc bind failed on {}: {e}", bind)))?;
     println!(
         "RPC listening on {} (network={} tip_h={} tip_hash={})",
-        args.bind,
+        bind,
         cfg.network_id,
         runtime.tip_height(),
         runtime.tip_hash()
     );
-    println!("Endpoints: GET /health, /status, /block/<height>, /tx/<height>/<index>");
-    if args.max_requests > 0 {
-        println!("Max requests before exit: {}", args.max_requests);
+    println!(
+        "Endpoints: GET /health, /status, /block/<height>, /tx/<height>/<index>, /mempool; POST /wallet/new, /wallet/address, /wallet/decode, /wallet/balance, /wallet/send-preview, /wallet/qr"
+    );
+    println!("UI assets directory: {}", ui_dir.display());
+    if let Some(path) = relay_telemetry.as_ref() {
+        println!("Relay telemetry source: {}", path.display());
+    }
+    if max_requests > 0 {
+        println!("Max requests before exit: {}", max_requests);
     }
 
     let mut served = 0u32;
@@ -6131,8 +6582,8 @@ fn run_rpc_serve(args: RpcServeArgs) -> Result<(), NodeError> {
             incoming.map_err(|e| NodeError::Runtime(format!("rpc accept failed: {e}")))?;
         configure_stream_timeouts(&stream)?;
 
-        let path = match read_http_get_path(&mut stream) {
-            Ok(Some(path)) => path,
+        let request = match read_http_request(&mut stream) {
+            Ok(Some(request)) => request,
             Ok(None) => continue,
             Err(err) => {
                 let body = json_error_body(&err.to_string());
@@ -6141,9 +6592,11 @@ fn run_rpc_serve(args: RpcServeArgs) -> Result<(), NodeError> {
             }
         };
 
-        let (status, body) = if path == "/health" {
+        let method = request.method.as_str();
+        let path = request.path.as_str();
+        let (status, body) = if method == "GET" && path == "/health" {
             ("200 OK", "{\"ok\":true}".to_owned())
-        } else if path == "/status" {
+        } else if method == "GET" && path == "/status" {
             let payload = StatusResponse {
                 network_id: cfg.network_id.clone(),
                 tip_height: runtime.tip_height(),
@@ -6158,7 +6611,42 @@ fn run_rpc_serve(args: RpcServeArgs) -> Result<(), NodeError> {
                     json_error_body(&format!("status serialization failed: {e}")),
                 ),
             }
-        } else if let Some(height_raw) = path.strip_prefix("/block/") {
+        } else if method == "GET" && path == "/mempool" {
+            let summary = if let Some(telemetry_path) = relay_telemetry.as_ref() {
+                match load_latest_jsonl_record::<RelayServerTelemetrySnapshot>(telemetry_path) {
+                    Ok(Some(snapshot)) => MempoolSummaryRpcResponse {
+                        available: true,
+                        source: telemetry_path.display().to_string(),
+                        snapshot: Some(snapshot),
+                    },
+                    Ok(None) => MempoolSummaryRpcResponse {
+                        available: false,
+                        source: telemetry_path.display().to_string(),
+                        snapshot: None,
+                    },
+                    Err(err) => {
+                        let body = json_error_body(&err.to_string());
+                        write_http_json_response(&mut stream, "500 Internal Server Error", &body)?;
+                        continue;
+                    }
+                }
+            } else {
+                MempoolSummaryRpcResponse {
+                    available: false,
+                    source: "relay telemetry not configured".to_owned(),
+                    snapshot: None,
+                }
+            };
+            match to_pretty_json(&summary) {
+                Ok(body) => ("200 OK", body),
+                Err(e) => (
+                    "500 Internal Server Error",
+                    json_error_body(&format!("mempool summary serialization failed: {e}")),
+                ),
+            }
+        } else if method == "GET"
+            && let Some(height_raw) = path.strip_prefix("/block/")
+        {
             match height_raw.parse::<u64>() {
                 Ok(height) => match runtime.block_hash_at_height(height) {
                     Some(hash) => match runtime.block_by_hash(&hash) {
@@ -6191,7 +6679,9 @@ fn run_rpc_serve(args: RpcServeArgs) -> Result<(), NodeError> {
                     json_error_body("invalid block height, expected unsigned integer"),
                 ),
             }
-        } else if let Some(rest) = path.strip_prefix("/tx/") {
+        } else if method == "GET"
+            && let Some(rest) = path.strip_prefix("/tx/")
+        {
             let mut segments = rest.split('/');
             let height_raw = segments.next().unwrap_or_default();
             let index_raw = segments.next().unwrap_or_default();
@@ -6240,18 +6730,314 @@ fn run_rpc_serve(args: RpcServeArgs) -> Result<(), NodeError> {
                     ),
                 }
             }
-        } else {
-            (
-                "404 Not Found",
-                json_error_body(
-                    "unknown endpoint, use /health, /status, /block/<height>, /tx/<height>/<index>",
+        } else if method == "POST" && path == "/wallet/new" {
+            let req = match parse_json_body::<WalletNewRpcRequest>(&request) {
+                Ok(value) => value,
+                Err(err) => {
+                    let body = json_error_body(&err.to_string());
+                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
+                    continue;
+                }
+            };
+            let mnemonic = match new_mnemonic(req.words) {
+                Ok(value) => value,
+                Err(err) => {
+                    let body = json_error_body(&err.to_string());
+                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
+                    continue;
+                }
+            };
+            let seed = mnemonic.to_seed(&req.passphrase);
+            let key = match derive_wallet_key(&seed, req.account, req.index) {
+                Ok(value) => value,
+                Err(err) => {
+                    let body = json_error_body(&err.to_string());
+                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
+                    continue;
+                }
+            };
+            let hrp = req.hrp.unwrap_or_else(|| cfg.hrp.clone());
+            let payload = match wallet_address_response(&cfg, req.account, req.index, &hrp, &key) {
+                Ok(value) => value,
+                Err(err) => {
+                    let body = json_error_body(&err.to_string());
+                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
+                    continue;
+                }
+            };
+            let body = serde_json::json!({
+                "mnemonic": mnemonic.phrase(),
+                "network_id": payload.network_id,
+                "hrp": payload.hrp,
+                "account": payload.account,
+                "index": payload.index,
+                "address": payload.address,
+                "pubkey_compressed_hex": payload.pubkey_compressed_hex,
+                "key_hash20_hex": payload.key_hash20_hex
+            });
+            match serde_json::to_string_pretty(&body) {
+                Ok(rendered) => ("200 OK", rendered),
+                Err(e) => (
+                    "500 Internal Server Error",
+                    json_error_body(&format!("wallet new serialization failed: {e}")),
                 ),
-            )
+            }
+        } else if method == "POST" && path == "/wallet/address" {
+            let req = match parse_json_body::<WalletAddressRpcRequest>(&request) {
+                Ok(value) => value,
+                Err(err) => {
+                    let body = json_error_body(&err.to_string());
+                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
+                    continue;
+                }
+            };
+            let mnemonic = match WalletMnemonic::parse(&req.mnemonic) {
+                Ok(value) => value,
+                Err(err) => {
+                    let body = json_error_body(&err.to_string());
+                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
+                    continue;
+                }
+            };
+            let seed = mnemonic.to_seed(&req.passphrase);
+            let key = match derive_wallet_key(&seed, req.account, req.index) {
+                Ok(value) => value,
+                Err(err) => {
+                    let body = json_error_body(&err.to_string());
+                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
+                    continue;
+                }
+            };
+            let hrp = req.hrp.unwrap_or_else(|| cfg.hrp.clone());
+            let payload = match wallet_address_response(&cfg, req.account, req.index, &hrp, &key) {
+                Ok(value) => value,
+                Err(err) => {
+                    let body = json_error_body(&err.to_string());
+                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
+                    continue;
+                }
+            };
+            match to_pretty_json(&payload) {
+                Ok(body) => ("200 OK", body),
+                Err(e) => (
+                    "500 Internal Server Error",
+                    json_error_body(&format!("wallet address serialization failed: {e}")),
+                ),
+            }
+        } else if method == "POST" && path == "/wallet/decode" {
+            let req = match parse_json_body::<WalletDecodeRpcRequest>(&request) {
+                Ok(value) => value,
+                Err(err) => {
+                    let body = json_error_body(&err.to_string());
+                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
+                    continue;
+                }
+            };
+            let decoded = match parse_address(&req.address) {
+                Ok(value) => value,
+                Err(err) => {
+                    let body = json_error_body(&err.to_string());
+                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
+                    continue;
+                }
+            };
+            let payload = WalletDecodeRpcResponse {
+                hrp: decoded.hrp,
+                key_hash20_hex: hex::encode(decoded.key_hash20),
+            };
+            match to_pretty_json(&payload) {
+                Ok(body) => ("200 OK", body),
+                Err(e) => (
+                    "500 Internal Server Error",
+                    json_error_body(&format!("wallet decode serialization failed: {e}")),
+                ),
+            }
+        } else if method == "POST" && path == "/wallet/balance" {
+            let req = match parse_json_body::<WalletBalanceRpcRequest>(&request) {
+                Ok(value) => value,
+                Err(err) => {
+                    let body = json_error_body(&err.to_string());
+                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
+                    continue;
+                }
+            };
+            let mnemonic = match WalletMnemonic::parse(&req.mnemonic) {
+                Ok(value) => value,
+                Err(err) => {
+                    let body = json_error_body(&err.to_string());
+                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
+                    continue;
+                }
+            };
+            let seed = mnemonic.to_seed(&req.passphrase);
+            let key = match derive_wallet_key(&seed, req.account, req.index) {
+                Ok(value) => value,
+                Err(err) => {
+                    let body = json_error_body(&err.to_string());
+                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
+                    continue;
+                }
+            };
+            let address_payload =
+                match wallet_address_response(&cfg, req.account, req.index, &cfg.hrp, &key) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        let body = json_error_body(&err.to_string());
+                        write_http_json_response(&mut stream, "400 Bad Request", &body)?;
+                        continue;
+                    }
+                };
+            let key_hash20 = scam_core::hash160_blake3(&key.pubkey_compressed());
+            let payload = wallet_balance_response(
+                &runtime,
+                &cfg,
+                req.account,
+                req.index,
+                address_payload.address,
+                key_hash20,
+            );
+            match to_pretty_json(&payload) {
+                Ok(body) => ("200 OK", body),
+                Err(e) => (
+                    "500 Internal Server Error",
+                    json_error_body(&format!("wallet balance serialization failed: {e}")),
+                ),
+            }
+        } else if method == "POST" && path == "/wallet/send-preview" {
+            let req = match parse_json_body::<WalletSendPreviewRpcRequest>(&request) {
+                Ok(value) => value,
+                Err(err) => {
+                    let body = json_error_body(&err.to_string());
+                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
+                    continue;
+                }
+            };
+            if req.amount == 0 {
+                let body = json_error_body("amount must be > 0");
+                write_http_json_response(&mut stream, "400 Bad Request", &body)?;
+                continue;
+            }
+            let recipient = match parse_address(&req.to) {
+                Ok(value) => value,
+                Err(err) => {
+                    let body = json_error_body(&err.to_string());
+                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
+                    continue;
+                }
+            };
+            let accepted_hrps = accepted_hrps_for_network(network, &cfg.hrp);
+            if !accepted_hrps.iter().any(|hrp| hrp == &recipient.hrp) {
+                let body = json_error_body(&format!(
+                    "address hrp '{}' is not valid for network '{}' (accepted: {})",
+                    recipient.hrp,
+                    cfg.network_id,
+                    accepted_hrps.join(", ")
+                ));
+                write_http_json_response(&mut stream, "400 Bad Request", &body)?;
+                continue;
+            }
+            let mnemonic = match WalletMnemonic::parse(&req.mnemonic) {
+                Ok(value) => value,
+                Err(err) => {
+                    let body = json_error_body(&err.to_string());
+                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
+                    continue;
+                }
+            };
+            let seed = mnemonic.to_seed(&req.passphrase);
+            let key = match derive_wallet_key(&seed, req.account, req.index) {
+                Ok(value) => value,
+                Err(err) => {
+                    let body = json_error_body(&err.to_string());
+                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
+                    continue;
+                }
+            };
+            let signed = match build_signed_transfer_tx(
+                &runtime,
+                &cfg.network_id,
+                &key,
+                recipient.key_hash20,
+                req.amount,
+                req.fee,
+            ) {
+                Ok(value) => value,
+                Err(err) => {
+                    let body = json_error_body(&err.to_string());
+                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
+                    continue;
+                }
+            };
+            let payload = WalletSendPreviewRpcResponse {
+                network_id: cfg.network_id.clone(),
+                txid: signed.tx.txid().to_hex(),
+                raw_tx_hex: hex::encode(signed.tx.encode_for_hash()),
+                amount: req.amount,
+                fee: req.fee,
+                input_total: signed.input_total,
+                change: signed.change_value,
+                is_self_transfer: signed.is_self_transfer,
+                selected_inputs: signed
+                    .selected_inputs
+                    .into_iter()
+                    .map(|item| WalletSendPreviewInput {
+                        txid: item.outpoint.txid.to_hex(),
+                        vout: item.outpoint.vout,
+                        value: item.value,
+                    })
+                    .collect(),
+            };
+            match to_pretty_json(&payload) {
+                Ok(body) => ("200 OK", body),
+                Err(e) => (
+                    "500 Internal Server Error",
+                    json_error_body(&format!("wallet send serialization failed: {e}")),
+                ),
+            }
+        } else if method == "POST" && path == "/wallet/qr" {
+            let req = match parse_json_body::<WalletQrRpcRequest>(&request) {
+                Ok(value) => value,
+                Err(err) => {
+                    let body = json_error_body(&err.to_string());
+                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
+                    continue;
+                }
+            };
+            if req.address.trim().is_empty() {
+                let body = json_error_body("address must not be empty");
+                write_http_json_response(&mut stream, "400 Bad Request", &body)?;
+                continue;
+            }
+            let ascii = match qr_for_payment_uri(&req.address, req.amount, req.label.as_deref()) {
+                Ok(value) => value,
+                Err(err) => {
+                    let body = json_error_body(&err.to_string());
+                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
+                    continue;
+                }
+            };
+            let payload = WalletQrRpcResponse { ascii };
+            match to_pretty_json(&payload) {
+                Ok(body) => ("200 OK", body),
+                Err(e) => (
+                    "500 Internal Server Error",
+                    json_error_body(&format!("wallet qr serialization failed: {e}")),
+                ),
+            }
+        } else {
+            if method == "GET" && try_serve_ui_asset(&mut stream, &ui_dir, path)? {
+                served = served.saturating_add(1);
+                if max_requests > 0 && served >= max_requests {
+                    break;
+                }
+                continue;
+            }
+            ("404 Not Found", json_error_body("unknown endpoint"))
         };
 
         write_http_json_response(&mut stream, status, &body)?;
         served = served.saturating_add(1);
-        if args.max_requests > 0 && served >= args.max_requests {
+        if max_requests > 0 && served >= max_requests {
             break;
         }
     }

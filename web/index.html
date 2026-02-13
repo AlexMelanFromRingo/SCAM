@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>SCAM Console</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="layout">
+      <header class="hero reveal" style="--delay: 0.03s">
+        <div class="hero-topline">SCAM Console</div>
+        <h1>Explorer + Wallet</h1>
+        <p>
+          Modern local cockpit for SCAM: chain visibility, mempool telemetry, and wallet flows
+          powered by <code>rpc-serve</code>.
+        </p>
+      </header>
+
+      <section class="panel reveal" style="--delay: 0.08s">
+        <h2>RPC Endpoint</h2>
+        <div class="endpoint-row">
+          <input id="apiBase" type="text" />
+          <button id="saveEndpoint" type="button">Apply</button>
+          <button id="refreshAll" type="button">Refresh</button>
+        </div>
+        <p class="hint">
+          Tip: run <code>scam-node rpc-serve --network devnet --runtime-db data/devnet.runtime.redb</code>
+          and open this page on the same host.
+        </p>
+      </section>
+
+      <section class="grid reveal" style="--delay: 0.12s">
+        <article class="stat-card">
+          <div class="label">Network</div>
+          <div class="value" id="statNetwork">-</div>
+        </article>
+        <article class="stat-card">
+          <div class="label">Tip Height</div>
+          <div class="value" id="statHeight">-</div>
+        </article>
+        <article class="stat-card">
+          <div class="label">UTXO Count</div>
+          <div class="value" id="statUtxo">-</div>
+        </article>
+        <article class="stat-card">
+          <div class="label">Chainwork</div>
+          <div class="value mono" id="statWork">-</div>
+        </article>
+      </section>
+
+      <section class="panel reveal" style="--delay: 0.16s">
+        <div class="panel-head">
+          <h2>Latest Blocks</h2>
+          <span class="tag" id="latestRange">-</span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Height</th>
+                <th>Hash</th>
+                <th>Txs</th>
+                <th>Timestamp</th>
+                <th>Target</th>
+              </tr>
+            </thead>
+            <tbody id="latestBlocksBody"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="split reveal" style="--delay: 0.20s">
+        <article class="panel">
+          <h2>Block Lookup</h2>
+          <form id="blockLookupForm" class="stack">
+            <input id="blockHeightInput" type="number" min="0" placeholder="Height" required />
+            <button type="submit">Load Block</button>
+          </form>
+          <pre id="blockLookupOut" class="result"></pre>
+        </article>
+
+        <article class="panel">
+          <h2>TX Lookup</h2>
+          <form id="txLookupForm" class="stack">
+            <input id="txHeightInput" type="number" min="0" placeholder="Block height" required />
+            <input id="txIndexInput" type="number" min="0" placeholder="Tx index" required />
+            <button type="submit">Load TX</button>
+          </form>
+          <pre id="txLookupOut" class="result"></pre>
+        </article>
+      </section>
+
+      <section class="panel reveal" style="--delay: 0.24s">
+        <h2>Mempool Snapshot</h2>
+        <pre id="mempoolOut" class="result"></pre>
+      </section>
+
+      <section class="panel reveal" style="--delay: 0.28s">
+        <h2>Wallet</h2>
+        <div class="tabs" role="tablist">
+          <button data-tab="new" class="tab active" type="button">New</button>
+          <button data-tab="address" class="tab" type="button">Address</button>
+          <button data-tab="balance" class="tab" type="button">Balance</button>
+          <button data-tab="send" class="tab" type="button">Send Preview</button>
+          <button data-tab="decode" class="tab" type="button">Decode</button>
+          <button data-tab="qr" class="tab" type="button">QR</button>
+        </div>
+
+        <div class="tab-panels">
+          <section data-panel="new" class="tab-panel active">
+            <form id="walletNewForm" class="stack">
+              <label>
+                Words
+                <select name="words">
+                  <option value="12">12</option>
+                  <option value="15">15</option>
+                  <option value="18">18</option>
+                  <option value="21">21</option>
+                  <option value="24">24</option>
+                </select>
+              </label>
+              <label>
+                Passphrase (optional)
+                <input name="passphrase" type="text" />
+              </label>
+              <label>
+                Account
+                <input name="account" type="number" min="0" value="0" />
+              </label>
+              <label>
+                Index
+                <input name="index" type="number" min="0" value="0" />
+              </label>
+              <label>
+                HRP (optional)
+                <input name="hrp" type="text" placeholder="auto from network" />
+              </label>
+              <button type="submit">Generate Wallet</button>
+            </form>
+          </section>
+
+          <section data-panel="address" class="tab-panel">
+            <form id="walletAddressForm" class="stack">
+              <label>
+                Mnemonic
+                <textarea name="mnemonic" rows="3" required></textarea>
+              </label>
+              <label>
+                Passphrase (optional)
+                <input name="passphrase" type="text" />
+              </label>
+              <label>
+                Account
+                <input name="account" type="number" min="0" value="0" />
+              </label>
+              <label>
+                Index
+                <input name="index" type="number" min="0" value="0" />
+              </label>
+              <label>
+                HRP (optional)
+                <input name="hrp" type="text" placeholder="auto from network" />
+              </label>
+              <button type="submit">Derive Address</button>
+            </form>
+          </section>
+
+          <section data-panel="balance" class="tab-panel">
+            <form id="walletBalanceForm" class="stack">
+              <label>
+                Mnemonic
+                <textarea name="mnemonic" rows="3" required></textarea>
+              </label>
+              <label>
+                Passphrase (optional)
+                <input name="passphrase" type="text" />
+              </label>
+              <label>
+                Account
+                <input name="account" type="number" min="0" value="0" />
+              </label>
+              <label>
+                Index
+                <input name="index" type="number" min="0" value="0" />
+              </label>
+              <button type="submit">Get Balance</button>
+            </form>
+          </section>
+
+          <section data-panel="send" class="tab-panel">
+            <form id="walletSendForm" class="stack">
+              <label>
+                Mnemonic
+                <textarea name="mnemonic" rows="3" required></textarea>
+              </label>
+              <label>
+                Passphrase (optional)
+                <input name="passphrase" type="text" />
+              </label>
+              <label>
+                Recipient Address
+                <input name="to" type="text" required />
+              </label>
+              <label>
+                Amount
+                <input name="amount" type="number" min="1" required />
+              </label>
+              <label>
+                Fee
+                <input name="fee" type="number" min="1" value="1" required />
+              </label>
+              <label>
+                Account
+                <input name="account" type="number" min="0" value="0" />
+              </label>
+              <label>
+                Index
+                <input name="index" type="number" min="0" value="0" />
+              </label>
+              <button type="submit">Build Preview</button>
+            </form>
+          </section>
+
+          <section data-panel="decode" class="tab-panel">
+            <form id="walletDecodeForm" class="stack">
+              <label>
+                Address
+                <input name="address" type="text" required />
+              </label>
+              <button type="submit">Decode Address</button>
+            </form>
+          </section>
+
+          <section data-panel="qr" class="tab-panel">
+            <form id="walletQrForm" class="stack">
+              <label>
+                Address
+                <input name="address" type="text" required />
+              </label>
+              <label>
+                Amount (optional)
+                <input name="amount" type="number" min="1" />
+              </label>
+              <label>
+                Label (optional)
+                <input name="label" type="text" />
+              </label>
+              <button type="submit">Generate QR</button>
+            </form>
+          </section>
+        </div>
+
+        <pre id="walletOut" class="result"></pre>
+      </section>
+    </main>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

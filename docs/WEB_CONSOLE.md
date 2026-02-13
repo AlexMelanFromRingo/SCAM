@@ -1,0 +1,76 @@
+# Web Console (Explorer + Wallet)
+
+SCAM includes a browser UI served directly by `scam-node rpc-serve`.
+
+The UI is in `web/` and provides:
+- explorer view (status, latest blocks, block lookup, tx lookup),
+- mempool telemetry snapshot view (from relay telemetry JSONL),
+- wallet flows over RPC (`new`, `address`, `balance`, `send-preview`, `decode`, `qr`).
+
+## 1) Start Node Runtime
+
+Prepare runtime DB first:
+
+```bash
+cargo run -p scam-node -- node \
+  --network devnet \
+  --config config/devnet.toml \
+  --runtime-db data/devnet.runtime.redb
+```
+
+Optional: run relay for live telemetry snapshots:
+
+```bash
+cargo run -p scam-node -- relay-serve \
+  --network devnet \
+  --config config/devnet.toml \
+  --runtime-db data/devnet.runtime.redb \
+  --bind 0.0.0.0:18444 \
+  --telemetry-out data/relay.telemetry.jsonl
+```
+
+## 2) Start RPC + UI Server
+
+```bash
+cargo run -p scam-node -- rpc-serve \
+  --network devnet \
+  --config config/devnet.toml \
+  --runtime-db data/devnet.runtime.redb \
+  --bind 127.0.0.1:18080 \
+  --ui-dir web \
+  --relay-telemetry data/relay.telemetry.jsonl
+```
+
+Open:
+
+```text
+http://127.0.0.1:18080/
+```
+
+## 3) RPC Endpoint Map
+
+GET:
+- `/health`
+- `/status`
+- `/block/<height>`
+- `/tx/<height>/<index>`
+- `/mempool`
+
+POST:
+- `/wallet/new`
+- `/wallet/address`
+- `/wallet/decode`
+- `/wallet/balance`
+- `/wallet/send-preview`
+- `/wallet/qr`
+
+## 4) Security Notes
+
+- Wallet RPC methods can include mnemonic material in request bodies.
+- Run RPC/UI only on trusted interfaces (default bind is loopback).
+- Keep this endpoint behind network controls for any multi-user environment.
+
+## 5) Stratum vs RPC
+
+- RPC/UI is for operator tooling, explorer, and wallet operations.
+- Mining jobs and share submission should use Stratum/SV2 commands (`stratum-serve`, `stratum-mine`, role services).
