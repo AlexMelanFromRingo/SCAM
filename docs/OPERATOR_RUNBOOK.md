@@ -87,6 +87,12 @@ cargo run -p scam-node -- soak \
   --telemetry-every-rounds 1
 ```
 
+Public testnet dry-run (end-to-end checklist automation):
+
+```bash
+scripts/testnet-dress-rehearsal.sh
+```
+
 ## 6) Hardening Signals
 
 - Keep gossip replacement-rate limits enabled (default in current code path).

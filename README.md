@@ -90,6 +90,12 @@ Crash-loop durability:
 scripts/chaos-crash-loop.sh
 ```
 
+Public testnet dry-run:
+
+```bash
+scripts/testnet-dress-rehearsal.sh
+```
+
 Soak with persisted telemetry snapshots (JSONL):
 
 ```bash
@@ -139,3 +145,4 @@ A full pool-grade SV2 deployment still needs:
 - `docs/MEMPOOL_THREAT_MODEL.md`
 - `docs/TESTING_STRATEGY.md`
 - `docs/FORKING_GUIDE.md`
+- `docs/SV2_POOL_GRADE_GAP.md`

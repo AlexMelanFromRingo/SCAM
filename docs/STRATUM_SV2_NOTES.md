@@ -58,3 +58,5 @@ A full pool-grade SV2 deployment still needs:
 - full role split (Template Provider / Job Declarator / Translator),
 - production transport security (Noise-based encrypted channels),
 - exhaustive interoperability matrix testing with third-party SV2 stacks.
+
+Tracking file: `docs/SV2_POOL_GRADE_GAP.md`.

@@ -88,3 +88,11 @@ scripts/chaos-crash-loop.sh
 ```
 
 This repeatedly kills the node process and validates DB reopen/recovery.
+
+## Public Testnet Dress Rehearsal
+
+```bash
+scripts/testnet-dress-rehearsal.sh
+```
+
+This runs bootstrap/sync/short-soak/reindex/status checks in sequence.
