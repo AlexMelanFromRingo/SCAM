@@ -11,6 +11,14 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
+Stratum coverage is included in workspace tests (`scam-stratum`):
+
+- frame encode/decode roundtrip,
+- session state-machine happy path,
+- unknown job rejection,
+- reject-budget closure behavior,
+- VarDiff target retune behavior.
+
 ## Fuzzing Baseline
 
 Fuzz harness package lives in `fuzz/` with targets:

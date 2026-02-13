@@ -33,6 +33,9 @@ cargo run -p scam-node -- stratum-serve \
   --config config/myfork.toml \
   --runtime-db data/myfork.runtime.redb \
   --bind 0.0.0.0:3347 \
+  --vardiff-target-shares-per-minute 6 \
+  --vardiff-retarget-interval-shares 24 \
+  --max-rejected-shares 64 \
   --max-jobs-per-channel 128
 ```
 
@@ -43,6 +46,7 @@ cargo run -p scam-node -- stratum-serve \
 - `difficulty_algorithm`: yes (`windowed`, `lwma`, `asert`).
 - `target_block_time_sec`, `difficulty_adjustment_window`, clamps: yes.
 - P2P policy fields (`dns_seeds`, bucket cap): yes.
+- Stratum policy fields (`share_target`, `min/max share target`, VarDiff knobs, client limits): yes.
 
 ## Quality Notes
 

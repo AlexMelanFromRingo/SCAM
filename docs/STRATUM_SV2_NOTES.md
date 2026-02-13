@@ -2,12 +2,17 @@
 
 Current implementation provides a production-oriented baseline with:
 
-- framed transport (`u32` big-endian length + JSON payload),
+- binary SV2-style framing (`extension_type:u16 + msg_type:u8 + len:u24 + payload`),
+- binary payload codec (`bincode`) plus header/payload message-type consistency checks,
 - protocol state machine (`SetupConnection` -> `OpenStandardMiningChannel` -> active),
-- per-connection session stats (accepted/rejected shares),
+- per-connection session stats (accepted/rejected shares + target updates),
 - bounded per-channel job cache,
 - share validation (`share_target` + `network_target`),
+- VarDiff share target retuning (`SetTarget`) based on recent accepted-share cadence,
+- reject-budget circuit breaker (`max_rejected_shares`) that closes abusive sessions,
+- idle keepalive loop and idle timeout handling,
 - multi-client threaded server in `scam-node stratum-serve`,
+- tip-change driven job refresh for connected clients,
 - automatic new-job issue after valid block share.
 
 ## Commands
@@ -19,12 +24,23 @@ cargo run -p scam-node -- stratum-serve \
   --runtime-db data/devnet.runtime.redb \
   --bind 127.0.0.1:3347 \
   --share-target-hex ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff \
+  --min-share-target-hex 00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff \
+  --max-share-target-hex ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff \
+  --vardiff-target-shares-per-minute 6 \
+  --vardiff-retarget-interval-shares 24 \
+  --max-rejected-shares 64 \
+  --read-timeout-sec 2 \
+  --keepalive-sec 30 \
+  --idle-timeout-sec 180 \
   --max-jobs-per-channel 64 \
-  --max-clients 16
+  --max-active-clients 256
 ```
 
 ## Scope
 
 This is a robust SV2 subset suitable for integration testing and external miner connectivity.
-A full pool-grade SV2 deployment still needs full role separation, template distribution,
-transport security, and full interoperability matrix testing against third-party implementations.
+A full pool-grade SV2 deployment still needs:
+
+- full role split (Template Provider / Job Declarator / Translator),
+- production transport security (Noise-based encrypted channels),
+- exhaustive interoperability matrix testing with third-party SV2 stacks.
