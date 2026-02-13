@@ -733,6 +733,9 @@ pub enum StorageError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use std::path::PathBuf;
 
     use scam_consensus::UtxoSet;
@@ -744,6 +747,22 @@ mod tests {
         load_snapshot, load_snapshot_db, save_chain_archive_db, save_mempool_db, save_peer_book_db,
         save_snapshot, save_snapshot_db,
     };
+
+    fn temp_test_file(stem: &str, ext: &str) -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nonce = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "scam-{stem}-{}-{ts}-{nonce}.{ext}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
 
     #[test]
     fn snapshot_roundtrip() {
@@ -778,7 +797,7 @@ mod tests {
             &utxos,
         );
 
-        let path = PathBuf::from("target/test-snapshot.bin");
+        let path = temp_test_file("snapshot", "bin");
         save_snapshot(&path, &snapshot).expect("save");
         let loaded = load_snapshot(&path).expect("load");
         assert_eq!(loaded.network_id, "devnet");
@@ -825,7 +844,7 @@ mod tests {
             &utxos,
         );
 
-        let path = PathBuf::from("target/test-snapshot.redb");
+        let path = temp_test_file("snapshot", "redb");
         save_snapshot_db(&path, &snapshot).expect("save db");
         let loaded = load_snapshot_db(&path).expect("load db");
         assert_eq!(loaded.network_id, "devnet");
@@ -885,7 +904,7 @@ mod tests {
             blocks_by_height: vec![genesis.clone(), block1.clone()],
         };
 
-        let path = PathBuf::from("target/test-chain-archive.redb");
+        let path = temp_test_file("chain-archive", "redb");
         save_chain_archive_db(&path, &archive).expect("save archive");
         let loaded = load_chain_archive_db(&path).expect("load archive");
         assert_eq!(loaded.network_id, "devnet");
@@ -919,7 +938,7 @@ mod tests {
             ],
         };
 
-        let path = PathBuf::from("target/test-peer-book.redb");
+        let path = temp_test_file("peer-book", "redb");
         save_peer_book_db(&path, &peer_book).expect("save peer book");
         let loaded = load_peer_book_db(&path).expect("load peer book");
         assert_eq!(loaded.network_id, "devnet");
@@ -940,7 +959,7 @@ mod tests {
                 ban_score: 0,
             }],
         };
-        let path = PathBuf::from("target/test-peer-book-invalid.redb");
+        let path = temp_test_file("peer-book-invalid", "redb");
         let err = save_peer_book_db(&path, &peer_book).expect_err("must reject empty address");
         assert!(matches!(err, crate::StorageError::InvalidPeerBook(_)));
     }
@@ -991,7 +1010,7 @@ mod tests {
             ],
         };
 
-        let path = PathBuf::from("target/test-mempool.redb");
+        let path = temp_test_file("mempool", "redb");
         save_mempool_db(&path, &snapshot).expect("save mempool");
         let loaded = load_mempool_db(&path).expect("load mempool");
         assert_eq!(loaded.network_id, "devnet");
@@ -1016,7 +1035,7 @@ mod tests {
                 fee: 1,
             }],
         };
-        let path = PathBuf::from("target/test-mempool-invalid.redb");
+        let path = temp_test_file("mempool-invalid", "redb");
         let err = save_mempool_db(&path, &snapshot).expect_err("must reject mismatch");
         assert!(matches!(err, crate::StorageError::InvalidMempool(_)));
     }

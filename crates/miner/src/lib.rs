@@ -593,6 +593,43 @@ mod tests {
     }
 
     #[test]
+    fn template_builder_keeps_cpfp_package_under_fee_pressure() {
+        let mut mempool = Mempool::with_policy(100, 0).expect("mempool");
+        let parent = spend_tx([21u8; 32], 0, b"parent-low", 21);
+        let parent_id = parent.txid();
+        let child = spend_tx(parent_id.0, 0, b"child-high", 22);
+        let child_id = child.txid();
+        let mid_a = spend_tx([23u8; 32], 0, b"mid-a", 23);
+        let mid_a_id = mid_a.txid();
+        let mid_b = spend_tx([24u8; 32], 0, b"mid-b", 24);
+        let mid_c = spend_tx([25u8; 32], 0, b"mid-c", 25);
+
+        mempool.insert_with_fee(parent, 1).expect("insert parent");
+        mempool.insert_with_fee(child, 1_000).expect("insert child");
+        mempool.insert_with_fee(mid_a, 400).expect("insert mid_a");
+        mempool.insert_with_fee(mid_b, 350).expect("insert mid_b");
+        mempool.insert_with_fee(mid_c, 300).expect("insert mid_c");
+
+        let params = MempoolTemplateParams {
+            version: 1,
+            prev_block: scam_core::Hash256::ZERO,
+            timestamp: 1_770_763_200,
+            target: Target::MAX,
+            block_subsidy: 50,
+            miner_key_hash20: [8u8; 20],
+            coinbase_tag: "cpfp-pressure".to_owned(),
+            max_txs: 3,
+        };
+        let (_template, summary) =
+            build_template_from_mempool(&params, &mempool).expect("template");
+
+        assert_eq!(summary.included_txids.len(), 3);
+        assert!(summary.included_txids.contains(&parent_id));
+        assert!(summary.included_txids.contains(&child_id));
+        assert!(summary.included_txids.contains(&mid_a_id));
+    }
+
+    #[test]
     fn extra_nonce_is_injected_into_coinbase_signature() {
         let template = BlockTemplate {
             version: 1,

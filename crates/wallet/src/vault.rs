@@ -227,6 +227,9 @@ pub enum WalletVaultError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use std::path::PathBuf;
 
     use crate::vault::{
@@ -234,6 +237,22 @@ mod tests {
     };
 
     const MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+    fn temp_test_file(stem: &str) -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nonce = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "scam-{stem}-{}-{ts}-{nonce}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
 
     #[test]
     fn vault_encrypt_decrypt_roundtrip() {
@@ -254,7 +273,7 @@ mod tests {
     #[test]
     fn vault_file_roundtrip() {
         let vault = new_encrypted_wallet_vault(MNEMONIC, "x", "vault-pass").expect("vault");
-        let path = PathBuf::from("target/test-wallet-vault.json");
+        let path = temp_test_file("wallet-vault");
         save_wallet_vault(&path, &vault).expect("save");
         let loaded = load_wallet_vault(&path).expect("load");
         let secret = decrypt_wallet_vault(&loaded, "vault-pass").expect("decrypt");

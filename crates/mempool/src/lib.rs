@@ -187,6 +187,9 @@ impl Mempool {
         required_fee_for_size(tx.encode_for_hash().len(), self.min_relay_fee_per_kb)
     }
 
+    /// Returns independent tx feerate ordering.
+    ///
+    /// CPFP package/ancestor scoring is applied by the miner template builder.
     pub fn txids_by_feerate_desc(&self) -> Vec<Hash256> {
         let mut ranked = self
             .txs
@@ -831,6 +834,42 @@ mod tests {
         }
     }
 
+    fn mk_two_input_tx(
+        first_spend: ([u8; 32], u32),
+        second_spend: ([u8; 32], u32),
+        signature: &[u8],
+        output_seed: u8,
+    ) -> Transaction {
+        Transaction {
+            version: 1,
+            inputs: vec![
+                TxIn {
+                    prev_out: OutPoint {
+                        txid: scam_core::Hash256(first_spend.0),
+                        vout: first_spend.1,
+                    },
+                    signature: signature.to_vec(),
+                    pubkey_compressed: vec![2u8; 33],
+                    sequence: 0,
+                },
+                TxIn {
+                    prev_out: OutPoint {
+                        txid: scam_core::Hash256(second_spend.0),
+                        vout: second_spend.1,
+                    },
+                    signature: signature.to_vec(),
+                    pubkey_compressed: vec![3u8; 33],
+                    sequence: 0,
+                },
+            ],
+            outputs: vec![TxOut {
+                value: 1,
+                key_hash20: [output_seed; 20],
+            }],
+            lock_time: 0,
+        }
+    }
+
     #[test]
     fn conflicting_tx_prefers_higher_feerate() {
         let mut mempool =
@@ -965,6 +1004,83 @@ mod tests {
             } if incoming == parent_new_id
         ));
         assert!(mempool.contains(&parent_old_id));
+    }
+
+    #[test]
+    fn replacement_accepts_when_fee_equals_required_threshold() {
+        let mut mempool = Mempool::with_policy_and_replacement(100, 0, 10, 25).expect("mempool");
+        let root = [53u8; 32];
+        let old_tx = mk_tx(root, 0, b"same-size-a", 1);
+        let new_tx = mk_tx(root, 0, b"same-size-b", 2);
+        let old_id = old_tx.txid();
+        let new_id = new_tx.txid();
+
+        mempool.insert_with_fee(old_tx, 100).expect("insert old");
+        let outcome = mempool
+            .insert_with_fee(new_tx, 110)
+            .expect("replacement evaluation");
+        assert!(matches!(
+            outcome,
+            InsertOutcome::Replaced { inserted, .. } if inserted == new_id
+        ));
+        assert!(mempool.contains(&new_id));
+        assert!(!mempool.contains(&old_id));
+    }
+
+    #[test]
+    fn replacement_accepts_when_descendant_count_equals_limit() {
+        let mut mempool = Mempool::with_policy_and_replacement(100, 0, 1, 2).expect("mempool");
+        let root = [54u8; 32];
+        let parent_old = mk_tx(root, 0, b"parent-old", 1);
+        let parent_old_id = parent_old.txid();
+        let child_1 = mk_tx(parent_old_id.0, 0, b"child-1", 2);
+        let child_1_id = child_1.txid();
+        let child_2 = mk_tx(child_1_id.0, 0, b"child-2", 3);
+        let parent_new = mk_tx(root, 0, b"parent-new", 4);
+        let parent_new_id = parent_new.txid();
+
+        mempool
+            .insert_with_fee(parent_old, 10)
+            .expect("insert parent");
+        mempool.insert_with_fee(child_1, 10).expect("insert child1");
+        mempool.insert_with_fee(child_2, 10).expect("insert child2");
+
+        let outcome = mempool
+            .insert_with_fee(parent_new, 100)
+            .expect("replacement should pass at descendant limit");
+        assert!(matches!(
+            outcome,
+            InsertOutcome::Replaced { inserted, .. } if inserted == parent_new_id
+        ));
+        assert!(mempool.contains(&parent_new_id));
+        assert!(!mempool.contains(&parent_old_id));
+    }
+
+    #[test]
+    fn replacement_rejects_if_incoming_conflicts_with_multiple_transactions() {
+        let mut mempool = Mempool::with_policy_and_replacement(100, 0, 1, 25).expect("mempool");
+        let tx_a = mk_tx([61u8; 32], 0, b"a", 1);
+        let tx_b = mk_tx([62u8; 32], 0, b"b", 2);
+        let tx_a_id = tx_a.txid();
+        let tx_b_id = tx_b.txid();
+        mempool.insert_with_fee(tx_a, 10).expect("insert a");
+        mempool.insert_with_fee(tx_b, 10).expect("insert b");
+        let mut expected_conflicts = vec![tx_a_id, tx_b_id];
+        expected_conflicts.sort_unstable();
+
+        let tx_conflict = mk_two_input_tx(([61u8; 32], 0), ([62u8; 32], 0), b"replace-both", 3);
+        let conflict_id = tx_conflict.txid();
+        let err = mempool
+            .insert_with_fee(tx_conflict, 500)
+            .expect_err("must reject multi-conflict replacement");
+
+        assert!(matches!(
+            err,
+            MempoolError::MultipleConflicts {
+                incoming,
+                conflicts,
+            } if incoming == conflict_id && conflicts == expected_conflicts
+        ));
     }
 
     #[test]
