@@ -58,6 +58,20 @@ scripts/mutation-baseline.sh
 
 This invokes `cargo-mutants` for the workspace and writes report artifacts into `target/mutants`.
 
+Staged workflow (preferred for day-to-day iteration and less flaky long runs):
+
+```bash
+scripts/mutation-staged.sh stage1
+scripts/mutation-staged.sh stage2
+scripts/mutation-staged.sh stage3
+```
+
+Optional package scoping with the baseline helper:
+
+```bash
+MUTATION_PACKAGES="scam-core scam-consensus" scripts/mutation-baseline.sh
+```
+
 ## Soak Harness
 
 Long-run devnet soak command:

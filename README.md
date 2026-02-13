@@ -538,6 +538,20 @@ Run baseline script:
 scripts/mutation-baseline.sh
 ```
 
+Run staged script (recommended for faster signal and lower flakiness):
+
+```bash
+scripts/mutation-staged.sh stage1
+scripts/mutation-staged.sh stage2
+scripts/mutation-staged.sh stage3
+```
+
+Package-scoped mutation is also available:
+
+```bash
+MUTATION_PACKAGES="scam-core scam-consensus" scripts/mutation-baseline.sh
+```
+
 ---
 
 ## 13) Conformance and Interop Matrix
