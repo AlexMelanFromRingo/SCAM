@@ -42,6 +42,17 @@ mod tests {
     use proptest::prelude::*;
 
     #[test]
+    fn target_hex_roundtrip_and_display_match() {
+        let target =
+            Target::from_hex("00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+                .expect("target must parse");
+        let hex = target.to_hex();
+        assert_eq!(hex.len(), 64);
+        assert_eq!(Target::from_hex(&hex).expect("roundtrip"), target);
+        assert_eq!(format!("{target}"), hex);
+    }
+
+    #[test]
     fn numeric_compare_is_hash_lte_target() {
         let target =
             Target::from_hex("00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")

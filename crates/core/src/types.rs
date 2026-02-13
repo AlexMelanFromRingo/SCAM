@@ -204,6 +204,38 @@ mod tests {
     }
 
     #[test]
+    fn outpoint_non_coinbase_detection_works() {
+        let prev = OutPoint {
+            txid: crate::hash::hash256(b"prev"),
+            vout: 0,
+        };
+        assert!(!prev.is_coinbase());
+        assert!(OutPoint::coinbase().is_coinbase());
+    }
+
+    #[test]
+    fn tx_with_regular_input_is_not_coinbase() {
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: OutPoint {
+                    txid: crate::hash::hash256(b"prev"),
+                    vout: 1,
+                },
+                signature: vec![1, 2, 3],
+                pubkey_compressed: vec![2u8; 33],
+                sequence: 0,
+            }],
+            outputs: vec![TxOut {
+                value: 50,
+                key_hash20: [0u8; 20],
+            }],
+            lock_time: 0,
+        };
+        assert!(!tx.is_coinbase());
+    }
+
+    #[test]
     fn block_merkle_root_validation_works() {
         let tx = Transaction {
             version: 1,
@@ -234,6 +266,80 @@ mod tests {
         };
 
         assert!(block.has_valid_merkle_root());
+    }
+
+    #[test]
+    fn block_merkle_root_validation_rejects_wrong_root() {
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: OutPoint::coinbase(),
+                signature: b"genesis".to_vec(),
+                pubkey_compressed: Vec::new(),
+                sequence: u32::MAX,
+            }],
+            outputs: vec![TxOut {
+                value: 50,
+                key_hash20: [2u8; 20],
+            }],
+            lock_time: 0,
+        };
+        let mut wrong_merkle = crate::merkle::merkle_root(&[tx.txid()]).0;
+        wrong_merkle[31] ^= 0x01;
+        let block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_block: crate::Hash256::ZERO,
+                merkle_root: crate::Hash256(wrong_merkle),
+                timestamp: 0,
+                target: Target::MAX,
+                nonce: 0,
+            },
+            transactions: vec![tx],
+        };
+        assert!(!block.has_valid_merkle_root());
+    }
+
+    #[test]
+    fn encode_for_signing_only_keeps_selected_input_pubkey() {
+        let signing_key = vec![3u8; 33];
+        let non_signing_key = vec![4u8; 33];
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![
+                TxIn {
+                    prev_out: OutPoint {
+                        txid: crate::hash::hash256(b"prev-a"),
+                        vout: 0,
+                    },
+                    signature: vec![9u8; 64],
+                    pubkey_compressed: non_signing_key,
+                    sequence: 11,
+                },
+                TxIn {
+                    prev_out: OutPoint {
+                        txid: crate::hash::hash256(b"prev-b"),
+                        vout: 1,
+                    },
+                    signature: vec![8u8; 64],
+                    pubkey_compressed: signing_key.clone(),
+                    sequence: 22,
+                },
+            ],
+            outputs: vec![TxOut {
+                value: 7,
+                key_hash20: [1u8; 20],
+            }],
+            lock_time: 5,
+        };
+
+        let encoded = tx.encode_for_signing(1);
+        assert!(encoded.len() > 32);
+        // Version + input count + first prevout txid + first prevout vout.
+        assert_eq!(encoded[41], 0u8);
+        // Second input pubkey length prefix + pubkey bytes.
+        assert_eq!(encoded[82], signing_key.len() as u8);
+        assert_eq!(&encoded[83..116], signing_key.as_slice());
     }
 
     #[test]

@@ -37,7 +37,10 @@ pub fn render_hash_bitmap_16x16(hash: Hash256) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::{Hash256, visual::hash_to_bitmap_16x16};
+    use crate::{
+        Hash256,
+        visual::{hash_to_bitmap_16x16, render_hash_bitmap_16x16},
+    };
 
     #[test]
     fn bitmap_is_16_by_16() {
@@ -53,5 +56,22 @@ mod tests {
         let bitmap = hash_to_bitmap_16x16(Hash256(bytes));
         assert_eq!(bitmap[0][0], 1);
         assert_eq!(bitmap[0][1], 0);
+    }
+
+    #[test]
+    fn rendered_bitmap_has_expected_dimensions() {
+        let rendered = render_hash_bitmap_16x16(Hash256([0u8; 32]));
+        let rows: Vec<&str> = rendered.lines().collect();
+        assert_eq!(rows.len(), 16);
+        assert!(rows.iter().all(|line| line.len() == 32));
+    }
+
+    #[test]
+    fn rendered_bitmap_maps_first_two_bits_to_expected_cells() {
+        let mut bytes = [0u8; 32];
+        bytes[0] = 0b1000_0000;
+        let rendered = render_hash_bitmap_16x16(Hash256(bytes));
+        let first_row = rendered.lines().next().expect("first row should exist");
+        assert!(first_row.starts_with("  ##"));
     }
 }

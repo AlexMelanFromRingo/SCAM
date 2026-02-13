@@ -107,6 +107,16 @@ mod tests {
         let a = hash160_blake3(b"payload");
         let b = hash160_blake3(b"payload");
         assert_eq!(a, b);
+        assert_ne!(a, [0u8; 20]);
+        assert_ne!(a, [1u8; 20]);
+    }
+
+    #[test]
+    fn hash_display_is_hex_encoded() {
+        let hash = hash256(b"display");
+        let rendered = format!("{hash}");
+        assert_eq!(rendered, hash.to_hex());
+        assert_eq!(rendered.len(), 64);
     }
 
     proptest! {

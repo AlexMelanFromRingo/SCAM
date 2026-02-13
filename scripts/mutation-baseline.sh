@@ -41,6 +41,8 @@ fi
 
 echo "[mutation-baseline] out=${OUT_DIR} test_tool=${TEST_TOOL} jobs=${JOBS} timeout=${TIMEOUT}s min_test_timeout=${MIN_TEST_TIMEOUT}s"
 
+mkdir -p "$(dirname "${OUT_DIR}")"
+
 SCOPE_ARGS=("--workspace")
 if [[ -n "${MUTATION_PACKAGES}" ]]; then
   SCOPE_ARGS=()
