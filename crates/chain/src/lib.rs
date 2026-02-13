@@ -532,7 +532,7 @@ mod tests {
     use scam_core::{OutPoint, Transaction, TxIn, TxOut};
     use scam_miner::{BlockTemplate, mine_block};
 
-    use super::{asert_next, lwma_next, retarget_next};
+    use super::{asert_next, chainwork_for_target, lwma_next, retarget_next};
     use crate::{BlockSubmissionOutcome, ChainError, ChainRuntime};
 
     fn coinbase(value: u64, key_hash20: [u8; 20], tag: &[u8]) -> Transaction {
@@ -557,6 +557,39 @@ mod tests {
         assert_eq!(runtime.tip_height(), 0);
         assert_eq!(runtime.block_hashes().len(), 1);
         assert_eq!(runtime.utxo_len(), 1);
+        assert_eq!(runtime.utxo_set().len(), runtime.utxo_len());
+    }
+
+    #[test]
+    fn runtime_accessors_track_height_and_cumulative_work() {
+        let config: scam_core::ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let reward = config.genesis_reward_key_hash20().expect("key");
+        let mut runtime = ChainRuntime::from_config(config.clone()).expect("runtime");
+        let prev_work = runtime.cumulative_work().clone();
+        let target = runtime.expected_target_for_next_block().expect("target");
+
+        let template = BlockTemplate {
+            version: 1,
+            prev_block: runtime.tip_hash(),
+            timestamp: runtime.tip_header().timestamp + 30,
+            target,
+            transactions: vec![coinbase(config.block_subsidy, reward, b"accessor-work")],
+        };
+        let block = mine_block(&template, 200_000).expect("mine");
+        runtime.apply_next_block(block).expect("apply");
+
+        assert_eq!(runtime.tip_height(), 1);
+        assert_eq!(runtime.utxo_set().len(), runtime.utxo_len());
+        assert!(
+            runtime
+                .utxo_set()
+                .values()
+                .any(|entry| entry.created_height == runtime.tip_height()),
+            "new outputs should be tagged with current block height"
+        );
+        let expected_work = prev_work + chainwork_for_target(target);
+        assert_eq!(*runtime.cumulative_work(), expected_work);
     }
 
     #[test]
@@ -969,6 +1002,30 @@ mod tests {
         let block = mine_block(&template, 200_000).expect("mine");
         let err = runtime.apply_next_block(block).expect_err("must reject");
         assert!(matches!(err, ChainError::TimestampTooFarInFuture { .. }));
+    }
+
+    #[test]
+    fn block_timestamp_within_future_window_is_accepted() {
+        let config: scam_core::ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let reward = config.genesis_reward_key_hash20().expect("key");
+        let mut runtime = ChainRuntime::from_config(config.clone()).expect("runtime");
+        let now = super::current_unix_timestamp().expect("now");
+
+        // Keep this comfortably below the 2-hour guard so tiny clock drift during validation
+        // does not make the test flaky.
+        let near_future_timestamp = now + 4_000;
+        let template = BlockTemplate {
+            version: 1,
+            prev_block: runtime.tip_hash(),
+            timestamp: near_future_timestamp,
+            target: runtime.expected_target_for_next_block().expect("target"),
+            transactions: vec![coinbase(config.block_subsidy, reward, b"within-future")],
+        };
+        let block = mine_block(&template, 200_000).expect("mine");
+        runtime
+            .apply_next_block(block)
+            .expect("timestamp below future window should pass");
     }
 
     #[test]

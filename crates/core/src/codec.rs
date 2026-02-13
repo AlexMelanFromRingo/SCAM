@@ -54,6 +54,11 @@ impl Encoder {
     pub fn into_bytes(self) -> Vec<u8> {
         self.bytes
     }
+
+    #[cfg(test)]
+    fn capacity(&self) -> usize {
+        self.bytes.capacity()
+    }
 }
 
 #[cfg(test)]
@@ -100,6 +105,15 @@ mod tests {
         assert_eq!(
             enc.into_bytes(),
             vec![0xff, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00]
+        );
+    }
+
+    #[test]
+    fn with_capacity_reserves_requested_space() {
+        let enc = Encoder::with_capacity(128);
+        assert!(
+            enc.capacity() >= 128,
+            "with_capacity should preallocate requested bytes"
         );
     }
 }

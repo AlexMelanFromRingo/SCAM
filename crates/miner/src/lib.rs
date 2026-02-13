@@ -250,6 +250,16 @@ fn build_cpfp_package(
     included_set: &HashSet<Hash256>,
     max_package_txs: usize,
 ) -> PackageCandidate {
+    if max_package_txs == 0 {
+        return PackageCandidate {
+            root,
+            ordered_txids: Vec::new(),
+            total_fee: 0,
+            total_size: 0,
+            score_key: 0,
+        };
+    }
+
     let mut package = HashSet::<Hash256>::new();
     package.insert(root);
 
@@ -725,6 +735,30 @@ mod tests {
         assert_eq!(package.ordered_txids, vec![root, c1, c2, c3]);
         assert_eq!(package.total_fee, 10);
         assert_eq!(package.total_size, 400);
+        assert_eq!(package.score_key, 25);
+    }
+
+    #[test]
+    fn cpfp_package_builder_respects_zero_tx_limit() {
+        let root = scam_core::Hash256([31u8; 32]);
+        let ranked = vec![root];
+        let mut entries = HashMap::<scam_core::Hash256, CandidateEntry>::new();
+        entries.insert(
+            root,
+            CandidateEntry {
+                fee: 100,
+                size: 200,
+                parents: vec![],
+            },
+        );
+        let children = HashMap::<scam_core::Hash256, Vec<scam_core::Hash256>>::new();
+        let included = HashSet::new();
+
+        let package = build_cpfp_package(root, &ranked, &entries, &children, &included, 0);
+        assert_eq!(package.ordered_txids, Vec::<scam_core::Hash256>::new());
+        assert_eq!(package.total_fee, 0);
+        assert_eq!(package.total_size, 0);
+        assert_eq!(package.score_key, 0);
     }
 
     #[test]
@@ -802,5 +836,35 @@ mod tests {
             .build_or_reuse(&next_tip_params, &mempool)
             .expect("rebuild on tip change");
         assert_eq!(refresh_d, TemplateRefresh::Rebuilt);
+    }
+
+    #[test]
+    fn template_manager_invalidate_forces_rebuild() {
+        let mut mempool = Mempool::with_policy(100, 0).expect("mempool");
+        let tx = spend_tx([61u8; 32], 0, b"invalidate", 1);
+        mempool.insert_with_fee(tx, 10).expect("insert tx");
+
+        let mut manager = TemplateManager::new();
+        let params = MempoolTemplateParams {
+            version: 1,
+            prev_block: scam_core::Hash256::ZERO,
+            timestamp: 1_770_763_200,
+            target: Target::MAX,
+            block_subsidy: 50,
+            miner_key_hash20: [7u8; 20],
+            coinbase_tag: "invalidate".to_owned(),
+            max_txs: 100,
+        };
+
+        let (refresh_a, _, _) = manager.build_or_reuse(&params, &mempool).expect("build");
+        assert_eq!(refresh_a, TemplateRefresh::Rebuilt);
+        let (refresh_b, _, _) = manager.build_or_reuse(&params, &mempool).expect("cached");
+        assert_eq!(refresh_b, TemplateRefresh::Cached);
+
+        manager.invalidate();
+        let (refresh_c, _, _) = manager
+            .build_or_reuse(&params, &mempool)
+            .expect("rebuild after invalidate");
+        assert_eq!(refresh_c, TemplateRefresh::Rebuilt);
     }
 }

@@ -210,6 +210,16 @@ mod tests {
             vout: 0,
         };
         assert!(!prev.is_coinbase());
+        let zero_hash_non_coinbase_vout = OutPoint {
+            txid: crate::Hash256::ZERO,
+            vout: 1,
+        };
+        assert!(!zero_hash_non_coinbase_vout.is_coinbase());
+        let non_zero_hash_coinbase_vout = OutPoint {
+            txid: crate::hash::hash256(b"prev2"),
+            vout: OutPoint::COINBASE_VOUT,
+        };
+        assert!(!non_zero_hash_coinbase_vout.is_coinbase());
         assert!(OutPoint::coinbase().is_coinbase());
     }
 

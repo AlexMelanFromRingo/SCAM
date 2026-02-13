@@ -718,4 +718,89 @@ genesis_reward_key_hash20 = "0000000000000000000000000000000000000000"
                 .contains("p2p_replacement_max_per_peer must be > 0")
         );
     }
+
+    #[test]
+    fn config_accepts_boundary_values_for_clamps_and_targets() {
+        let mut cfg = sample_config();
+        cfg.difficulty_clamp_up = 1.0;
+        cfg.difficulty_clamp_down = 1.0;
+        cfg.stratum_vardiff_retarget_interval_shares = 2;
+        cfg.stratum_vardiff_clamp_up = 1.0;
+        cfg.stratum_vardiff_clamp_down = 1.0;
+        cfg.stratum_share_target = cfg.stratum_min_share_target.clone();
+        cfg.validate()
+            .expect("lower-bound targets must be accepted");
+
+        let mut cfg = sample_config();
+        cfg.stratum_share_target = cfg.stratum_max_share_target.clone();
+        cfg.validate()
+            .expect("upper-bound targets must be accepted");
+    }
+
+    #[test]
+    fn config_rejects_out_of_range_share_target_and_vardiff_bounds() {
+        let mut cfg = sample_config();
+        cfg.stratum_share_target =
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_owned();
+        cfg.stratum_max_share_target =
+            "00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_owned();
+        let err = cfg
+            .validate()
+            .expect_err("share target above max must fail");
+        assert!(
+            err.to_string()
+                .contains("stratum_share_target must be within [stratum_min_share_target, stratum_max_share_target]")
+        );
+
+        let mut cfg = sample_config();
+        cfg.stratum_vardiff_retarget_interval_shares = 1;
+        let err = cfg
+            .validate()
+            .expect_err("retarget interval shares < 2 must fail");
+        assert!(
+            err.to_string()
+                .contains("stratum_vardiff_retarget_interval_shares must be >= 2")
+        );
+
+        let mut cfg = sample_config();
+        cfg.stratum_vardiff_clamp_down = 1.1;
+        let err = cfg
+            .validate()
+            .expect_err("vardiff clamp_down > 1 must fail");
+        assert!(
+            err.to_string()
+                .contains("stratum_vardiff_clamp_down must be in (0.0, 1.0]")
+        );
+    }
+
+    #[test]
+    fn config_parsers_return_configured_values() {
+        let mut cfg = sample_config();
+        cfg.genesis_target =
+            "00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_owned();
+        cfg.genesis_reward_key_hash20 = "11223344556677889900aabbccddeeff00112233".to_owned();
+        cfg.stratum_min_share_target =
+            "10ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_owned();
+
+        let genesis_target = cfg.genesis_target().expect("target parse");
+        assert_eq!(
+            genesis_target.to_hex(),
+            "00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        );
+        let key_hash = cfg
+            .genesis_reward_key_hash20()
+            .expect("reward key hash should parse");
+        let expected_key_hash: [u8; 20] = hex::decode("11223344556677889900aabbccddeeff00112233")
+            .expect("hex")
+            .try_into()
+            .expect("20 bytes");
+        assert_eq!(key_hash, expected_key_hash);
+        let min_share = cfg
+            .stratum_min_share_target()
+            .expect("stratum min share target parse");
+        assert_eq!(
+            min_share.to_hex(),
+            "10ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        );
+    }
 }

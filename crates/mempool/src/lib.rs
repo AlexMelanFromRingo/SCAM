@@ -807,7 +807,7 @@ mod tests {
 
     use crate::{
         InsertOutcome, Mempool, MempoolError, MempoolInventoryDelta, OrphanInsertOutcome,
-        OrphanPool,
+        OrphanPool, required_fee_for_size,
     };
 
     fn mk_tx(
@@ -895,6 +895,22 @@ mod tests {
         ));
         assert!(mempool.contains(&high_id));
         assert!(!mempool.contains(&low_id));
+    }
+
+    #[test]
+    fn mempool_accessors_reflect_inserted_transaction_state() {
+        let mut mempool = Mempool::with_policy(100, 0).expect("mempool");
+        assert!(mempool.is_empty());
+
+        let tx = mk_tx([201u8; 32], 0, b"accessor", 1);
+        let txid = tx.txid();
+        mempool.insert_with_fee(tx.clone(), 777).expect("insert");
+
+        assert!(!mempool.is_empty());
+        assert_eq!(mempool.len(), 1);
+        assert_eq!(mempool.get(&txid), Some(&tx));
+        assert_eq!(mempool.fee(&txid), Some(777));
+        assert_eq!(mempool.get_with_fee(&txid), Some((&tx, 777)));
     }
 
     #[test]
@@ -1138,6 +1154,13 @@ mod tests {
             .insert_with_fee(tx, required)
             .expect("must accept fee at threshold");
         assert!(matches!(accepted, InsertOutcome::Accepted { .. }));
+    }
+
+    #[test]
+    fn required_fee_rounds_up_per_kilobyte() {
+        assert_eq!(required_fee_for_size(1000, 1000).expect("fee"), 1000);
+        assert_eq!(required_fee_for_size(1001, 1000).expect("fee"), 1001);
+        assert_eq!(required_fee_for_size(1500, 2000).expect("fee"), 3000);
     }
 
     #[test]
@@ -1390,6 +1413,29 @@ mod tests {
         ));
         assert!(!pool.contains(&tx_a_id));
         assert!(pool.contains(&tx_b_id));
+    }
+
+    #[test]
+    fn orphan_pool_len_and_is_empty_track_entries() {
+        let mut pool = OrphanPool::new(4, 600).expect("pool");
+        assert!(pool.is_empty());
+        assert_eq!(pool.len(), 0);
+
+        let tx = mk_tx([220u8; 32], 0, b"orphan-len", 1);
+        let txid = tx.txid();
+        let dep = OutPoint {
+            txid: scam_core::Hash256([221u8; 32]),
+            vout: 0,
+        };
+        let outcome = pool
+            .insert(tx, 10, vec![dep], 1_000)
+            .expect("insert orphan");
+        assert!(matches!(
+            outcome,
+            OrphanInsertOutcome::Accepted { txid: got } if got == txid
+        ));
+        assert!(!pool.is_empty());
+        assert_eq!(pool.len(), 1);
     }
 
     #[test]

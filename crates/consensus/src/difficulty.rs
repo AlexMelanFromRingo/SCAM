@@ -366,4 +366,52 @@ mod tests {
         let next = asert_next(target, 1, 10_000, 1, Target::MAX).expect("asert");
         assert!(next > Target::MIN);
     }
+
+    #[test]
+    fn retarget_accepts_clamp_boundaries_equal_to_one() {
+        let old =
+            Target::from_hex("00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+                .expect("target parse");
+        let next = retarget_next(old, 2400, 2400, 1.0, 1.0, Target::MAX).expect("retarget");
+        assert_eq!(next, old);
+    }
+
+    #[test]
+    fn lwma_rejects_layout_mismatch_when_lengths_differ_with_enough_history() {
+        let target =
+            Target::from_hex("00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+                .expect("target parse");
+        let err = lwma_next(&[target, target, target], &[1, 2], 120, Target::MAX)
+            .expect_err("length mismatch must fail");
+        assert!(matches!(
+            err,
+            crate::difficulty::DifficultyError::InvalidHistoryLayout
+        ));
+    }
+
+    #[test]
+    fn asert_keeps_target_when_observed_equals_expected() {
+        let target =
+            Target::from_hex("00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+                .expect("target parse");
+        let next = asert_next(target, 120, 120, 600, Target::MAX).expect("asert");
+        assert_eq!(next, target);
+    }
+
+    #[test]
+    fn asert_clamps_to_max_target() {
+        let target =
+            Target::from_hex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff00")
+                .expect("target parse");
+        let next = asert_next(target, 10_000, 1, 1, Target::MAX).expect("asert");
+        assert_eq!(next, Target::MAX);
+    }
+
+    #[test]
+    fn chainwork_for_target_zero_is_zero() {
+        assert_eq!(
+            chainwork_for_target(Target::MIN),
+            num_bigint::BigUint::from(0u8)
+        );
+    }
 }
