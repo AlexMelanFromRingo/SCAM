@@ -71,6 +71,22 @@ Crash-loop durability:
 scripts/chaos-crash-loop.sh
 ```
 
+Soak with persisted telemetry snapshots:
+
+```bash
+cargo run -p scam-node -- soak \
+  --network devnet \
+  --config config/devnet.toml \
+  --runtime-db data/devnet.runtime.redb \
+  --rounds 720 \
+  --sleep-per-round-sec 120 \
+  --txs-per-round 1 \
+  --tx-amount 1000 \
+  --tx-fee 1 \
+  --telemetry-out data/soak.telemetry.jsonl \
+  --telemetry-every-rounds 1
+```
+
 ## 6) Hardening Signals
 
 - Keep gossip replacement-rate limits enabled (default in current code path).

@@ -65,10 +65,13 @@ cargo run -p scam-node -- soak \
   --txs-per-round 1 \
   --tx-amount 1000 \
   --tx-fee 1 \
+  --telemetry-out data/soak.telemetry.jsonl \
+  --telemetry-every-rounds 1 \
   --sleep-per-round-sec 120
 ```
 
 This runs for ~24h wall-clock time (720 rounds with 120-second sleeps) at 2-minute block cadence and includes transaction churn.
+Telemetry JSONL can be post-processed for alert thresholds on replacement/orphan churn.
 
 Shortcut script:
 

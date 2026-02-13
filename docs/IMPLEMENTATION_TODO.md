@@ -45,6 +45,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] Added crash-loop chaos test harness (`scripts/chaos-crash-loop.sh`) for repeated kill/restart DB durability checks.
 - [x] Added per-peer replacement rate limit in gossip path for mempool-delta relay (`apply_mempool_inventory_delta_from_peer`) with ban-score penalties.
 - [x] Added telemetry hooks for mempool replacement and orphan churn (`MempoolTelemetry`, `OrphanPoolTelemetry`) and gossip replacement counters.
+- [x] Added soak telemetry snapshot persistence (`--telemetry-out`) and integrated peer-scoped replacement quota checks into soak runtime tx admission loop.
 - [x] Added Stratum worker client command (`scam-node stratum-mine --pool <addr>`) for manual pool endpoint connectivity without DNS dependency.
 - [x] Added operator runbook document (`docs/OPERATOR_RUNBOOK.md`) covering bootstrap, sync, mining endpoint, reindex/recovery, and soak/chaos procedures.
 - [x] Config now explicitly freezes relay/orphan policy constants across network preset files.
@@ -299,6 +300,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] Soak test:
 - [x] 24h wall-clock-capable devnet soak profile with mining + tx flow (`scripts/soak-24h.sh`).
 - [x] Chaos crash-loop durability test script (`scripts/chaos-crash-loop.sh`).
+- [x] Soak telemetry snapshot export (`--telemetry-out`) for churn trend and alert-threshold analysis.
 
 ## 17) Launch Strategy TODO
 
