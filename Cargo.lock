@@ -949,9 +949,11 @@ dependencies = [
 name = "scam-stratum"
 version = "0.1.0"
 dependencies = [
+ "bincode",
+ "num-bigint",
+ "num-traits",
  "scam-core",
  "serde",
- "serde_json",
  "thiserror",
 ]
 
