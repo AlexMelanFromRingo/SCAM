@@ -39,6 +39,11 @@ cargo run -p scam-node -- stratum-serve \
   --vardiff-retarget-interval-shares 24 \
   --max-rejected-shares 64 \
   --max-jobs-per-channel 128
+
+cargo run -p scam-node -- stratum-mine \
+  --pool 127.0.0.1:3347 \
+  --user my-miner \
+  --max-shares 5
 ```
 
 ## What Is Safe To Change In Config

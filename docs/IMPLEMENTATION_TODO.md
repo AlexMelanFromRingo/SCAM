@@ -43,6 +43,9 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] Stratum operational policy defaults moved into chain config (`stratum_*`) with CLI override support.
 - [x] Added Stratum v2 subset crate + framed multi-client node server (`scam-node stratum-serve`) with session state machine, bounded job cache, idle keepalive loop, VarDiff target tuning, and reject-budget session closure.
 - [x] Added crash-loop chaos test harness (`scripts/chaos-crash-loop.sh`) for repeated kill/restart DB durability checks.
+- [x] Added per-peer replacement rate limit in gossip path for mempool-delta relay (`apply_mempool_inventory_delta_from_peer`) with ban-score penalties.
+- [x] Added telemetry hooks for mempool replacement and orphan churn (`MempoolTelemetry`, `OrphanPoolTelemetry`) and gossip replacement counters.
+- [x] Added Stratum worker client command (`scam-node stratum-mine --pool <addr>`) for manual pool endpoint connectivity without DNS dependency.
 - [x] Config now explicitly freezes relay/orphan policy constants across network preset files.
 - [x] Miner template + nonce search loop implemented (`mine-once` CLI).
 - [x] Chainstate snapshot save/load implemented.
@@ -239,6 +242,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] Implement real socketed sync runtime (IBD): headers pipeline -> block inventory/download -> validation -> persistence.
 - [x] Add peer discovery hardening: outbound diversity, rotation, and basic eclipse-risk mitigation.
 - [x] Add DNS-seed ingestion and per-subnet outbound cap in sync path.
+- [x] Add per-peer replacement-rate controls in gossip relay path for replacement-heavy mempool deltas.
 
 ## 14) Mining TODO
 
@@ -262,6 +266,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] `node sync-peer --peer <addr>`
 - [x] `node sync-book` (sync from persisted peer book with discovery-based peer ordering)
 - [x] `node stratum-serve` (SV2-subset server for miner clients)
+- [x] `node stratum-mine --pool <addr>` (SV2-subset worker client with manual pool endpoint)
 - [x] Wallet CLI:
 - [x] `wallet new`
 - [x] `wallet restore`

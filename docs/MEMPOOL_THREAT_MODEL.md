@@ -59,7 +59,12 @@ Scope: double-spend race behavior and DoS pressure around conflicting UTXO spend
   - structural sanity rejections,
   - orphan pool bounds/expiry/dependency release.
 
+## Recent Hardening Completed
+
+- Added per-peer replacement rate limits in networking path (`scam-p2p` gossip delta path with peer penalty/banning).
+- Added metrics/telemetry hooks for replacement and orphan churn (`MempoolTelemetry`, `OrphanPoolTelemetry`, `GossipTelemetry`).
+
 ## Recommended Next Hardening
 
-- Add per-peer replacement rate limits in networking path.
-- Add metrics/telemetry hooks for replacement and orphan churn.
+- Persist telemetry snapshots for long-run soak analysis and alerting thresholds.
+- Add peer-scoped replacement quota integration in full runtime P2P mempool admission loop.

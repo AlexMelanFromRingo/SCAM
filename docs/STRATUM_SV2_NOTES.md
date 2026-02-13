@@ -20,6 +20,8 @@ CLI flags in `stratum-serve` override config values when provided.
 
 ## Commands
 
+Pool server:
+
 ```bash
 cargo run -p scam-node -- stratum-serve \
   --network devnet \
@@ -37,6 +39,15 @@ cargo run -p scam-node -- stratum-serve \
   --idle-timeout-sec 180 \
   --max-jobs-per-channel 64 \
   --max-active-clients 256
+```
+
+Worker (manual pool endpoint, no DNS requirement):
+
+```bash
+cargo run -p scam-node -- stratum-mine \
+  --pool 127.0.0.1:3347 \
+  --user miner01 \
+  --max-shares 10
 ```
 
 ## Scope

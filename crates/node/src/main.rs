@@ -78,6 +78,7 @@ enum Command {
     Soak(SoakArgs),
     ReorgDemo(ReorgDemoArgs),
     StratumServe(StratumServeArgs),
+    StratumMine(StratumMineArgs),
     RpcServe(RpcServeArgs),
     Snapshot(SnapshotArgs),
     P2pDemo,
@@ -445,6 +446,22 @@ struct StratumServeArgs {
     min_share_target_hex: Option<String>,
     #[arg(long)]
     max_share_target_hex: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct StratumMineArgs {
+    #[arg(long)]
+    pool: String,
+    #[arg(long, default_value = "scam-miner")]
+    user: String,
+    #[arg(long, default_value_t = 2)]
+    read_timeout_sec: u64,
+    #[arg(long, default_value_t = 250_000)]
+    max_nonce_per_cycle: u64,
+    #[arg(long, default_value_t = 0)]
+    max_shares: u64,
+    #[arg(long, default_value_t = 0)]
+    max_runtime_sec: u64,
 }
 
 #[derive(Debug, Args)]
@@ -3617,6 +3634,281 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
     Ok(())
 }
 
+fn parse_remote_job(message: Sv2Message) -> Result<Option<MiningJob>, NodeError> {
+    match message {
+        Sv2Message::NewMiningJob {
+            channel_id,
+            job_id,
+            version,
+            prev_hash_hex,
+            merkle_root_hex,
+            ntime,
+            network_target_hex,
+        } => {
+            let prev_hash = Hash256::from_hex(&prev_hash_hex)
+                .map_err(|e| NodeError::Runtime(format!("invalid prev_hash_hex in job: {e}")))?;
+            let merkle_root = Hash256::from_hex(&merkle_root_hex)
+                .map_err(|e| NodeError::Runtime(format!("invalid merkle_root_hex in job: {e}")))?;
+            let network_target = Target::from_hex(&network_target_hex).map_err(|e| {
+                NodeError::Runtime(format!("invalid network_target_hex in job: {e}"))
+            })?;
+            Ok(Some(MiningJob {
+                channel_id,
+                job_id,
+                version,
+                prev_hash,
+                merkle_root,
+                ntime,
+                network_target,
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn try_find_share_for_job(
+    job: &MiningJob,
+    share_target: Target,
+    start_nonce: u64,
+    attempts: u64,
+) -> Option<(u64, Hash256, bool, u64)> {
+    if attempts == 0 {
+        return None;
+    }
+
+    for step in 0..attempts {
+        let nonce = start_nonce.wrapping_add(step);
+        let header = scam_core::BlockHeader {
+            version: job.version,
+            prev_block: job.prev_hash,
+            merkle_root: job.merkle_root,
+            timestamp: job.ntime,
+            target: job.network_target,
+            nonce,
+        };
+        let hash = header.block_hash();
+        if share_target.allows_hash(&hash) {
+            return Some((
+                nonce,
+                hash,
+                job.network_target.allows_hash(&hash),
+                nonce.wrapping_add(1),
+            ));
+        }
+    }
+    None
+}
+
+fn run_stratum_mine(args: StratumMineArgs) -> Result<(), NodeError> {
+    let mut stream = TcpStream::connect(&args.pool)
+        .map_err(|e| NodeError::Runtime(format!("stratum connect failed to {}: {e}", args.pool)))?;
+    let timeout = Duration::from_secs(args.read_timeout_sec.max(1));
+    configure_stream_timeouts_with(&stream, timeout, timeout)?;
+
+    println!("Stratum miner connecting to {}", args.pool);
+    write_sv2_message(
+        &mut stream,
+        &Sv2Message::SetupConnection {
+            protocol: 2,
+            min_version: SUPPORTED_SV2_VERSION,
+            max_version: SUPPORTED_SV2_VERSION,
+            flags: 0,
+            user_agent: "scam-node/stratum-mine".to_owned(),
+        },
+    )?;
+
+    let started_at = Instant::now();
+    let mut last_io = Instant::now();
+    let mut open_sent = false;
+    let mut share_target = Target::MAX;
+    let mut channel_id = None::<u32>;
+    let mut active_job_id = None::<u32>;
+    let mut jobs = HashMap::<u32, MiningJob>::new();
+    let mut nonce_cursor = HashMap::<u32, u64>::new();
+    let mut submitted_shares = 0u64;
+    let mut accepted_shares = 0u64;
+    let mut found_blocks = 0u64;
+
+    loop {
+        if args.max_runtime_sec > 0 && started_at.elapsed().as_secs() >= args.max_runtime_sec {
+            println!(
+                "stratum miner stopped by max_runtime_sec={} (submitted={}, accepted={}, blocks={})",
+                args.max_runtime_sec, submitted_shares, accepted_shares, found_blocks
+            );
+            break;
+        }
+        if args.max_shares > 0 && accepted_shares >= args.max_shares {
+            println!(
+                "stratum miner reached max_shares={} (submitted={}, blocks={})",
+                args.max_shares, submitted_shares, found_blocks
+            );
+            break;
+        }
+
+        match read_sv2_message(&mut stream)? {
+            StratumReadOutcome::Closed => {
+                println!("stratum pool closed connection");
+                break;
+            }
+            StratumReadOutcome::Timeout => {
+                if let Some(job_id) = active_job_id {
+                    if let Some(job) = jobs.get(&job_id) {
+                        let cursor = *nonce_cursor.get(&job_id).unwrap_or(&0);
+                        if let Some((nonce, hash, is_block, next_cursor)) = try_find_share_for_job(
+                            job,
+                            share_target,
+                            cursor,
+                            args.max_nonce_per_cycle,
+                        ) {
+                            nonce_cursor.insert(job_id, next_cursor);
+                            write_sv2_message(
+                                &mut stream,
+                                &Sv2Message::SubmitSharesStandard {
+                                    channel_id: job.channel_id,
+                                    job_id,
+                                    nonce,
+                                    ntime: job.ntime,
+                                },
+                            )?;
+                            submitted_shares = submitted_shares.saturating_add(1);
+                            println!(
+                                "submitted share: channel={} job={} nonce={} hash={} is_block={}",
+                                job.channel_id, job_id, nonce, hash, is_block
+                            );
+                            last_io = Instant::now();
+                        } else {
+                            nonce_cursor.insert(
+                                job_id,
+                                cursor.wrapping_add(args.max_nonce_per_cycle.saturating_add(1)),
+                            );
+                        }
+                    }
+                } else if last_io.elapsed().as_secs() >= 10 {
+                    write_sv2_message(&mut stream, &Sv2Message::KeepAlive)?;
+                    last_io = Instant::now();
+                }
+            }
+            StratumReadOutcome::Message(message) => match message {
+                Sv2Message::SetupConnectionSuccess { .. } => {
+                    if !open_sent {
+                        write_sv2_message(
+                            &mut stream,
+                            &Sv2Message::OpenStandardMiningChannel {
+                                request_id: 1,
+                                user: args.user.clone(),
+                            },
+                        )?;
+                        open_sent = true;
+                        last_io = Instant::now();
+                    }
+                }
+                Sv2Message::SetupConnectionError { code, reason } => {
+                    return Err(NodeError::Runtime(format!(
+                        "stratum setup rejected: code={code} reason={reason}"
+                    )));
+                }
+                Sv2Message::OpenStandardMiningChannelSuccess {
+                    channel_id: opened_channel,
+                    target_hex,
+                    ..
+                } => {
+                    channel_id = Some(opened_channel);
+                    share_target = Target::from_hex(&target_hex).map_err(|e| {
+                        NodeError::Runtime(format!("invalid share target from pool: {e}"))
+                    })?;
+                    println!(
+                        "channel opened: id={} initial_share_target={}",
+                        opened_channel, share_target
+                    );
+                }
+                Sv2Message::OpenStandardMiningChannelError { code, reason, .. } => {
+                    return Err(NodeError::Runtime(format!(
+                        "stratum open channel rejected: code={code} reason={reason}"
+                    )));
+                }
+                Sv2Message::SetTarget {
+                    channel_id: msg_channel,
+                    maximum_target_hex,
+                } => {
+                    if channel_id == Some(msg_channel) {
+                        share_target = Target::from_hex(&maximum_target_hex).map_err(|e| {
+                            NodeError::Runtime(format!("invalid set_target from pool: {e}"))
+                        })?;
+                        println!(
+                            "share target updated: channel={} target={}",
+                            msg_channel, share_target
+                        );
+                    }
+                }
+                Sv2Message::SetNewPrevHash {
+                    channel_id: msg_channel,
+                    job_id,
+                    prev_hash_hex,
+                    ntime,
+                    network_target_hex,
+                } => {
+                    if channel_id == Some(msg_channel)
+                        && let Some(job) = jobs.get_mut(&job_id)
+                    {
+                        job.prev_hash = Hash256::from_hex(&prev_hash_hex).map_err(|e| {
+                            NodeError::Runtime(format!(
+                                "invalid prev_hash in set_new_prev_hash: {e}"
+                            ))
+                        })?;
+                        job.ntime = ntime;
+                        job.network_target =
+                            Target::from_hex(&network_target_hex).map_err(|e| {
+                                NodeError::Runtime(format!(
+                                    "invalid network_target in set_new_prev_hash: {e}"
+                                ))
+                            })?;
+                        active_job_id = Some(job_id);
+                    }
+                }
+                Sv2Message::SubmitSharesSuccess {
+                    accepted, is_block, ..
+                } => {
+                    accepted_shares = accepted_shares.saturating_add(accepted as u64);
+                    if is_block {
+                        found_blocks = found_blocks.saturating_add(1);
+                    }
+                    println!(
+                        "share accepted: accepted={} total_accepted={} blocks={}",
+                        accepted, accepted_shares, found_blocks
+                    );
+                }
+                Sv2Message::SubmitSharesError { code, reason, .. } => {
+                    println!("share rejected: code={} reason={}", code, reason);
+                }
+                Sv2Message::KeepAlive => {
+                    write_sv2_message(&mut stream, &Sv2Message::KeepAlive)?;
+                    last_io = Instant::now();
+                }
+                other => {
+                    if let Some(job) = parse_remote_job(other)? {
+                        active_job_id = Some(job.job_id);
+                        nonce_cursor.insert(job.job_id, 0);
+                        println!(
+                            "new mining job: channel={} job={} ntime={} target={}",
+                            job.channel_id, job.job_id, job.ntime, job.network_target
+                        );
+                        jobs.insert(job.job_id, job);
+                    }
+                }
+            },
+        }
+    }
+
+    println!(
+        "stratum miner summary: submitted={} accepted={} blocks={} runtime_sec={}",
+        submitted_shares,
+        accepted_shares,
+        found_blocks,
+        started_at.elapsed().as_secs()
+    );
+    Ok(())
+}
+
 fn json_error_body(message: &str) -> String {
     let escaped = message
         .replace('\\', "\\\\")
@@ -3851,6 +4143,7 @@ fn run() -> Result<(), NodeError> {
         Some(Command::Soak(args)) => run_soak(args),
         Some(Command::ReorgDemo(args)) => run_reorg_demo(args),
         Some(Command::StratumServe(args)) => run_stratum_serve(args),
+        Some(Command::StratumMine(args)) => run_stratum_mine(args),
         Some(Command::RpcServe(args)) => run_rpc_serve(args),
         Some(Command::Snapshot(args)) => run_snapshot(args.command),
         Some(Command::P2pDemo) => run_p2p_demo(),
@@ -3875,14 +4168,16 @@ mod tests {
     use scam_core::{ChainConfig, Hash256, OutPoint};
     use scam_miner::{BlockTemplate, mine_block};
     use scam_storage::{load_chain_archive_db, load_peer_book_db};
+    use scam_stratum::Sv2Message;
     use scam_wallet::{WalletMnemonic, derive_wallet_key};
 
     use super::{
         AddPeerArgs, ConfigScaffoldArgs, DifficultyAlgoArg, Network, ReindexRuntimeArgs,
         SOAK_FLOW_MNEMONIC, SpendableUtxo, SyncBookArgs, accepted_hrps_for_network,
         build_coinbase_tx, build_signed_transfer_tx, execute_soak_rounds, load_chain_config,
-        mine_block_with_transactions, mine_blocks_on_runtime, persist_runtime_db, run_add_peer,
-        run_config_scaffold, run_reindex_runtime, run_sync_book, select_utxos_for_amount,
+        mine_block_with_transactions, mine_blocks_on_runtime, parse_remote_job, persist_runtime_db,
+        run_add_peer, run_config_scaffold, run_reindex_runtime, run_sync_book,
+        select_utxos_for_amount, try_find_share_for_job,
     };
 
     fn utxo(seed: u8, value: u64) -> SpendableUtxo {
@@ -4250,5 +4545,44 @@ mod tests {
         assert!(signed.is_self_transfer);
         assert!(!signed.selected_inputs.is_empty());
         assert_eq!(signed.tx.outputs[0].value, 1_000);
+    }
+
+    #[test]
+    fn parse_remote_job_decodes_valid_new_job_message() {
+        let message = Sv2Message::NewMiningJob {
+            channel_id: 9,
+            job_id: 77,
+            version: 1,
+            prev_hash_hex: "0000000000000000000000000000000000000000000000000000000000000001"
+                .to_owned(),
+            merkle_root_hex: "0000000000000000000000000000000000000000000000000000000000000002"
+                .to_owned(),
+            ntime: 1_800_000_000,
+            network_target_hex: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                .to_owned(),
+        };
+        let job = parse_remote_job(message)
+            .expect("parse")
+            .expect("job present");
+        assert_eq!(job.channel_id, 9);
+        assert_eq!(job.job_id, 77);
+        assert_eq!(job.ntime, 1_800_000_000);
+    }
+
+    #[test]
+    fn try_find_share_for_job_finds_nonce_for_max_target() {
+        let job = scam_stratum::MiningJob {
+            channel_id: 1,
+            job_id: 2,
+            version: 1,
+            prev_hash: Hash256::ZERO,
+            merkle_root: Hash256::ZERO,
+            ntime: 1_800_000_000,
+            network_target: scam_core::Target::MAX,
+        };
+        let found = try_find_share_for_job(&job, scam_core::Target::MAX, 0, 100)
+            .expect("must find share immediately");
+        assert_eq!(found.0, 0);
+        assert!(found.2);
     }
 }

@@ -19,6 +19,12 @@ Stratum coverage is included in workspace tests (`scam-stratum`):
 - reject-budget closure behavior,
 - VarDiff target retune behavior.
 
+Networking/mempool hardening coverage includes:
+
+- per-peer replacement rate limit tests in `scam-p2p`,
+- telemetry counters for replacement and orphan churn in `scam-mempool`,
+- gossip telemetry counters for replacement-driven relay paths.
+
 ## Fuzzing Baseline
 
 Fuzz harness package lives in `fuzz/` with targets:
