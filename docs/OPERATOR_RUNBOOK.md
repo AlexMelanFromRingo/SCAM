@@ -87,6 +87,12 @@ cargo run -p scam-node -- soak \
   --telemetry-every-rounds 1
 ```
 
+Telemetry threshold check:
+
+```bash
+scripts/telemetry-alert-check.py --input data/soak.telemetry.jsonl
+```
+
 Public testnet dry-run (end-to-end checklist automation):
 
 ```bash

@@ -46,6 +46,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] Added per-peer replacement rate limit in gossip path for mempool-delta relay (`apply_mempool_inventory_delta_from_peer`) with ban-score penalties.
 - [x] Added telemetry hooks for mempool replacement and orphan churn (`MempoolTelemetry`, `OrphanPoolTelemetry`) and gossip replacement counters.
 - [x] Added soak telemetry snapshot persistence (`--telemetry-out`) and integrated peer-scoped replacement quota checks into soak runtime tx admission loop.
+- [x] Added telemetry threshold-check helper script (`scripts/telemetry-alert-check.py`) for soak churn alert gates.
 - [x] Added Stratum worker client command (`scam-node stratum-mine --pool <addr>`) for manual pool endpoint connectivity without DNS dependency.
 - [x] Added operator runbook document (`docs/OPERATOR_RUNBOOK.md`) covering bootstrap, sync, mining endpoint, reindex/recovery, and soak/chaos procedures.
 - [x] Added public-testnet dress rehearsal helper script (`scripts/testnet-dress-rehearsal.sh`) and explicit SV2 pool-grade gap tracker (`docs/SV2_POOL_GRADE_GAP.md`).

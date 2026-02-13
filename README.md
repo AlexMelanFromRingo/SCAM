@@ -112,6 +112,12 @@ cargo run -p scam-node -- soak \
   --telemetry-every-rounds 1
 ```
 
+Check telemetry thresholds:
+
+```bash
+scripts/telemetry-alert-check.py --input data/soak.telemetry.jsonl
+```
+
 ## Config-First Forking
 
 Generate a new network config:

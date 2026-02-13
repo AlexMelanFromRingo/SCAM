@@ -73,6 +73,16 @@ cargo run -p scam-node -- soak \
 This runs for ~24h wall-clock time (720 rounds with 120-second sleeps) at 2-minute block cadence and includes transaction churn.
 Telemetry JSONL can be post-processed for alert thresholds on replacement/orphan churn.
 
+Threshold checker:
+
+```bash
+scripts/telemetry-alert-check.py \
+  --input data/soak.telemetry.jsonl \
+  --max-rate-limited 0 \
+  --max-orphan-pool-len 500 \
+  --max-mempool-len 50000
+```
+
 Shortcut script:
 
 ```bash

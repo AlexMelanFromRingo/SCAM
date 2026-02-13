@@ -57,7 +57,10 @@ cargo run -p scam-node -- reindex-runtime \
   --config "${CONFIG}" \
   --runtime-db "${RUNTIME_DB}"
 
-echo "[dress] step 6/6: final status"
+echo "[dress] step 6/7: final status"
 cargo run -p scam-node -- status --network "${NETWORK}" --config "${CONFIG}"
+
+echo "[dress] step 7/7: telemetry threshold checks"
+scripts/telemetry-alert-check.py --input "${TELEMETRY_OUT}"
 
 echo "[dress] complete. telemetry=${TELEMETRY_OUT}"
