@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
@@ -15,12 +15,13 @@ use scam_core::{
     ChainConfig, ChainConfigError, DifficultyAlgorithm, Hash256, OutPoint, Target, Transaction,
     TxIn, TxOut, block_meets_pow, render_hash_bitmap_16x16,
 };
+use scam_mempool::{InsertOutcome, Mempool, MempoolError, OrphanPool};
 use scam_miner::{BlockTemplate, mine_block};
 use scam_p2p::{
-    FramingConfig, GossipEngine, InventoryItem, LocalHandshake, PeerCandidate, TransportError,
-    WireMessage, build_block_locator, client_handshake, read_message, request_blocks,
-    request_headers, select_block_hashes_for_peer, select_headers_for_peer, select_outbound_peers,
-    send_message, server_handshake,
+    FramingConfig, GossipEngine, GossipError, InventoryItem, LocalHandshake, PeerCandidate,
+    ReplacementRateLimit, TransportError, WireMessage, build_block_locator, client_handshake,
+    read_message, request_blocks, request_headers, select_block_hashes_for_peer,
+    select_headers_for_peer, select_outbound_peers, send_message, server_handshake,
 };
 use scam_rpc::{StatusResponse, TxResponse, header_to_block_response, to_pretty_json};
 use scam_storage::{
@@ -38,6 +39,7 @@ use scam_wallet::{
     load_wallet_vault, new_encrypted_wallet_vault, new_mnemonic, parse_address, qr_for_payment_uri,
     rescan_blocks, save_wallet_vault, sign_digest, to_address, verify_digest,
 };
+use serde::Serialize;
 use thiserror::Error;
 
 #[derive(Debug, Parser)]
@@ -386,6 +388,18 @@ struct SoakArgs {
     tx_fee: u64,
     #[arg(long, default_value_t = 0)]
     sleep_per_round_sec: u64,
+    #[arg(long)]
+    telemetry_out: Option<PathBuf>,
+    #[arg(long, default_value_t = 1)]
+    telemetry_every_rounds: u32,
+    #[arg(long, default_value_t = 8)]
+    simulated_peers: u32,
+    #[arg(long, default_value_t = 60)]
+    replacement_window_sec: u64,
+    #[arg(long, default_value_t = 20)]
+    replacement_max_per_peer: usize,
+    #[arg(long, default_value_t = 25)]
+    replacement_penalty: u32,
 }
 
 #[derive(Debug, Args)]
@@ -791,6 +805,10 @@ enum NodeError {
     Validation(#[from] TxValidationError),
     #[error("chain runtime error: {0}")]
     Chain(#[from] ChainError),
+    #[error("mempool error: {0}")]
+    Mempool(#[from] MempoolError),
+    #[error("gossip error: {0}")]
+    Gossip(#[from] GossipError),
     #[error("storage error: {0}")]
     Storage(#[from] StorageError),
     #[error("transport error: {0}")]
@@ -2947,6 +2965,158 @@ fn derive_soak_flow_keys() -> Result<(WalletKey, [u8; 20]), NodeError> {
     Ok((sender_key, recipient_key_hash20))
 }
 
+struct SoakRelayState {
+    mempool: Mempool,
+    orphan_pool: OrphanPool,
+    gossip: GossipEngine,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct SoakTelemetrySnapshot {
+    round: u32,
+    unix_sec: u64,
+    tip_height: u64,
+    mempool_len: usize,
+    orphan_pool_len: usize,
+    mempool_accepted_total: u64,
+    mempool_replaced_total: u64,
+    mempool_removed_by_replacement_total: u64,
+    mempool_evicted_total: u64,
+    mempool_removed_by_block_total: u64,
+    mempool_rejected_conflict_total: u64,
+    orphan_accepted_total: u64,
+    orphan_evicted_total: u64,
+    orphan_expired_total: u64,
+    orphan_promoted_total: u64,
+    gossip_announced_txs_total: u64,
+    gossip_removed_txs_total: u64,
+    gossip_inbound_replacement_events_total: u64,
+    gossip_replacement_rate_limited_total: u64,
+}
+
+fn append_soak_telemetry_snapshot(
+    path: &Path,
+    snapshot: &SoakTelemetrySnapshot,
+) -> Result<(), NodeError> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).map_err(|e| {
+            NodeError::Runtime(format!(
+                "cannot create telemetry directory {}: {e}",
+                parent.display()
+            ))
+        })?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| {
+            NodeError::Runtime(format!(
+                "cannot open telemetry output {}: {e}",
+                path.display()
+            ))
+        })?;
+    let line = serde_json::to_string(snapshot)
+        .map_err(|e| NodeError::Runtime(format!("cannot encode telemetry json: {e}")))?;
+    file.write_all(line.as_bytes()).map_err(|e| {
+        NodeError::Runtime(format!(
+            "cannot write telemetry output {}: {e}",
+            path.display()
+        ))
+    })?;
+    file.write_all(b"\n").map_err(|e| {
+        NodeError::Runtime(format!(
+            "cannot finalize telemetry output {}: {e}",
+            path.display()
+        ))
+    })?;
+    Ok(())
+}
+
+fn detect_missing_outpoints(
+    runtime: &ChainRuntime,
+    mempool: &Mempool,
+    tx: &Transaction,
+) -> Vec<OutPoint> {
+    let mut missing = HashSet::<OutPoint>::new();
+    for input in &tx.inputs {
+        if runtime.utxo_set().contains_key(&input.prev_out) {
+            continue;
+        }
+        if mempool.contains(&input.prev_out.txid) {
+            continue;
+        }
+        missing.insert(input.prev_out.clone());
+    }
+    missing.into_iter().collect::<Vec<_>>()
+}
+
+fn admit_peer_tx_into_relay(
+    relay: &mut SoakRelayState,
+    runtime: &ChainRuntime,
+    peer_id: u64,
+    tx: Transaction,
+    fee: u64,
+    now_unix_sec: u64,
+) -> Result<(), NodeError> {
+    let mut pending = VecDeque::<(Transaction, u64)>::new();
+    pending.push_back((tx, fee));
+
+    while let Some((candidate_tx, candidate_fee)) = pending.pop_front() {
+        let missing = detect_missing_outpoints(runtime, &relay.mempool, &candidate_tx);
+        if !missing.is_empty() {
+            let _ = relay
+                .orphan_pool
+                .insert(candidate_tx, candidate_fee, missing, now_unix_sec)?;
+            continue;
+        }
+
+        let outcome = relay.mempool.insert_with_fee(candidate_tx, candidate_fee)?;
+        let inserted_txid = match outcome {
+            InsertOutcome::Accepted { txid } => Some(txid),
+            InsertOutcome::Replaced { inserted, .. } => Some(inserted),
+            InsertOutcome::AcceptedWithEviction { inserted, .. } => Some(inserted),
+            InsertOutcome::AlreadyPresent { .. }
+            | InsertOutcome::RejectedConflictInsufficientFee { .. }
+            | InsertOutcome::RejectedConflictInsufficientFeerate { .. } => None,
+        };
+
+        let delta = outcome.inventory_delta();
+        if !delta.announced_txids.is_empty() || !delta.removed_txids.is_empty() {
+            let announced_txs = delta
+                .announced_txids
+                .iter()
+                .filter_map(|txid| relay.mempool.get(txid).cloned())
+                .collect::<Vec<_>>();
+            let _ = relay.gossip.apply_mempool_inventory_delta_from_peer(
+                peer_id,
+                announced_txs,
+                &delta.removed_txids,
+                now_unix_sec,
+            )?;
+        }
+
+        if let Some(txid) = inserted_txid
+            && let Some(inserted_tx) = relay.mempool.get(&txid).cloned()
+        {
+            for vout in 0..inserted_tx.outputs.len() {
+                let outpoint = OutPoint {
+                    txid,
+                    vout: vout as u32,
+                };
+                let ready = relay.orphan_pool.resolve_outpoint(&outpoint);
+                for ready_orphan in ready {
+                    pending.push_back((ready_orphan.tx, ready_orphan.fee));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn execute_soak_rounds<F>(
     runtime: &mut ChainRuntime,
     cfg: &ChainConfig,
@@ -3001,6 +3171,48 @@ fn run_soak(args: SoakArgs) -> Result<(), NodeError> {
             "tx_amount must be > 0 when txs_per_round is enabled".to_owned(),
         ));
     }
+    if args.telemetry_every_rounds == 0 {
+        return Err(NodeError::Runtime(
+            "telemetry_every_rounds must be > 0".to_owned(),
+        ));
+    }
+    if args.simulated_peers == 0 {
+        return Err(NodeError::Runtime("simulated_peers must be > 0".to_owned()));
+    }
+    if args.replacement_window_sec == 0 {
+        return Err(NodeError::Runtime(
+            "replacement_window_sec must be > 0".to_owned(),
+        ));
+    }
+    if args.replacement_max_per_peer == 0 {
+        return Err(NodeError::Runtime(
+            "replacement_max_per_peer must be > 0".to_owned(),
+        ));
+    }
+    if args.replacement_penalty == 0 {
+        return Err(NodeError::Runtime(
+            "replacement_penalty must be > 0".to_owned(),
+        ));
+    }
+
+    if let Some(path) = args.telemetry_out.as_ref() {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent).map_err(|e| {
+                NodeError::Runtime(format!(
+                    "cannot create telemetry parent {}: {e}",
+                    parent.display()
+                ))
+            })?;
+        }
+        fs::write(path, b"").map_err(|e| {
+            NodeError::Runtime(format!(
+                "cannot initialize telemetry output {}: {e}",
+                path.display()
+            ))
+        })?;
+    }
 
     let tx_flow_enabled = args.txs_per_round > 0;
     let (soak_sender_key, soak_recipient_key_hash20, miner_key_hash) = if tx_flow_enabled {
@@ -3011,8 +3223,31 @@ fn run_soak(args: SoakArgs) -> Result<(), NodeError> {
         (None, [0u8; 20], cfg.genesis_reward_key_hash20()?)
     };
 
+    let mut relay_state = if tx_flow_enabled {
+        let mut gossip = GossipEngine::with_limits_and_replacement(
+            256,
+            100,
+            ReplacementRateLimit {
+                window_sec: args.replacement_window_sec,
+                max_replacements: args.replacement_max_per_peer,
+                penalty: args.replacement_penalty,
+            },
+        )?;
+        for peer_id in 1..=args.simulated_peers {
+            gossip.connect_peer(peer_id as u64);
+        }
+        Some(SoakRelayState {
+            mempool: Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)?,
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)?,
+            gossip,
+        })
+    } else {
+        None
+    };
+
     let mut tx_blocks_mined = 0u64;
     let mut txs_included = 0u64;
+    let mut rate_limited_events = 0u64;
     let persist_every_rounds = args.persist_every_rounds.max(1);
     let execution = SoakExecutionParams {
         rounds: args.rounds,
@@ -3023,33 +3258,73 @@ fn run_soak(args: SoakArgs) -> Result<(), NodeError> {
         sleep_per_round_sec: args.sleep_per_round_sec,
     };
     let summary = execute_soak_rounds(&mut runtime, &cfg, execution, |round, runtime| {
+        let now_unix_sec = current_unix_sec()?;
         if tx_flow_enabled {
             let sender_key = soak_sender_key
                 .as_ref()
                 .expect("tx flow enabled means sender key is present");
-            let mut round_txs = Vec::<Transaction>::new();
             for tx_index in 0..args.txs_per_round {
                 let recipient_key_hash20 = if tx_index % 2 == 0 {
                     soak_recipient_key_hash20
                 } else {
                     miner_key_hash
                 };
+                let tx_fee = args.tx_fee.saturating_add((tx_index % 4) as u64);
                 match build_signed_transfer_tx(
                     runtime,
                     &cfg.network_id,
                     sender_key,
                     recipient_key_hash20,
                     args.tx_amount,
-                    args.tx_fee,
+                    tx_fee,
                 ) {
-                    Ok(signed) => round_txs.push(signed.tx),
+                    Ok(signed) => {
+                        let peer_id =
+                            ((round as u64 + tx_index as u64) % args.simulated_peers as u64) + 1;
+                        match admit_peer_tx_into_relay(
+                            relay_state
+                                .as_mut()
+                                .expect("relay state must exist when tx flow is enabled"),
+                            runtime,
+                            peer_id,
+                            signed.tx,
+                            tx_fee,
+                            now_unix_sec,
+                        ) {
+                            Ok(()) => {}
+                            Err(NodeError::Gossip(GossipError::ReplacementRateLimited {
+                                ..
+                            })) => {
+                                rate_limited_events = rate_limited_events.saturating_add(1);
+                            }
+                            Err(NodeError::Mempool(
+                                MempoolError::MultipleConflicts { .. }
+                                | MempoolError::ReplacementTooManyDescendants { .. }
+                                | MempoolError::FeeTooLow { .. }
+                                | MempoolError::Full { .. },
+                            )) => {}
+                            Err(other) => return Err(other),
+                        }
+                    }
                     Err(NodeError::InsufficientFunds { .. }) => break,
                     Err(other) => return Err(other),
                 }
             }
 
+            let relay = relay_state
+                .as_mut()
+                .expect("relay state must exist when tx flow is enabled");
+            let ranked = relay.mempool.txids_by_feerate_desc();
+            let mut round_txs = Vec::<Transaction>::new();
+            for txid in ranked.into_iter().take(args.txs_per_round as usize) {
+                if let Some(tx) = relay.mempool.get(&txid) {
+                    round_txs.push(tx.clone());
+                }
+            }
+
             if !round_txs.is_empty() {
                 let tx_count = round_txs.len() as u64;
+                let included_txids = round_txs.iter().map(Transaction::txid).collect::<Vec<_>>();
                 mine_block_with_transactions(
                     runtime,
                     args.interval_sec,
@@ -3059,9 +3334,71 @@ fn run_soak(args: SoakArgs) -> Result<(), NodeError> {
                     format!("soak-tx-{round}"),
                     round_txs,
                 )?;
+                let removed_confirmed = relay.mempool.remove_confirmed_txids(&included_txids);
+                if !removed_confirmed.is_empty() {
+                    let _ = relay
+                        .gossip
+                        .apply_mempool_inventory_delta(Vec::new(), &removed_confirmed);
+                }
                 tx_blocks_mined = tx_blocks_mined.saturating_add(1);
                 txs_included = txs_included.saturating_add(tx_count);
             }
+            let _ = relay.orphan_pool.expire(now_unix_sec);
+        }
+
+        if let Some(path) = args.telemetry_out.as_ref()
+            && round % args.telemetry_every_rounds == 0
+        {
+            let snapshot = if let Some(relay) = relay_state.as_ref() {
+                let mem = relay.mempool.telemetry();
+                let orphan = relay.orphan_pool.telemetry();
+                let gossip = relay.gossip.telemetry();
+                SoakTelemetrySnapshot {
+                    round,
+                    unix_sec: now_unix_sec,
+                    tip_height: runtime.tip_height(),
+                    mempool_len: relay.mempool.len(),
+                    orphan_pool_len: relay.orphan_pool.len(),
+                    mempool_accepted_total: mem.accepted_total,
+                    mempool_replaced_total: mem.replaced_total,
+                    mempool_removed_by_replacement_total: mem.removed_by_replacement_total,
+                    mempool_evicted_total: mem.evicted_total,
+                    mempool_removed_by_block_total: mem.removed_by_block_total,
+                    mempool_rejected_conflict_total: mem.rejected_conflict_total,
+                    orphan_accepted_total: orphan.accepted_total,
+                    orphan_evicted_total: orphan.evicted_total,
+                    orphan_expired_total: orphan.expired_total,
+                    orphan_promoted_total: orphan.promoted_total,
+                    gossip_announced_txs_total: gossip.announced_txs_total,
+                    gossip_removed_txs_total: gossip.removed_txs_total,
+                    gossip_inbound_replacement_events_total: gossip
+                        .inbound_replacement_events_total,
+                    gossip_replacement_rate_limited_total: gossip.replacement_rate_limited_total,
+                }
+            } else {
+                SoakTelemetrySnapshot {
+                    round,
+                    unix_sec: now_unix_sec,
+                    tip_height: runtime.tip_height(),
+                    mempool_len: 0,
+                    orphan_pool_len: 0,
+                    mempool_accepted_total: 0,
+                    mempool_replaced_total: 0,
+                    mempool_removed_by_replacement_total: 0,
+                    mempool_evicted_total: 0,
+                    mempool_removed_by_block_total: 0,
+                    mempool_rejected_conflict_total: 0,
+                    orphan_accepted_total: 0,
+                    orphan_evicted_total: 0,
+                    orphan_expired_total: 0,
+                    orphan_promoted_total: 0,
+                    gossip_announced_txs_total: 0,
+                    gossip_removed_txs_total: 0,
+                    gossip_inbound_replacement_events_total: 0,
+                    gossip_replacement_rate_limited_total: 0,
+                }
+            };
+            append_soak_telemetry_snapshot(path, &snapshot)?;
         }
 
         if round % persist_every_rounds == 0 {
@@ -3095,6 +3432,14 @@ fn run_soak(args: SoakArgs) -> Result<(), NodeError> {
         println!("TX fee: {}", args.tx_fee);
         println!("TX blocks mined: {}", tx_blocks_mined);
         println!("TXs included: {}", txs_included);
+        println!("Replacement rate-limited events: {}", rate_limited_events);
+        if let Some(path) = args.telemetry_out.as_ref() {
+            println!("Telemetry out: {}", path.display());
+            println!(
+                "Telemetry snapshots every {} round(s)",
+                args.telemetry_every_rounds
+            );
+        }
         println!("Round sleep sec: {}", args.sleep_per_round_sec);
         println!(
             "Projected wall-clock sec (round sleeps): {}",
@@ -4165,18 +4510,20 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use scam_chain::ChainRuntime;
-    use scam_core::{ChainConfig, Hash256, OutPoint};
+    use scam_core::{ChainConfig, Hash256, OutPoint, Transaction, TxIn, TxOut};
+    use scam_mempool::{Mempool, OrphanPool};
     use scam_miner::{BlockTemplate, mine_block};
+    use scam_p2p::{GossipEngine, ReplacementRateLimit};
     use scam_storage::{load_chain_archive_db, load_peer_book_db};
     use scam_stratum::Sv2Message;
     use scam_wallet::{WalletMnemonic, derive_wallet_key};
 
     use super::{
         AddPeerArgs, ConfigScaffoldArgs, DifficultyAlgoArg, Network, ReindexRuntimeArgs,
-        SOAK_FLOW_MNEMONIC, SpendableUtxo, SyncBookArgs, accepted_hrps_for_network,
-        build_coinbase_tx, build_signed_transfer_tx, execute_soak_rounds, load_chain_config,
-        mine_block_with_transactions, mine_blocks_on_runtime, parse_remote_job, persist_runtime_db,
-        run_add_peer, run_config_scaffold, run_reindex_runtime, run_sync_book,
+        SOAK_FLOW_MNEMONIC, SoakRelayState, SpendableUtxo, SyncBookArgs, accepted_hrps_for_network,
+        admit_peer_tx_into_relay, build_coinbase_tx, build_signed_transfer_tx, execute_soak_rounds,
+        load_chain_config, mine_block_with_transactions, mine_blocks_on_runtime, parse_remote_job,
+        persist_runtime_db, run_add_peer, run_config_scaffold, run_reindex_runtime, run_sync_book,
         select_utxos_for_amount, try_find_share_for_job,
     };
 
@@ -4584,5 +4931,72 @@ mod tests {
             .expect("must find share immediately");
         assert_eq!(found.0, 0);
         assert!(found.2);
+    }
+
+    fn relay_tx(spend: OutPoint, sig_seed: u8, out_seed: u8) -> Transaction {
+        Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: spend,
+                signature: vec![sig_seed; 64],
+                pubkey_compressed: vec![0x02; 33],
+                sequence: 0,
+            }],
+            outputs: vec![TxOut {
+                value: 1,
+                key_hash20: [out_seed; 20],
+            }],
+            lock_time: 0,
+        }
+    }
+
+    #[test]
+    fn relay_admission_enforces_peer_replacement_rate_limit() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        cfg.validate().expect("config validate");
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let (base_outpoint, _) = runtime
+            .utxo_set()
+            .iter()
+            .next()
+            .expect("genesis utxo must exist");
+
+        let mut gossip = GossipEngine::with_limits_and_replacement(
+            256,
+            50,
+            ReplacementRateLimit {
+                window_sec: 60,
+                max_replacements: 1,
+                penalty: 60,
+            },
+        )
+        .expect("gossip");
+        gossip.connect_peer(1);
+
+        let mut relay = SoakRelayState {
+            mempool: Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip,
+        };
+
+        let tx1 = relay_tx(base_outpoint.clone(), 1, 11);
+        let tx2 = relay_tx(base_outpoint.clone(), 2, 12);
+        let tx3 = relay_tx(base_outpoint.clone(), 3, 13);
+
+        admit_peer_tx_into_relay(&mut relay, &runtime, 1, tx1, 1_000, 1_000).expect("first");
+        admit_peer_tx_into_relay(&mut relay, &runtime, 1, tx2, 1_001, 1_001)
+            .expect("replacement 1");
+        let err = admit_peer_tx_into_relay(&mut relay, &runtime, 1, tx3, 1_002, 1_002)
+            .expect_err("replacement 2 should be rate limited");
+        assert!(matches!(
+            err,
+            super::NodeError::Gossip(scam_p2p::GossipError::ReplacementRateLimited {
+                peer_id: 1,
+                ..
+            })
+        ));
     }
 }

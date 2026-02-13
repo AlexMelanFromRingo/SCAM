@@ -63,6 +63,7 @@ pub struct MempoolTelemetry {
     pub replaced_total: u64,
     pub removed_by_replacement_total: u64,
     pub evicted_total: u64,
+    pub removed_by_block_total: u64,
     pub rejected_conflict_total: u64,
     pub duplicate_total: u64,
 }
@@ -149,6 +150,33 @@ impl Mempool {
 
     pub fn get_with_fee(&self, txid: &Hash256) -> Option<(&Transaction, u64)> {
         self.txs.get(txid).map(|entry| (&entry.tx, entry.fee))
+    }
+
+    pub fn remove_confirmed_txids(&mut self, txids: &[Hash256]) -> Vec<Hash256> {
+        if txids.is_empty() {
+            return Vec::new();
+        }
+
+        let mut removed = Vec::<Hash256>::new();
+        let mut seen = HashSet::<Hash256>::new();
+        for txid in txids {
+            if !seen.insert(*txid) {
+                continue;
+            }
+            if self.txs.remove(txid).is_some() {
+                removed.push(*txid);
+            }
+        }
+        if !removed.is_empty() {
+            self.rebuild_spent_outpoints();
+            self.bump_revision();
+            self.telemetry.removed_by_block_total = self
+                .telemetry
+                .removed_by_block_total
+                .saturating_add(removed.len() as u64);
+            removed.sort_unstable();
+        }
+        removed
     }
 
     pub fn insert(&mut self, tx: Transaction) -> Result<InsertOutcome, MempoolError> {
@@ -1375,5 +1403,24 @@ mod tests {
         assert_eq!(telemetry.evicted_total, 1);
         assert_eq!(telemetry.promoted_total, 0);
         assert_eq!(telemetry.expired_total, 1);
+    }
+
+    #[test]
+    fn remove_confirmed_txids_updates_pool_and_telemetry() {
+        let mut mempool = Mempool::with_policy_and_replacement(100, 0, 1, 25).expect("mempool");
+        let tx_a = mk_tx([171u8; 32], 0, b"a", 1);
+        let tx_b = mk_tx([172u8; 32], 0, b"b", 2);
+        let tx_a_id = tx_a.txid();
+        let tx_b_id = tx_b.txid();
+        let missing = scam_core::Hash256([199u8; 32]);
+
+        let _ = mempool.insert_with_fee(tx_a, 10).expect("insert a");
+        let _ = mempool.insert_with_fee(tx_b, 10).expect("insert b");
+        let removed = mempool.remove_confirmed_txids(&[tx_b_id, missing, tx_a_id, tx_b_id]);
+
+        assert_eq!(removed, vec![tx_a_id, tx_b_id]);
+        assert!(mempool.is_empty());
+        let telemetry = mempool.telemetry();
+        assert_eq!(telemetry.removed_by_block_total, 2);
     }
 }
