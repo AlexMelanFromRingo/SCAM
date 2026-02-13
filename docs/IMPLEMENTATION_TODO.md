@@ -296,10 +296,10 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 
 ## 17) Launch Strategy TODO
 
-- [ ] Phase 1: single-node consensus correctness (no P2P).
-- [ ] Phase 2: mempool + mining + persistent chainstate.
-- [ ] Phase 3: P2P gossip and headers-first sync.
-- [ ] Phase 4: wallet, mnemonic, QR, send/receive UX.
+- [x] Phase 1: single-node consensus correctness (no P2P).
+- [x] Phase 2: mempool + mining + persistent chainstate.
+- [x] Phase 3: P2P gossip and headers-first sync.
+- [x] Phase 4: wallet, mnemonic, QR, send/receive UX.
 - [ ] Phase 5: hardening, tests, docs, public testnet.
 - [ ] Phase 6: mainnet parameter freeze and genesis lock-in.
 
