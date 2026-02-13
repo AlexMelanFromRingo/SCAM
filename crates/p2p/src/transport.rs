@@ -404,6 +404,7 @@ mod tests {
     use std::time::Duration;
 
     use scam_core::{Hash256, Target, hash::hash256};
+    use tokio::io::AsyncReadExt;
     use tokio::runtime::Runtime;
 
     use crate::sync::{build_block_locator, select_block_hashes_for_peer, select_headers_for_peer};
@@ -555,6 +556,41 @@ mod tests {
             assert!(!blocks.is_empty());
 
             server.await.expect("server join");
+        });
+    }
+
+    #[test]
+    fn send_message_async_writes_header_and_payload_bytes() {
+        let runtime = Runtime::new().expect("tokio runtime");
+        runtime.block_on(async {
+            let cfg = FramingConfig::default();
+            let (mut tx, mut rx) = tokio::io::duplex(4 * 1024);
+            let message = WireMessage::Ping {
+                nonce: 0xabcdef1234567890,
+            };
+
+            let writer = tokio::spawn(async move {
+                send_message_async(&mut tx, &message, &cfg)
+                    .await
+                    .expect("send message");
+            });
+
+            let reader = tokio::spawn(async move {
+                let mut header = [0u8; 8];
+                tokio::time::timeout(Duration::from_millis(500), rx.read_exact(&mut header))
+                    .await
+                    .expect("timed out waiting for header bytes")
+                    .expect("read header");
+                header
+            });
+
+            writer.await.expect("writer join");
+            let header = reader.await.expect("reader join");
+            let magic = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
+            assert_eq!(magic, FramingConfig::default().magic);
+            let payload_len =
+                u32::from_be_bytes([header[4], header[5], header[6], header[7]]) as usize;
+            assert!(payload_len > 0);
         });
     }
 

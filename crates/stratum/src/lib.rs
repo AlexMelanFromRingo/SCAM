@@ -496,6 +496,9 @@ impl Sv2Session {
             });
         }
 
+        if self.jobs.contains_key(&job.job_id) {
+            self.job_order.retain(|job_id| *job_id != job.job_id);
+        }
         self.jobs.insert(job.job_id, job.clone());
         self.job_order.push_back(job.job_id);
         while self.job_order.len() > self.cfg.max_jobs {
@@ -2019,24 +2022,25 @@ pub enum StratumError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::io::Cursor;
     #[cfg(unix)]
     use std::os::unix::net::UnixStream;
     #[cfg(unix)]
     use std::thread;
-    #[cfg(unix)]
     use std::time::Duration;
 
     use scam_core::{Hash256, Target};
     use secp256k1::{PublicKey, Secp256k1, SecretKey};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::runtime::Runtime;
 
     use crate::{
         IdentityTranslator, JobDeclarator, MiningJob, MiningTemplate, NoiseSv2Transport,
         SUPPORTED_SV2_VERSION, SecureRole, SecureSv2Transport, SequentialJobDeclarator,
         SessionConfig, SessionEvent, ShareSubmission, ShareValidation, Sv2Message, Sv2Session,
-        Translator, decode_secure_handshake_packet, read_frame, read_frame_async, validate_share,
-        write_frame, write_frame_async,
+        Translator, decode_secure_handshake_packet, decode_single_frame_bytes, read_frame,
+        read_frame_async, validate_share, write_frame, write_frame_async,
     };
 
     fn test_session_config() -> SessionConfig {
@@ -2056,6 +2060,33 @@ mod tests {
             vardiff_clamp_down: 0.25,
             max_rejected_shares: 3,
         }
+    }
+
+    fn activate_session(mut cfg: SessionConfig) -> Sv2Session {
+        cfg.max_jobs = cfg.max_jobs.max(1);
+        let mut session = Sv2Session::new(cfg).expect("session");
+        session
+            .handle_message(Sv2Message::SetupConnection {
+                protocol: 2,
+                min_version: 2,
+                max_version: 2,
+                flags: 0,
+                user_agent: "test-miner".to_owned(),
+            })
+            .expect("setup");
+        session
+            .handle_message(Sv2Message::OpenStandardMiningChannel {
+                request_id: 1,
+                user: "alice".to_owned(),
+            })
+            .expect("open");
+        session
+    }
+
+    fn keepalive_frame_bytes() -> Vec<u8> {
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &Sv2Message::KeepAlive).expect("encode keepalive");
+        buf
     }
 
     #[cfg(unix)]
@@ -2093,6 +2124,61 @@ mod tests {
             .expect("decode")
             .expect("some frame");
         assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn read_frame_rejects_invalid_extension() {
+        let mut frame = keepalive_frame_bytes();
+        frame[0] = 1;
+        frame[1] = 0;
+        let err = read_frame(&mut Cursor::new(frame)).expect_err("must reject extension");
+        assert!(matches!(err, crate::StratumError::UnsupportedExtension(_)));
+    }
+
+    #[test]
+    fn read_frame_rejects_zero_and_oversized_lengths() {
+        let mut zero_len = keepalive_frame_bytes();
+        zero_len.truncate(crate::SV2_HEADER_LEN);
+        zero_len[3] = 0;
+        zero_len[4] = 0;
+        zero_len[5] = 0;
+        let err = read_frame(&mut Cursor::new(zero_len)).expect_err("must reject zero len");
+        assert!(matches!(err, crate::StratumError::InvalidFrameLength(0)));
+
+        let mut oversized = keepalive_frame_bytes();
+        oversized.truncate(crate::SV2_HEADER_LEN);
+        let len = (crate::MAX_FRAME_SIZE + 1) as u32;
+        oversized[3] = (len & 0xff) as u8;
+        oversized[4] = ((len >> 8) & 0xff) as u8;
+        oversized[5] = ((len >> 16) & 0xff) as u8;
+        let err = read_frame(&mut Cursor::new(oversized)).expect_err("must reject oversized");
+        assert!(matches!(err, crate::StratumError::FrameTooLarge { .. }));
+    }
+
+    #[test]
+    fn read_frame_rejects_type_mismatch_and_trailing_payload() {
+        let mut mismatch = keepalive_frame_bytes();
+        let header_type = crate::message_type(&Sv2Message::SetupConnection {
+            protocol: 2,
+            min_version: 2,
+            max_version: 2,
+            flags: 0,
+            user_agent: "x".to_owned(),
+        });
+        mismatch[2] = header_type;
+        let err = read_frame(&mut Cursor::new(mismatch)).expect_err("must reject type mismatch");
+        assert!(matches!(
+            err,
+            crate::StratumError::MessageTypeMismatch {
+                header_type: _,
+                payload_type: _
+            }
+        ));
+
+        let mut framed = keepalive_frame_bytes();
+        framed.push(0xff);
+        let err = decode_single_frame_bytes(&framed).expect_err("must reject trailing payload");
+        assert!(matches!(err, crate::StratumError::SecureTransport(_)));
     }
 
     #[test]
@@ -2150,6 +2236,60 @@ mod tests {
             submit.events.as_slice(),
             [SessionEvent::ShareAccepted { is_block: true, .. }]
         ));
+    }
+
+    #[test]
+    fn install_job_evicts_oldest_entry_and_preserves_cache_invariants() {
+        let mut cfg = test_session_config();
+        cfg.max_jobs = 2;
+        let mut session = activate_session(cfg);
+
+        let mk_job = |job_id: u32| MiningJob {
+            channel_id: 7,
+            job_id,
+            version: 1,
+            prev_hash: Hash256::ZERO,
+            merkle_root: Hash256::ZERO,
+            ntime: 1_770_763_200 + job_id as u64,
+            network_target: Target::MAX,
+        };
+
+        session.install_job(mk_job(1)).expect("job 1");
+        session.install_job(mk_job(2)).expect("job 2");
+        session.install_job(mk_job(3)).expect("job 3");
+
+        assert!(session.job(1).is_none());
+        assert!(session.job(2).is_some());
+        assert!(session.job(3).is_some());
+        assert_eq!(session.jobs.len(), 2);
+        assert_eq!(session.job_order, VecDeque::from(vec![2, 3]));
+    }
+
+    #[test]
+    fn install_job_replacing_same_id_keeps_single_queue_entry() {
+        let mut cfg = test_session_config();
+        cfg.max_jobs = 4;
+        let mut session = activate_session(cfg);
+
+        let first = MiningJob {
+            channel_id: 7,
+            job_id: 42,
+            version: 1,
+            prev_hash: Hash256::ZERO,
+            merkle_root: Hash256::ZERO,
+            ntime: 1_770_763_200,
+            network_target: Target::MAX,
+        };
+        let mut second = first.clone();
+        second.version = 2;
+        second.ntime = first.ntime + 1;
+
+        session.install_job(first).expect("install first");
+        session.install_job(second.clone()).expect("replace");
+
+        assert_eq!(session.jobs.len(), 1);
+        assert_eq!(session.job_order, VecDeque::from(vec![42]));
+        assert_eq!(session.job(42).expect("job"), &second);
     }
 
     #[test]
@@ -2244,6 +2384,52 @@ mod tests {
 
         assert!(updated.is_some());
         assert!(session.share_target() < initial);
+    }
+
+    #[test]
+    fn vardiff_respects_clamp_up_boundary() {
+        let mut cfg = test_session_config();
+        cfg.share_target =
+            Target::from_hex("20ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+                .expect("target");
+        cfg.max_share_target =
+            Target::from_hex("40ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+                .expect("target");
+        let mut session = Sv2Session::new(cfg).expect("session");
+
+        let _ = session.record_share_timestamp(1_000).expect("record 1");
+        let _ = session.record_share_timestamp(2_000).expect("record 2");
+        let _ = session.record_share_timestamp(3_000).expect("record 3");
+        let updated = session.record_share_timestamp(4_000).expect("record 4");
+
+        let expected = super::scale_target(cfg.share_target, cfg.vardiff_clamp_up)
+            .expect("scaled")
+            .clamp(cfg.min_share_target, cfg.max_share_target);
+        assert_eq!(updated, Some(expected));
+        assert_eq!(session.share_target(), expected);
+    }
+
+    #[test]
+    fn vardiff_respects_clamp_down_boundary() {
+        let mut cfg = test_session_config();
+        cfg.share_target =
+            Target::from_hex("40ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+                .expect("target");
+        cfg.min_share_target =
+            Target::from_hex("10ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+                .expect("target");
+        let mut session = Sv2Session::new(cfg).expect("session");
+
+        let _ = session.record_share_timestamp(1_000).expect("record 1");
+        let _ = session.record_share_timestamp(1_001).expect("record 2");
+        let _ = session.record_share_timestamp(1_002).expect("record 3");
+        let updated = session.record_share_timestamp(1_003).expect("record 4");
+
+        let expected = super::scale_target(cfg.share_target, cfg.vardiff_clamp_down)
+            .expect("scaled")
+            .clamp(cfg.min_share_target, cfg.max_share_target);
+        assert_eq!(updated, Some(expected));
+        assert_eq!(session.share_target(), expected);
     }
 
     #[test]
@@ -2473,6 +2659,34 @@ mod tests {
     }
 
     #[test]
+    fn async_read_frame_rejects_malformed_headers() {
+        let runtime = Runtime::new().expect("tokio runtime");
+        runtime.block_on(async {
+            let mut frame = keepalive_frame_bytes();
+            frame[2] = crate::message_type(&Sv2Message::SetupConnection {
+                protocol: 2,
+                min_version: 2,
+                max_version: 2,
+                flags: 0,
+                user_agent: "x".to_owned(),
+            });
+
+            let (mut tx, mut rx) = tokio::io::duplex(4 * 1024);
+            tx.write_all(&frame).await.expect("write malformed frame");
+            tx.flush().await.expect("flush malformed frame");
+            drop(tx);
+
+            let err = read_frame_async(&mut rx)
+                .await
+                .expect_err("must reject malformed frame");
+            assert!(matches!(
+                err,
+                crate::StratumError::MessageTypeMismatch { .. }
+            ));
+        });
+    }
+
+    #[test]
     fn async_secure_transport_roundtrip() {
         let runtime = Runtime::new().expect("tokio runtime");
         runtime.block_on(async {
@@ -2512,6 +2726,41 @@ mod tests {
             let echoed = client.await.expect("client join");
             server.await.expect("server join");
             assert_eq!(echoed, Sv2Message::KeepAlive);
+        });
+    }
+
+    #[test]
+    fn async_secure_transport_write_message_emits_bytes() {
+        let runtime = Runtime::new().expect("tokio runtime");
+        runtime.block_on(async {
+            let (mut client_io, mut server_io) = tokio::io::duplex(8 * 1024);
+
+            let client = tokio::spawn(async move {
+                let mut transport = SecureSv2Transport::handshake_client_async(&mut client_io)
+                    .await
+                    .expect("client handshake");
+                transport
+                    .write_message_async(&mut client_io, &Sv2Message::KeepAlive)
+                    .await
+                    .expect("client write");
+            });
+
+            let server = tokio::spawn(async move {
+                let _transport = SecureSv2Transport::handshake_server_async(&mut server_io)
+                    .await
+                    .expect("server handshake");
+                let mut len_prefix = [0u8; 4];
+                tokio::time::timeout(
+                    Duration::from_millis(500),
+                    server_io.read_exact(&mut len_prefix),
+                )
+                .await
+                .expect("timed out waiting for secure frame")
+                .expect("read secure frame len");
+            });
+
+            client.await.expect("client join");
+            server.await.expect("server join");
         });
     }
 

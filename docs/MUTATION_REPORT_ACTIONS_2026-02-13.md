@@ -24,12 +24,12 @@ Run window: `2026-02-13T16:10:10Z` -> `2026-02-13T17:09:00Z`
 
 ## P1: Stratum / P2P Protocol Robustness
 
-- [ ] Expand `read_frame`/`read_frame_async` tests for malformed headers, type mismatch, zero/oversized payload, trailing bytes (`crates/stratum/src/lib.rs`).
-- [ ] Add tests for `Sv2Session::install_job` capacity/eviction boundaries and job cache invariants (`crates/stratum/src/lib.rs`).
-- [ ] Add tests for `Sv2Session::record_share_timestamp` VarDiff retarget boundaries (`crates/stratum/src/lib.rs`).
-- [ ] Add tests that fail if `SecureSv2Transport::write_message_async` is a no-op (`crates/stratum/src/lib.rs`).
-- [ ] Add async transport contract tests that fail if `send_message_async` does not write bytes (`crates/p2p/src/transport.rs`).
-- [ ] Add richer interop assertions around `run_sv2_conformance` message sequence and error paths (`crates/node/src/main.rs`).
+- [x] Expand `read_frame`/`read_frame_async` tests for malformed headers, type mismatch, zero/oversized payload, trailing bytes (`crates/stratum/src/lib.rs`).
+- [x] Add tests for `Sv2Session::install_job` capacity/eviction boundaries and job cache invariants (`crates/stratum/src/lib.rs`).
+- [x] Add tests for `Sv2Session::record_share_timestamp` VarDiff retarget boundaries (`crates/stratum/src/lib.rs`).
+- [x] Add tests that fail if `SecureSv2Transport::write_message_async` is a no-op (`crates/stratum/src/lib.rs`).
+- [x] Add async transport contract tests that fail if `send_message_async` does not write bytes (`crates/p2p/src/transport.rs`).
+- [x] Add richer interop assertions around `run_sv2_conformance` message sequence and error paths (`crates/node/src/main.rs`).
 
 ## P2: Node/RPC/Wallet Path Coverage
 

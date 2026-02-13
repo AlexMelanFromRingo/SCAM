@@ -7425,20 +7425,21 @@ mod tests {
     use scam_miner::{BlockTemplate, mine_block};
     use scam_p2p::{GossipEngine, InventoryItem, ReplacementRateLimit, WireMessage};
     use scam_storage::{load_chain_archive_db, load_peer_book_db};
-    use scam_stratum::{IdentityTranslator, Sv2Message, Translator};
+    use scam_stratum::{IdentityTranslator, Sv2Message, Translator, read_frame, write_frame};
     use scam_wallet::{WalletMnemonic, derive_wallet_key};
 
     use super::{
         AddPeerArgs, ConfigScaffoldArgs, DifficultyAlgoArg, Network, ReindexRuntimeArgs,
         RelayAdmissionState, RelayServerState, SOAK_FLOW_MNEMONIC, SpendableUtxo,
-        Sv2JobDeclaratorArgs, Sv2TemplateProviderArgs, Sv2TranslatorArgs, SyncBookArgs,
-        TemplateProviderRequest, accepted_hrps_for_network, admit_peer_tx_into_relay,
+        Sv2ConformanceArgs, Sv2JobDeclaratorArgs, Sv2TemplateProviderArgs, Sv2TranslatorArgs,
+        SyncBookArgs, TemplateProviderRequest, accepted_hrps_for_network, admit_peer_tx_into_relay,
         build_coinbase_tx, build_signed_transfer_tx, execute_soak_rounds, load_chain_config,
         mine_block_with_transactions, mine_blocks_on_runtime, persist_runtime_db,
         process_relay_wire_message, relay_fee_hint, request_job_id_from_declarator,
         request_template_from_provider, run_add_peer, run_config_scaffold, run_reindex_runtime,
-        run_sv2_job_declarator, run_sv2_template_provider, run_sv2_translator, run_sync_book,
-        select_utxos_for_amount, translate_remote_job_with_service, try_find_share_for_job,
+        run_sv2_conformance, run_sv2_job_declarator, run_sv2_template_provider, run_sv2_translator,
+        run_sync_book, select_utxos_for_amount, translate_remote_job_with_service,
+        try_find_share_for_job,
     };
 
     fn utxo(seed: u8, value: u64) -> SpendableUtxo {
@@ -7871,6 +7872,192 @@ mod tests {
             .expect("must find share immediately");
         assert_eq!(found.0, 0);
         assert!(found.2);
+    }
+
+    #[test]
+    fn sv2_conformance_happy_path_reports_expected_sequence() {
+        let Some(addr) = allocate_local_addr() else {
+            return;
+        };
+        let listener = match TcpListener::bind(&addr) {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("bind failed: {err}"),
+        };
+        let work_dir = temp_dir("test-sv2-conformance-pass");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let report_path = work_dir.join("report.json");
+
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("set read timeout");
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .expect("set write timeout");
+
+            let setup = read_frame(&mut stream).expect("read setup").expect("setup");
+            assert!(matches!(setup, Sv2Message::SetupConnection { .. }));
+            write_frame(
+                &mut stream,
+                &Sv2Message::SetupConnectionSuccess {
+                    used_version: 2,
+                    flags: 0,
+                },
+            )
+            .expect("write setup success");
+
+            let open = read_frame(&mut stream).expect("read open").expect("open");
+            let request_id = match open {
+                Sv2Message::OpenStandardMiningChannel { request_id, .. } => request_id,
+                other => panic!("unexpected open message: {other:?}"),
+            };
+            write_frame(
+                &mut stream,
+                &Sv2Message::OpenStandardMiningChannelSuccess {
+                    request_id,
+                    channel_id: 7,
+                    target_hex: scam_core::Target::MAX.to_hex(),
+                    extranonce_prefix_hex: "00000007".to_owned(),
+                },
+            )
+            .expect("write open success");
+
+            let keepalive = read_frame(&mut stream)
+                .expect("read keepalive")
+                .expect("keepalive");
+            assert!(matches!(keepalive, Sv2Message::KeepAlive));
+            write_frame(&mut stream, &Sv2Message::KeepAlive).expect("write keepalive");
+        });
+
+        run_sv2_conformance(Sv2ConformanceArgs {
+            pool: addr,
+            user: "sv2-test-user".to_owned(),
+            read_timeout_sec: 1,
+            secure_transport: false,
+            secure_transport_mode: None,
+            secure_rekey_interval_messages: 10_000,
+            secure_static_secret_key_hex: None,
+            secure_expected_remote_static_pubkey_hex: None,
+            corpus: None,
+            out: Some(report_path.clone()),
+            stack_name: Some("mock-stack".to_owned()),
+        })
+        .expect("conformance should pass");
+        server.join().expect("server join");
+
+        let rendered = fs::read_to_string(&report_path).expect("read report");
+        let report: serde_json::Value = serde_json::from_str(&rendered).expect("parse report");
+        assert_eq!(report["pass"], serde_json::Value::Bool(true));
+        assert_eq!(
+            report["setup_success"],
+            serde_json::Value::Bool(true),
+            "setup flag"
+        );
+        assert_eq!(
+            report["channel_opened"],
+            serde_json::Value::Bool(true),
+            "channel-opened flag"
+        );
+        let steps = report["steps"].as_array().expect("steps array");
+        assert_eq!(steps.len(), 3);
+        assert_eq!(steps[0]["sent"], "SetupConnection");
+        assert_eq!(steps[0]["received"], "SetupConnectionSuccess");
+        assert_eq!(steps[1]["sent"], "OpenStandardMiningChannel");
+        assert_eq!(steps[1]["received"], "OpenStandardMiningChannelSuccess");
+        assert_eq!(steps[2]["sent"], "KeepAlive");
+        assert_eq!(steps[2]["received"], "KeepAlive");
+
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
+    fn sv2_conformance_error_path_reports_fail_and_errors() {
+        let Some(addr) = allocate_local_addr() else {
+            return;
+        };
+        let listener = match TcpListener::bind(&addr) {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("bind failed: {err}"),
+        };
+        let work_dir = temp_dir("test-sv2-conformance-fail");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let report_path = work_dir.join("report.json");
+
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("set read timeout");
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .expect("set write timeout");
+
+            let setup = read_frame(&mut stream).expect("read setup").expect("setup");
+            assert!(matches!(setup, Sv2Message::SetupConnection { .. }));
+            write_frame(
+                &mut stream,
+                &Sv2Message::SetupConnectionError {
+                    code: "unsupported_version".to_owned(),
+                    reason: "mock failure".to_owned(),
+                },
+            )
+            .expect("write setup error");
+
+            let open = read_frame(&mut stream).expect("read open").expect("open");
+            let request_id = match open {
+                Sv2Message::OpenStandardMiningChannel { request_id, .. } => request_id,
+                other => panic!("unexpected open message: {other:?}"),
+            };
+            write_frame(
+                &mut stream,
+                &Sv2Message::OpenStandardMiningChannelError {
+                    request_id,
+                    code: "denied".to_owned(),
+                    reason: "mock open failure".to_owned(),
+                },
+            )
+            .expect("write open error");
+
+            let keepalive = read_frame(&mut stream)
+                .expect("read keepalive")
+                .expect("keepalive");
+            assert!(matches!(keepalive, Sv2Message::KeepAlive));
+            write_frame(&mut stream, &Sv2Message::KeepAlive).expect("write keepalive");
+        });
+
+        let err = run_sv2_conformance(Sv2ConformanceArgs {
+            pool: addr,
+            user: "sv2-test-user".to_owned(),
+            read_timeout_sec: 1,
+            secure_transport: false,
+            secure_transport_mode: None,
+            secure_rekey_interval_messages: 10_000,
+            secure_static_secret_key_hex: None,
+            secure_expected_remote_static_pubkey_hex: None,
+            corpus: None,
+            out: Some(report_path.clone()),
+            stack_name: Some("mock-stack".to_owned()),
+        })
+        .expect_err("conformance must fail on setup/open errors");
+        assert!(err.to_string().contains("conformance check failed"));
+        server.join().expect("server join");
+
+        let rendered = fs::read_to_string(&report_path).expect("read report");
+        let report: serde_json::Value = serde_json::from_str(&rendered).expect("parse report");
+        assert_eq!(report["pass"], serde_json::Value::Bool(false));
+        let errors = report["errors"].as_array().expect("errors array");
+        assert!(!errors.is_empty());
+        assert!(
+            errors
+                .iter()
+                .any(|entry| { entry.as_str().unwrap_or_default().contains("setup error") }),
+            "expected setup error entry"
+        );
+
+        let _ = fs::remove_dir_all(work_dir);
     }
 
     fn relay_tx(spend: OutPoint, sig_seed: u8, out_seed: u8) -> Transaction {
