@@ -52,7 +52,9 @@ Run window: `2026-02-13T16:10:10Z` -> `2026-02-13T17:09:00Z`
 - `core::merkle_root`
 - `mempool::collect_replacement_set`
 - `miner::build_cpfp_package`
-- [ ] Reduce mutation flakiness by isolating long-running integration tests from unit mutation targets where possible.
+- [x] Reduce mutation flakiness by isolating long-running integration tests from unit mutation targets where possible.
+  - Added package-scoped mutation mode in `scripts/mutation-baseline.sh` via `MUTATION_PACKAGES`.
+  - Added staged runner `scripts/mutation-staged.sh` (`stage1`, `stage2`, `stage3`, `all`) to split heavy integration paths from core mutation loops.
 
 ## Execution Order (After Repo Publish)
 

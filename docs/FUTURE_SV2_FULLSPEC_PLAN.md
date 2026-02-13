@@ -8,8 +8,10 @@ Clarification: consensus is already functionally implemented; future items touch
 ## 0) Immediate Execution Order (Requested)
 
 - [ ] Wait for the running mutation baseline to finish and freeze report artifacts.
-- [ ] Create a private GitHub repository and push the project with full commit history (no squashing).
-- [ ] Verify remote integrity (`git log`, tags/branches if present, and repository visibility).
+- [x] Create a private GitHub repository and push the project with full commit history (no squashing).
+  - Remote: `https://github.com/AlexMelanFromRingo/SCAM` (private).
+- [x] Verify remote integrity (`git log`, tags/branches if present, and repository visibility).
+  - Verified branch mapping and visibility via GitHub CLI (`gh repo view`).
 - [ ] Continue post-publish hardening work:
 - mutation-gap closure in `core/consensus/node`,
 - expanded external SV2 interoperability matrix,
