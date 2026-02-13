@@ -7413,7 +7413,8 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::net::TcpListener;
+    use std::io::{Read, Write};
+    use std::net::{Shutdown, TcpListener, TcpStream};
     use std::path::PathBuf;
     use std::thread;
     use std::time::Duration;
@@ -7430,15 +7431,17 @@ mod tests {
 
     use super::{
         AddPeerArgs, ConfigScaffoldArgs, DifficultyAlgoArg, Network, ReindexRuntimeArgs,
-        RelayAdmissionState, RelayServerState, SOAK_FLOW_MNEMONIC, SpendableUtxo,
-        Sv2ConformanceArgs, Sv2JobDeclaratorArgs, Sv2TemplateProviderArgs, Sv2TranslatorArgs,
-        SyncBookArgs, TemplateProviderRequest, accepted_hrps_for_network, admit_peer_tx_into_relay,
-        build_coinbase_tx, build_signed_transfer_tx, execute_soak_rounds, load_chain_config,
+        RelayAdmissionState, RelayServerState, RpcServeArgs, SOAK_FLOW_MNEMONIC, SpendableUtxo,
+        StratumMineArgs, StratumServeArgs, Sv2ConformanceArgs, Sv2JobDeclaratorArgs,
+        Sv2TemplateProviderArgs, Sv2TranslatorArgs, SyncBookArgs, TemplateProviderRequest,
+        accepted_hrps_for_network, admit_peer_tx_into_relay, build_coinbase_tx,
+        build_signed_transfer_tx, execute_soak_rounds, load_chain_config,
         mine_block_with_transactions, mine_blocks_on_runtime, persist_runtime_db,
         process_relay_wire_message, relay_fee_hint, request_job_id_from_declarator,
         request_template_from_provider, run_add_peer, run_config_scaffold, run_reindex_runtime,
-        run_sv2_conformance, run_sv2_job_declarator, run_sv2_template_provider, run_sv2_translator,
-        run_sync_book, select_utxos_for_amount, translate_remote_job_with_service,
+        run_rpc_serve, run_stratum_mine, run_stratum_serve, run_sv2_conformance,
+        run_sv2_job_declarator, run_sv2_template_provider, run_sv2_translator, run_sync_book,
+        run_wallet, select_utxos_for_amount, translate_remote_job_with_service,
         try_find_share_for_job,
     };
 
@@ -7506,6 +7509,368 @@ mod tests {
             Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => None,
             Err(err) => panic!("bind failed: {err}"),
         }
+    }
+
+    fn read_http_request_from_raw(
+        raw: &[u8],
+    ) -> Result<Option<super::HttpRequest>, super::NodeError> {
+        let listener = match TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                return Err(super::NodeError::Runtime(
+                    "socket bind permission denied".to_owned(),
+                ));
+            }
+            Err(err) => panic!("bind listener: {err}"),
+        };
+        let addr = listener.local_addr().expect("listener addr");
+        let payload = raw.to_vec();
+        let sender = thread::spawn(move || {
+            let mut stream = TcpStream::connect(addr).expect("connect");
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .expect("set write timeout");
+            stream.write_all(&payload).expect("send raw http request");
+            stream.flush().expect("flush request");
+            stream
+                .shutdown(Shutdown::Write)
+                .expect("shutdown write half");
+        });
+
+        let (mut incoming, _) = listener.accept().expect("accept");
+        incoming
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set read timeout");
+        let request = super::read_http_request(&mut incoming);
+        sender.join().expect("sender join");
+        request
+    }
+
+    fn connect_with_retry(addr: &str) -> TcpStream {
+        for _ in 0..20 {
+            match TcpStream::connect(addr) {
+                Ok(stream) => return stream,
+                Err(_) => thread::sleep(Duration::from_millis(25)),
+            }
+        }
+        panic!("connect retry exhausted for {addr}");
+    }
+
+    #[test]
+    fn read_http_request_rejects_invalid_content_length_header() {
+        let raw = b"POST /wallet/new HTTP/1.1\r\nHost: localhost\r\nContent-Length: nope\r\n\r\n";
+        let result = read_http_request_from_raw(raw);
+        if let Err(err) = &result
+            && err.to_string().contains("permission denied")
+        {
+            return;
+        }
+        let err = result.expect_err("must reject invalid content-length");
+        assert!(err.to_string().contains("invalid Content-Length"));
+    }
+
+    #[test]
+    fn read_http_request_rejects_missing_header_terminator() {
+        let raw = b"GET /health HTTP/1.1\r\nHost: localhost\r\n";
+        let result = read_http_request_from_raw(raw);
+        if let Err(err) = &result
+            && err.to_string().contains("permission denied")
+        {
+            return;
+        }
+        let err = result.expect_err("must reject malformed headers");
+        assert!(err.to_string().contains("missing header terminator"));
+    }
+
+    #[test]
+    fn wallet_balance_response_handles_empty_and_immature_outputs() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+
+        let empty = super::wallet_balance_response(
+            &runtime,
+            &cfg,
+            0,
+            0,
+            "sd1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqpk5fg".to_owned(),
+            [0xAA; 20],
+        );
+        assert_eq!(empty.utxo_count, 0);
+        assert_eq!(empty.total, 0);
+        assert_eq!(empty.spendable, 0);
+        assert_eq!(empty.immature, 0);
+
+        let genesis_key = cfg.genesis_reward_key_hash20().expect("key hash");
+        let immature = super::wallet_balance_response(
+            &runtime,
+            &cfg,
+            0,
+            0,
+            "sd1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqpk5fg".to_owned(),
+            genesis_key,
+        );
+        assert_eq!(immature.utxo_count, 1);
+        assert_eq!(immature.spendable_utxo_count, 0);
+        assert_eq!(immature.immature_utxo_count, 1);
+        assert_eq!(immature.total, cfg.block_subsidy as u128);
+        assert_eq!(immature.immature, cfg.block_subsidy as u128);
+    }
+
+    #[test]
+    fn static_asset_helpers_handle_unknown_suffix_and_traversal() {
+        assert_eq!(
+            super::guess_content_type(std::path::Path::new("bundle.unknown")),
+            "application/octet-stream"
+        );
+
+        let ui_dir = temp_dir("test-ui-assets");
+        fs::create_dir_all(&ui_dir).expect("mkdir");
+        fs::write(ui_dir.join("index.html"), "<html>ok</html>").expect("write index");
+
+        let Some(addr) = allocate_local_addr() else {
+            let _ = fs::remove_dir_all(ui_dir);
+            return;
+        };
+        let listener = match TcpListener::bind(&addr) {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                let _ = fs::remove_dir_all(ui_dir);
+                return;
+            }
+            Err(err) => panic!("bind: {err}"),
+        };
+        let addr = listener.local_addr().expect("addr");
+        let ui_clone = ui_dir.clone();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let served = super::try_serve_ui_asset(&mut stream, &ui_clone, "/../secrets.txt")
+                .expect("serve");
+            assert!(served);
+        });
+
+        let mut client = TcpStream::connect(addr).expect("connect");
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set timeout");
+        let mut body = String::new();
+        client.read_to_string(&mut body).expect("read response");
+        server.join().expect("server join");
+        assert!(body.starts_with("HTTP/1.1 400 Bad Request"));
+
+        let Some(addr) = allocate_local_addr() else {
+            let _ = fs::remove_dir_all(ui_dir);
+            return;
+        };
+        let listener = match TcpListener::bind(&addr) {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                let _ = fs::remove_dir_all(ui_dir);
+                return;
+            }
+            Err(err) => panic!("bind: {err}"),
+        };
+        let addr = listener.local_addr().expect("addr");
+        let ui_clone = ui_dir.clone();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let served = super::try_serve_ui_asset(&mut stream, &ui_clone, "/does-not-exist")
+                .expect("serve");
+            assert!(served);
+        });
+        let mut client = TcpStream::connect(addr).expect("connect");
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set timeout");
+        let mut body = String::new();
+        client.read_to_string(&mut body).expect("read response");
+        server.join().expect("server join");
+        assert!(body.starts_with("HTTP/1.1 200 OK"));
+        assert!(body.contains("<html>ok</html>"));
+
+        let _ = fs::remove_dir_all(ui_dir);
+    }
+
+    #[test]
+    fn run_rpc_serve_dispatches_health_and_unknown_routes() {
+        let Some(addr) = allocate_local_addr() else {
+            return;
+        };
+        let work_dir = temp_dir("test-rpc-serve-routes");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let config_path = work_dir.join("devnet.toml");
+        fs::write(&config_path, include_str!("../../../config/devnet.toml")).expect("write cfg");
+        let runtime_db = work_dir.join("runtime.redb");
+        let ui_dir = work_dir.join("ui");
+        fs::create_dir_all(&ui_dir).expect("mkdir ui");
+        fs::write(ui_dir.join("index.html"), "<html>ui</html>").expect("write ui");
+
+        let server_addr = addr.clone();
+        let server = thread::spawn(move || {
+            run_rpc_serve(RpcServeArgs {
+                network: Network::Devnet,
+                config: Some(config_path),
+                runtime_db: Some(runtime_db),
+                bind: server_addr,
+                ui_dir,
+                relay_telemetry: None,
+                mine_blocks: 0,
+                interval_sec: 120,
+                max_nonce: 500_000,
+                max_requests: 2,
+            })
+            .expect("rpc serve");
+        });
+
+        let mut health_stream = connect_with_retry(&addr);
+        health_stream
+            .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .expect("write health");
+        health_stream
+            .shutdown(Shutdown::Write)
+            .expect("shutdown write health");
+        let mut health_response = String::new();
+        health_stream
+            .read_to_string(&mut health_response)
+            .expect("read health");
+        assert!(health_response.starts_with("HTTP/1.1 200 OK"));
+        assert!(health_response.contains("{\"ok\":true}"));
+
+        let mut unknown_stream = connect_with_retry(&addr);
+        unknown_stream
+            .write_all(b"GET /nope HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .expect("write unknown");
+        unknown_stream
+            .shutdown(Shutdown::Write)
+            .expect("shutdown write unknown");
+        let mut unknown_response = String::new();
+        unknown_stream
+            .read_to_string(&mut unknown_response)
+            .expect("read unknown");
+        assert!(unknown_response.starts_with("HTTP/1.1 404 Not Found"));
+
+        server.join().expect("server join");
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
+    fn stratum_config_validation_errors_are_exposed_early() {
+        let work_dir = temp_dir("test-stratum-validate");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let config_path = work_dir.join("devnet.toml");
+        fs::write(&config_path, include_str!("../../../config/devnet.toml")).expect("write cfg");
+        let runtime_db = work_dir.join("runtime.redb");
+
+        let serve_err = run_stratum_serve(StratumServeArgs {
+            network: Network::Devnet,
+            config: Some(config_path.clone()),
+            runtime_db: Some(runtime_db.clone()),
+            bind: "127.0.0.1:0".to_owned(),
+            share_target_hex: None,
+            max_jobs_per_channel: None,
+            max_clients: 0,
+            max_active_clients: None,
+            read_timeout_sec: None,
+            keepalive_sec: None,
+            idle_timeout_sec: None,
+            vardiff_target_shares_per_minute: None,
+            vardiff_retarget_interval_shares: None,
+            vardiff_clamp_up: None,
+            vardiff_clamp_down: None,
+            max_rejected_shares: None,
+            min_share_target_hex: None,
+            max_share_target_hex: None,
+            secure_transport: true,
+            secure_transport_mode: Some(super::SecureTransportModeArg::NoiseXx),
+            secure_rekey_interval_messages: Some(1_000),
+            secure_static_secret_key_hex: None,
+            secure_expected_remote_static_pubkey_hex: None,
+            template_provider_addr: None,
+            job_declarator_addr: None,
+        })
+        .expect_err("serve must reject missing noise static key");
+        assert!(
+            serve_err
+                .to_string()
+                .contains("requires --secure-static-secret-key-hex"),
+            "unexpected serve error: {serve_err}"
+        );
+
+        let listener = match TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                let _ = fs::remove_dir_all(work_dir);
+                return;
+            }
+            Err(err) => panic!("bind: {err}"),
+        };
+        let pool = listener.local_addr().expect("addr").to_string();
+        let acceptor = thread::spawn(move || {
+            let _ = listener.accept();
+        });
+        let mine_err = run_stratum_mine(StratumMineArgs {
+            pool,
+            user: "miner".to_owned(),
+            read_timeout_sec: 1,
+            max_nonce_per_cycle: 100,
+            max_shares: 0,
+            max_runtime_sec: 0,
+            secure_transport: true,
+            secure_transport_mode: Some(super::SecureTransportModeArg::NoiseXx),
+            secure_rekey_interval_messages: 1_000,
+            secure_static_secret_key_hex: None,
+            secure_expected_remote_static_pubkey_hex: None,
+            translator_addr: None,
+        })
+        .expect_err("mine must reject missing noise static key");
+        assert!(
+            mine_err
+                .to_string()
+                .contains("requires --secure-static-secret-key-hex"),
+            "unexpected mine error: {mine_err}"
+        );
+        acceptor.join().expect("acceptor join");
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
+    fn run_wallet_reports_decode_and_network_hrp_errors() {
+        let decode_err = run_wallet(super::WalletCommand::Decode {
+            address: "not-an-address".to_owned(),
+        })
+        .expect_err("invalid address must fail");
+        assert!(decode_err.to_string().contains("bech32 error"));
+
+        let mnemonic = WalletMnemonic::parse(SOAK_FLOW_MNEMONIC).expect("mnemonic");
+        let seed = mnemonic.to_seed("");
+        let key = derive_wallet_key(&seed, 0, 0).expect("wallet key");
+        let mainnet_address =
+            scam_wallet::to_address("s", key.pubkey_compressed()).expect("address");
+        let work_dir = temp_dir("test-wallet-send-hrp");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let config_path = work_dir.join("devnet.toml");
+        fs::write(&config_path, include_str!("../../../config/devnet.toml")).expect("write cfg");
+
+        let send_err = run_wallet(super::WalletCommand::Send {
+            network: Network::Devnet,
+            config: Some(config_path),
+            mnemonic: SOAK_FLOW_MNEMONIC.to_owned(),
+            passphrase: "".to_owned(),
+            account: 0,
+            index: 0,
+            to: mainnet_address,
+            amount: 1,
+            fee: 1,
+            mine_blocks: 0,
+            interval_sec: 120,
+            max_nonce: 500_000,
+        })
+        .expect_err("mismatched hrp must fail");
+        assert!(
+            send_err.to_string().contains("is not valid for network"),
+            "unexpected send error: {send_err}"
+        );
+        let _ = fs::remove_dir_all(work_dir);
     }
 
     #[test]

@@ -318,4 +318,77 @@ mod tests {
             .expect("digest");
         assert_ne!(devnet, mainnet);
     }
+
+    #[test]
+    fn signing_digest_rejects_out_of_bounds_input_index() {
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: OutPoint {
+                    txid: crate::hash::hash256(b"prev"),
+                    vout: 0,
+                },
+                signature: vec![],
+                pubkey_compressed: vec![2u8; 33],
+                sequence: 0,
+            }],
+            outputs: vec![TxOut {
+                value: 1,
+                key_hash20: [1u8; 20],
+            }],
+            lock_time: 0,
+        };
+
+        let err = tx
+            .signing_digest_with_chain_domain(1, b"scam-devnet")
+            .expect_err("index 1 is out of bounds");
+        assert!(matches!(
+            err,
+            crate::types::TxSigningError::InputOutOfBounds {
+                index: 1,
+                total_inputs: 1
+            }
+        ));
+    }
+
+    #[test]
+    fn txid_changes_when_fields_change() {
+        let mut tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: OutPoint {
+                    txid: crate::hash::hash256(b"prev"),
+                    vout: 0,
+                },
+                signature: vec![1],
+                pubkey_compressed: vec![2u8; 33],
+                sequence: 0,
+            }],
+            outputs: vec![TxOut {
+                value: 10,
+                key_hash20: [1u8; 20],
+            }],
+            lock_time: 0,
+        };
+        let first = tx.txid();
+        tx.outputs[0].value = 11;
+        let second = tx.txid();
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn block_hash_changes_with_nonce() {
+        let mut header = BlockHeader {
+            version: 1,
+            prev_block: crate::Hash256::ZERO,
+            merkle_root: crate::Hash256::ZERO,
+            timestamp: 1_770_763_200,
+            target: Target::MAX,
+            nonce: 1,
+        };
+        let first = header.block_hash();
+        header.nonce = 2;
+        let second = header.block_hash();
+        assert_ne!(first, second);
+    }
 }

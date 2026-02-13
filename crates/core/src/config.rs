@@ -470,6 +470,10 @@ pub enum ChainConfigError {
 mod tests {
     use crate::{ChainConfig, DifficultyAlgorithm};
 
+    fn sample_config() -> ChainConfig {
+        toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse")
+    }
+
     #[test]
     fn config_builds_genesis_block() {
         let cfg = ChainConfig {
@@ -644,5 +648,74 @@ genesis_reward_key_hash20 = "0000000000000000000000000000000000000000"
         assert_eq!(cfg.stratum_secure_transport_mode, "noise_xx");
         assert_eq!(cfg.stratum_secure_rekey_interval_messages, 10_000);
         cfg.validate().expect("validate");
+    }
+
+    #[test]
+    fn config_rejects_cross_field_violations() {
+        let mut cfg = sample_config();
+        cfg.max_tx_size = cfg.max_block_size + 1;
+        let err = cfg.validate().expect_err("max_tx_size > max_block_size");
+        assert!(
+            err.to_string()
+                .contains("max_tx_size must be <= max_block_size")
+        );
+
+        let mut cfg = sample_config();
+        cfg.stratum_min_share_target =
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_owned();
+        cfg.stratum_max_share_target =
+            "00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_owned();
+        let err = cfg
+            .validate()
+            .expect_err("stratum min target above max must fail");
+        assert!(
+            err.to_string()
+                .contains("stratum_min_share_target must be <= stratum_max_share_target")
+        );
+
+        let mut cfg = sample_config();
+        cfg.stratum_share_target =
+            "00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_owned();
+        cfg.stratum_min_share_target =
+            "10ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_owned();
+        let err = cfg
+            .validate()
+            .expect_err("share target below min bound must fail");
+        assert!(
+            err.to_string()
+                .contains("stratum_share_target must be within [stratum_min_share_target, stratum_max_share_target]")
+        );
+
+        let mut cfg = sample_config();
+        cfg.stratum_keepalive_sec = 30;
+        cfg.stratum_idle_timeout_sec = 30;
+        let err = cfg
+            .validate()
+            .expect_err("idle timeout equal to keepalive must fail");
+        assert!(
+            err.to_string()
+                .contains("stratum_idle_timeout_sec must be > stratum_keepalive_sec")
+        );
+    }
+
+    #[test]
+    fn config_rejects_invalid_seed_and_replacement_limits() {
+        let mut cfg = sample_config();
+        cfg.dns_seeds = vec!["seed.example.org".to_owned(), "   ".to_owned()];
+        let err = cfg.validate().expect_err("empty dns seed must fail");
+        assert!(
+            err.to_string()
+                .contains("dns_seeds must not contain empty entries")
+        );
+
+        let mut cfg = sample_config();
+        cfg.p2p_replacement_max_per_peer = 0;
+        let err = cfg
+            .validate()
+            .expect_err("replacement max per peer == 0 must fail");
+        assert!(
+            err.to_string()
+                .contains("p2p_replacement_max_per_peer must be > 0")
+        );
     }
 }

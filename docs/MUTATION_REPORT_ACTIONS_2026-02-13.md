@@ -33,18 +33,18 @@ Run window: `2026-02-13T16:10:10Z` -> `2026-02-13T17:09:00Z`
 
 ## P2: Node/RPC/Wallet Path Coverage
 
-- [ ] Add focused tests for `run_rpc_serve` parser/dispatch/error branches (`crates/node/src/main.rs`).
-- [ ] Add tests for `read_http_request` invalid method/header/content-length combinations (`crates/node/src/main.rs`).
-- [ ] Add tests for `wallet_balance_response` / `run_wallet` edge cases (empty UTXO, mismatched HRP/network, decode errors).
-- [ ] Add tests for `run_stratum_serve` and `run_stratum_mine` config validation branches.
-- [ ] Add tests for static asset helpers (`guess_content_type`, `try_serve_ui_asset`) including unknown suffix and traversal rejection.
+- [x] Add focused tests for `run_rpc_serve` parser/dispatch/error branches (`crates/node/src/main.rs`).
+- [x] Add tests for `read_http_request` invalid method/header/content-length combinations (`crates/node/src/main.rs`).
+- [x] Add tests for `wallet_balance_response` / `run_wallet` edge cases (empty UTXO, mismatched HRP/network, decode errors).
+- [x] Add tests for `run_stratum_serve` and `run_stratum_mine` config validation branches.
+- [x] Add tests for static asset helpers (`guess_content_type`, `try_serve_ui_asset`) including unknown suffix and traversal rejection.
 
 ## P3: Core Utility Gaps
 
-- [ ] Add stronger tests for `ChainConfig::validate` cross-field invariants (`crates/core/src/config.rs`).
-- [ ] Add mutation-killing tests for `Encoder::write_varint` branch thresholds (`crates/core/src/codec.rs`).
-- [ ] Add tests for `types.rs` arithmetic/overflow/signature edge conditions missed by current suite.
-- [ ] Add tests for `wallet/src/qr.rs::render_ascii_qr` output invariants on minimal and high-density matrices.
+- [x] Add stronger tests for `ChainConfig::validate` cross-field invariants (`crates/core/src/config.rs`).
+- [x] Add mutation-killing tests for `Encoder::write_varint` branch thresholds (`crates/core/src/codec.rs`).
+- [x] Add tests for `types.rs` arithmetic/overflow/signature edge conditions missed by current suite.
+- [x] Add tests for `wallet/src/qr.rs::render_ascii_qr` output invariants on minimal and high-density matrices.
 
 ## Timeout-Specific Actions
 

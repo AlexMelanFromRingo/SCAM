@@ -60,7 +60,9 @@ pub enum QrError {
 
 #[cfg(test)]
 mod tests {
-    use crate::qr::{qr_for_payment_uri, qr_for_text};
+    use qrcodegen::{QrCode, QrCodeEcc};
+
+    use crate::qr::{qr_for_payment_uri, qr_for_text, render_ascii_qr};
 
     #[test]
     fn qr_generation_works() {
@@ -73,5 +75,26 @@ mod tests {
         let ascii =
             qr_for_payment_uri("sc1deadbeef", Some(100), Some("Alice")).expect("must generate");
         assert!(!ascii.is_empty());
+    }
+
+    #[test]
+    fn render_ascii_qr_has_consistent_row_width() {
+        let qr = QrCode::encode_text("a", QrCodeEcc::Low).expect("qr");
+        let rendered = render_ascii_qr(&qr, 1);
+        let lines = rendered.lines().collect::<Vec<_>>();
+        assert!(!lines.is_empty());
+        let width = lines[0].len();
+        assert!(width > 0);
+        assert!(lines.iter().all(|line| line.len() == width));
+    }
+
+    #[test]
+    fn render_ascii_qr_high_density_contains_dark_and_light_modules() {
+        let payload =
+            "coin:sd1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqpk5fg?amount=123456&label=HighDensityCase";
+        let qr = QrCode::encode_text(payload, QrCodeEcc::High).expect("qr");
+        let rendered = render_ascii_qr(&qr, 1);
+        assert!(rendered.contains("##"));
+        assert!(rendered.contains("  "));
     }
 }

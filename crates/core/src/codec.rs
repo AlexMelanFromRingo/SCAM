@@ -69,4 +69,37 @@ mod tests {
         let data = enc.into_bytes();
         assert!(!data.is_empty());
     }
+
+    #[test]
+    fn varint_threshold_encodings_are_canonical() {
+        let mut enc = Encoder::default();
+        enc.write_varint(0xfc);
+        assert_eq!(enc.into_bytes(), vec![0xfc]);
+
+        let mut enc = Encoder::default();
+        enc.write_varint(0xfd);
+        assert_eq!(enc.into_bytes(), vec![0xfd, 0xfd, 0x00]);
+
+        let mut enc = Encoder::default();
+        enc.write_varint(0xffff);
+        assert_eq!(enc.into_bytes(), vec![0xfd, 0xff, 0xff]);
+
+        let mut enc = Encoder::default();
+        enc.write_varint(0x1_0000);
+        assert_eq!(enc.into_bytes(), vec![0xfe, 0x00, 0x00, 0x01, 0x00]);
+
+        let mut enc = Encoder::default();
+        enc.write_varint(0xffff_ffffusize);
+        assert_eq!(enc.into_bytes(), vec![0xfe, 0xff, 0xff, 0xff, 0xff]);
+    }
+
+    #[test]
+    fn varint_u64_path_is_used_for_large_values() {
+        let mut enc = Encoder::default();
+        enc.write_varint(0x1_0000_0000usize);
+        assert_eq!(
+            enc.into_bytes(),
+            vec![0xff, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00]
+        );
+    }
 }
