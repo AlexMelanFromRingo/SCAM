@@ -1630,11 +1630,6 @@ fn run_wallet(command: WalletCommand) -> Result<(), NodeError> {
         println!("Immature total: {}", report.immature_total);
         println!("Unspent outputs: {}", report.unspent_count);
 
-        if !has_unspent_wallet_balance(report.unspent_total) {
-            println!("No funds found in watched derivation range.");
-            return Ok(());
-        }
-
         println!("Balances by derived address:");
         for balance in &report.balances {
             let key = (balance.account, balance.index, balance.key_hash20);
@@ -8931,6 +8926,86 @@ mod tests {
         assert!(signed.is_self_transfer);
         assert!(!signed.selected_inputs.is_empty());
         assert_eq!(signed.tx.outputs[0].value, 1_000);
+    }
+
+    #[test]
+    fn collect_spendable_utxos_filters_owner_and_coinbase_maturity() {
+        let mut cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        cfg.coinbase_maturity = 2;
+        cfg.validate().expect("config validate");
+
+        let mut runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let owner_key_hash20 = cfg.genesis_reward_key_hash20().expect("owner key hash");
+        let params = super::MiningLoopParams {
+            count: 2,
+            interval_sec: 30,
+            max_nonce: 500_000,
+            subsidy: cfg.block_subsidy,
+            miner_key_hash: owner_key_hash20,
+            label_prefix: "collect-spendable",
+            print_each: false,
+        };
+        mine_blocks_on_runtime(&mut runtime, &params).expect("mine blocks");
+
+        let (owner_spendable, owner_total) =
+            super::collect_spendable_utxos(&runtime, owner_key_hash20);
+        assert_eq!(owner_spendable.len(), 1);
+        assert_eq!(owner_total, cfg.block_subsidy as u128);
+
+        let (other_spendable, other_total) = super::collect_spendable_utxos(&runtime, [0xAA; 20]);
+        assert!(other_spendable.is_empty());
+        assert_eq!(other_total, 0);
+    }
+
+    #[test]
+    fn build_signed_transfer_tx_change_output_is_emitted_only_when_positive() {
+        let mut cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        cfg.coinbase_maturity = 1;
+        cfg.validate().expect("config validate");
+
+        let mut runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let mnemonic = WalletMnemonic::parse(SOAK_FLOW_MNEMONIC).expect("mnemonic");
+        let seed = mnemonic.to_seed("");
+        let sender_key = derive_wallet_key(&seed, 0, 0).expect("sender key");
+        let sender_key_hash20 = scam_core::hash160_blake3(&sender_key.pubkey_compressed());
+        let recipient_key_hash20 = [0x55; 20];
+
+        let params = super::MiningLoopParams {
+            count: 2,
+            interval_sec: 30,
+            max_nonce: 500_000,
+            subsidy: cfg.block_subsidy,
+            miner_key_hash: sender_key_hash20,
+            label_prefix: "change-output",
+            print_each: false,
+        };
+        mine_blocks_on_runtime(&mut runtime, &params).expect("mine blocks");
+
+        let no_change = build_signed_transfer_tx(
+            &runtime,
+            &cfg.network_id,
+            &sender_key,
+            recipient_key_hash20,
+            cfg.block_subsidy.saturating_sub(1),
+            1,
+        )
+        .expect("signed tx without change");
+        assert_eq!(no_change.change_value, 0);
+        assert_eq!(no_change.tx.outputs.len(), 1);
+
+        let with_change = build_signed_transfer_tx(
+            &runtime,
+            &cfg.network_id,
+            &sender_key,
+            recipient_key_hash20,
+            cfg.block_subsidy.saturating_sub(2),
+            1,
+        )
+        .expect("signed tx with change");
+        assert_eq!(with_change.change_value, 1);
+        assert_eq!(with_change.tx.outputs.len(), 2);
     }
 
     #[test]
