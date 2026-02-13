@@ -24,6 +24,8 @@ const SECURE_AEAD_TAG_LEN: usize = 16;
 const SECURE_MAX_FRAME_SIZE: usize = MAX_FRAME_SIZE + SV2_HEADER_LEN + SECURE_AEAD_TAG_LEN;
 const SECURE_KEY_CONTEXT_CLIENT_TO_SERVER: &str = "SCAM-SV2-NoiseLike-c2s-v1";
 const SECURE_KEY_CONTEXT_SERVER_TO_CLIENT: &str = "SCAM-SV2-NoiseLike-s2c-v1";
+const SECURE_KEY_CONTEXT_REKEY: &str = "SCAM-SV2-NoiseLike-rekey-v1";
+const DEFAULT_SECURE_REKEY_INTERVAL_MESSAGES: u64 = 10_000;
 
 const MSG_SETUP_CONNECTION: u8 = 0x00;
 const MSG_SETUP_CONNECTION_SUCCESS: u8 = 0x01;
@@ -732,6 +734,9 @@ pub struct SecureSv2Transport {
     recv_key: [u8; 32],
     send_nonce: u64,
     recv_nonce: u64,
+    rekey_interval_messages: u64,
+    send_epoch: u64,
+    recv_epoch: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -780,6 +785,16 @@ impl SecureSv2Transport {
             remote_pk,
             SecureRole::Server,
         ))
+    }
+
+    pub fn set_rekey_interval_messages(&mut self, interval: u64) -> Result<(), StratumError> {
+        if interval == 0 {
+            return Err(StratumError::InvalidConfig(
+                "secure rekey interval must be > 0".to_owned(),
+            ));
+        }
+        self.rekey_interval_messages = interval;
+        Ok(())
     }
 
     pub fn write_message<W: Write>(
@@ -874,23 +889,54 @@ impl SecureSv2Transport {
             recv_key,
             send_nonce: 0,
             recv_nonce: 0,
+            rekey_interval_messages: DEFAULT_SECURE_REKEY_INTERVAL_MESSAGES,
+            send_epoch: 0,
+            recv_epoch: 0,
         }
     }
 
     fn encrypt_payload(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, StratumError> {
         let nonce = next_nonce(&mut self.send_nonce)?;
         let cipher = ChaCha20Poly1305::new(Key::from_slice(&self.send_key));
-        cipher
+        let ciphertext = cipher
             .encrypt(Nonce::from_slice(&nonce), plaintext)
-            .map_err(|_| StratumError::SecureTransport("encryption failed".to_owned()))
+            .map_err(|_| StratumError::SecureTransport("encryption failed".to_owned()))?;
+        self.maybe_rekey_send()?;
+        Ok(ciphertext)
     }
 
     fn decrypt_payload(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>, StratumError> {
         let nonce = next_nonce(&mut self.recv_nonce)?;
         let cipher = ChaCha20Poly1305::new(Key::from_slice(&self.recv_key));
-        cipher
+        let plaintext = cipher
             .decrypt(Nonce::from_slice(&nonce), ciphertext)
-            .map_err(|_| StratumError::SecureTransport("decryption failed".to_owned()))
+            .map_err(|_| StratumError::SecureTransport("decryption failed".to_owned()))?;
+        self.maybe_rekey_recv()?;
+        Ok(plaintext)
+    }
+
+    fn maybe_rekey_send(&mut self) -> Result<(), StratumError> {
+        if self.send_nonce < self.rekey_interval_messages {
+            return Ok(());
+        }
+        self.send_epoch = self.send_epoch.checked_add(1).ok_or_else(|| {
+            StratumError::SecureTransport("secure send epoch overflow".to_owned())
+        })?;
+        self.send_key = derive_rekey_key(self.send_key, self.send_epoch);
+        self.send_nonce = 0;
+        Ok(())
+    }
+
+    fn maybe_rekey_recv(&mut self) -> Result<(), StratumError> {
+        if self.recv_nonce < self.rekey_interval_messages {
+            return Ok(());
+        }
+        self.recv_epoch = self.recv_epoch.checked_add(1).ok_or_else(|| {
+            StratumError::SecureTransport("secure recv epoch overflow".to_owned())
+        })?;
+        self.recv_key = derive_rekey_key(self.recv_key, self.recv_epoch);
+        self.recv_nonce = 0;
+        Ok(())
     }
 }
 
@@ -921,6 +967,13 @@ fn next_nonce(counter: &mut u64) -> Result<[u8; 12], StratumError> {
     let mut nonce = [0u8; 12];
     nonce[4..].copy_from_slice(&current.to_le_bytes());
     Ok(nonce)
+}
+
+fn derive_rekey_key(current_key: [u8; 32], epoch: u64) -> [u8; 32] {
+    let mut material = [0u8; 32 + 8];
+    material[..32].copy_from_slice(&current_key);
+    material[32..40].copy_from_slice(&epoch.to_le_bytes());
+    blake3::derive_key(SECURE_KEY_CONTEXT_REKEY, &material)
 }
 
 fn decode_single_frame_bytes(buf: &[u8]) -> Result<Sv2Message, StratumError> {
@@ -1442,6 +1495,34 @@ mod tests {
         invalid[..8].copy_from_slice(b"BADMAGIC");
         let err = decode_secure_handshake_packet(&invalid).expect_err("must fail");
         assert!(err.to_string().contains("secure handshake failed"));
+    }
+
+    #[test]
+    fn secure_transport_rekeys_after_interval() {
+        let secp = Secp256k1::new();
+        let client_sk = SecretKey::from_slice(&[3u8; 32]).expect("client sk");
+        let server_sk = SecretKey::from_slice(&[4u8; 32]).expect("server sk");
+        let client_pk = PublicKey::from_secret_key(&secp, &client_sk);
+        let server_pk = PublicKey::from_secret_key(&secp, &server_sk);
+
+        let mut client =
+            SecureSv2Transport::from_handshake(client_sk, client_pk, server_pk, SecureRole::Client);
+        let mut server =
+            SecureSv2Transport::from_handshake(server_sk, server_pk, client_pk, SecureRole::Server);
+        client.set_rekey_interval_messages(2).expect("client cfg");
+        server.set_rekey_interval_messages(2).expect("server cfg");
+
+        for _ in 0..6 {
+            let mut wire = Vec::new();
+            client
+                .write_message(&mut wire, &Sv2Message::KeepAlive)
+                .expect("encrypt");
+            let decoded = server
+                .read_message(&mut Cursor::new(wire))
+                .expect("decrypt")
+                .expect("msg");
+            assert_eq!(decoded, Sv2Message::KeepAlive);
+        }
     }
 
     #[test]

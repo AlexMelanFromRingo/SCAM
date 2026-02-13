@@ -50,6 +50,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] Added Stratum worker client command (`scam-node stratum-mine --pool <addr>`) for manual pool endpoint connectivity without DNS dependency.
 - [x] Added Stratum local role-split baseline (Template Provider / Job Declarator / Translator wiring) in runtime server/worker flows.
 - [x] Added optional encrypted Stratum transport mode (`--secure-transport`, `stratum_secure_transport`) with ECDH+AEAD framing baseline.
+- [x] Added configurable secure rekey interval policy (`stratum_secure_rekey_interval_messages`) in encrypted Stratum mode.
 - [x] Added operator runbook document (`docs/OPERATOR_RUNBOOK.md`) covering bootstrap, sync, mining endpoint, reindex/recovery, and soak/chaos procedures.
 - [x] Added public-testnet dress rehearsal helper script (`scripts/testnet-dress-rehearsal.sh`) and explicit SV2 pool-grade gap tracker (`docs/SV2_POOL_GRADE_GAP.md`).
 - [x] Config now explicitly freezes relay/orphan policy constants across network preset files.

@@ -65,8 +65,8 @@ cargo run -p scam-node -- stratum-mine --pool 127.0.0.1:3347 --user miner01 --ma
 Enable encrypted transport on both sides:
 
 ```bash
-cargo run -p scam-node -- stratum-serve --network devnet --config config/devnet.toml --secure-transport
-cargo run -p scam-node -- stratum-mine --pool 127.0.0.1:3347 --user miner01 --secure-transport
+cargo run -p scam-node -- stratum-serve --network devnet --config config/devnet.toml --secure-transport --secure-rekey-interval-messages 10000
+cargo run -p scam-node -- stratum-mine --pool 127.0.0.1:3347 --user miner01 --secure-transport --secure-rekey-interval-messages 10000
 ```
 
 ## Manual Peer Connectivity
@@ -130,7 +130,7 @@ scripts/telemetry-alert-check.py --input data/soak.telemetry.jsonl
 Generate a new network config:
 
 ```bash
-cargo run -p scam-node -- config-scaffold --network-id myfork --hrp sc --stratum-secure-transport --out config/myfork.toml
+cargo run -p scam-node -- config-scaffold --network-id myfork --hrp sc --stratum-secure-transport --stratum-secure-rekey-interval-messages 10000 --out config/myfork.toml
 ```
 
 See `docs/FORKING_GUIDE.md` for full constructor options.

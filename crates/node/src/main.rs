@@ -225,6 +225,8 @@ struct ConfigScaffoldArgs {
     stratum_max_active_clients: usize,
     #[arg(long, default_value_t = false)]
     stratum_secure_transport: bool,
+    #[arg(long, default_value_t = 10_000)]
+    stratum_secure_rekey_interval_messages: u64,
     #[arg(long, default_value = "SCAM custom genesis block")]
     genesis_message: String,
     #[arg(long)]
@@ -466,6 +468,8 @@ struct StratumServeArgs {
     max_share_target_hex: Option<String>,
     #[arg(long, default_value_t = false)]
     secure_transport: bool,
+    #[arg(long)]
+    secure_rekey_interval_messages: Option<u64>,
 }
 
 #[derive(Debug, Args)]
@@ -484,6 +488,8 @@ struct StratumMineArgs {
     max_runtime_sec: u64,
     #[arg(long, default_value_t = false)]
     secure_transport: bool,
+    #[arg(long, default_value_t = 10_000)]
+    secure_rekey_interval_messages: u64,
 }
 
 #[derive(Debug, Args)]
@@ -1144,6 +1150,7 @@ fn run_config_scaffold(args: ConfigScaffoldArgs) -> Result<(), NodeError> {
         stratum_max_jobs_per_channel: args.stratum_max_jobs_per_channel,
         stratum_max_active_clients: args.stratum_max_active_clients,
         stratum_secure_transport: args.stratum_secure_transport,
+        stratum_secure_rekey_interval_messages: args.stratum_secure_rekey_interval_messages,
         genesis_message: args.genesis_message.clone(),
         genesis_timestamp,
         genesis_target: args.genesis_target.clone(),
@@ -1167,6 +1174,10 @@ fn run_config_scaffold(args: ConfigScaffoldArgs) -> Result<(), NodeError> {
         cfg.difficulty_algorithm, cfg.difficulty_adjustment_window, cfg.asert_half_life_sec
     );
     println!("Stratum secure transport: {}", cfg.stratum_secure_transport);
+    println!(
+        "Stratum secure rekey interval (messages): {}",
+        cfg.stratum_secure_rekey_interval_messages
+    );
     println!("Genesis timestamp: {}", cfg.genesis_timestamp);
     println!("Genesis hash: {}", genesis_hash);
     Ok(())
@@ -3680,6 +3691,7 @@ struct StratumServerContext {
     max_jobs_per_channel: usize,
     active_clients: Arc<Mutex<usize>>,
     secure_transport: bool,
+    secure_rekey_interval_messages: u64,
 }
 
 fn lock_runtime<'a>(
@@ -3732,10 +3744,14 @@ fn run_stratum_client(mut stream: TcpStream, ctx: StratumServerContext) -> Resul
     let read_timeout = Duration::from_secs(ctx.read_timeout_sec.max(1));
     configure_stream_timeouts_with(&stream, read_timeout, read_timeout)?;
     let mut secure_transport = if ctx.secure_transport {
-        Some(
-            SecureSv2Transport::handshake_server(&mut stream)
-                .map_err(|e| NodeError::Runtime(format!("stratum secure handshake failed: {e}")))?,
-        )
+        let mut transport = SecureSv2Transport::handshake_server(&mut stream)
+            .map_err(|e| NodeError::Runtime(format!("stratum secure handshake failed: {e}")))?;
+        transport
+            .set_rekey_interval_messages(ctx.secure_rekey_interval_messages)
+            .map_err(|e| {
+                NodeError::Runtime(format!("stratum secure transport config failed: {e}"))
+            })?;
+        Some(transport)
     } else {
         None
     };
@@ -3927,6 +3943,10 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
         .unwrap_or(cfg.stratum_max_active_clients)
         .max(1);
     let secure_transport = cfg.stratum_secure_transport || args.secure_transport;
+    let secure_rekey_interval_messages = args
+        .secure_rekey_interval_messages
+        .unwrap_or(cfg.stratum_secure_rekey_interval_messages)
+        .max(1);
 
     let share_target = Target::from_hex(share_target_hex)
         .map_err(|e| NodeError::Runtime(format!("invalid share_target_hex: {e}")))?;
@@ -3981,6 +4001,10 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
         read_timeout_sec, keepalive_sec, idle_timeout_sec
     );
     println!("Secure transport: {}", secure_transport);
+    println!(
+        "Secure rekey interval (messages): {}",
+        secure_rekey_interval_messages
+    );
     if args.max_clients > 0 {
         println!("Max clients before exit: {}", args.max_clients);
     }
@@ -4006,6 +4030,7 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
         max_jobs_per_channel,
         active_clients: Arc::new(Mutex::new(0)),
         secure_transport,
+        secure_rekey_interval_messages,
     };
 
     let mut served = 0u32;
@@ -4101,16 +4126,26 @@ fn run_stratum_mine(args: StratumMineArgs) -> Result<(), NodeError> {
     let timeout = Duration::from_secs(args.read_timeout_sec.max(1));
     configure_stream_timeouts_with(&stream, timeout, timeout)?;
     let mut secure_transport = if args.secure_transport {
-        Some(
-            SecureSv2Transport::handshake_client(&mut stream)
-                .map_err(|e| NodeError::Runtime(format!("stratum secure handshake failed: {e}")))?,
-        )
+        let mut transport = SecureSv2Transport::handshake_client(&mut stream)
+            .map_err(|e| NodeError::Runtime(format!("stratum secure handshake failed: {e}")))?;
+        transport
+            .set_rekey_interval_messages(args.secure_rekey_interval_messages.max(1))
+            .map_err(|e| {
+                NodeError::Runtime(format!("stratum secure transport config failed: {e}"))
+            })?;
+        Some(transport)
     } else {
         None
     };
 
     println!("Stratum miner connecting to {}", args.pool);
     println!("Secure transport: {}", args.secure_transport);
+    if args.secure_transport {
+        println!(
+            "Secure rekey interval (messages): {}",
+            args.secure_rekey_interval_messages.max(1)
+        );
+    }
     write_sv2_message(
         &mut stream,
         secure_transport.as_mut(),
@@ -4771,6 +4806,7 @@ mod tests {
             stratum_max_jobs_per_channel: 64,
             stratum_max_active_clients: 256,
             stratum_secure_transport: false,
+            stratum_secure_rekey_interval_messages: 10_000,
             genesis_message: "fork genesis".to_owned(),
             genesis_timestamp: Some(1_800_000_000),
             genesis_target: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
@@ -4795,6 +4831,7 @@ mod tests {
         assert_eq!(cfg.stratum_max_jobs_per_channel, 64);
         assert_eq!(cfg.stratum_max_active_clients, 256);
         assert!(!cfg.stratum_secure_transport);
+        assert_eq!(cfg.stratum_secure_rekey_interval_messages, 10_000);
 
         let _ = fs::remove_dir_all(work_dir);
     }

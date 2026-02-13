@@ -15,7 +15,8 @@ This file tracks the remaining items for full pool-grade SV2 readiness.
 
 - [x] Add encrypted transport baseline (ECDH handshake + AEAD frame protection).
 - [ ] Integrate full Noise-spec encrypted channels.
-- [ ] Add key lifecycle and rotation policy.
+- [x] Add baseline key rotation policy (message-count rekey interval in config/CLI).
+- [ ] Add production key lifecycle and rotation policy (identity management + rotation operations).
 - [ ] Add secure handshake/error handling tests.
 
 ## 3) Interoperability Matrix

@@ -19,6 +19,7 @@ Stratum coverage is included in workspace tests (`scam-stratum`):
 - reject-budget closure behavior,
 - VarDiff target retune behavior.
 - secure transport encrypted frame roundtrip and handshake magic rejection.
+- secure transport rekey-interval rotation behavior.
 - role-split primitives (`SequentialJobDeclarator`, `IdentityTranslator`) unit coverage.
 
 Networking/mempool hardening coverage includes:

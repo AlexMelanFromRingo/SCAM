@@ -39,8 +39,8 @@ cargo run -p scam-node -- stratum-mine --pool 127.0.0.1:3347 --user miner01 --ma
 Encrypted transport mode:
 
 ```bash
-cargo run -p scam-node -- stratum-serve --network devnet --config config/devnet.toml --secure-transport
-cargo run -p scam-node -- stratum-mine --pool 127.0.0.1:3347 --user miner01 --secure-transport
+cargo run -p scam-node -- stratum-serve --network devnet --config config/devnet.toml --secure-transport --secure-rekey-interval-messages 10000
+cargo run -p scam-node -- stratum-mine --pool 127.0.0.1:3347 --user miner01 --secure-transport --secure-rekey-interval-messages 10000
 ```
 
 ## 4) Backup, Reindex, Recovery

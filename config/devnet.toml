@@ -30,6 +30,7 @@ stratum_idle_timeout_sec = 180
 stratum_max_jobs_per_channel = 64
 stratum_max_active_clients = 256
 stratum_secure_transport = false
+stratum_secure_rekey_interval_messages = 10000
 
 genesis_message = "SCAM devnet genesis block 2026-02-11"
 genesis_timestamp = 1_770_763_200

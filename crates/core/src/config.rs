@@ -71,6 +71,8 @@ pub struct ChainConfig {
     pub stratum_max_active_clients: usize,
     #[serde(default = "default_stratum_secure_transport")]
     pub stratum_secure_transport: bool,
+    #[serde(default = "default_stratum_secure_rekey_interval_messages")]
+    pub stratum_secure_rekey_interval_messages: u64,
     pub genesis_message: String,
     pub genesis_timestamp: u64,
     pub genesis_target: String,
@@ -226,6 +228,11 @@ impl ChainConfig {
                 "stratum_max_active_clients must be > 0".to_owned(),
             ));
         }
+        if self.stratum_secure_rekey_interval_messages == 0 {
+            return Err(ChainConfigError::InvalidField(
+                "stratum_secure_rekey_interval_messages must be > 0".to_owned(),
+            ));
+        }
         if self.genesis_message.trim().is_empty() {
             return Err(ChainConfigError::InvalidField(
                 "genesis_message must not be empty".to_owned(),
@@ -378,6 +385,10 @@ const fn default_stratum_secure_transport() -> bool {
     false
 }
 
+const fn default_stratum_secure_rekey_interval_messages() -> u64 {
+    10_000
+}
+
 #[derive(Debug, Error)]
 pub enum ChainConfigError {
     #[error("{0}")]
@@ -428,6 +439,7 @@ mod tests {
             stratum_max_jobs_per_channel: 64,
             stratum_max_active_clients: 256,
             stratum_secure_transport: false,
+            stratum_secure_rekey_interval_messages: 10_000,
             genesis_message: "SCAM genesis".to_owned(),
             genesis_timestamp: 1_770_763_200,
             genesis_target: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
@@ -479,6 +491,7 @@ mod tests {
             stratum_max_jobs_per_channel: 64,
             stratum_max_active_clients: 256,
             stratum_secure_transport: false,
+            stratum_secure_rekey_interval_messages: 10_000,
             genesis_message: "SCAM genesis".to_owned(),
             genesis_timestamp: 1_770_763_200,
             genesis_target: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
@@ -542,6 +555,7 @@ genesis_reward_key_hash20 = "0000000000000000000000000000000000000000"
         assert_eq!(cfg.stratum_max_jobs_per_channel, 64);
         assert_eq!(cfg.stratum_max_active_clients, 256);
         assert!(!cfg.stratum_secure_transport);
+        assert_eq!(cfg.stratum_secure_rekey_interval_messages, 10_000);
         cfg.validate().expect("validate");
     }
 }

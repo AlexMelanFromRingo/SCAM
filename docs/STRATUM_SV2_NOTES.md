@@ -19,6 +19,7 @@ Current implementation provides a production-oriented baseline with:
 - Job Declarator (`SequentialJobDeclarator`) for monotonic job IDs,
 - Translator (`IdentityTranslator`) for remote job message decoding.
 - optional encrypted transport channel (`--secure-transport` + `stratum_secure_transport`) using ECDH + AEAD framing.
+- configurable secure rekey interval (`--secure-rekey-interval-messages` + `stratum_secure_rekey_interval_messages`).
 
 All operational defaults are available in network config as `stratum_*` fields.
 CLI flags in `stratum-serve` override config values when provided.
@@ -44,7 +45,8 @@ cargo run -p scam-node -- stratum-serve \
   --idle-timeout-sec 180 \
   --max-jobs-per-channel 64 \
   --max-active-clients 256 \
-  --secure-transport
+  --secure-transport \
+  --secure-rekey-interval-messages 10000
 ```
 
 Worker (manual pool endpoint, no DNS requirement):
@@ -54,7 +56,8 @@ cargo run -p scam-node -- stratum-mine \
   --pool 127.0.0.1:3347 \
   --user miner01 \
   --max-shares 10 \
-  --secure-transport
+  --secure-transport \
+  --secure-rekey-interval-messages 10000
 ```
 
 ## Scope
