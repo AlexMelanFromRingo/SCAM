@@ -4,7 +4,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 
 ## Progress Snapshot (2026-02-11)
 
-- [x] Workspace crates created: `core`, `consensus`, `mempool`, `wallet`, `p2p`, `miner`, `storage`, `node`.
+- [x] Workspace crates created: `core`, `consensus`, `mempool`, `wallet`, `p2p`, `miner`, `storage`, `stratum`, `node`.
 - [x] Core block/tx/header structures + deterministic serialization + BLAKE3 hash API.
 - [x] PoW numeric target compare (`hash <= target`) implemented.
 - [x] Dynamic difficulty retarget formula implemented (window/clamp from config).
@@ -20,6 +20,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] Net demo upgraded to perform `getdata` block download and apply downloaded blocks to local runtime.
 - [x] Added one-shot socketed sync command `sync-peer` (headers -> inv -> getdata -> block validation -> DB persistence).
 - [x] Added peer-book sync command `sync-book` (discovery-ordered multi-peer sync with peer health score updates).
+- [x] Added DNS-seed merge + per-bucket outbound cap in `sync-book` flow for stronger eclipse resistance.
 - [x] Property-based tests baseline added with `proptest` (hash/target invariants in `scam-core`).
 - [x] Property-based tests expanded to tx/UTXO invariants in `scam-consensus` (self-transfer fee accounting + overspend rejection).
 - [x] Added orphan tx pool primitive with bounded size + TTL expiry + dependency resolution hooks.
@@ -30,12 +31,16 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] Added redb-backed optional mempool snapshot persistence API with validation tests.
 - [x] Added peer discovery hardening baseline (outbound diversity + rotation candidate selector in `scam-p2p`).
 - [x] Added miner `TemplateManager` cache/rebuild flow keyed by tip hash + mempool revision.
+- [x] Miner template selection upgraded with CPFP package-aware ordering (child-fee can pull parent).
 - [x] Added mempool inventory delta API + gossip hook for replacement/eviction-style tx announcements.
 - [x] Added explicit mempool double-spend threat model document (`docs/MEMPOOL_THREAT_MODEL.md`).
 - [x] Added fuzzing harness package (`fuzz/`) with wire/block/tx decode targets.
 - [x] Added mutation testing runner baseline (`scripts/mutation-baseline.sh`) and testing strategy doc.
 - [x] Added durable atomic DB replacement helper (`rename + fsync file/dir`) for runtime storage writes.
 - [x] Added long-run soak harness command (`scam-node soak`) with optional tx flow (`--txs-per-round`) and wall-clock pacing (`--sleep-per-round-sec`), plus a 24h helper script.
+- [x] Added difficulty algorithm switch in config (`windowed`, `lwma`, `asert`) with runtime support.
+- [x] Added network config constructor command (`scam-node config-scaffold`) for quick fork bootstrap.
+- [x] Added Stratum v2 subset crate + node server command (`scam-node stratum-serve`) for external miner integration baseline.
 - [x] Config now explicitly freezes relay/orphan policy constants across network preset files.
 - [x] Miner template + nonce search loop implemented (`mine-once` CLI).
 - [x] Chainstate snapshot save/load implemented.
@@ -51,7 +56,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - Hash algorithm: BLAKE3, 32-byte output (`Hash256`).
 - Block validity rule: interpret block hash and target as unsigned 256-bit integers; valid when `hash <= target`.
 - Target block time: `120` seconds.
-- Difficulty adjustment window: `20` blocks (configurable constant).
+- Difficulty adjustment policy is configurable: `windowed` / `lwma` / `asert` (selected per network config).
 - Reward model: fixed block subsidy (no hard cap by default).
 - Double-spend mempool policy: fee-aware replacement for conflicting spends (higher feerate + minimum absolute fee delta), with descendant-limit checks for anti-DoS baseline.
 - Public key format at interfaces: compressed secp256k1 pubkey (33 bytes, `02/03 + x`).
@@ -88,6 +93,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] `crates/node` (orchestrator, startup, config).
 - [x] `crates/miner` (template builder, nonce loop).
 - [x] `crates/wallet` (mnemonic, HD keys, sign/send).
+- [x] `crates/stratum` (Stratum v2 subset messages + share validation helpers).
 - [x] `crates/rpc` (CLI/RPC surface).
 - [x] Keep `src/main.rs` as thin bootstrap only.
 
@@ -106,6 +112,8 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] `hrp` for addresses
 - [x] `genesis_*` fields
 - [x] `genesis_message` (human-readable string embedded in genesis coinbase/script)
+- [x] `difficulty_algorithm` and `asert_half_life_sec`
+- [x] `p2p_max_outbound_per_bucket` and `dns_seeds`
 - [x] Add separate presets: `devnet.toml`, `testnet.toml`, `mainnet.toml`.
 
 ## 5) Cryptography TODO
@@ -163,6 +171,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] On incoming tx without conflict: validate then insert.
 - [x] Replace current `txid`-based conflict rule with final anti-grinding policy (`fee-rate RBF` or `first-seen` + explicit replacement gate).
 - [x] Add replacement anti-DoS rules (rate limits, minimum delta fee, descendant limits).
+- [x] Add CPFP package-aware miner selection (child fee can accelerate low-fee parent confirmation).
 - [x] Re-run threat model for double-spend race after new policy is chosen.
 - [x] Broadcast replacement/eviction events to peers as inventory updates.
 - [x] Add orphan tx pool with size/time limits.
@@ -187,6 +196,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] `new_target = old_target * actual / expected`
 - [x] Clamp change per window (for stability).
 - [x] Enforce min/max target bounds.
+- [x] Add per-network configurable algorithm switch (`windowed`/`lwma`/`asert`) and preserve historical windowed mode as default.
 - [x] Add protections for timestamp abuse:
 - [x] median-time-past check
 - [x] max future block time
@@ -225,6 +235,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] Add rate limits and max message size guards.
 - [x] Implement real socketed sync runtime (IBD): headers pipeline -> block inventory/download -> validation -> persistence.
 - [x] Add peer discovery hardening: outbound diversity, rotation, and basic eclipse-risk mitigation.
+- [x] Add DNS-seed ingestion and per-subnet outbound cap in sync path.
 
 ## 14) Mining TODO
 
@@ -234,6 +245,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] Add extra nonce in coinbase to extend search space.
 - [x] Rebuild template on new best block or mempool updates.
 - [x] Add CPU miner mode for devnet/testnet.
+- [x] Add Stratum v2 subset server baseline for external worker share submission.
 
 ## 15) Node and RPC TODO
 
@@ -243,8 +255,10 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] `node add-peer <addr>`
 - [x] `node get-block <hash>`
 - [x] `node get-tx <txid>`
+- [x] `node config-scaffold` (fork-friendly network config constructor)
 - [x] `node sync-peer --peer <addr>`
 - [x] `node sync-book` (sync from persisted peer book with discovery-based peer ordering)
+- [x] `node stratum-serve` (SV2-subset server for miner clients)
 - [x] Wallet CLI:
 - [x] `wallet new`
 - [x] `wallet restore`

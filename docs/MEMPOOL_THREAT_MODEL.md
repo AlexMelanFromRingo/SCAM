@@ -6,6 +6,7 @@ Scope: double-spend race behavior and DoS pressure around conflicting UTXO spend
 ## Baseline Policy
 
 - Conflict rule: fee-aware replacement only.
+- Miner template policy: CPFP package-aware selection (high-fee child can pull low-fee parent).
 - Replacement conditions:
   - incoming feerate must be strictly higher,
   - incoming absolute fee must exceed previous fee by configured minimum delta,
@@ -61,5 +62,4 @@ Scope: double-spend race behavior and DoS pressure around conflicting UTXO spend
 ## Recommended Next Hardening
 
 - Add per-peer replacement rate limits in networking path.
-- Add package-aware feerate accounting (ancestor package policy).
 - Add metrics/telemetry hooks for replacement and orphan churn.
