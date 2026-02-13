@@ -43,6 +43,32 @@ pub struct ChainConfig {
     pub coinbase_maturity: u32,
     pub block_subsidy: u64,
     pub hrp: String,
+    #[serde(default = "default_stratum_share_target")]
+    pub stratum_share_target: String,
+    #[serde(default = "default_stratum_min_share_target")]
+    pub stratum_min_share_target: String,
+    #[serde(default = "default_stratum_max_share_target")]
+    pub stratum_max_share_target: String,
+    #[serde(default = "default_stratum_vardiff_target_shares_per_minute")]
+    pub stratum_vardiff_target_shares_per_minute: u32,
+    #[serde(default = "default_stratum_vardiff_retarget_interval_shares")]
+    pub stratum_vardiff_retarget_interval_shares: usize,
+    #[serde(default = "default_stratum_vardiff_clamp_up")]
+    pub stratum_vardiff_clamp_up: f64,
+    #[serde(default = "default_stratum_vardiff_clamp_down")]
+    pub stratum_vardiff_clamp_down: f64,
+    #[serde(default = "default_stratum_max_rejected_shares")]
+    pub stratum_max_rejected_shares: u32,
+    #[serde(default = "default_stratum_read_timeout_sec")]
+    pub stratum_read_timeout_sec: u64,
+    #[serde(default = "default_stratum_keepalive_sec")]
+    pub stratum_keepalive_sec: u64,
+    #[serde(default = "default_stratum_idle_timeout_sec")]
+    pub stratum_idle_timeout_sec: u64,
+    #[serde(default = "default_stratum_max_jobs_per_channel")]
+    pub stratum_max_jobs_per_channel: usize,
+    #[serde(default = "default_stratum_max_active_clients")]
+    pub stratum_max_active_clients: usize,
     pub genesis_message: String,
     pub genesis_timestamp: u64,
     pub genesis_target: String,
@@ -127,6 +153,77 @@ impl ChainConfig {
                 "hrp must start with 's'".to_owned(),
             ));
         }
+        let share_target = self.stratum_share_target()?;
+        let min_share_target = self.stratum_min_share_target()?;
+        let max_share_target = self.stratum_max_share_target()?;
+        if min_share_target > max_share_target {
+            return Err(ChainConfigError::InvalidField(
+                "stratum_min_share_target must be <= stratum_max_share_target".to_owned(),
+            ));
+        }
+        if share_target < min_share_target || share_target > max_share_target {
+            return Err(ChainConfigError::InvalidField(
+                "stratum_share_target must be within [stratum_min_share_target, stratum_max_share_target]"
+                    .to_owned(),
+            ));
+        }
+        if self.stratum_vardiff_target_shares_per_minute == 0 {
+            return Err(ChainConfigError::InvalidField(
+                "stratum_vardiff_target_shares_per_minute must be > 0".to_owned(),
+            ));
+        }
+        if self.stratum_vardiff_retarget_interval_shares < 2 {
+            return Err(ChainConfigError::InvalidField(
+                "stratum_vardiff_retarget_interval_shares must be >= 2".to_owned(),
+            ));
+        }
+        if self.stratum_vardiff_clamp_up < 1.0 {
+            return Err(ChainConfigError::InvalidField(
+                "stratum_vardiff_clamp_up must be >= 1.0".to_owned(),
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.stratum_vardiff_clamp_down)
+            || self.stratum_vardiff_clamp_down == 0.0
+        {
+            return Err(ChainConfigError::InvalidField(
+                "stratum_vardiff_clamp_down must be in (0.0, 1.0]".to_owned(),
+            ));
+        }
+        if self.stratum_max_rejected_shares == 0 {
+            return Err(ChainConfigError::InvalidField(
+                "stratum_max_rejected_shares must be > 0".to_owned(),
+            ));
+        }
+        if self.stratum_read_timeout_sec == 0 {
+            return Err(ChainConfigError::InvalidField(
+                "stratum_read_timeout_sec must be > 0".to_owned(),
+            ));
+        }
+        if self.stratum_keepalive_sec == 0 {
+            return Err(ChainConfigError::InvalidField(
+                "stratum_keepalive_sec must be > 0".to_owned(),
+            ));
+        }
+        if self.stratum_idle_timeout_sec == 0 {
+            return Err(ChainConfigError::InvalidField(
+                "stratum_idle_timeout_sec must be > 0".to_owned(),
+            ));
+        }
+        if self.stratum_keepalive_sec >= self.stratum_idle_timeout_sec {
+            return Err(ChainConfigError::InvalidField(
+                "stratum_idle_timeout_sec must be > stratum_keepalive_sec".to_owned(),
+            ));
+        }
+        if self.stratum_max_jobs_per_channel == 0 {
+            return Err(ChainConfigError::InvalidField(
+                "stratum_max_jobs_per_channel must be > 0".to_owned(),
+            ));
+        }
+        if self.stratum_max_active_clients == 0 {
+            return Err(ChainConfigError::InvalidField(
+                "stratum_max_active_clients must be > 0".to_owned(),
+            ));
+        }
         if self.genesis_message.trim().is_empty() {
             return Err(ChainConfigError::InvalidField(
                 "genesis_message must not be empty".to_owned(),
@@ -150,6 +247,18 @@ impl ChainConfig {
 
     pub fn genesis_reward_key_hash20(&self) -> Result<[u8; 20], ChainConfigError> {
         decode_hex_array(&self.genesis_reward_key_hash20).map_err(ChainConfigError::from)
+    }
+
+    pub fn stratum_share_target(&self) -> Result<Target, ChainConfigError> {
+        Target::from_hex(&self.stratum_share_target).map_err(ChainConfigError::from)
+    }
+
+    pub fn stratum_min_share_target(&self) -> Result<Target, ChainConfigError> {
+        Target::from_hex(&self.stratum_min_share_target).map_err(ChainConfigError::from)
+    }
+
+    pub fn stratum_max_share_target(&self) -> Result<Target, ChainConfigError> {
+        Target::from_hex(&self.stratum_max_share_target).map_err(ChainConfigError::from)
     }
 
     pub fn build_genesis_block(&self) -> Result<Block, ChainConfigError> {
@@ -211,6 +320,58 @@ fn default_dns_seeds() -> Vec<String> {
     Vec::new()
 }
 
+fn default_stratum_share_target() -> String {
+    "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_owned()
+}
+
+fn default_stratum_min_share_target() -> String {
+    "00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_owned()
+}
+
+fn default_stratum_max_share_target() -> String {
+    "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_owned()
+}
+
+const fn default_stratum_vardiff_target_shares_per_minute() -> u32 {
+    6
+}
+
+const fn default_stratum_vardiff_retarget_interval_shares() -> usize {
+    24
+}
+
+const fn default_stratum_vardiff_clamp_up() -> f64 {
+    2.0
+}
+
+const fn default_stratum_vardiff_clamp_down() -> f64 {
+    0.5
+}
+
+const fn default_stratum_max_rejected_shares() -> u32 {
+    64
+}
+
+const fn default_stratum_read_timeout_sec() -> u64 {
+    2
+}
+
+const fn default_stratum_keepalive_sec() -> u64 {
+    30
+}
+
+const fn default_stratum_idle_timeout_sec() -> u64 {
+    180
+}
+
+const fn default_stratum_max_jobs_per_channel() -> usize {
+    64
+}
+
+const fn default_stratum_max_active_clients() -> usize {
+    256
+}
+
 #[derive(Debug, Error)]
 pub enum ChainConfigError {
     #[error("{0}")]
@@ -244,6 +405,22 @@ mod tests {
             coinbase_maturity: 100,
             block_subsidy: 5_000_000_000,
             hrp: "sd".to_owned(),
+            stratum_share_target:
+                "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_owned(),
+            stratum_min_share_target:
+                "00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_owned(),
+            stratum_max_share_target:
+                "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_owned(),
+            stratum_vardiff_target_shares_per_minute: 6,
+            stratum_vardiff_retarget_interval_shares: 24,
+            stratum_vardiff_clamp_up: 2.0,
+            stratum_vardiff_clamp_down: 0.5,
+            stratum_max_rejected_shares: 64,
+            stratum_read_timeout_sec: 2,
+            stratum_keepalive_sec: 30,
+            stratum_idle_timeout_sec: 180,
+            stratum_max_jobs_per_channel: 64,
+            stratum_max_active_clients: 256,
             genesis_message: "SCAM genesis".to_owned(),
             genesis_timestamp: 1_770_763_200,
             genesis_target: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
@@ -278,6 +455,22 @@ mod tests {
             coinbase_maturity: 100,
             block_subsidy: 5_000_000_000,
             hrp: "sd".to_owned(),
+            stratum_share_target:
+                "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_owned(),
+            stratum_min_share_target:
+                "00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_owned(),
+            stratum_max_share_target:
+                "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_owned(),
+            stratum_vardiff_target_shares_per_minute: 6,
+            stratum_vardiff_retarget_interval_shares: 24,
+            stratum_vardiff_clamp_up: 2.0,
+            stratum_vardiff_clamp_down: 0.5,
+            stratum_max_rejected_shares: 64,
+            stratum_read_timeout_sec: 2,
+            stratum_keepalive_sec: 30,
+            stratum_idle_timeout_sec: 180,
+            stratum_max_jobs_per_channel: 64,
+            stratum_max_active_clients: 256,
             genesis_message: "SCAM genesis".to_owned(),
             genesis_timestamp: 1_770_763_200,
             genesis_target: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
@@ -318,6 +511,28 @@ genesis_reward_key_hash20 = "0000000000000000000000000000000000000000"
         assert_eq!(cfg.orphan_ttl_sec, 1_200);
         assert_eq!(cfg.p2p_max_outbound_per_bucket, 2);
         assert!(cfg.dns_seeds.is_empty());
+        assert_eq!(
+            cfg.stratum_share_target,
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        );
+        assert_eq!(
+            cfg.stratum_min_share_target,
+            "00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        );
+        assert_eq!(
+            cfg.stratum_max_share_target,
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        );
+        assert_eq!(cfg.stratum_vardiff_target_shares_per_minute, 6);
+        assert_eq!(cfg.stratum_vardiff_retarget_interval_shares, 24);
+        assert_eq!(cfg.stratum_vardiff_clamp_up, 2.0);
+        assert_eq!(cfg.stratum_vardiff_clamp_down, 0.5);
+        assert_eq!(cfg.stratum_max_rejected_shares, 64);
+        assert_eq!(cfg.stratum_read_timeout_sec, 2);
+        assert_eq!(cfg.stratum_keepalive_sec, 30);
+        assert_eq!(cfg.stratum_idle_timeout_sec, 180);
+        assert_eq!(cfg.stratum_max_jobs_per_channel, 64);
+        assert_eq!(cfg.stratum_max_active_clients, 256);
         cfg.validate().expect("validate");
     }
 }

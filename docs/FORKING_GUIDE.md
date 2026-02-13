@@ -14,6 +14,8 @@ cargo run -p scam-node -- config-scaffold \
   --difficulty-algorithm lwma \
   --difficulty-adjustment-window 20 \
   --asert-half-life-sec 3600 \
+  --stratum-vardiff-target-shares-per-minute 6 \
+  --stratum-vardiff-retarget-interval-shares 24 \
   --dns-seed seed1.myfork.org \
   --dns-seed seed2.myfork.org \
   --out config/myfork.toml

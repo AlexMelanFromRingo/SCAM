@@ -15,6 +15,9 @@ Current implementation provides a production-oriented baseline with:
 - tip-change driven job refresh for connected clients,
 - automatic new-job issue after valid block share.
 
+All operational defaults are available in network config as `stratum_*` fields.
+CLI flags in `stratum-serve` override config values when provided.
+
 ## Commands
 
 ```bash

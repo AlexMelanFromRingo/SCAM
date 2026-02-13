@@ -40,6 +40,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] Added long-run soak harness command (`scam-node soak`) with optional tx flow (`--txs-per-round`) and wall-clock pacing (`--sleep-per-round-sec`), plus a 24h helper script.
 - [x] Added difficulty algorithm switch in config (`windowed`, `lwma`, `asert`) with runtime support.
 - [x] Added network config constructor command (`scam-node config-scaffold`) for quick fork bootstrap.
+- [x] Stratum operational policy defaults moved into chain config (`stratum_*`) with CLI override support.
 - [x] Added Stratum v2 subset crate + framed multi-client node server (`scam-node stratum-serve`) with session state machine, bounded job cache, idle keepalive loop, VarDiff target tuning, and reject-budget session closure.
 - [x] Added crash-loop chaos test harness (`scripts/chaos-crash-loop.sh`) for repeated kill/restart DB durability checks.
 - [x] Config now explicitly freezes relay/orphan policy constants across network preset files.
@@ -115,6 +116,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] `genesis_message` (human-readable string embedded in genesis coinbase/script)
 - [x] `difficulty_algorithm` and `asert_half_life_sec`
 - [x] `p2p_max_outbound_per_bucket` and `dns_seeds`
+- [x] `stratum_*` policy defaults (share target bounds, VarDiff, keepalive/timeouts, client/job caps)
 - [x] Add separate presets: `devnet.toml`, `testnet.toml`, `mainnet.toml`.
 
 ## 5) Cryptography TODO

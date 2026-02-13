@@ -183,6 +183,41 @@ struct ConfigScaffoldArgs {
     coinbase_maturity: u32,
     #[arg(long, default_value_t = 5_000_000_000)]
     block_subsidy: u64,
+    #[arg(
+        long,
+        default_value = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+    )]
+    stratum_share_target: String,
+    #[arg(
+        long,
+        default_value = "00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+    )]
+    stratum_min_share_target: String,
+    #[arg(
+        long,
+        default_value = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+    )]
+    stratum_max_share_target: String,
+    #[arg(long, default_value_t = 6)]
+    stratum_vardiff_target_shares_per_minute: u32,
+    #[arg(long, default_value_t = 24)]
+    stratum_vardiff_retarget_interval_shares: usize,
+    #[arg(long, default_value_t = 2.0)]
+    stratum_vardiff_clamp_up: f64,
+    #[arg(long, default_value_t = 0.5)]
+    stratum_vardiff_clamp_down: f64,
+    #[arg(long, default_value_t = 64)]
+    stratum_max_rejected_shares: u32,
+    #[arg(long, default_value_t = 2)]
+    stratum_read_timeout_sec: u64,
+    #[arg(long, default_value_t = 30)]
+    stratum_keepalive_sec: u64,
+    #[arg(long, default_value_t = 180)]
+    stratum_idle_timeout_sec: u64,
+    #[arg(long, default_value_t = 64)]
+    stratum_max_jobs_per_channel: usize,
+    #[arg(long, default_value_t = 256)]
+    stratum_max_active_clients: usize,
     #[arg(long, default_value = "SCAM custom genesis block")]
     genesis_message: String,
     #[arg(long)]
@@ -382,43 +417,34 @@ struct StratumServeArgs {
     runtime_db: Option<PathBuf>,
     #[arg(long, default_value = "127.0.0.1:3347")]
     bind: String,
-    #[arg(
-        long,
-        default_value = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-    )]
-    share_target_hex: String,
-    #[arg(long, default_value_t = 64)]
-    max_jobs_per_channel: usize,
+    #[arg(long)]
+    share_target_hex: Option<String>,
+    #[arg(long)]
+    max_jobs_per_channel: Option<usize>,
     #[arg(long, default_value_t = 0)]
     max_clients: u32,
-    #[arg(long, default_value_t = 256)]
-    max_active_clients: usize,
-    #[arg(long, default_value_t = 2)]
-    read_timeout_sec: u64,
-    #[arg(long, default_value_t = 30)]
-    keepalive_sec: u64,
-    #[arg(long, default_value_t = 180)]
-    idle_timeout_sec: u64,
-    #[arg(long, default_value_t = 6)]
-    vardiff_target_shares_per_minute: u32,
-    #[arg(long, default_value_t = 24)]
-    vardiff_retarget_interval_shares: usize,
-    #[arg(long, default_value_t = 2.0)]
-    vardiff_clamp_up: f64,
-    #[arg(long, default_value_t = 0.5)]
-    vardiff_clamp_down: f64,
-    #[arg(long, default_value_t = 64)]
-    max_rejected_shares: u32,
-    #[arg(
-        long,
-        default_value = "00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-    )]
-    min_share_target_hex: String,
-    #[arg(
-        long,
-        default_value = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-    )]
-    max_share_target_hex: String,
+    #[arg(long)]
+    max_active_clients: Option<usize>,
+    #[arg(long)]
+    read_timeout_sec: Option<u64>,
+    #[arg(long)]
+    keepalive_sec: Option<u64>,
+    #[arg(long)]
+    idle_timeout_sec: Option<u64>,
+    #[arg(long)]
+    vardiff_target_shares_per_minute: Option<u32>,
+    #[arg(long)]
+    vardiff_retarget_interval_shares: Option<usize>,
+    #[arg(long)]
+    vardiff_clamp_up: Option<f64>,
+    #[arg(long)]
+    vardiff_clamp_down: Option<f64>,
+    #[arg(long)]
+    max_rejected_shares: Option<u32>,
+    #[arg(long)]
+    min_share_target_hex: Option<String>,
+    #[arg(long)]
+    max_share_target_hex: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -1061,6 +1087,19 @@ fn run_config_scaffold(args: ConfigScaffoldArgs) -> Result<(), NodeError> {
         coinbase_maturity: args.coinbase_maturity,
         block_subsidy: args.block_subsidy,
         hrp: args.hrp.clone(),
+        stratum_share_target: args.stratum_share_target.clone(),
+        stratum_min_share_target: args.stratum_min_share_target.clone(),
+        stratum_max_share_target: args.stratum_max_share_target.clone(),
+        stratum_vardiff_target_shares_per_minute: args.stratum_vardiff_target_shares_per_minute,
+        stratum_vardiff_retarget_interval_shares: args.stratum_vardiff_retarget_interval_shares,
+        stratum_vardiff_clamp_up: args.stratum_vardiff_clamp_up,
+        stratum_vardiff_clamp_down: args.stratum_vardiff_clamp_down,
+        stratum_max_rejected_shares: args.stratum_max_rejected_shares,
+        stratum_read_timeout_sec: args.stratum_read_timeout_sec,
+        stratum_keepalive_sec: args.stratum_keepalive_sec,
+        stratum_idle_timeout_sec: args.stratum_idle_timeout_sec,
+        stratum_max_jobs_per_channel: args.stratum_max_jobs_per_channel,
+        stratum_max_active_clients: args.stratum_max_active_clients,
         genesis_message: args.genesis_message.clone(),
         genesis_timestamp,
         genesis_target: args.genesis_target.clone(),
@@ -3396,11 +3435,62 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
         .runtime_db
         .unwrap_or_else(|| default_runtime_db_path(args.network));
     let (runtime, source) = load_runtime_from_db_or_genesis(&cfg, &runtime_db_path)?;
-    let share_target = Target::from_hex(&args.share_target_hex)
+    let share_target_hex = args
+        .share_target_hex
+        .as_deref()
+        .unwrap_or(&cfg.stratum_share_target);
+    let min_share_target_hex = args
+        .min_share_target_hex
+        .as_deref()
+        .unwrap_or(&cfg.stratum_min_share_target);
+    let max_share_target_hex = args
+        .max_share_target_hex
+        .as_deref()
+        .unwrap_or(&cfg.stratum_max_share_target);
+
+    let vardiff_target_shares_per_minute = args
+        .vardiff_target_shares_per_minute
+        .unwrap_or(cfg.stratum_vardiff_target_shares_per_minute);
+    let vardiff_retarget_interval_shares = args
+        .vardiff_retarget_interval_shares
+        .unwrap_or(cfg.stratum_vardiff_retarget_interval_shares)
+        .max(2);
+    let vardiff_clamp_up = args
+        .vardiff_clamp_up
+        .unwrap_or(cfg.stratum_vardiff_clamp_up);
+    let vardiff_clamp_down = args
+        .vardiff_clamp_down
+        .unwrap_or(cfg.stratum_vardiff_clamp_down);
+    let max_rejected_shares = args
+        .max_rejected_shares
+        .unwrap_or(cfg.stratum_max_rejected_shares)
+        .max(1);
+    let read_timeout_sec = args
+        .read_timeout_sec
+        .unwrap_or(cfg.stratum_read_timeout_sec)
+        .max(1);
+    let keepalive_sec = args
+        .keepalive_sec
+        .unwrap_or(cfg.stratum_keepalive_sec)
+        .max(1);
+    let idle_timeout_sec = args
+        .idle_timeout_sec
+        .unwrap_or(cfg.stratum_idle_timeout_sec)
+        .max(1);
+    let max_jobs_per_channel = args
+        .max_jobs_per_channel
+        .unwrap_or(cfg.stratum_max_jobs_per_channel)
+        .max(1);
+    let max_active_clients = args
+        .max_active_clients
+        .unwrap_or(cfg.stratum_max_active_clients)
+        .max(1);
+
+    let share_target = Target::from_hex(share_target_hex)
         .map_err(|e| NodeError::Runtime(format!("invalid share_target_hex: {e}")))?;
-    let min_share_target = Target::from_hex(&args.min_share_target_hex)
+    let min_share_target = Target::from_hex(min_share_target_hex)
         .map_err(|e| NodeError::Runtime(format!("invalid min_share_target_hex: {e}")))?;
-    let max_share_target = Target::from_hex(&args.max_share_target_hex)
+    let max_share_target = Target::from_hex(max_share_target_hex)
         .map_err(|e| NodeError::Runtime(format!("invalid max_share_target_hex: {e}")))?;
     if min_share_target > max_share_target {
         return Err(NodeError::Runtime(
@@ -3413,7 +3503,7 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
                 .to_owned(),
         ));
     }
-    if args.keepalive_sec.max(1) >= args.idle_timeout_sec.max(1) {
+    if keepalive_sec >= idle_timeout_sec {
         return Err(NodeError::Runtime(
             "idle_timeout_sec must be greater than keepalive_sec".to_owned(),
         ));
@@ -3432,23 +3522,21 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
     println!("Share target: {share_target}");
     println!(
         "VarDiff target shares/min: {}",
-        args.vardiff_target_shares_per_minute
+        vardiff_target_shares_per_minute
     );
     println!(
         "VarDiff window shares: {} clamp_down={} clamp_up={}",
-        args.vardiff_retarget_interval_shares, args.vardiff_clamp_down, args.vardiff_clamp_up
+        vardiff_retarget_interval_shares, vardiff_clamp_down, vardiff_clamp_up
     );
     println!(
         "Share target bounds: min={} max={}",
         min_share_target, max_share_target
     );
-    println!("Max jobs/channel: {}", args.max_jobs_per_channel.max(1));
-    println!("Max active clients: {}", args.max_active_clients.max(1));
+    println!("Max jobs/channel: {}", max_jobs_per_channel);
+    println!("Max active clients: {}", max_active_clients);
     println!(
         "Read timeout={}s keepalive={}s idle timeout={}s",
-        args.read_timeout_sec.max(1),
-        args.keepalive_sec.max(1),
-        args.idle_timeout_sec.max(1)
+        read_timeout_sec, keepalive_sec, idle_timeout_sec
     );
     if args.max_clients > 0 {
         println!("Max clients before exit: {}", args.max_clients);
@@ -3461,17 +3549,17 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
         share_target,
         min_share_target,
         max_share_target,
-        vardiff_target_shares_per_minute: args.vardiff_target_shares_per_minute,
-        vardiff_retarget_interval_shares: args.vardiff_retarget_interval_shares.max(2),
-        vardiff_clamp_up: args.vardiff_clamp_up,
-        vardiff_clamp_down: args.vardiff_clamp_down,
-        max_rejected_shares: args.max_rejected_shares.max(1),
-        read_timeout_sec: args.read_timeout_sec.max(1),
-        keepalive_sec: args.keepalive_sec.max(1),
-        idle_timeout_sec: args.idle_timeout_sec.max(1),
+        vardiff_target_shares_per_minute,
+        vardiff_retarget_interval_shares,
+        vardiff_clamp_up,
+        vardiff_clamp_down,
+        max_rejected_shares,
+        read_timeout_sec,
+        keepalive_sec,
+        idle_timeout_sec,
         next_channel_id: Arc::new(AtomicU32::new(0)),
         next_job_id: Arc::new(AtomicU32::new(0)),
-        max_jobs_per_channel: args.max_jobs_per_channel.max(1),
+        max_jobs_per_channel,
         active_clients: Arc::new(Mutex::new(0)),
     };
 
@@ -3486,11 +3574,10 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
             })?;
             *active
         };
-        if current_active >= args.max_active_clients.max(1) {
+        if current_active >= max_active_clients {
             println!(
                 "stratum dropping connection (active={} max_active={})",
-                current_active,
-                args.max_active_clients.max(1)
+                current_active, max_active_clients
             );
             drop(stream);
             continue;
@@ -3950,6 +4037,22 @@ mod tests {
             ],
             coinbase_maturity: 100,
             block_subsidy: 5_000_000_000,
+            stratum_share_target:
+                "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_owned(),
+            stratum_min_share_target:
+                "00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_owned(),
+            stratum_max_share_target:
+                "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_owned(),
+            stratum_vardiff_target_shares_per_minute: 6,
+            stratum_vardiff_retarget_interval_shares: 24,
+            stratum_vardiff_clamp_up: 2.0,
+            stratum_vardiff_clamp_down: 0.5,
+            stratum_max_rejected_shares: 64,
+            stratum_read_timeout_sec: 2,
+            stratum_keepalive_sec: 30,
+            stratum_idle_timeout_sec: 180,
+            stratum_max_jobs_per_channel: 64,
+            stratum_max_active_clients: 256,
             genesis_message: "fork genesis".to_owned(),
             genesis_timestamp: Some(1_800_000_000),
             genesis_target: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
@@ -3969,6 +4072,10 @@ mod tests {
         );
         assert_eq!(cfg.p2p_max_outbound_per_bucket, 2);
         assert_eq!(cfg.dns_seeds.len(), 2);
+        assert_eq!(cfg.stratum_vardiff_target_shares_per_minute, 6);
+        assert_eq!(cfg.stratum_vardiff_retarget_interval_shares, 24);
+        assert_eq!(cfg.stratum_max_jobs_per_channel, 64);
+        assert_eq!(cfg.stratum_max_active_clients, 256);
 
         let _ = fs::remove_dir_all(work_dir);
     }
