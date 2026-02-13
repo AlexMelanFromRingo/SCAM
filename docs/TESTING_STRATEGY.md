@@ -61,3 +61,13 @@ Shortcut script:
 ```bash
 scripts/soak-24h.sh
 ```
+
+## Chaos Crash-Loop
+
+Power-loss style durability run:
+
+```bash
+scripts/chaos-crash-loop.sh
+```
+
+This repeatedly kills the node process and validates DB reopen/recovery.

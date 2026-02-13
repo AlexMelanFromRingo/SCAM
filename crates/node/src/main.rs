@@ -1,8 +1,10 @@
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -27,8 +29,8 @@ use scam_storage::{
     save_chain_archive_db, save_peer_book_db, save_snapshot, save_snapshot_db,
 };
 use scam_stratum::{
-    MiningJob, ShareSubmission, ShareValidation, Sv2Message, decode_line as decode_sv2_line,
-    encode_line as encode_sv2_line, validate_share,
+    MiningJob, SUPPORTED_SV2_VERSION, SessionConfig as Sv2SessionConfig, SessionEvent, Sv2Message,
+    Sv2Session, read_frame as read_sv2_frame, write_frame as write_sv2_frame,
 };
 use scam_wallet::{
     AddressError, DeriveKeyError, MnemonicError, QrError, RescanError, SchnorrError, WalletKey,
@@ -385,6 +387,8 @@ struct StratumServeArgs {
         default_value = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
     )]
     share_target_hex: String,
+    #[arg(long, default_value_t = 64)]
+    max_jobs_per_channel: usize,
     #[arg(long, default_value_t = 1)]
     max_clients: u32,
 }
@@ -3145,24 +3149,123 @@ fn build_stratum_work(
 }
 
 fn write_sv2_message(stream: &mut TcpStream, message: &Sv2Message) -> Result<(), NodeError> {
-    let line = encode_sv2_line(message)?;
-    stream
-        .write_all(line.as_bytes())
+    write_sv2_frame(stream, message)
         .map_err(|e| NodeError::Runtime(format!("stratum write failed: {e}")))
 }
 
-fn read_sv2_message(reader: &mut BufReader<TcpStream>) -> Result<Sv2Message, NodeError> {
-    let mut line = String::new();
-    let bytes = reader
-        .read_line(&mut line)
-        .map_err(|e| NodeError::Runtime(format!("stratum read failed: {e}")))?;
-    if bytes == 0 {
-        return Err(NodeError::Runtime(
-            "stratum peer closed the connection".to_owned(),
-        ));
+fn read_sv2_message(stream: &mut TcpStream) -> Result<Option<Sv2Message>, NodeError> {
+    read_sv2_frame(stream).map_err(|e| NodeError::Runtime(format!("stratum read failed: {e}")))
+}
+
+#[derive(Clone)]
+struct StratumServerContext {
+    cfg: ChainConfig,
+    runtime: Arc<Mutex<ChainRuntime>>,
+    runtime_db_path: PathBuf,
+    share_target: Target,
+    next_channel_id: Arc<AtomicU32>,
+    next_job_id: Arc<AtomicU32>,
+    max_jobs_per_channel: usize,
+}
+
+fn lock_runtime<'a>(
+    runtime: &'a Arc<Mutex<ChainRuntime>>,
+) -> Result<std::sync::MutexGuard<'a, ChainRuntime>, NodeError> {
+    runtime
+        .lock()
+        .map_err(|_| NodeError::Runtime("stratum runtime mutex poisoned".to_owned()))
+}
+
+fn issue_new_stratum_job(
+    session: &mut Sv2Session,
+    ctx: &StratumServerContext,
+    stream: &mut TcpStream,
+    jobs: &mut HashMap<u32, StratumWork>,
+) -> Result<(), NodeError> {
+    let job_id = ctx
+        .next_job_id
+        .fetch_add(1, Ordering::Relaxed)
+        .saturating_add(1);
+    let runtime = lock_runtime(&ctx.runtime)?;
+    let work = build_stratum_work(&runtime, &ctx.cfg, session.channel_id(), job_id)?;
+    drop(runtime);
+
+    let new_job = session.install_job(work.job.clone())?;
+    write_sv2_message(stream, &new_job)?;
+    let prev = session.set_new_prev_hash(&work.job)?;
+    write_sv2_message(stream, &prev)?;
+    jobs.insert(work.job.job_id, work);
+    jobs.retain(|job_id, _| session.job(*job_id).is_some());
+    Ok(())
+}
+
+fn run_stratum_client(mut stream: TcpStream, ctx: StratumServerContext) -> Result<(), NodeError> {
+    configure_stream_timeouts(&stream)?;
+    let channel_id = ctx
+        .next_channel_id
+        .fetch_add(1, Ordering::Relaxed)
+        .saturating_add(1);
+    let mut session = Sv2Session::new(Sv2SessionConfig {
+        channel_id,
+        share_target: ctx.share_target,
+        max_jobs: ctx.max_jobs_per_channel,
+        supported_version: SUPPORTED_SV2_VERSION,
+    })?;
+    let mut jobs = HashMap::<u32, StratumWork>::new();
+
+    while let Some(inbound) = read_sv2_message(&mut stream)? {
+        let response = session.handle_message(inbound)?;
+        for outbound in response.outbound {
+            write_sv2_message(&mut stream, &outbound)?;
+        }
+
+        for event in response.events {
+            match event {
+                SessionEvent::SetupAccepted => {}
+                SessionEvent::ChannelOpened { .. } => {
+                    issue_new_stratum_job(&mut session, &ctx, &mut stream, &mut jobs)?;
+                }
+                SessionEvent::ShareAccepted {
+                    channel_id,
+                    job_id,
+                    nonce,
+                    ntime,
+                    is_block,
+                    ..
+                } => {
+                    if !is_block {
+                        continue;
+                    }
+                    let Some(work) = jobs.get(&job_id).cloned() else {
+                        continue;
+                    };
+                    let block = scam_core::Block {
+                        header: scam_core::BlockHeader {
+                            version: work.job.version,
+                            prev_block: work.job.prev_hash,
+                            merkle_root: work.job.merkle_root,
+                            timestamp: ntime,
+                            target: work.job.network_target,
+                            nonce,
+                        },
+                        transactions: vec![work.coinbase],
+                    };
+
+                    let mut runtime = lock_runtime(&ctx.runtime)?;
+                    let _ = runtime.submit_block(block)?;
+                    persist_runtime_db(&runtime, &ctx.runtime_db_path)?;
+                    drop(runtime);
+                    jobs.clear();
+                    if channel_id == session.channel_id() {
+                        issue_new_stratum_job(&mut session, &ctx, &mut stream, &mut jobs)?;
+                    }
+                }
+                SessionEvent::ShareRejected { .. } => {}
+            }
+        }
     }
-    decode_sv2_line(line.trim())
-        .map_err(|e| NodeError::Runtime(format!("stratum decode failed: {e}")))
+    session.close();
+    Ok(())
 }
 
 fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
@@ -3173,14 +3276,14 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
     let runtime_db_path = args
         .runtime_db
         .unwrap_or_else(|| default_runtime_db_path(args.network));
-    let (mut runtime, source) = load_runtime_from_db_or_genesis(&cfg, &runtime_db_path)?;
+    let (runtime, source) = load_runtime_from_db_or_genesis(&cfg, &runtime_db_path)?;
     let share_target = Target::from_hex(&args.share_target_hex)
         .map_err(|e| NodeError::Runtime(format!("invalid share_target_hex: {e}")))?;
 
     let listener = TcpListener::bind(&args.bind)
         .map_err(|e| NodeError::Runtime(format!("stratum bind failed on {}: {e}", args.bind)))?;
     println!(
-        "Stratum (SV2-subset) listening on {} network={} source={} tip_h={} tip_hash={}",
+        "Stratum (SV2 framed) listening on {} network={} source={} tip_h={} tip_hash={}",
         args.bind,
         cfg.network_id,
         source,
@@ -3188,141 +3291,43 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
         runtime.tip_hash()
     );
     println!("Share target: {share_target}");
+    println!("Max jobs/channel: {}", args.max_jobs_per_channel.max(1));
     if args.max_clients > 0 {
         println!("Max clients before exit: {}", args.max_clients);
     }
 
+    let ctx = StratumServerContext {
+        cfg,
+        runtime: Arc::new(Mutex::new(runtime)),
+        runtime_db_path,
+        share_target,
+        next_channel_id: Arc::new(AtomicU32::new(0)),
+        next_job_id: Arc::new(AtomicU32::new(0)),
+        max_jobs_per_channel: args.max_jobs_per_channel.max(1),
+    };
+
     let mut served = 0u32;
+    let mut handles = Vec::new();
     for incoming in listener.incoming() {
-        let mut stream =
+        let stream =
             incoming.map_err(|e| NodeError::Runtime(format!("stratum accept failed: {e}")))?;
-        configure_stream_timeouts(&stream)?;
-        let mut reader = BufReader::new(
-            stream
-                .try_clone()
-                .map_err(|e| NodeError::Runtime(format!("stratum stream clone failed: {e}")))?,
-        );
-
-        let setup = read_sv2_message(&mut reader)?;
-        if !matches!(setup, Sv2Message::SetupConnection { .. }) {
-            return Err(NodeError::Runtime(
-                "expected setup_connection as first stratum message".to_owned(),
-            ));
-        }
-        write_sv2_message(
-            &mut stream,
-            &Sv2Message::SetupConnectionSuccess {
-                used_version: 2,
-                flags: 0,
-            },
-        )?;
-
-        let open = read_sv2_message(&mut reader)?;
-        let (request_id, _user) = match open {
-            Sv2Message::OpenStandardMiningChannel { request_id, user } => (request_id, user),
-            other => {
-                return Err(NodeError::Runtime(format!(
-                    "expected open_standard_mining_channel, got {other:?}"
-                )));
-            }
-        };
-        let channel_id = served.saturating_add(1);
-        write_sv2_message(
-            &mut stream,
-            &Sv2Message::OpenStandardMiningChannelSuccess {
-                request_id,
-                channel_id,
-                target_hex: share_target.to_hex(),
-            },
-        )?;
-
-        let mut next_job_id = 1u32;
-        let mut work = build_stratum_work(&runtime, &cfg, channel_id, next_job_id)?;
-        write_sv2_message(
-            &mut stream,
-            &Sv2Message::NewMiningJob {
-                channel_id,
-                job_id: work.job.job_id,
-                version: work.job.version,
-                prev_hash_hex: work.job.prev_hash.to_hex(),
-                merkle_root_hex: work.job.merkle_root.to_hex(),
-                ntime: work.job.ntime,
-                network_target_hex: work.job.network_target.to_hex(),
-            },
-        )?;
-
-        while let Ok(msg) = read_sv2_message(&mut reader) {
-            let inbound = msg;
-            let submission = match inbound {
-                Sv2Message::SubmitSharesStandard {
-                    channel_id,
-                    job_id,
-                    nonce,
-                    ntime,
-                } => ShareSubmission {
-                    channel_id,
-                    job_id,
-                    nonce,
-                    ntime,
-                },
-                _ => continue,
-            };
-
-            match validate_share(&work.job, submission, share_target) {
-                Ok(ShareValidation::AcceptedShare { is_block, .. }) => {
-                    write_sv2_message(
-                        &mut stream,
-                        &Sv2Message::SubmitSharesSuccess {
-                            channel_id: work.job.channel_id,
-                            accepted: 1,
-                        },
-                    )?;
-                    if is_block {
-                        let block = scam_core::Block {
-                            header: scam_core::BlockHeader {
-                                version: work.job.version,
-                                prev_block: work.job.prev_hash,
-                                merkle_root: work.job.merkle_root,
-                                timestamp: submission.ntime,
-                                target: work.job.network_target,
-                                nonce: submission.nonce,
-                            },
-                            transactions: vec![work.coinbase.clone()],
-                        };
-                        runtime.submit_block(block)?;
-                        persist_runtime_db(&runtime, &runtime_db_path)?;
-                        next_job_id = next_job_id.saturating_add(1);
-                        work = build_stratum_work(&runtime, &cfg, channel_id, next_job_id)?;
-                        write_sv2_message(
-                            &mut stream,
-                            &Sv2Message::NewMiningJob {
-                                channel_id,
-                                job_id: work.job.job_id,
-                                version: work.job.version,
-                                prev_hash_hex: work.job.prev_hash.to_hex(),
-                                merkle_root_hex: work.job.merkle_root.to_hex(),
-                                ntime: work.job.ntime,
-                                network_target_hex: work.job.network_target.to_hex(),
-                            },
-                        )?;
-                    }
-                }
-                Err(err) => {
-                    write_sv2_message(
-                        &mut stream,
-                        &Sv2Message::SubmitSharesError {
-                            channel_id: work.job.channel_id,
-                            code: "share_rejected".to_owned(),
-                            reason: err.to_string(),
-                        },
-                    )?;
-                }
-            }
-        }
+        let client_ctx = ctx.clone();
+        handles.push(thread::spawn(move || {
+            run_stratum_client(stream, client_ctx)
+        }));
 
         served = served.saturating_add(1);
         if args.max_clients > 0 && served >= args.max_clients {
             break;
+        }
+    }
+
+    for handle in handles {
+        let result = handle
+            .join()
+            .map_err(|_| NodeError::Runtime("stratum worker thread panicked".to_owned()))?;
+        if let Err(err) = result {
+            return Err(NodeError::Runtime(format!("stratum worker error: {err}")));
         }
     }
     Ok(())
