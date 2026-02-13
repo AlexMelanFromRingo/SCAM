@@ -45,7 +45,7 @@ for ((i=1; i<=ROUNDS; i++)); do
   wait "${pid}" 2>/dev/null || true
 
   echo "[chaos] cycle ${i}: validating DB can be reopened"
-  cargo run -p scam-node -- node run \
+  cargo run -p scam-node -- node \
     --network "${NETWORK}" \
     --config "${CONFIG}" \
     --runtime-db "${RUNTIME_DB}" >/dev/null

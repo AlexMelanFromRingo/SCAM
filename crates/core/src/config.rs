@@ -40,6 +40,16 @@ pub struct ChainConfig {
     pub p2p_max_outbound_per_bucket: u32,
     #[serde(default = "default_dns_seeds")]
     pub dns_seeds: Vec<String>,
+    #[serde(default = "default_p2p_max_inv_items")]
+    pub p2p_max_inv_items: usize,
+    #[serde(default = "default_p2p_ban_threshold")]
+    pub p2p_ban_threshold: u32,
+    #[serde(default = "default_p2p_replacement_window_sec")]
+    pub p2p_replacement_window_sec: u64,
+    #[serde(default = "default_p2p_replacement_max_per_peer")]
+    pub p2p_replacement_max_per_peer: usize,
+    #[serde(default = "default_p2p_replacement_penalty")]
+    pub p2p_replacement_penalty: u32,
     pub coinbase_maturity: u32,
     pub block_subsidy: u64,
     pub hrp: String,
@@ -71,6 +81,8 @@ pub struct ChainConfig {
     pub stratum_max_active_clients: usize,
     #[serde(default = "default_stratum_secure_transport")]
     pub stratum_secure_transport: bool,
+    #[serde(default = "default_stratum_secure_transport_mode")]
+    pub stratum_secure_transport_mode: String,
     #[serde(default = "default_stratum_secure_rekey_interval_messages")]
     pub stratum_secure_rekey_interval_messages: u64,
     pub genesis_message: String,
@@ -140,6 +152,31 @@ impl ChainConfig {
         if self.p2p_max_outbound_per_bucket == 0 {
             return Err(ChainConfigError::InvalidField(
                 "p2p_max_outbound_per_bucket must be > 0".to_owned(),
+            ));
+        }
+        if self.p2p_max_inv_items == 0 {
+            return Err(ChainConfigError::InvalidField(
+                "p2p_max_inv_items must be > 0".to_owned(),
+            ));
+        }
+        if self.p2p_ban_threshold == 0 {
+            return Err(ChainConfigError::InvalidField(
+                "p2p_ban_threshold must be > 0".to_owned(),
+            ));
+        }
+        if self.p2p_replacement_window_sec == 0 {
+            return Err(ChainConfigError::InvalidField(
+                "p2p_replacement_window_sec must be > 0".to_owned(),
+            ));
+        }
+        if self.p2p_replacement_max_per_peer == 0 {
+            return Err(ChainConfigError::InvalidField(
+                "p2p_replacement_max_per_peer must be > 0".to_owned(),
+            ));
+        }
+        if self.p2p_replacement_penalty == 0 {
+            return Err(ChainConfigError::InvalidField(
+                "p2p_replacement_penalty must be > 0".to_owned(),
             ));
         }
         if self.dns_seeds.iter().any(|seed| seed.trim().is_empty()) {
@@ -231,6 +268,14 @@ impl ChainConfig {
         if self.stratum_secure_rekey_interval_messages == 0 {
             return Err(ChainConfigError::InvalidField(
                 "stratum_secure_rekey_interval_messages must be > 0".to_owned(),
+            ));
+        }
+        if !matches!(
+            self.stratum_secure_transport_mode.as_str(),
+            "legacy" | "noise_xx"
+        ) {
+            return Err(ChainConfigError::InvalidField(
+                "stratum_secure_transport_mode must be one of: legacy, noise_xx".to_owned(),
             ));
         }
         if self.genesis_message.trim().is_empty() {
@@ -329,6 +374,26 @@ fn default_dns_seeds() -> Vec<String> {
     Vec::new()
 }
 
+const fn default_p2p_max_inv_items() -> usize {
+    2_000
+}
+
+const fn default_p2p_ban_threshold() -> u32 {
+    100
+}
+
+const fn default_p2p_replacement_window_sec() -> u64 {
+    60
+}
+
+const fn default_p2p_replacement_max_per_peer() -> usize {
+    20
+}
+
+const fn default_p2p_replacement_penalty() -> u32 {
+    25
+}
+
 fn default_stratum_share_target() -> String {
     "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_owned()
 }
@@ -385,6 +450,10 @@ const fn default_stratum_secure_transport() -> bool {
     false
 }
 
+fn default_stratum_secure_transport_mode() -> String {
+    "noise_xx".to_owned()
+}
+
 const fn default_stratum_secure_rekey_interval_messages() -> u64 {
     10_000
 }
@@ -419,6 +488,11 @@ mod tests {
             orphan_ttl_sec: 1_200,
             p2p_max_outbound_per_bucket: 2,
             dns_seeds: Vec::new(),
+            p2p_max_inv_items: 2_000,
+            p2p_ban_threshold: 100,
+            p2p_replacement_window_sec: 60,
+            p2p_replacement_max_per_peer: 20,
+            p2p_replacement_penalty: 25,
             coinbase_maturity: 100,
             block_subsidy: 5_000_000_000,
             hrp: "sd".to_owned(),
@@ -439,6 +513,7 @@ mod tests {
             stratum_max_jobs_per_channel: 64,
             stratum_max_active_clients: 256,
             stratum_secure_transport: false,
+            stratum_secure_transport_mode: "noise_xx".to_owned(),
             stratum_secure_rekey_interval_messages: 10_000,
             genesis_message: "SCAM genesis".to_owned(),
             genesis_timestamp: 1_770_763_200,
@@ -471,6 +546,11 @@ mod tests {
             orphan_ttl_sec: 1_200,
             p2p_max_outbound_per_bucket: 2,
             dns_seeds: Vec::new(),
+            p2p_max_inv_items: 2_000,
+            p2p_ban_threshold: 100,
+            p2p_replacement_window_sec: 60,
+            p2p_replacement_max_per_peer: 20,
+            p2p_replacement_penalty: 25,
             coinbase_maturity: 100,
             block_subsidy: 5_000_000_000,
             hrp: "sd".to_owned(),
@@ -491,6 +571,7 @@ mod tests {
             stratum_max_jobs_per_channel: 64,
             stratum_max_active_clients: 256,
             stratum_secure_transport: false,
+            stratum_secure_transport_mode: "noise_xx".to_owned(),
             stratum_secure_rekey_interval_messages: 10_000,
             genesis_message: "SCAM genesis".to_owned(),
             genesis_timestamp: 1_770_763_200,
@@ -532,6 +613,11 @@ genesis_reward_key_hash20 = "0000000000000000000000000000000000000000"
         assert_eq!(cfg.orphan_ttl_sec, 1_200);
         assert_eq!(cfg.p2p_max_outbound_per_bucket, 2);
         assert!(cfg.dns_seeds.is_empty());
+        assert_eq!(cfg.p2p_max_inv_items, 2_000);
+        assert_eq!(cfg.p2p_ban_threshold, 100);
+        assert_eq!(cfg.p2p_replacement_window_sec, 60);
+        assert_eq!(cfg.p2p_replacement_max_per_peer, 20);
+        assert_eq!(cfg.p2p_replacement_penalty, 25);
         assert_eq!(
             cfg.stratum_share_target,
             "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
@@ -555,6 +641,7 @@ genesis_reward_key_hash20 = "0000000000000000000000000000000000000000"
         assert_eq!(cfg.stratum_max_jobs_per_channel, 64);
         assert_eq!(cfg.stratum_max_active_clients, 256);
         assert!(!cfg.stratum_secure_transport);
+        assert_eq!(cfg.stratum_secure_transport_mode, "noise_xx");
         assert_eq!(cfg.stratum_secure_rekey_interval_messages, 10_000);
         cfg.validate().expect("validate");
     }

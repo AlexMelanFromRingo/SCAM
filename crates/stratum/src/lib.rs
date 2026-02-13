@@ -11,6 +11,9 @@ use scam_core::{BlockHeader, Hash256, Target};
 use secp256k1::ecdh::SharedSecret;
 use secp256k1::{PublicKey, Secp256k1, SecretKey};
 use serde::{Deserialize, Serialize};
+use snow::Builder as NoiseBuilder;
+use snow::params::NoiseParams;
+use snow::{HandshakeState as NoiseHandshakeState, TransportState as NoiseTransportState};
 use thiserror::Error;
 
 pub const SUPPORTED_SV2_VERSION: u16 = 2;
@@ -26,6 +29,44 @@ const SECURE_KEY_CONTEXT_CLIENT_TO_SERVER: &str = "SCAM-SV2-NoiseLike-c2s-v1";
 const SECURE_KEY_CONTEXT_SERVER_TO_CLIENT: &str = "SCAM-SV2-NoiseLike-s2c-v1";
 const SECURE_KEY_CONTEXT_REKEY: &str = "SCAM-SV2-NoiseLike-rekey-v1";
 const DEFAULT_SECURE_REKEY_INTERVAL_MESSAGES: u64 = 10_000;
+const NOISE_PROTOCOL_XX: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
+const NOISE_HANDSHAKE_MAX_PACKET_SIZE: usize = 65_535;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecureTransportMode {
+    Legacy,
+    NoiseXx,
+}
+
+impl SecureTransportMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::NoiseXx => "noise_xx",
+        }
+    }
+}
+
+impl std::str::FromStr for SecureTransportMode {
+    type Err = StratumError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "legacy" => Ok(Self::Legacy),
+            "noise_xx" => Ok(Self::NoiseXx),
+            other => Err(StratumError::InvalidConfig(format!(
+                "unsupported secure transport mode: {other}"
+            ))),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NoiseStaticKeypair {
+    pub private: [u8; 32],
+    pub public: [u8; 32],
+}
 
 const MSG_SETUP_CONNECTION: u8 = 0x00;
 const MSG_SETUP_CONNECTION_SUCCESS: u8 = 0x01;
@@ -940,6 +981,321 @@ impl SecureSv2Transport {
     }
 }
 
+#[derive(Debug)]
+pub struct NoiseSv2Transport {
+    transport: NoiseTransportState,
+    rekey_interval_messages: u64,
+    sent_messages: u64,
+    received_messages: u64,
+}
+
+pub fn generate_noise_static_keypair() -> Result<NoiseStaticKeypair, StratumError> {
+    let params = parse_noise_params()?;
+    let builder = NoiseBuilder::new(params);
+    let keypair = builder.generate_keypair().map_err(|e| {
+        StratumError::SecureTransport(format!("noise keypair generation failed: {e}"))
+    })?;
+    let private = decode_noise_key_bytes(&keypair.private, "private")?;
+    let public = decode_noise_key_bytes(&keypair.public, "public")?;
+    Ok(NoiseStaticKeypair { private, public })
+}
+
+impl NoiseSv2Transport {
+    pub fn handshake_client<IO: Read + Write>(
+        io: &mut IO,
+        local_static_private_key: Option<[u8; 32]>,
+        expected_remote_static_public_key: Option<[u8; 32]>,
+    ) -> Result<Self, StratumError> {
+        let local_static = resolve_noise_private_key(local_static_private_key)?;
+        let mut state = build_noise_handshake_state(true, local_static)?;
+        let mut out_buf = vec![0u8; NOISE_HANDSHAKE_MAX_PACKET_SIZE];
+        let mut in_buf = vec![0u8; NOISE_HANDSHAKE_MAX_PACKET_SIZE];
+
+        let first_len = state.write_message(&[], &mut out_buf).map_err(|e| {
+            StratumError::SecureHandshake(format!("noise initiator write m1 failed: {e}"))
+        })?;
+        write_noise_handshake_packet(io, &out_buf[..first_len])?;
+
+        let second = read_noise_handshake_packet(io)?;
+        state.read_message(&second, &mut in_buf).map_err(|e| {
+            StratumError::SecureHandshake(format!("noise initiator read m2 failed: {e}"))
+        })?;
+
+        let third_len = state.write_message(&[], &mut out_buf).map_err(|e| {
+            StratumError::SecureHandshake(format!("noise initiator write m3 failed: {e}"))
+        })?;
+        write_noise_handshake_packet(io, &out_buf[..third_len])?;
+
+        if let Some(expected) = expected_remote_static_public_key {
+            match state.get_remote_static() {
+                Some(remote) if remote == expected => {}
+                Some(_) => {
+                    return Err(StratumError::SecureHandshake(
+                        "noise remote static key mismatch".to_owned(),
+                    ));
+                }
+                None => {
+                    return Err(StratumError::SecureHandshake(
+                        "noise remote static key missing".to_owned(),
+                    ));
+                }
+            }
+        }
+
+        let transport = state.into_transport_mode().map_err(|e| {
+            StratumError::SecureHandshake(format!("noise initiator transport upgrade failed: {e}"))
+        })?;
+        Ok(Self {
+            transport,
+            rekey_interval_messages: DEFAULT_SECURE_REKEY_INTERVAL_MESSAGES,
+            sent_messages: 0,
+            received_messages: 0,
+        })
+    }
+
+    pub fn handshake_server<IO: Read + Write>(
+        io: &mut IO,
+        local_static_private_key: Option<[u8; 32]>,
+        expected_remote_static_public_key: Option<[u8; 32]>,
+    ) -> Result<Self, StratumError> {
+        let local_static = resolve_noise_private_key(local_static_private_key)?;
+        let mut state = build_noise_handshake_state(false, local_static)?;
+        let mut out_buf = vec![0u8; NOISE_HANDSHAKE_MAX_PACKET_SIZE];
+        let mut in_buf = vec![0u8; NOISE_HANDSHAKE_MAX_PACKET_SIZE];
+
+        let first = read_noise_handshake_packet(io)?;
+        state.read_message(&first, &mut in_buf).map_err(|e| {
+            StratumError::SecureHandshake(format!("noise responder read m1 failed: {e}"))
+        })?;
+
+        let second_len = state.write_message(&[], &mut out_buf).map_err(|e| {
+            StratumError::SecureHandshake(format!("noise responder write m2 failed: {e}"))
+        })?;
+        write_noise_handshake_packet(io, &out_buf[..second_len])?;
+
+        let third = read_noise_handshake_packet(io)?;
+        state.read_message(&third, &mut in_buf).map_err(|e| {
+            StratumError::SecureHandshake(format!("noise responder read m3 failed: {e}"))
+        })?;
+
+        if let Some(expected) = expected_remote_static_public_key {
+            match state.get_remote_static() {
+                Some(remote) if remote == expected => {}
+                Some(_) => {
+                    return Err(StratumError::SecureHandshake(
+                        "noise remote static key mismatch".to_owned(),
+                    ));
+                }
+                None => {
+                    return Err(StratumError::SecureHandshake(
+                        "noise remote static key missing".to_owned(),
+                    ));
+                }
+            }
+        }
+
+        let transport = state.into_transport_mode().map_err(|e| {
+            StratumError::SecureHandshake(format!("noise responder transport upgrade failed: {e}"))
+        })?;
+        Ok(Self {
+            transport,
+            rekey_interval_messages: DEFAULT_SECURE_REKEY_INTERVAL_MESSAGES,
+            sent_messages: 0,
+            received_messages: 0,
+        })
+    }
+
+    pub fn set_rekey_interval_messages(&mut self, interval: u64) -> Result<(), StratumError> {
+        if interval == 0 {
+            return Err(StratumError::InvalidConfig(
+                "secure rekey interval must be > 0".to_owned(),
+            ));
+        }
+        self.rekey_interval_messages = interval;
+        Ok(())
+    }
+
+    pub fn write_message<W: Write>(
+        &mut self,
+        writer: &mut W,
+        message: &Sv2Message,
+    ) -> Result<(), StratumError> {
+        let mut plaintext = Vec::new();
+        write_frame(&mut plaintext, message)?;
+
+        let mut ciphertext = vec![0u8; plaintext.len() + 64];
+        let encrypted_len = self
+            .transport
+            .write_message(&plaintext, &mut ciphertext)
+            .map_err(|e| StratumError::SecureTransport(format!("noise encrypt failed: {e}")))?;
+        ciphertext.truncate(encrypted_len);
+        if ciphertext.len() > SECURE_MAX_FRAME_SIZE {
+            return Err(StratumError::FrameTooLarge {
+                got: ciphertext.len(),
+                max: SECURE_MAX_FRAME_SIZE,
+            });
+        }
+
+        let len = u32::try_from(ciphertext.len()).map_err(|_| StratumError::FrameTooLarge {
+            got: ciphertext.len(),
+            max: SECURE_MAX_FRAME_SIZE,
+        })?;
+        writer
+            .write_all(&len.to_le_bytes())
+            .map_err(StratumError::Io)?;
+        writer.write_all(&ciphertext).map_err(StratumError::Io)?;
+        writer.flush().map_err(StratumError::Io)?;
+        self.sent_messages = self.sent_messages.saturating_add(1);
+        self.maybe_rekey_outgoing()
+    }
+
+    pub fn read_message<R: Read>(
+        &mut self,
+        reader: &mut R,
+    ) -> Result<Option<Sv2Message>, StratumError> {
+        let mut first = [0u8; 1];
+        match reader.read(&mut first) {
+            Ok(0) => return Ok(None),
+            Ok(1) => {}
+            Ok(_) => unreachable!(),
+            Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(err) => return Err(StratumError::Io(err)),
+        }
+
+        let mut rest = [0u8; 3];
+        reader.read_exact(&mut rest).map_err(StratumError::Io)?;
+        let len = u32::from_le_bytes([first[0], rest[0], rest[1], rest[2]]) as usize;
+        if len == 0 {
+            return Err(StratumError::InvalidFrameLength(0));
+        }
+        if len > SECURE_MAX_FRAME_SIZE {
+            return Err(StratumError::FrameTooLarge {
+                got: len,
+                max: SECURE_MAX_FRAME_SIZE,
+            });
+        }
+
+        let mut ciphertext = vec![0u8; len];
+        reader
+            .read_exact(&mut ciphertext)
+            .map_err(StratumError::Io)?;
+
+        let mut plaintext = vec![0u8; len];
+        let decrypted_len = self
+            .transport
+            .read_message(&ciphertext, &mut plaintext)
+            .map_err(|e| StratumError::SecureTransport(format!("noise decrypt failed: {e}")))?;
+        plaintext.truncate(decrypted_len);
+        self.received_messages = self.received_messages.saturating_add(1);
+        self.maybe_rekey_incoming()?;
+        decode_single_frame_bytes(&plaintext).map(Some)
+    }
+
+    fn maybe_rekey_outgoing(&mut self) -> Result<(), StratumError> {
+        if self.sent_messages < self.rekey_interval_messages {
+            return Ok(());
+        }
+        self.transport.rekey_outgoing();
+        self.sent_messages = 0;
+        Ok(())
+    }
+
+    fn maybe_rekey_incoming(&mut self) -> Result<(), StratumError> {
+        if self.received_messages < self.rekey_interval_messages {
+            return Ok(());
+        }
+        self.transport.rekey_incoming();
+        self.received_messages = 0;
+        Ok(())
+    }
+}
+
+fn parse_noise_params() -> Result<NoiseParams, StratumError> {
+    NOISE_PROTOCOL_XX
+        .parse()
+        .map_err(|e| StratumError::SecureTransport(format!("noise params parse failed: {e}")))
+}
+
+fn decode_noise_key_bytes(input: &[u8], label: &str) -> Result<[u8; 32], StratumError> {
+    let bytes: [u8; 32] = input.try_into().map_err(|_| {
+        StratumError::SecureTransport(format!("noise {label} key must be 32 bytes"))
+    })?;
+    Ok(bytes)
+}
+
+fn resolve_noise_private_key(
+    local_static_private_key: Option<[u8; 32]>,
+) -> Result<[u8; 32], StratumError> {
+    if let Some(private_key) = local_static_private_key {
+        return Ok(private_key);
+    }
+    Err(StratumError::InvalidConfig(
+        "noise_xx transport requires local static private key".to_owned(),
+    ))
+}
+
+fn build_noise_handshake_state(
+    initiator: bool,
+    local_private_key: [u8; 32],
+) -> Result<NoiseHandshakeState, StratumError> {
+    let params = parse_noise_params()?;
+    let builder = NoiseBuilder::new(params).local_private_key(&local_private_key);
+    if initiator {
+        builder.build_initiator().map_err(|e| {
+            StratumError::SecureHandshake(format!("noise build initiator failed: {e}"))
+        })
+    } else {
+        builder.build_responder().map_err(|e| {
+            StratumError::SecureHandshake(format!("noise build responder failed: {e}"))
+        })
+    }
+}
+
+fn write_noise_handshake_packet<IO: Write>(
+    io: &mut IO,
+    payload: &[u8],
+) -> Result<(), StratumError> {
+    if payload.is_empty() {
+        return Err(StratumError::SecureHandshake(
+            "noise handshake payload cannot be empty".to_owned(),
+        ));
+    }
+    if payload.len() > NOISE_HANDSHAKE_MAX_PACKET_SIZE {
+        return Err(StratumError::FrameTooLarge {
+            got: payload.len(),
+            max: NOISE_HANDSHAKE_MAX_PACKET_SIZE,
+        });
+    }
+    let len = u16::try_from(payload.len()).map_err(|_| StratumError::FrameTooLarge {
+        got: payload.len(),
+        max: NOISE_HANDSHAKE_MAX_PACKET_SIZE,
+    })?;
+    io.write_all(&len.to_le_bytes()).map_err(StratumError::Io)?;
+    io.write_all(payload).map_err(StratumError::Io)?;
+    io.flush().map_err(StratumError::Io)?;
+    Ok(())
+}
+
+fn read_noise_handshake_packet<IO: Read>(io: &mut IO) -> Result<Vec<u8>, StratumError> {
+    let mut len_buf = [0u8; 2];
+    io.read_exact(&mut len_buf).map_err(StratumError::Io)?;
+    let len = u16::from_le_bytes(len_buf) as usize;
+    if len == 0 {
+        return Err(StratumError::SecureHandshake(
+            "noise handshake payload cannot be empty".to_owned(),
+        ));
+    }
+    if len > NOISE_HANDSHAKE_MAX_PACKET_SIZE {
+        return Err(StratumError::FrameTooLarge {
+            got: len,
+            max: NOISE_HANDSHAKE_MAX_PACKET_SIZE,
+        });
+    }
+    let mut payload = vec![0u8; len];
+    io.read_exact(&mut payload).map_err(StratumError::Io)?;
+    Ok(payload)
+}
+
 fn encode_secure_handshake_packet(pubkey: &PublicKey) -> [u8; SECURE_HANDSHAKE_SIZE] {
     let mut packet = [0u8; SECURE_HANDSHAKE_SIZE];
     packet[..8].copy_from_slice(SECURE_HANDSHAKE_MAGIC);
@@ -1222,15 +1578,21 @@ pub enum StratumError {
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
+    #[cfg(unix)]
+    use std::os::unix::net::UnixStream;
+    #[cfg(unix)]
+    use std::thread;
+    #[cfg(unix)]
+    use std::time::Duration;
 
     use scam_core::{Hash256, Target};
     use secp256k1::{PublicKey, Secp256k1, SecretKey};
 
     use crate::{
-        IdentityTranslator, JobDeclarator, MiningJob, MiningTemplate, SUPPORTED_SV2_VERSION,
-        SecureRole, SecureSv2Transport, SequentialJobDeclarator, SessionConfig, SessionEvent,
-        ShareSubmission, ShareValidation, Sv2Message, Sv2Session, Translator,
-        decode_secure_handshake_packet, read_frame, validate_share, write_frame,
+        IdentityTranslator, JobDeclarator, MiningJob, MiningTemplate, NoiseSv2Transport,
+        SUPPORTED_SV2_VERSION, SecureRole, SecureSv2Transport, SequentialJobDeclarator,
+        SessionConfig, SessionEvent, ShareSubmission, ShareValidation, Sv2Message, Sv2Session,
+        Translator, decode_secure_handshake_packet, read_frame, validate_share, write_frame,
     };
 
     fn test_session_config() -> SessionConfig {
@@ -1250,6 +1612,24 @@ mod tests {
             vardiff_clamp_down: 0.25,
             max_rejected_shares: 3,
         }
+    }
+
+    #[cfg(unix)]
+    fn apply_test_socket_timeouts(stream: &UnixStream) -> bool {
+        let timeout = Some(Duration::from_millis(250));
+        if let Err(err) = stream.set_read_timeout(timeout) {
+            if err.kind() == std::io::ErrorKind::PermissionDenied {
+                return false;
+            }
+            panic!("set_read_timeout failed: {err}");
+        }
+        if let Err(err) = stream.set_write_timeout(timeout) {
+            if err.kind() == std::io::ErrorKind::PermissionDenied {
+                return false;
+            }
+            panic!("set_write_timeout failed: {err}");
+        }
+        true
     }
 
     #[test]
@@ -1523,6 +1903,104 @@ mod tests {
                 .expect("msg");
             assert_eq!(decoded, Sv2Message::KeepAlive);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn noise_transport_handshake_and_encrypted_roundtrip() {
+        let client_private = [1u8; 32];
+        let server_private = [2u8; 32];
+        let (mut client_io, mut server_io) = UnixStream::pair().expect("unix pair");
+        if !apply_test_socket_timeouts(&client_io) || !apply_test_socket_timeouts(&server_io) {
+            return;
+        }
+
+        let server = thread::spawn(move || -> Result<(), crate::StratumError> {
+            let mut server =
+                NoiseSv2Transport::handshake_server(&mut server_io, Some(server_private), None)?;
+            let setup = server
+                .read_message(&mut server_io)?
+                .expect("server should receive setup");
+            match setup {
+                Sv2Message::SetupConnection { .. } => {}
+                other => panic!("unexpected setup message: {other:?}"),
+            }
+            server.write_message(&mut server_io, &Sv2Message::KeepAlive)?;
+            Ok(())
+        });
+
+        let mut client =
+            match NoiseSv2Transport::handshake_client(&mut client_io, Some(client_private), None) {
+                Ok(client) => client,
+                Err(crate::StratumError::Io(err))
+                    if err.kind() == std::io::ErrorKind::PermissionDenied =>
+                {
+                    let _ = server.join();
+                    return;
+                }
+                Err(other) => panic!("client handshake: {other}"),
+            };
+        client
+            .write_message(
+                &mut client_io,
+                &Sv2Message::SetupConnection {
+                    protocol: 2,
+                    min_version: SUPPORTED_SV2_VERSION,
+                    max_version: SUPPORTED_SV2_VERSION,
+                    flags: 0,
+                    user_agent: "noise-test".to_owned(),
+                },
+            )
+            .expect("client write");
+        let keepalive = client
+            .read_message(&mut client_io)
+            .expect("client read")
+            .expect("keepalive");
+        assert_eq!(keepalive, Sv2Message::KeepAlive);
+        server.join().expect("server thread").expect("server ok");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn noise_transport_rekeys_after_interval() {
+        let client_private = [3u8; 32];
+        let server_private = [4u8; 32];
+        let (mut client_io, mut server_io) = UnixStream::pair().expect("unix pair");
+        if !apply_test_socket_timeouts(&client_io) || !apply_test_socket_timeouts(&server_io) {
+            return;
+        }
+
+        let server = thread::spawn(move || -> Result<(), crate::StratumError> {
+            let mut server =
+                NoiseSv2Transport::handshake_server(&mut server_io, Some(server_private), None)?;
+            server.set_rekey_interval_messages(2)?;
+            for _ in 0..6 {
+                let msg = server.read_message(&mut server_io)?.expect("message");
+                assert_eq!(msg, Sv2Message::KeepAlive);
+            }
+            Ok(())
+        });
+
+        let mut client =
+            match NoiseSv2Transport::handshake_client(&mut client_io, Some(client_private), None) {
+                Ok(client) => client,
+                Err(crate::StratumError::Io(err))
+                    if err.kind() == std::io::ErrorKind::PermissionDenied =>
+                {
+                    let _ = server.join();
+                    return;
+                }
+                Err(other) => panic!("client handshake: {other}"),
+            };
+        client
+            .set_rekey_interval_messages(2)
+            .expect("client rekey cfg");
+        for _ in 0..6 {
+            client
+                .write_message(&mut client_io, &Sv2Message::KeepAlive)
+                .expect("write keepalive");
+        }
+        server.join().expect("server thread").expect("server ok");
     }
 
     #[test]

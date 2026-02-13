@@ -1,9 +1,9 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -30,10 +30,10 @@ use scam_storage::{
     save_chain_archive_db, save_peer_book_db, save_snapshot, save_snapshot_db,
 };
 use scam_stratum::{
-    IdentityTranslator, JobDeclarator, MiningJob, MiningTemplate, SUPPORTED_SV2_VERSION,
-    SecureSv2Transport, SequentialJobDeclarator, SessionConfig as Sv2SessionConfig, SessionEvent,
-    Sv2Message, Sv2Session, Translator, read_frame as read_sv2_frame,
-    write_frame as write_sv2_frame,
+    IdentityTranslator, JobDeclarator, MiningJob, MiningTemplate, NoiseSv2Transport,
+    SUPPORTED_SV2_VERSION, SecureSv2Transport, SecureTransportMode, SequentialJobDeclarator,
+    SessionConfig as Sv2SessionConfig, SessionEvent, Sv2Message, Sv2Session, Translator,
+    generate_noise_static_keypair, read_frame as read_sv2_frame, write_frame as write_sv2_frame,
 };
 use scam_wallet::{
     AddressError, DeriveKeyError, MnemonicError, QrError, RescanError, SchnorrError, WalletKey,
@@ -41,7 +41,8 @@ use scam_wallet::{
     load_wallet_vault, new_encrypted_wallet_vault, new_mnemonic, parse_address, qr_for_payment_uri,
     rescan_blocks, save_wallet_vault, sign_digest, to_address, verify_digest,
 };
-use serde::Serialize;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 #[derive(Debug, Parser)]
@@ -78,11 +79,18 @@ enum Command {
     NetDemo(NetDemoArgs),
     SyncPeer(SyncPeerArgs),
     SyncBook(SyncBookArgs),
+    RelayServe(RelayServeArgs),
     ReindexRuntime(ReindexRuntimeArgs),
     Soak(SoakArgs),
     ReorgDemo(ReorgDemoArgs),
+    Sv2TemplateProvider(Sv2TemplateProviderArgs),
+    Sv2JobDeclarator(Sv2JobDeclaratorArgs),
+    Sv2Translator(Sv2TranslatorArgs),
     StratumServe(StratumServeArgs),
     StratumMine(StratumMineArgs),
+    StratumKeygen(StratumKeygenArgs),
+    StratumKeyRotate(StratumKeyRotateArgs),
+    Sv2Conformance(Sv2ConformanceArgs),
     RpcServe(RpcServeArgs),
     Snapshot(SnapshotArgs),
     P2pDemo,
@@ -182,6 +190,16 @@ struct ConfigScaffoldArgs {
     orphan_ttl_sec: u64,
     #[arg(long, default_value_t = 2)]
     p2p_max_outbound_per_bucket: u32,
+    #[arg(long, default_value_t = 2_000)]
+    p2p_max_inv_items: usize,
+    #[arg(long, default_value_t = 100)]
+    p2p_ban_threshold: u32,
+    #[arg(long, default_value_t = 60)]
+    p2p_replacement_window_sec: u64,
+    #[arg(long, default_value_t = 20)]
+    p2p_replacement_max_per_peer: usize,
+    #[arg(long, default_value_t = 25)]
+    p2p_replacement_penalty: u32,
     #[arg(long = "dns-seed")]
     dns_seeds: Vec<String>,
     #[arg(long, default_value_t = 100)]
@@ -225,6 +243,8 @@ struct ConfigScaffoldArgs {
     stratum_max_active_clients: usize,
     #[arg(long, default_value_t = false)]
     stratum_secure_transport: bool,
+    #[arg(long, value_enum, default_value_t = SecureTransportModeArg::NoiseXx)]
+    stratum_secure_transport_mode: SecureTransportModeArg,
     #[arg(long, default_value_t = 10_000)]
     stratum_secure_rekey_interval_messages: u64,
     #[arg(long, default_value = "SCAM custom genesis block")]
@@ -369,6 +389,40 @@ struct ReindexRuntimeArgs {
 }
 
 #[derive(Debug, Args)]
+struct RelayServeArgs {
+    #[arg(long, value_enum, default_value_t = Network::Devnet)]
+    network: Network,
+    #[arg(long)]
+    config: Option<PathBuf>,
+    #[arg(long)]
+    runtime_db: Option<PathBuf>,
+    #[arg(long, default_value = "0.0.0.0:18444")]
+    bind: String,
+    #[arg(long, default_value_t = 0)]
+    max_clients: u32,
+    #[arg(long, default_value_t = 0)]
+    max_messages_per_peer: u32,
+    #[arg(long, default_value_t = 5)]
+    read_timeout_sec: u64,
+    #[arg(long, default_value_t = 5)]
+    write_timeout_sec: u64,
+    #[arg(long)]
+    max_inv_items: Option<usize>,
+    #[arg(long)]
+    ban_threshold: Option<u32>,
+    #[arg(long)]
+    replacement_window_sec: Option<u64>,
+    #[arg(long)]
+    replacement_max_per_peer: Option<usize>,
+    #[arg(long)]
+    replacement_penalty: Option<u32>,
+    #[arg(long)]
+    telemetry_out: Option<PathBuf>,
+    #[arg(long, default_value_t = 30)]
+    telemetry_every_sec: u64,
+}
+
+#[derive(Debug, Args)]
 struct SoakArgs {
     #[arg(long, value_enum, default_value_t = Network::Devnet)]
     network: Network,
@@ -429,6 +483,38 @@ struct ReorgDemoArgs {
 }
 
 #[derive(Debug, Args)]
+struct Sv2TemplateProviderArgs {
+    #[arg(long, default_value = "127.0.0.1:3550")]
+    bind: String,
+    #[arg(long, default_value_t = 0)]
+    max_requests: u32,
+    #[arg(long)]
+    telemetry_out: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct Sv2JobDeclaratorArgs {
+    #[arg(long, default_value = "127.0.0.1:3551")]
+    bind: String,
+    #[arg(long, default_value_t = 0)]
+    max_requests: u32,
+    #[arg(long, default_value_t = 0)]
+    start_job_id: u32,
+    #[arg(long)]
+    telemetry_out: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct Sv2TranslatorArgs {
+    #[arg(long, default_value = "127.0.0.1:3552")]
+    bind: String,
+    #[arg(long, default_value_t = 0)]
+    max_requests: u32,
+    #[arg(long)]
+    telemetry_out: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
 struct StratumServeArgs {
     #[arg(long, value_enum, default_value_t = Network::Devnet)]
     network: Network,
@@ -468,8 +554,18 @@ struct StratumServeArgs {
     max_share_target_hex: Option<String>,
     #[arg(long, default_value_t = false)]
     secure_transport: bool,
+    #[arg(long, value_enum)]
+    secure_transport_mode: Option<SecureTransportModeArg>,
     #[arg(long)]
     secure_rekey_interval_messages: Option<u64>,
+    #[arg(long)]
+    secure_static_secret_key_hex: Option<String>,
+    #[arg(long)]
+    secure_expected_remote_static_pubkey_hex: Option<String>,
+    #[arg(long)]
+    template_provider_addr: Option<String>,
+    #[arg(long)]
+    job_declarator_addr: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -488,8 +584,62 @@ struct StratumMineArgs {
     max_runtime_sec: u64,
     #[arg(long, default_value_t = false)]
     secure_transport: bool,
+    #[arg(long, value_enum)]
+    secure_transport_mode: Option<SecureTransportModeArg>,
     #[arg(long, default_value_t = 10_000)]
     secure_rekey_interval_messages: u64,
+    #[arg(long)]
+    secure_static_secret_key_hex: Option<String>,
+    #[arg(long)]
+    secure_expected_remote_static_pubkey_hex: Option<String>,
+    #[arg(long)]
+    translator_addr: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct StratumKeygenArgs {
+    #[arg(long, default_value = "data/stratum-keys/server.secret.hex")]
+    secret_out: PathBuf,
+    #[arg(long, default_value = "data/stratum-keys/server.public.hex")]
+    public_out: PathBuf,
+    #[arg(long, default_value_t = false)]
+    force: bool,
+}
+
+#[derive(Debug, Args)]
+struct StratumKeyRotateArgs {
+    #[arg(long, default_value = "data/stratum-keys/server.secret.hex")]
+    secret_path: PathBuf,
+    #[arg(long, default_value = "data/stratum-keys/server.public.hex")]
+    public_path: PathBuf,
+    #[arg(long, default_value = "data/stratum-keys/archive")]
+    archive_dir: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct Sv2ConformanceArgs {
+    #[arg(long)]
+    pool: String,
+    #[arg(long, default_value = "scam-conformance")]
+    user: String,
+    #[arg(long, default_value_t = 3)]
+    read_timeout_sec: u64,
+    #[arg(long, default_value_t = false)]
+    secure_transport: bool,
+    #[arg(long, value_enum)]
+    secure_transport_mode: Option<SecureTransportModeArg>,
+    #[arg(long, default_value_t = 10_000)]
+    secure_rekey_interval_messages: u64,
+    #[arg(long)]
+    secure_static_secret_key_hex: Option<String>,
+    #[arg(long)]
+    secure_expected_remote_static_pubkey_hex: Option<String>,
+    #[arg(long)]
+    corpus: Option<PathBuf>,
+    #[arg(long)]
+    out: Option<PathBuf>,
+    #[arg(long)]
+    stack_name: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -766,12 +916,27 @@ enum DifficultyAlgoArg {
     Asert,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum SecureTransportModeArg {
+    Legacy,
+    NoiseXx,
+}
+
 impl From<DifficultyAlgoArg> for DifficultyAlgorithm {
     fn from(value: DifficultyAlgoArg) -> Self {
         match value {
             DifficultyAlgoArg::Windowed => DifficultyAlgorithm::Windowed,
             DifficultyAlgoArg::Lwma => DifficultyAlgorithm::Lwma,
             DifficultyAlgoArg::Asert => DifficultyAlgorithm::Asert,
+        }
+    }
+}
+
+impl From<SecureTransportModeArg> for SecureTransportMode {
+    fn from(value: SecureTransportModeArg) -> Self {
+        match value {
+            SecureTransportModeArg::Legacy => SecureTransportMode::Legacy,
+            SecureTransportModeArg::NoiseXx => SecureTransportMode::NoiseXx,
         }
     }
 }
@@ -799,6 +964,12 @@ fn accepted_hrps_for_network(network: Network, configured_hrp: &str) -> Vec<Stri
         }
     }
     out
+}
+
+fn parse_secure_transport_mode(value: &str) -> Result<SecureTransportMode, NodeError> {
+    value
+        .parse::<SecureTransportMode>()
+        .map_err(|e| NodeError::Runtime(format!("invalid secure transport mode '{value}': {e}")))
 }
 
 #[derive(Debug, Error)]
@@ -993,6 +1164,16 @@ fn decode_fixed_hex<const N: usize>(field: &'static str, raw: &str) -> Result<[u
     Ok(out)
 }
 
+fn decode_optional_hex32(
+    field: &'static str,
+    value: &Option<String>,
+) -> Result<Option<[u8; 32]>, NodeError> {
+    match value {
+        Some(raw) => Ok(Some(decode_fixed_hex::<32>(field, raw)?)),
+        None => Ok(None),
+    }
+}
+
 fn run_status(args: StatusArgs) -> Result<(), NodeError> {
     let (cfg, runtime) = build_runtime_for_query(
         args.network,
@@ -1133,6 +1314,11 @@ fn run_config_scaffold(args: ConfigScaffoldArgs) -> Result<(), NodeError> {
         orphan_ttl_sec: args.orphan_ttl_sec,
         p2p_max_outbound_per_bucket: args.p2p_max_outbound_per_bucket,
         dns_seeds: args.dns_seeds.clone(),
+        p2p_max_inv_items: args.p2p_max_inv_items,
+        p2p_ban_threshold: args.p2p_ban_threshold,
+        p2p_replacement_window_sec: args.p2p_replacement_window_sec,
+        p2p_replacement_max_per_peer: args.p2p_replacement_max_per_peer,
+        p2p_replacement_penalty: args.p2p_replacement_penalty,
         coinbase_maturity: args.coinbase_maturity,
         block_subsidy: args.block_subsidy,
         hrp: args.hrp.clone(),
@@ -1150,6 +1336,11 @@ fn run_config_scaffold(args: ConfigScaffoldArgs) -> Result<(), NodeError> {
         stratum_max_jobs_per_channel: args.stratum_max_jobs_per_channel,
         stratum_max_active_clients: args.stratum_max_active_clients,
         stratum_secure_transport: args.stratum_secure_transport,
+        stratum_secure_transport_mode: SecureTransportMode::from(
+            args.stratum_secure_transport_mode,
+        )
+        .as_str()
+        .to_owned(),
         stratum_secure_rekey_interval_messages: args.stratum_secure_rekey_interval_messages,
         genesis_message: args.genesis_message.clone(),
         genesis_timestamp,
@@ -1174,6 +1365,10 @@ fn run_config_scaffold(args: ConfigScaffoldArgs) -> Result<(), NodeError> {
         cfg.difficulty_algorithm, cfg.difficulty_adjustment_window, cfg.asert_half_life_sec
     );
     println!("Stratum secure transport: {}", cfg.stratum_secure_transport);
+    println!(
+        "Stratum secure transport mode: {}",
+        cfg.stratum_secure_transport_mode
+    );
     println!(
         "Stratum secure rekey interval (messages): {}",
         cfg.stratum_secure_rekey_interval_messages
@@ -2918,6 +3113,488 @@ fn run_sync_book(args: SyncBookArgs) -> Result<(), NodeError> {
     Ok(())
 }
 
+struct RelayServerState {
+    runtime: ChainRuntime,
+    relay: RelayAdmissionState,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RelayServerTelemetrySnapshot {
+    timestamp_unix_sec: u64,
+    active_peers: usize,
+    tip_height: u64,
+    tip_hash: String,
+    mempool_len: usize,
+    orphan_pool_len: usize,
+    mempool_inserted_total: u64,
+    mempool_replaced_total: u64,
+    mempool_removed_by_replacement_total: u64,
+    mempool_rejected_conflict_total: u64,
+    orphan_accepted_total: u64,
+    orphan_evicted_total: u64,
+    orphan_expired_total: u64,
+    orphan_promoted_total: u64,
+    gossip_replacement_rate_limited_total: u64,
+}
+
+fn relay_fee_hint(tx: &Transaction) -> u64 {
+    let txid = tx.txid();
+    let mut hint = [0u8; 8];
+    hint.copy_from_slice(&txid.0[..8]);
+    u64::from_be_bytes(hint).saturating_add(1)
+}
+
+fn relay_server_snapshot(
+    state: &RelayServerState,
+    active_peers: usize,
+    now_unix_sec: u64,
+) -> RelayServerTelemetrySnapshot {
+    let mem = state.relay.mempool.telemetry();
+    let orphan = state.relay.orphan_pool.telemetry();
+    let gossip = state.relay.gossip.telemetry();
+    RelayServerTelemetrySnapshot {
+        timestamp_unix_sec: now_unix_sec,
+        active_peers,
+        tip_height: state.runtime.tip_height(),
+        tip_hash: state.runtime.tip_hash().to_hex(),
+        mempool_len: state.relay.mempool.len(),
+        orphan_pool_len: state.relay.orphan_pool.len(),
+        mempool_inserted_total: mem.accepted_total,
+        mempool_replaced_total: mem.replaced_total,
+        mempool_removed_by_replacement_total: mem.removed_by_replacement_total,
+        mempool_rejected_conflict_total: mem.rejected_conflict_total,
+        orphan_accepted_total: orphan.accepted_total,
+        orphan_evicted_total: orphan.evicted_total,
+        orphan_expired_total: orphan.expired_total,
+        orphan_promoted_total: orphan.promoted_total,
+        gossip_replacement_rate_limited_total: gossip.replacement_rate_limited_total,
+    }
+}
+
+fn append_relay_telemetry_snapshot(
+    path: &Path,
+    snapshot: &RelayServerTelemetrySnapshot,
+) -> Result<(), NodeError> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).map_err(|e| {
+            NodeError::Runtime(format!(
+                "cannot create relay telemetry directory {}: {e}",
+                parent.display()
+            ))
+        })?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| {
+            NodeError::Runtime(format!(
+                "cannot open relay telemetry output {}: {e}",
+                path.display()
+            ))
+        })?;
+    let line = serde_json::to_string(snapshot)
+        .map_err(|e| NodeError::Runtime(format!("cannot encode relay telemetry json: {e}")))?;
+    file.write_all(line.as_bytes()).map_err(|e| {
+        NodeError::Runtime(format!(
+            "cannot write relay telemetry output {}: {e}",
+            path.display()
+        ))
+    })?;
+    file.write_all(b"\n").map_err(|e| {
+        NodeError::Runtime(format!(
+            "cannot finalize relay telemetry output {}: {e}",
+            path.display()
+        ))
+    })?;
+    Ok(())
+}
+
+fn append_jsonl_record<T: Serialize>(
+    path: &Path,
+    record: &T,
+    context: &str,
+) -> Result<(), NodeError> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).map_err(|e| {
+            NodeError::Runtime(format!(
+                "cannot create {} telemetry directory {}: {e}",
+                context,
+                parent.display()
+            ))
+        })?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| {
+            NodeError::Runtime(format!(
+                "cannot open {} telemetry output {}: {e}",
+                context,
+                path.display()
+            ))
+        })?;
+    let line = serde_json::to_string(record).map_err(|e| {
+        NodeError::Runtime(format!("cannot encode {} telemetry json: {e}", context))
+    })?;
+    file.write_all(line.as_bytes()).map_err(|e| {
+        NodeError::Runtime(format!(
+            "cannot write {} telemetry output {}: {e}",
+            context,
+            path.display()
+        ))
+    })?;
+    file.write_all(b"\n").map_err(|e| {
+        NodeError::Runtime(format!(
+            "cannot finalize {} telemetry output {}: {e}",
+            context,
+            path.display()
+        ))
+    })?;
+    Ok(())
+}
+
+fn append_role_service_telemetry(
+    path: &Path,
+    role: &str,
+    requests_total: u64,
+    success_total: u64,
+    error_total: u64,
+) -> Result<(), NodeError> {
+    let snapshot = RoleServiceTelemetry {
+        timestamp_unix_sec: current_unix_sec()?,
+        role: role.to_owned(),
+        requests_total,
+        success_total,
+        error_total,
+    };
+    append_jsonl_record(path, &snapshot, "role-service")
+}
+
+fn process_relay_wire_message(
+    state: &mut RelayServerState,
+    peer_id: u64,
+    message: WireMessage,
+    now_unix_sec: u64,
+) -> Result<Vec<WireMessage>, NodeError> {
+    match message {
+        WireMessage::Ping { nonce } => Ok(vec![WireMessage::Pong { nonce }]),
+        WireMessage::Version { .. } => Ok(vec![WireMessage::Verack]),
+        WireMessage::Verack | WireMessage::Pong { .. } | WireMessage::Headers { .. } => {
+            Ok(Vec::new())
+        }
+        WireMessage::GetHeaders { locator, stop } => {
+            let mut headers_by_hash = HashMap::new();
+            for hash in state.runtime.block_hashes() {
+                if let Some(header) = state.runtime.header_by_hash(hash) {
+                    headers_by_hash.insert(*hash, header.clone());
+                }
+            }
+            let headers = select_headers_for_peer(
+                state.runtime.block_hashes(),
+                &headers_by_hash,
+                &locator,
+                stop,
+                2_000,
+            );
+            Ok(vec![WireMessage::Headers { headers }])
+        }
+        WireMessage::GetBlocks { locator, stop } => {
+            let hashes =
+                select_block_hashes_for_peer(state.runtime.block_hashes(), &locator, stop, 2_000);
+            let items = hashes.into_iter().map(InventoryItem::Block).collect();
+            Ok(vec![WireMessage::Inv { items }])
+        }
+        WireMessage::GetData { items } => {
+            let mut out = Vec::<WireMessage>::new();
+            let mut not_found = Vec::<InventoryItem>::new();
+            for item in items {
+                match item {
+                    InventoryItem::Tx(txid) => {
+                        if let Some(tx) = state.relay.mempool.get(&txid).cloned() {
+                            out.push(WireMessage::Tx { tx });
+                        } else {
+                            not_found.push(InventoryItem::Tx(txid));
+                        }
+                    }
+                    InventoryItem::Block(hash) => {
+                        if let Some(block) = state.runtime.block_by_hash(&hash).cloned() {
+                            out.push(WireMessage::Block { block });
+                        } else {
+                            not_found.push(InventoryItem::Block(hash));
+                        }
+                    }
+                }
+            }
+            if !not_found.is_empty() {
+                out.push(WireMessage::NotFound { items: not_found });
+            }
+            Ok(out)
+        }
+        WireMessage::Inv { items } => {
+            let outbound = state
+                .relay
+                .gossip
+                .on_message(peer_id, WireMessage::Inv { items })?;
+            Ok(outbound
+                .into_iter()
+                .filter(|msg| msg.peer_id == peer_id)
+                .map(|msg| msg.message)
+                .collect())
+        }
+        WireMessage::Tx { tx } => {
+            let txid = tx.txid();
+            let fee_hint = relay_fee_hint(&tx);
+            match admit_peer_tx_into_relay(
+                &mut state.relay,
+                &state.runtime,
+                peer_id,
+                tx,
+                fee_hint,
+                now_unix_sec,
+            ) {
+                Ok(()) => Ok(vec![WireMessage::Inv {
+                    items: vec![InventoryItem::Tx(txid)],
+                }]),
+                Err(NodeError::Gossip(GossipError::ReplacementRateLimited { .. })) => {
+                    Ok(vec![WireMessage::NotFound {
+                        items: vec![InventoryItem::Tx(txid)],
+                    }])
+                }
+                Err(NodeError::Mempool(MempoolError::FeeTooLow { .. })) => Ok(Vec::new()),
+                Err(err) => Err(err),
+            }
+        }
+        WireMessage::Block { block } => {
+            let txids = block
+                .transactions
+                .iter()
+                .map(|tx| tx.txid())
+                .collect::<Vec<_>>();
+            match state.runtime.submit_block(block.clone()) {
+                Ok(_) => {
+                    let _ = state.relay.mempool.remove_confirmed_txids(&txids);
+                    let _ = state.relay.gossip.announce_block(block);
+                    Ok(Vec::new())
+                }
+                Err(err) => Err(NodeError::Chain(err)),
+            }
+        }
+        WireMessage::NotFound { .. } => Ok(Vec::new()),
+    }
+}
+
+fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
+    let config_path = args
+        .config
+        .unwrap_or_else(|| PathBuf::from(format!("config/{}.toml", args.network.as_str())));
+    let cfg = load_chain_config(&config_path)?;
+    let runtime_db_path = args
+        .runtime_db
+        .unwrap_or_else(|| default_runtime_db_path(args.network));
+    let (runtime, source) = load_runtime_from_db_or_genesis(&cfg, &runtime_db_path)?;
+
+    let max_inv_items = args.max_inv_items.unwrap_or(cfg.p2p_max_inv_items).max(1);
+    let ban_threshold = args.ban_threshold.unwrap_or(cfg.p2p_ban_threshold).max(1);
+    let replacement = ReplacementRateLimit {
+        window_sec: args
+            .replacement_window_sec
+            .unwrap_or(cfg.p2p_replacement_window_sec)
+            .max(1),
+        max_replacements: args
+            .replacement_max_per_peer
+            .unwrap_or(cfg.p2p_replacement_max_per_peer)
+            .max(1),
+        penalty: args
+            .replacement_penalty
+            .unwrap_or(cfg.p2p_replacement_penalty)
+            .max(1),
+    };
+    let relay = RelayAdmissionState {
+        mempool: Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)?,
+        orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)?,
+        gossip: GossipEngine::with_limits_and_replacement(
+            max_inv_items,
+            ban_threshold,
+            replacement,
+        )?,
+    };
+    let state = Arc::new(Mutex::new(RelayServerState { runtime, relay }));
+    let active_peers = Arc::new(Mutex::new(0usize));
+    let next_peer_id = Arc::new(AtomicU64::new(0));
+
+    let listener = TcpListener::bind(&args.bind)
+        .map_err(|e| NodeError::Runtime(format!("relay bind failed on {}: {e}", args.bind)))?;
+    println!(
+        "P2P relay serving on {} network={} source={} (tx mempool admission active)",
+        args.bind, cfg.network_id, source
+    );
+    println!(
+        "Relay policy: max_inv_items={} ban_threshold={} replacement_window={}s replacement_max_per_peer={} replacement_penalty={}",
+        max_inv_items,
+        ban_threshold,
+        replacement.window_sec,
+        replacement.max_replacements,
+        replacement.penalty
+    );
+
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let telemetry_handle = if let Some(path) = args.telemetry_out.clone() {
+        let path_clone = path.clone();
+        let state_clone = state.clone();
+        let active_clone = active_peers.clone();
+        let stop_clone = stop_flag.clone();
+        let every_sec = args.telemetry_every_sec.max(1);
+        Some(thread::spawn(move || {
+            while !stop_clone.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_secs(every_sec));
+                let now = match current_unix_sec() {
+                    Ok(now) => now,
+                    Err(_) => continue,
+                };
+                let peers = match active_clone.lock() {
+                    Ok(guard) => *guard,
+                    Err(_) => continue,
+                };
+                let snapshot = match state_clone.lock() {
+                    Ok(guard) => relay_server_snapshot(&guard, peers, now),
+                    Err(_) => continue,
+                };
+                let _ = append_relay_telemetry_snapshot(&path_clone, &snapshot);
+            }
+        }))
+    } else {
+        None
+    };
+
+    let mut served = 0u32;
+    let mut handles = Vec::new();
+    for incoming in listener.incoming() {
+        let mut stream =
+            incoming.map_err(|e| NodeError::Runtime(format!("relay accept failed: {e}")))?;
+        configure_stream_timeouts_with(
+            &stream,
+            Duration::from_secs(args.read_timeout_sec.max(1)),
+            Duration::from_secs(args.write_timeout_sec.max(1)),
+        )?;
+        let peer_id = next_peer_id
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        let state_clone = state.clone();
+        let active_clone = active_peers.clone();
+        let cfg_clone = cfg.clone();
+        let read_limit = args.max_messages_per_peer;
+        handles.push(thread::spawn(move || -> Result<(), NodeError> {
+            let result = (|| -> Result<(), NodeError> {
+                {
+                    let mut active = active_clone.lock().map_err(|_| {
+                        NodeError::Runtime("relay active peer mutex poisoned".to_owned())
+                    })?;
+                    *active = active.saturating_add(1);
+                }
+
+                let framing = FramingConfig::default();
+                let local_hello = LocalHandshake {
+                    protocol_version: 1,
+                    network_id: cfg_clone.network_id.clone(),
+                    user_agent: "scam-node/relay-serve".to_owned(),
+                    start_height: 0,
+                };
+                let remote = server_handshake(&mut stream, &framing, &local_hello)?;
+                if remote.network_id != cfg_clone.network_id {
+                    return Err(NodeError::Runtime(format!(
+                        "relay peer network mismatch: expected {}, got {}",
+                        cfg_clone.network_id, remote.network_id
+                    )));
+                }
+                {
+                    let mut guard = state_clone
+                        .lock()
+                        .map_err(|_| NodeError::Runtime("relay state mutex poisoned".to_owned()))?;
+                    guard.relay.gossip.connect_peer(peer_id);
+                }
+
+                let mut seen = 0u32;
+                loop {
+                    if read_limit > 0 && seen >= read_limit {
+                        break;
+                    }
+                    let inbound = match read_message(&mut stream, &framing) {
+                        Ok(msg) => msg,
+                        Err(TransportError::Io(err))
+                            if matches!(
+                                err.kind(),
+                                std::io::ErrorKind::TimedOut
+                                    | std::io::ErrorKind::WouldBlock
+                                    | std::io::ErrorKind::Interrupted
+                                    | std::io::ErrorKind::UnexpectedEof
+                            ) =>
+                        {
+                            break;
+                        }
+                        Err(err) => return Err(NodeError::Transport(err)),
+                    };
+                    seen = seen.saturating_add(1);
+                    let now = current_unix_sec()?;
+                    let outbound = {
+                        let mut guard = state_clone.lock().map_err(|_| {
+                            NodeError::Runtime("relay state mutex poisoned".to_owned())
+                        })?;
+                        process_relay_wire_message(&mut guard, peer_id, inbound, now)?
+                    };
+                    for msg in outbound {
+                        send_message(&mut stream, &msg, &framing)?;
+                    }
+                    let banned = {
+                        let guard = state_clone.lock().map_err(|_| {
+                            NodeError::Runtime("relay state mutex poisoned".to_owned())
+                        })?;
+                        guard.relay.gossip.is_banned(peer_id)
+                    };
+                    if banned {
+                        break;
+                    }
+                }
+
+                Ok(())
+            })();
+
+            if let Ok(mut guard) = state_clone.lock() {
+                guard.relay.gossip.disconnect_peer(peer_id);
+            }
+            if let Ok(mut active) = active_clone.lock() {
+                *active = active.saturating_sub(1);
+            }
+            result
+        }));
+
+        served = served.saturating_add(1);
+        if args.max_clients > 0 && served >= args.max_clients {
+            break;
+        }
+    }
+
+    for handle in handles {
+        let result = handle
+            .join()
+            .map_err(|_| NodeError::Runtime("relay worker thread panicked".to_owned()))?;
+        if let Err(err) = result {
+            stop_flag.store(true, Ordering::Relaxed);
+            return Err(err);
+        }
+    }
+    stop_flag.store(true, Ordering::Relaxed);
+    if let Some(handle) = telemetry_handle {
+        let _ = handle.join();
+    }
+    Ok(())
+}
+
 fn run_reindex_runtime(args: ReindexRuntimeArgs) -> Result<(), NodeError> {
     let config_path = args
         .config
@@ -2986,7 +3663,7 @@ fn derive_soak_flow_keys() -> Result<(WalletKey, [u8; 20]), NodeError> {
     Ok((sender_key, recipient_key_hash20))
 }
 
-struct SoakRelayState {
+struct RelayAdmissionState {
     mempool: Mempool,
     orphan_pool: OrphanPool,
     gossip: GossipEngine,
@@ -3075,7 +3752,7 @@ fn detect_missing_outpoints(
 }
 
 fn admit_peer_tx_into_relay(
-    relay: &mut SoakRelayState,
+    relay: &mut RelayAdmissionState,
     runtime: &ChainRuntime,
     peer_id: u64,
     tx: Transaction,
@@ -3257,7 +3934,7 @@ fn run_soak(args: SoakArgs) -> Result<(), NodeError> {
         for peer_id in 1..=args.simulated_peers {
             gossip.connect_peer(peer_id as u64);
         }
-        Some(SoakRelayState {
+        Some(RelayAdmissionState {
             mempool: Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)?,
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)?,
             gossip,
@@ -3571,6 +4248,169 @@ fn run_reorg_demo(args: ReorgDemoArgs) -> Result<(), NodeError> {
     Ok(())
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct RpcMiningTemplate {
+    version: u32,
+    prev_hash_hex: String,
+    merkle_root_hex: String,
+    ntime: u64,
+    network_target_hex: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct TemplateProviderRequest {
+    channel_id: u32,
+    version: u32,
+    prev_hash_hex: String,
+    ntime: u64,
+    network_target_hex: String,
+    block_subsidy: u64,
+    reward_key_hash20_hex: String,
+    coinbase_label: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct TemplateProviderResponse {
+    template: RpcMiningTemplate,
+    coinbase_tx_hex: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct JobDeclaratorRequest {
+    channel_id: u32,
+    template: RpcMiningTemplate,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct JobDeclaratorResponse {
+    job_id: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct TranslatorRequest {
+    message: Sv2Message,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct TranslatorResponse {
+    job: Option<RpcMiningTemplateWithJob>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct RpcMiningTemplateWithJob {
+    channel_id: u32,
+    job_id: u32,
+    template: RpcMiningTemplate,
+}
+
+fn mining_template_to_rpc(template: &MiningTemplate) -> RpcMiningTemplate {
+    RpcMiningTemplate {
+        version: template.version,
+        prev_hash_hex: template.prev_hash.to_hex(),
+        merkle_root_hex: template.merkle_root.to_hex(),
+        ntime: template.ntime,
+        network_target_hex: template.network_target.to_hex(),
+    }
+}
+
+fn mining_template_from_rpc(template: RpcMiningTemplate) -> Result<MiningTemplate, NodeError> {
+    Ok(MiningTemplate {
+        version: template.version,
+        prev_hash: Hash256::from_hex(&template.prev_hash_hex)
+            .map_err(|e| NodeError::Runtime(format!("invalid prev_hash_hex: {e}")))?,
+        merkle_root: Hash256::from_hex(&template.merkle_root_hex)
+            .map_err(|e| NodeError::Runtime(format!("invalid merkle_root_hex: {e}")))?,
+        ntime: template.ntime,
+        network_target: Target::from_hex(&template.network_target_hex)
+            .map_err(|e| NodeError::Runtime(format!("invalid network_target_hex: {e}")))?,
+    })
+}
+
+fn call_json_role_service<Req, Resp>(addr: &str, request: &Req) -> Result<Resp, NodeError>
+where
+    Req: Serialize,
+    Resp: DeserializeOwned,
+{
+    let mut stream = TcpStream::connect(addr)
+        .map_err(|e| NodeError::Runtime(format!("connect to role service {addr} failed: {e}")))?;
+    configure_stream_timeouts_with(&stream, Duration::from_secs(3), Duration::from_secs(3))?;
+    let request_json = serde_json::to_string(request)
+        .map_err(|e| NodeError::Runtime(format!("cannot encode role request: {e}")))?;
+    stream
+        .write_all(request_json.as_bytes())
+        .map_err(|e| NodeError::Runtime(format!("role request write failed: {e}")))?;
+    stream
+        .write_all(b"\n")
+        .map_err(|e| NodeError::Runtime(format!("role request write failed: {e}")))?;
+    stream
+        .flush()
+        .map_err(|e| NodeError::Runtime(format!("role request flush failed: {e}")))?;
+
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    let bytes = reader
+        .read_line(&mut line)
+        .map_err(|e| NodeError::Runtime(format!("role response read failed: {e}")))?;
+    if bytes == 0 {
+        return Err(NodeError::Runtime(
+            "role service returned empty response".to_owned(),
+        ));
+    }
+    serde_json::from_str::<Resp>(line.trim_end())
+        .map_err(|e| NodeError::Runtime(format!("cannot decode role response: {e}")))
+}
+
+fn request_template_from_provider(
+    addr: &str,
+    request: &TemplateProviderRequest,
+) -> Result<StratumTemplateWork, NodeError> {
+    let response =
+        call_json_role_service::<TemplateProviderRequest, TemplateProviderResponse>(addr, request)?;
+    let template = mining_template_from_rpc(response.template)?;
+    let coinbase_bytes = hex::decode(response.coinbase_tx_hex)
+        .map_err(|e| NodeError::Runtime(format!("invalid coinbase_tx_hex from provider: {e}")))?;
+    let coinbase = bincode::deserialize::<Transaction>(&coinbase_bytes)
+        .map_err(|e| NodeError::Runtime(format!("invalid coinbase tx payload: {e}")))?;
+    Ok(StratumTemplateWork { template, coinbase })
+}
+
+fn request_job_id_from_declarator(
+    addr: &str,
+    channel_id: u32,
+    template: &MiningTemplate,
+) -> Result<u32, NodeError> {
+    let request = JobDeclaratorRequest {
+        channel_id,
+        template: mining_template_to_rpc(template),
+    };
+    let response =
+        call_json_role_service::<JobDeclaratorRequest, JobDeclaratorResponse>(addr, &request)?;
+    Ok(response.job_id)
+}
+
+fn translate_remote_job_with_service(
+    addr: &str,
+    message: Sv2Message,
+) -> Result<Option<MiningJob>, NodeError> {
+    let request = TranslatorRequest { message };
+    let response = call_json_role_service::<TranslatorRequest, TranslatorResponse>(addr, &request)?;
+    match response.job {
+        Some(job) => {
+            let template = mining_template_from_rpc(job.template)?;
+            Ok(Some(MiningJob {
+                channel_id: job.channel_id,
+                job_id: job.job_id,
+                version: template.version,
+                prev_hash: template.prev_hash,
+                merkle_root: template.merkle_root,
+                ntime: template.ntime,
+                network_target: template.network_target,
+            }))
+        }
+        None => Ok(None),
+    }
+}
+
 #[derive(Clone)]
 struct StratumTemplateWork {
     template: MiningTemplate,
@@ -3624,15 +4464,23 @@ impl StratumTemplateProvider for RuntimeTemplateProvider {
     }
 }
 
+enum StratumSecureTransport {
+    Legacy(SecureSv2Transport),
+    Noise(NoiseSv2Transport),
+}
+
 fn write_sv2_message(
     stream: &mut TcpStream,
-    secure: Option<&mut SecureSv2Transport>,
+    secure: Option<&mut StratumSecureTransport>,
     message: &Sv2Message,
 ) -> Result<(), NodeError> {
     match secure {
-        Some(transport) => transport
+        Some(StratumSecureTransport::Legacy(transport)) => transport
             .write_message(stream, message)
-            .map_err(|e| NodeError::Runtime(format!("stratum secure write failed: {e}"))),
+            .map_err(|e| NodeError::Runtime(format!("stratum secure(legacy) write failed: {e}"))),
+        Some(StratumSecureTransport::Noise(transport)) => transport
+            .write_message(stream, message)
+            .map_err(|e| NodeError::Runtime(format!("stratum secure(noise_xx) write failed: {e}"))),
         None => write_sv2_frame(stream, message)
             .map_err(|e| NodeError::Runtime(format!("stratum write failed: {e}"))),
     }
@@ -3646,10 +4494,11 @@ enum StratumReadOutcome {
 
 fn read_sv2_message(
     stream: &mut TcpStream,
-    secure: Option<&mut SecureSv2Transport>,
+    secure: Option<&mut StratumSecureTransport>,
 ) -> Result<StratumReadOutcome, NodeError> {
     let read_result = match secure {
-        Some(transport) => transport.read_message(stream),
+        Some(StratumSecureTransport::Legacy(transport)) => transport.read_message(stream),
+        Some(StratumSecureTransport::Noise(transport)) => transport.read_message(stream),
         None => read_sv2_frame(stream),
     };
     match read_result {
@@ -3691,7 +4540,12 @@ struct StratumServerContext {
     max_jobs_per_channel: usize,
     active_clients: Arc<Mutex<usize>>,
     secure_transport: bool,
+    secure_transport_mode: SecureTransportMode,
     secure_rekey_interval_messages: u64,
+    secure_static_private_key: Option<[u8; 32]>,
+    secure_expected_remote_static_public_key: Option<[u8; 32]>,
+    template_provider_addr: Option<String>,
+    job_declarator_addr: Option<String>,
 }
 
 fn lock_runtime<'a>(
@@ -3706,20 +4560,53 @@ fn issue_new_stratum_job(
     session: &mut Sv2Session,
     ctx: &StratumServerContext,
     stream: &mut TcpStream,
-    secure: &mut Option<SecureSv2Transport>,
+    secure: &mut Option<StratumSecureTransport>,
     jobs: &mut HashMap<u32, StratumWork>,
 ) -> Result<Hash256, NodeError> {
     let runtime = lock_runtime(&ctx.runtime)?;
     let tip_hash = runtime.tip_hash();
-    let template_work = ctx.template_provider.build_template(&runtime, &ctx.cfg)?;
+    let template_work = if let Some(addr) = &ctx.template_provider_addr {
+        let target = runtime.expected_target_for_next_block()?;
+        let request = TemplateProviderRequest {
+            channel_id: session.channel_id(),
+            version: 1,
+            prev_hash_hex: runtime.tip_hash().to_hex(),
+            ntime: runtime
+                .tip_header()
+                .timestamp
+                .saturating_add(ctx.cfg.target_block_time_sec),
+            network_target_hex: target.to_hex(),
+            block_subsidy: ctx.cfg.block_subsidy,
+            reward_key_hash20_hex: hex::encode(ctx.cfg.genesis_reward_key_hash20()?),
+            coinbase_label: format!(
+                "stratum-template-h{}",
+                runtime.tip_height().saturating_add(1)
+            ),
+        };
+        request_template_from_provider(addr, &request)?
+    } else {
+        ctx.template_provider.build_template(&runtime, &ctx.cfg)?
+    };
     drop(runtime);
 
-    let job = {
+    let template = template_work.template;
+    let job_id = if let Some(addr) = &ctx.job_declarator_addr {
+        request_job_id_from_declarator(addr, session.channel_id(), &template)?
+    } else {
         let mut declarator = ctx
             .job_declarator
             .lock()
             .map_err(|_| NodeError::Runtime("stratum job declarator mutex poisoned".to_owned()))?;
-        declarator.declare_standard_job(session.channel_id(), template_work.template)
+        declarator.next_job_id()
+    };
+    let job = MiningJob {
+        channel_id: session.channel_id(),
+        job_id,
+        version: template.version,
+        prev_hash: template.prev_hash,
+        merkle_root: template.merkle_root,
+        ntime: template.ntime,
+        network_target: template.network_target,
     };
     let work = StratumWork {
         job,
@@ -3744,13 +4631,40 @@ fn run_stratum_client(mut stream: TcpStream, ctx: StratumServerContext) -> Resul
     let read_timeout = Duration::from_secs(ctx.read_timeout_sec.max(1));
     configure_stream_timeouts_with(&stream, read_timeout, read_timeout)?;
     let mut secure_transport = if ctx.secure_transport {
-        let mut transport = SecureSv2Transport::handshake_server(&mut stream)
-            .map_err(|e| NodeError::Runtime(format!("stratum secure handshake failed: {e}")))?;
-        transport
-            .set_rekey_interval_messages(ctx.secure_rekey_interval_messages)
-            .map_err(|e| {
-                NodeError::Runtime(format!("stratum secure transport config failed: {e}"))
-            })?;
+        let transport = match ctx.secure_transport_mode {
+            SecureTransportMode::Legacy => {
+                let mut legacy =
+                    SecureSv2Transport::handshake_server(&mut stream).map_err(|e| {
+                        NodeError::Runtime(format!("stratum secure(legacy) handshake failed: {e}"))
+                    })?;
+                legacy
+                    .set_rekey_interval_messages(ctx.secure_rekey_interval_messages)
+                    .map_err(|e| {
+                        NodeError::Runtime(format!(
+                            "stratum secure(legacy) transport config failed: {e}"
+                        ))
+                    })?;
+                StratumSecureTransport::Legacy(legacy)
+            }
+            SecureTransportMode::NoiseXx => {
+                let mut noise = NoiseSv2Transport::handshake_server(
+                    &mut stream,
+                    ctx.secure_static_private_key,
+                    ctx.secure_expected_remote_static_public_key,
+                )
+                .map_err(|e| {
+                    NodeError::Runtime(format!("stratum secure(noise_xx) handshake failed: {e}"))
+                })?;
+                noise
+                    .set_rekey_interval_messages(ctx.secure_rekey_interval_messages)
+                    .map_err(|e| {
+                        NodeError::Runtime(format!(
+                            "stratum secure(noise_xx) transport config failed: {e}"
+                        ))
+                    })?;
+                StratumSecureTransport::Noise(noise)
+            }
+        };
         Some(transport)
     } else {
         None
@@ -3883,6 +4797,255 @@ fn run_stratum_client(mut stream: TcpStream, ctx: StratumServerContext) -> Resul
     Ok(())
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct RoleServiceTelemetry {
+    timestamp_unix_sec: u64,
+    role: String,
+    requests_total: u64,
+    success_total: u64,
+    error_total: u64,
+}
+
+fn read_role_request<T: DeserializeOwned>(stream: &mut TcpStream) -> Result<T, NodeError> {
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    let bytes = reader
+        .read_line(&mut line)
+        .map_err(|e| NodeError::Runtime(format!("role request read failed: {e}")))?;
+    if bytes == 0 {
+        return Err(NodeError::Runtime(
+            "role request stream closed without payload".to_owned(),
+        ));
+    }
+    serde_json::from_str::<T>(line.trim_end())
+        .map_err(|e| NodeError::Runtime(format!("role request decode failed: {e}")))
+}
+
+fn write_role_response<T: Serialize>(
+    stream: &mut TcpStream,
+    response: &T,
+) -> Result<(), NodeError> {
+    let body = serde_json::to_string(response)
+        .map_err(|e| NodeError::Runtime(format!("role response encode failed: {e}")))?;
+    stream
+        .write_all(body.as_bytes())
+        .map_err(|e| NodeError::Runtime(format!("role response write failed: {e}")))?;
+    stream
+        .write_all(b"\n")
+        .map_err(|e| NodeError::Runtime(format!("role response write failed: {e}")))?;
+    stream
+        .flush()
+        .map_err(|e| NodeError::Runtime(format!("role response flush failed: {e}")))
+}
+
+fn run_sv2_template_provider(args: Sv2TemplateProviderArgs) -> Result<(), NodeError> {
+    let listener = TcpListener::bind(&args.bind).map_err(|e| {
+        NodeError::Runtime(format!(
+            "sv2-template-provider bind failed on {}: {e}",
+            args.bind
+        ))
+    })?;
+    println!("SV2 template provider listening on {}", args.bind);
+
+    let mut served = 0u32;
+    let mut requests_total = 0u64;
+    let mut success_total = 0u64;
+    let mut error_total = 0u64;
+    for incoming in listener.incoming() {
+        let mut stream = incoming
+            .map_err(|e| NodeError::Runtime(format!("template provider accept failed: {e}")))?;
+        requests_total = requests_total.saturating_add(1);
+        let handled = (|| -> Result<(), NodeError> {
+            configure_stream_timeouts_with(
+                &stream,
+                Duration::from_secs(3),
+                Duration::from_secs(3),
+            )?;
+            let request: TemplateProviderRequest = read_role_request(&mut stream)?;
+            let reward_key_hash20 =
+                decode_fixed_hex::<20>("reward_key_hash20_hex", &request.reward_key_hash20_hex)?;
+            let coinbase = build_coinbase_tx(
+                request.coinbase_label.clone(),
+                request.block_subsidy,
+                reward_key_hash20,
+            );
+            let merkle_root = scam_core::merkle::merkle_root(&[coinbase.txid()]);
+            let template = RpcMiningTemplate {
+                version: request.version,
+                prev_hash_hex: request.prev_hash_hex,
+                merkle_root_hex: merkle_root.to_hex(),
+                ntime: request.ntime,
+                network_target_hex: request.network_target_hex,
+            };
+            let coinbase_tx_hex = hex::encode(
+                bincode::serialize(&coinbase)
+                    .map_err(|e| NodeError::Runtime(format!("coinbase encode failed: {e}")))?,
+            );
+            let response = TemplateProviderResponse {
+                template,
+                coinbase_tx_hex,
+            };
+            write_role_response(&mut stream, &response)?;
+            Ok(())
+        })();
+        match handled {
+            Ok(()) => {
+                success_total = success_total.saturating_add(1);
+            }
+            Err(err) => {
+                error_total = error_total.saturating_add(1);
+                eprintln!("sv2-template-provider request error: {err}");
+            }
+        }
+        if let Some(path) = args.telemetry_out.as_ref() {
+            append_role_service_telemetry(
+                path,
+                "template_provider",
+                requests_total,
+                success_total,
+                error_total,
+            )?;
+        }
+
+        served = served.saturating_add(1);
+        if args.max_requests > 0 && served >= args.max_requests {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn run_sv2_job_declarator(args: Sv2JobDeclaratorArgs) -> Result<(), NodeError> {
+    let listener = TcpListener::bind(&args.bind).map_err(|e| {
+        NodeError::Runtime(format!(
+            "sv2-job-declarator bind failed on {}: {e}",
+            args.bind
+        ))
+    })?;
+    println!("SV2 job declarator listening on {}", args.bind);
+    let declarator = Arc::new(Mutex::new(SequentialJobDeclarator::new(args.start_job_id)));
+
+    let mut served = 0u32;
+    let mut requests_total = 0u64;
+    let mut success_total = 0u64;
+    let mut error_total = 0u64;
+    for incoming in listener.incoming() {
+        let mut stream = incoming
+            .map_err(|e| NodeError::Runtime(format!("job declarator accept failed: {e}")))?;
+        requests_total = requests_total.saturating_add(1);
+        let handled = (|| -> Result<(), NodeError> {
+            configure_stream_timeouts_with(
+                &stream,
+                Duration::from_secs(3),
+                Duration::from_secs(3),
+            )?;
+            let request: JobDeclaratorRequest = read_role_request(&mut stream)?;
+            let _ = mining_template_from_rpc(request.template)?;
+            let job_id = {
+                let mut guard = declarator
+                    .lock()
+                    .map_err(|_| NodeError::Runtime("job declarator mutex poisoned".to_owned()))?;
+                guard.next_job_id()
+            };
+            let response = JobDeclaratorResponse { job_id };
+            write_role_response(&mut stream, &response)?;
+            Ok(())
+        })();
+        match handled {
+            Ok(()) => {
+                success_total = success_total.saturating_add(1);
+            }
+            Err(err) => {
+                error_total = error_total.saturating_add(1);
+                eprintln!("sv2-job-declarator request error: {err}");
+            }
+        }
+        if let Some(path) = args.telemetry_out.as_ref() {
+            append_role_service_telemetry(
+                path,
+                "job_declarator",
+                requests_total,
+                success_total,
+                error_total,
+            )?;
+        }
+
+        served = served.saturating_add(1);
+        if args.max_requests > 0 && served >= args.max_requests {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn run_sv2_translator(args: Sv2TranslatorArgs) -> Result<(), NodeError> {
+    let listener = TcpListener::bind(&args.bind).map_err(|e| {
+        NodeError::Runtime(format!("sv2-translator bind failed on {}: {e}", args.bind))
+    })?;
+    println!("SV2 translator listening on {}", args.bind);
+    let translator = IdentityTranslator;
+
+    let mut served = 0u32;
+    let mut requests_total = 0u64;
+    let mut success_total = 0u64;
+    let mut error_total = 0u64;
+    for incoming in listener.incoming() {
+        let mut stream =
+            incoming.map_err(|e| NodeError::Runtime(format!("translator accept failed: {e}")))?;
+        requests_total = requests_total.saturating_add(1);
+        let handled = (|| -> Result<(), NodeError> {
+            configure_stream_timeouts_with(
+                &stream,
+                Duration::from_secs(3),
+                Duration::from_secs(3),
+            )?;
+            let request: TranslatorRequest = read_role_request(&mut stream)?;
+            let job = translator
+                .parse_remote_job_message(request.message)
+                .map_err(|e| NodeError::Runtime(format!("translator parse failed: {e}")))?;
+            let response = TranslatorResponse {
+                job: job.map(|job| RpcMiningTemplateWithJob {
+                    channel_id: job.channel_id,
+                    job_id: job.job_id,
+                    template: RpcMiningTemplate {
+                        version: job.version,
+                        prev_hash_hex: job.prev_hash.to_hex(),
+                        merkle_root_hex: job.merkle_root.to_hex(),
+                        ntime: job.ntime,
+                        network_target_hex: job.network_target.to_hex(),
+                    },
+                }),
+            };
+            write_role_response(&mut stream, &response)?;
+            Ok(())
+        })();
+        match handled {
+            Ok(()) => {
+                success_total = success_total.saturating_add(1);
+            }
+            Err(err) => {
+                error_total = error_total.saturating_add(1);
+                eprintln!("sv2-translator request error: {err}");
+            }
+        }
+        if let Some(path) = args.telemetry_out.as_ref() {
+            append_role_service_telemetry(
+                path,
+                "translator",
+                requests_total,
+                success_total,
+                error_total,
+            )?;
+        }
+
+        served = served.saturating_add(1);
+        if args.max_requests > 0 && served >= args.max_requests {
+            break;
+        }
+    }
+    Ok(())
+}
+
 fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
     let config_path = args
         .config
@@ -3943,10 +5106,32 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
         .unwrap_or(cfg.stratum_max_active_clients)
         .max(1);
     let secure_transport = cfg.stratum_secure_transport || args.secure_transport;
+    let secure_transport_mode = match args.secure_transport_mode {
+        Some(mode) => SecureTransportMode::from(mode),
+        None => parse_secure_transport_mode(&cfg.stratum_secure_transport_mode)?,
+    };
     let secure_rekey_interval_messages = args
         .secure_rekey_interval_messages
         .unwrap_or(cfg.stratum_secure_rekey_interval_messages)
         .max(1);
+    let secure_static_private_key = decode_optional_hex32(
+        "secure_static_secret_key_hex",
+        &args.secure_static_secret_key_hex,
+    )?;
+    let secure_expected_remote_static_public_key = decode_optional_hex32(
+        "secure_expected_remote_static_pubkey_hex",
+        &args.secure_expected_remote_static_pubkey_hex,
+    )?;
+    if secure_transport
+        && matches!(secure_transport_mode, SecureTransportMode::NoiseXx)
+        && secure_static_private_key.is_none()
+    {
+        return Err(NodeError::Runtime(
+            "secure transport mode noise_xx requires --secure-static-secret-key-hex \
+             (use `scam-node stratum-keygen` to generate keys)"
+                .to_owned(),
+        ));
+    }
 
     let share_target = Target::from_hex(share_target_hex)
         .map_err(|e| NodeError::Runtime(format!("invalid share_target_hex: {e}")))?;
@@ -4001,10 +5186,25 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
         read_timeout_sec, keepalive_sec, idle_timeout_sec
     );
     println!("Secure transport: {}", secure_transport);
+    println!("Secure transport mode: {}", secure_transport_mode.as_str());
     println!(
         "Secure rekey interval (messages): {}",
         secure_rekey_interval_messages
     );
+    println!(
+        "Secure static key configured: {}",
+        secure_static_private_key.is_some()
+    );
+    println!(
+        "Secure expected remote static key configured: {}",
+        secure_expected_remote_static_public_key.is_some()
+    );
+    if let Some(addr) = &args.template_provider_addr {
+        println!("Template provider service: {addr}");
+    }
+    if let Some(addr) = &args.job_declarator_addr {
+        println!("Job declarator service: {addr}");
+    }
     if args.max_clients > 0 {
         println!("Max clients before exit: {}", args.max_clients);
     }
@@ -4030,7 +5230,12 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
         max_jobs_per_channel,
         active_clients: Arc::new(Mutex::new(0)),
         secure_transport,
+        secure_transport_mode,
         secure_rekey_interval_messages,
+        secure_static_private_key,
+        secure_expected_remote_static_public_key,
+        template_provider_addr: args.template_provider_addr.clone(),
+        job_declarator_addr: args.job_declarator_addr.clone(),
     };
 
     let mut served = 0u32;
@@ -4125,14 +5330,63 @@ fn run_stratum_mine(args: StratumMineArgs) -> Result<(), NodeError> {
         .map_err(|e| NodeError::Runtime(format!("stratum connect failed to {}: {e}", args.pool)))?;
     let timeout = Duration::from_secs(args.read_timeout_sec.max(1));
     configure_stream_timeouts_with(&stream, timeout, timeout)?;
+    let secure_transport_mode = args
+        .secure_transport_mode
+        .map(SecureTransportMode::from)
+        .unwrap_or(SecureTransportMode::NoiseXx);
+    let secure_static_private_key = decode_optional_hex32(
+        "secure_static_secret_key_hex",
+        &args.secure_static_secret_key_hex,
+    )?;
+    let secure_expected_remote_static_public_key = decode_optional_hex32(
+        "secure_expected_remote_static_pubkey_hex",
+        &args.secure_expected_remote_static_pubkey_hex,
+    )?;
+    if args.secure_transport
+        && matches!(secure_transport_mode, SecureTransportMode::NoiseXx)
+        && secure_static_private_key.is_none()
+    {
+        return Err(NodeError::Runtime(
+            "secure transport mode noise_xx requires --secure-static-secret-key-hex \
+             (use `scam-node stratum-keygen` to generate keys)"
+                .to_owned(),
+        ));
+    }
     let mut secure_transport = if args.secure_transport {
-        let mut transport = SecureSv2Transport::handshake_client(&mut stream)
-            .map_err(|e| NodeError::Runtime(format!("stratum secure handshake failed: {e}")))?;
-        transport
-            .set_rekey_interval_messages(args.secure_rekey_interval_messages.max(1))
-            .map_err(|e| {
-                NodeError::Runtime(format!("stratum secure transport config failed: {e}"))
-            })?;
+        let transport = match secure_transport_mode {
+            SecureTransportMode::Legacy => {
+                let mut legacy =
+                    SecureSv2Transport::handshake_client(&mut stream).map_err(|e| {
+                        NodeError::Runtime(format!("stratum secure(legacy) handshake failed: {e}"))
+                    })?;
+                legacy
+                    .set_rekey_interval_messages(args.secure_rekey_interval_messages.max(1))
+                    .map_err(|e| {
+                        NodeError::Runtime(format!(
+                            "stratum secure(legacy) transport config failed: {e}"
+                        ))
+                    })?;
+                StratumSecureTransport::Legacy(legacy)
+            }
+            SecureTransportMode::NoiseXx => {
+                let mut noise = NoiseSv2Transport::handshake_client(
+                    &mut stream,
+                    secure_static_private_key,
+                    secure_expected_remote_static_public_key,
+                )
+                .map_err(|e| {
+                    NodeError::Runtime(format!("stratum secure(noise_xx) handshake failed: {e}"))
+                })?;
+                noise
+                    .set_rekey_interval_messages(args.secure_rekey_interval_messages.max(1))
+                    .map_err(|e| {
+                        NodeError::Runtime(format!(
+                            "stratum secure(noise_xx) transport config failed: {e}"
+                        ))
+                    })?;
+                StratumSecureTransport::Noise(noise)
+            }
+        };
         Some(transport)
     } else {
         None
@@ -4141,10 +5395,22 @@ fn run_stratum_mine(args: StratumMineArgs) -> Result<(), NodeError> {
     println!("Stratum miner connecting to {}", args.pool);
     println!("Secure transport: {}", args.secure_transport);
     if args.secure_transport {
+        println!("Secure transport mode: {}", secure_transport_mode.as_str());
         println!(
             "Secure rekey interval (messages): {}",
             args.secure_rekey_interval_messages.max(1)
         );
+        println!(
+            "Secure static key configured: {}",
+            secure_static_private_key.is_some()
+        );
+        println!(
+            "Secure expected remote static key configured: {}",
+            secure_expected_remote_static_public_key.is_some()
+        );
+    }
+    if let Some(addr) = &args.translator_addr {
+        println!("Translator service: {addr}");
     }
     write_sv2_message(
         &mut stream,
@@ -4166,6 +5432,7 @@ fn run_stratum_mine(args: StratumMineArgs) -> Result<(), NodeError> {
     let mut active_job_id = None::<u32>;
     let mut jobs = HashMap::<u32, MiningJob>::new();
     let mut nonce_cursor = HashMap::<u32, u64>::new();
+    let translator_addr = args.translator_addr.clone();
     let translator = IdentityTranslator;
     let mut submitted_shares = 0u64;
     let mut accepted_shares = 0u64;
@@ -4337,10 +5604,14 @@ fn run_stratum_mine(args: StratumMineArgs) -> Result<(), NodeError> {
                     last_io = Instant::now();
                 }
                 other => {
-                    if let Some(job) = translator
-                        .parse_remote_job_message(other)
-                        .map_err(|e| NodeError::Runtime(format!("stratum translate failed: {e}")))?
-                    {
+                    let translated = if let Some(addr) = translator_addr.as_deref() {
+                        translate_remote_job_with_service(addr, other)?
+                    } else {
+                        translator.parse_remote_job_message(other).map_err(|e| {
+                            NodeError::Runtime(format!("stratum translate failed: {e}"))
+                        })?
+                    };
+                    if let Some(job) = translated {
                         active_job_id = Some(job.job_id);
                         nonce_cursor.insert(job.job_id, 0);
                         println!(
@@ -4361,6 +5632,421 @@ fn run_stratum_mine(args: StratumMineArgs) -> Result<(), NodeError> {
         found_blocks,
         started_at.elapsed().as_secs()
     );
+    Ok(())
+}
+
+fn run_stratum_keygen(args: StratumKeygenArgs) -> Result<(), NodeError> {
+    if !args.force {
+        if args.secret_out.exists() {
+            return Err(NodeError::Runtime(format!(
+                "secret_out already exists (use --force to overwrite): {}",
+                args.secret_out.display()
+            )));
+        }
+        if args.public_out.exists() {
+            return Err(NodeError::Runtime(format!(
+                "public_out already exists (use --force to overwrite): {}",
+                args.public_out.display()
+            )));
+        }
+    }
+
+    if let Some(parent) = args.secret_out.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).map_err(|e| {
+            NodeError::Runtime(format!(
+                "cannot create secret key directory {}: {e}",
+                parent.display()
+            ))
+        })?;
+    }
+    if let Some(parent) = args.public_out.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).map_err(|e| {
+            NodeError::Runtime(format!(
+                "cannot create public key directory {}: {e}",
+                parent.display()
+            ))
+        })?;
+    }
+
+    let keypair = generate_noise_static_keypair()
+        .map_err(|e| NodeError::Runtime(format!("stratum noise keygen failed: {e}")))?;
+    let secret_hex = hex::encode(keypair.private);
+    let public_hex = hex::encode(keypair.public);
+
+    fs::write(&args.secret_out, format!("{secret_hex}\n")).map_err(|e| {
+        NodeError::Runtime(format!(
+            "cannot write secret key {}: {e}",
+            args.secret_out.display()
+        ))
+    })?;
+    fs::write(&args.public_out, format!("{public_hex}\n")).map_err(|e| {
+        NodeError::Runtime(format!(
+            "cannot write public key {}: {e}",
+            args.public_out.display()
+        ))
+    })?;
+
+    println!("Generated Stratum Noise XX static keypair");
+    println!("Secret key: {}", args.secret_out.display());
+    println!("Public key: {}", args.public_out.display());
+    println!("Public key hex: {public_hex}");
+    Ok(())
+}
+
+fn run_stratum_key_rotate(args: StratumKeyRotateArgs) -> Result<(), NodeError> {
+    if !args.secret_path.exists() {
+        return Err(NodeError::Runtime(format!(
+            "secret key file does not exist: {}",
+            args.secret_path.display()
+        )));
+    }
+    if !args.public_path.exists() {
+        return Err(NodeError::Runtime(format!(
+            "public key file does not exist: {}",
+            args.public_path.display()
+        )));
+    }
+    fs::create_dir_all(&args.archive_dir).map_err(|e| {
+        NodeError::Runtime(format!(
+            "cannot create archive directory {}: {e}",
+            args.archive_dir.display()
+        ))
+    })?;
+
+    let timestamp = current_unix_sec()?;
+    let archived_secret = args
+        .archive_dir
+        .join(format!("server.secret.{timestamp}.hex"));
+    let archived_public = args
+        .archive_dir
+        .join(format!("server.public.{timestamp}.hex"));
+    fs::rename(&args.secret_path, &archived_secret).map_err(|e| {
+        NodeError::Runtime(format!(
+            "cannot archive secret key {} -> {}: {e}",
+            args.secret_path.display(),
+            archived_secret.display()
+        ))
+    })?;
+    fs::rename(&args.public_path, &archived_public).map_err(|e| {
+        NodeError::Runtime(format!(
+            "cannot archive public key {} -> {}: {e}",
+            args.public_path.display(),
+            archived_public.display()
+        ))
+    })?;
+
+    run_stratum_keygen(StratumKeygenArgs {
+        secret_out: args.secret_path.clone(),
+        public_out: args.public_path.clone(),
+        force: false,
+    })?;
+
+    println!("Archived old secret key: {}", archived_secret.display());
+    println!("Archived old public key: {}", archived_public.display());
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct Sv2ConformanceStep {
+    sent: String,
+    received: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct Sv2ConformanceReport {
+    timestamp_unix_sec: u64,
+    stack_name: String,
+    endpoint: String,
+    secure_transport: bool,
+    secure_transport_mode: String,
+    corpus_source: String,
+    setup_success: bool,
+    channel_opened: bool,
+    job_messages_seen: u32,
+    set_target_seen: bool,
+    pass: bool,
+    observed_messages: Vec<String>,
+    errors: Vec<String>,
+    steps: Vec<Sv2ConformanceStep>,
+}
+
+fn sv2_message_kind(message: &Sv2Message) -> &'static str {
+    match message {
+        Sv2Message::SetupConnection { .. } => "SetupConnection",
+        Sv2Message::SetupConnectionSuccess { .. } => "SetupConnectionSuccess",
+        Sv2Message::SetupConnectionError { .. } => "SetupConnectionError",
+        Sv2Message::OpenStandardMiningChannel { .. } => "OpenStandardMiningChannel",
+        Sv2Message::OpenStandardMiningChannelSuccess { .. } => "OpenStandardMiningChannelSuccess",
+        Sv2Message::OpenStandardMiningChannelError { .. } => "OpenStandardMiningChannelError",
+        Sv2Message::NewMiningJob { .. } => "NewMiningJob",
+        Sv2Message::SetNewPrevHash { .. } => "SetNewPrevHash",
+        Sv2Message::SetTarget { .. } => "SetTarget",
+        Sv2Message::SubmitSharesStandard { .. } => "SubmitSharesStandard",
+        Sv2Message::SubmitSharesSuccess { .. } => "SubmitSharesSuccess",
+        Sv2Message::SubmitSharesError { .. } => "SubmitSharesError",
+        Sv2Message::KeepAlive => "KeepAlive",
+    }
+}
+
+fn default_sv2_conformance_corpus(user: &str) -> Vec<Sv2Message> {
+    vec![
+        Sv2Message::SetupConnection {
+            protocol: 2,
+            min_version: SUPPORTED_SV2_VERSION,
+            max_version: SUPPORTED_SV2_VERSION,
+            flags: 0,
+            user_agent: "scam-node/sv2-conformance".to_owned(),
+        },
+        Sv2Message::OpenStandardMiningChannel {
+            request_id: 1,
+            user: user.to_owned(),
+        },
+        Sv2Message::KeepAlive,
+    ]
+}
+
+fn load_sv2_corpus(path: &Path, user: &str) -> Result<Vec<Sv2Message>, NodeError> {
+    #[derive(Deserialize)]
+    struct Envelope {
+        messages: Vec<Sv2Message>,
+    }
+
+    let raw = fs::read_to_string(path).map_err(|e| {
+        NodeError::Runtime(format!("cannot read sv2 corpus {}: {e}", path.display()))
+    })?;
+    if let Ok(messages) = serde_json::from_str::<Vec<Sv2Message>>(&raw) {
+        if messages.is_empty() {
+            return Err(NodeError::Runtime("sv2 corpus is empty".to_owned()));
+        }
+        return Ok(messages);
+    }
+    if let Ok(envelope) = serde_json::from_str::<Envelope>(&raw) {
+        if envelope.messages.is_empty() {
+            return Err(NodeError::Runtime("sv2 corpus is empty".to_owned()));
+        }
+        return Ok(envelope.messages);
+    }
+
+    // Backward-compatible fallback: treat corpus as "default" keyword.
+    if raw.trim() == "default" {
+        return Ok(default_sv2_conformance_corpus(user));
+    }
+    Err(NodeError::Runtime(format!(
+        "cannot decode sv2 corpus {} (expected JSON array or {{\"messages\": [...]}})",
+        path.display()
+    )))
+}
+
+fn read_next_sv2_message(
+    stream: &mut TcpStream,
+    secure_transport: &mut Option<StratumSecureTransport>,
+    attempts: usize,
+) -> Result<Option<Sv2Message>, NodeError> {
+    for _ in 0..attempts.max(1) {
+        match read_sv2_message(stream, secure_transport.as_mut())? {
+            StratumReadOutcome::Message(msg) => return Ok(Some(msg)),
+            StratumReadOutcome::Timeout => continue,
+            StratumReadOutcome::Closed => return Ok(None),
+        }
+    }
+    Ok(None)
+}
+
+fn run_sv2_conformance(args: Sv2ConformanceArgs) -> Result<(), NodeError> {
+    let mut stream = TcpStream::connect(&args.pool)
+        .map_err(|e| NodeError::Runtime(format!("sv2 conformance connect failed: {e}")))?;
+    let timeout = Duration::from_secs(args.read_timeout_sec.max(1));
+    configure_stream_timeouts_with(&stream, timeout, timeout)?;
+
+    let secure_transport_mode = args
+        .secure_transport_mode
+        .map(SecureTransportMode::from)
+        .unwrap_or(SecureTransportMode::NoiseXx);
+    let secure_static_private_key = decode_optional_hex32(
+        "secure_static_secret_key_hex",
+        &args.secure_static_secret_key_hex,
+    )?;
+    let secure_expected_remote_static_public_key = decode_optional_hex32(
+        "secure_expected_remote_static_pubkey_hex",
+        &args.secure_expected_remote_static_pubkey_hex,
+    )?;
+    if args.secure_transport
+        && matches!(secure_transport_mode, SecureTransportMode::NoiseXx)
+        && secure_static_private_key.is_none()
+    {
+        return Err(NodeError::Runtime(
+            "secure transport mode noise_xx requires --secure-static-secret-key-hex \
+             (use `scam-node stratum-keygen` to generate keys)"
+                .to_owned(),
+        ));
+    }
+
+    let mut secure_transport = if args.secure_transport {
+        let transport = match secure_transport_mode {
+            SecureTransportMode::Legacy => {
+                let mut legacy =
+                    SecureSv2Transport::handshake_client(&mut stream).map_err(|e| {
+                        NodeError::Runtime(format!("sv2 conformance legacy handshake failed: {e}"))
+                    })?;
+                legacy
+                    .set_rekey_interval_messages(args.secure_rekey_interval_messages.max(1))
+                    .map_err(|e| {
+                        NodeError::Runtime(format!(
+                            "sv2 conformance legacy transport config failed: {e}"
+                        ))
+                    })?;
+                StratumSecureTransport::Legacy(legacy)
+            }
+            SecureTransportMode::NoiseXx => {
+                let mut noise = NoiseSv2Transport::handshake_client(
+                    &mut stream,
+                    secure_static_private_key,
+                    secure_expected_remote_static_public_key,
+                )
+                .map_err(|e| {
+                    NodeError::Runtime(format!("sv2 conformance noise_xx handshake failed: {e}"))
+                })?;
+                noise
+                    .set_rekey_interval_messages(args.secure_rekey_interval_messages.max(1))
+                    .map_err(|e| {
+                        NodeError::Runtime(format!(
+                            "sv2 conformance noise_xx transport config failed: {e}"
+                        ))
+                    })?;
+                StratumSecureTransport::Noise(noise)
+            }
+        };
+        Some(transport)
+    } else {
+        None
+    };
+
+    let (corpus, corpus_source) = if let Some(path) = args.corpus.as_ref() {
+        (
+            load_sv2_corpus(path, &args.user)?,
+            path.display().to_string(),
+        )
+    } else {
+        (
+            default_sv2_conformance_corpus(&args.user),
+            "builtin/default".to_owned(),
+        )
+    };
+
+    let mut setup_success = false;
+    let mut channel_opened = false;
+    let mut job_messages_seen = 0u32;
+    let mut set_target_seen = false;
+    let mut observed_messages = Vec::<String>::new();
+    let mut errors = Vec::<String>::new();
+    let mut steps = Vec::<Sv2ConformanceStep>::new();
+
+    for message in corpus {
+        let sent = sv2_message_kind(&message).to_owned();
+        write_sv2_message(&mut stream, secure_transport.as_mut(), &message)?;
+        let received = match read_next_sv2_message(&mut stream, &mut secure_transport, 3)? {
+            Some(response) => {
+                let kind = sv2_message_kind(&response).to_owned();
+                observed_messages.push(kind.clone());
+                match response {
+                    Sv2Message::SetupConnectionSuccess { .. } => setup_success = true,
+                    Sv2Message::SetupConnectionError { code, reason } => {
+                        errors.push(format!("setup error: code={code} reason={reason}"));
+                    }
+                    Sv2Message::OpenStandardMiningChannelSuccess { .. } => channel_opened = true,
+                    Sv2Message::OpenStandardMiningChannelError { code, reason, .. } => {
+                        errors.push(format!("open channel error: code={code} reason={reason}"));
+                    }
+                    Sv2Message::NewMiningJob { .. } | Sv2Message::SetNewPrevHash { .. } => {
+                        job_messages_seen = job_messages_seen.saturating_add(1);
+                    }
+                    Sv2Message::SetTarget { .. } => {
+                        set_target_seen = true;
+                    }
+                    _ => {}
+                }
+                Some(kind)
+            }
+            None => None,
+        };
+        steps.push(Sv2ConformanceStep { sent, received });
+    }
+
+    for _ in 0..8 {
+        let Some(msg) = read_next_sv2_message(&mut stream, &mut secure_transport, 1)? else {
+            break;
+        };
+        let kind = sv2_message_kind(&msg).to_owned();
+        observed_messages.push(kind.clone());
+        match msg {
+            Sv2Message::NewMiningJob { .. } | Sv2Message::SetNewPrevHash { .. } => {
+                job_messages_seen = job_messages_seen.saturating_add(1);
+            }
+            Sv2Message::SetTarget { .. } => set_target_seen = true,
+            Sv2Message::SetupConnectionSuccess { .. } => setup_success = true,
+            Sv2Message::OpenStandardMiningChannelSuccess { .. } => channel_opened = true,
+            Sv2Message::SetupConnectionError { code, reason } => {
+                errors.push(format!("setup error: code={code} reason={reason}"));
+            }
+            Sv2Message::OpenStandardMiningChannelError { code, reason, .. } => {
+                errors.push(format!("open channel error: code={code} reason={reason}"));
+            }
+            _ => {}
+        }
+    }
+
+    let pass = setup_success && channel_opened && errors.is_empty();
+    let report = Sv2ConformanceReport {
+        timestamp_unix_sec: current_unix_sec()?,
+        stack_name: args
+            .stack_name
+            .clone()
+            .unwrap_or_else(|| "unknown".to_owned()),
+        endpoint: args.pool.clone(),
+        secure_transport: args.secure_transport,
+        secure_transport_mode: secure_transport_mode.as_str().to_owned(),
+        corpus_source,
+        setup_success,
+        channel_opened,
+        job_messages_seen,
+        set_target_seen,
+        pass,
+        observed_messages,
+        errors,
+        steps,
+    };
+
+    let rendered = serde_json::to_string_pretty(&report)
+        .map_err(|e| NodeError::Runtime(format!("cannot encode conformance report json: {e}")))?;
+    if let Some(path) = args.out.as_ref() {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent).map_err(|e| {
+                NodeError::Runtime(format!(
+                    "cannot create conformance report directory {}: {e}",
+                    parent.display()
+                ))
+            })?;
+        }
+        fs::write(path, format!("{rendered}\n")).map_err(|e| {
+            NodeError::Runtime(format!(
+                "cannot write conformance report {}: {e}",
+                path.display()
+            ))
+        })?;
+        println!("SV2 conformance report saved: {}", path.display());
+    }
+    println!("{rendered}");
+    if !report.pass {
+        return Err(NodeError::Runtime(
+            "sv2 conformance check failed (see report)".to_owned(),
+        ));
+    }
     Ok(())
 }
 
@@ -4594,11 +6280,18 @@ fn run() -> Result<(), NodeError> {
         Some(Command::NetDemo(args)) => run_net_demo(args),
         Some(Command::SyncPeer(args)) => run_sync_peer(args),
         Some(Command::SyncBook(args)) => run_sync_book(args),
+        Some(Command::RelayServe(args)) => run_relay_serve(args),
         Some(Command::ReindexRuntime(args)) => run_reindex_runtime(args),
         Some(Command::Soak(args)) => run_soak(args),
         Some(Command::ReorgDemo(args)) => run_reorg_demo(args),
+        Some(Command::Sv2TemplateProvider(args)) => run_sv2_template_provider(args),
+        Some(Command::Sv2JobDeclarator(args)) => run_sv2_job_declarator(args),
+        Some(Command::Sv2Translator(args)) => run_sv2_translator(args),
         Some(Command::StratumServe(args)) => run_stratum_serve(args),
         Some(Command::StratumMine(args)) => run_stratum_mine(args),
+        Some(Command::StratumKeygen(args)) => run_stratum_keygen(args),
+        Some(Command::StratumKeyRotate(args)) => run_stratum_key_rotate(args),
+        Some(Command::Sv2Conformance(args)) => run_sv2_conformance(args),
         Some(Command::RpcServe(args)) => run_rpc_serve(args),
         Some(Command::Snapshot(args)) => run_snapshot(args.command),
         Some(Command::P2pDemo) => run_p2p_demo(),
@@ -4616,25 +6309,32 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::net::TcpListener;
     use std::path::PathBuf;
+    use std::thread;
+    use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use scam_chain::ChainRuntime;
     use scam_core::{ChainConfig, Hash256, OutPoint, Transaction, TxIn, TxOut};
     use scam_mempool::{Mempool, OrphanPool};
     use scam_miner::{BlockTemplate, mine_block};
-    use scam_p2p::{GossipEngine, ReplacementRateLimit};
+    use scam_p2p::{GossipEngine, InventoryItem, ReplacementRateLimit, WireMessage};
     use scam_storage::{load_chain_archive_db, load_peer_book_db};
     use scam_stratum::{IdentityTranslator, Sv2Message, Translator};
     use scam_wallet::{WalletMnemonic, derive_wallet_key};
 
     use super::{
         AddPeerArgs, ConfigScaffoldArgs, DifficultyAlgoArg, Network, ReindexRuntimeArgs,
-        SOAK_FLOW_MNEMONIC, SoakRelayState, SpendableUtxo, SyncBookArgs, accepted_hrps_for_network,
-        admit_peer_tx_into_relay, build_coinbase_tx, build_signed_transfer_tx, execute_soak_rounds,
-        load_chain_config, mine_block_with_transactions, mine_blocks_on_runtime,
-        persist_runtime_db, run_add_peer, run_config_scaffold, run_reindex_runtime, run_sync_book,
-        select_utxos_for_amount, try_find_share_for_job,
+        RelayAdmissionState, RelayServerState, SOAK_FLOW_MNEMONIC, SpendableUtxo,
+        Sv2JobDeclaratorArgs, Sv2TemplateProviderArgs, Sv2TranslatorArgs, SyncBookArgs,
+        TemplateProviderRequest, accepted_hrps_for_network, admit_peer_tx_into_relay,
+        build_coinbase_tx, build_signed_transfer_tx, execute_soak_rounds, load_chain_config,
+        mine_block_with_transactions, mine_blocks_on_runtime, persist_runtime_db,
+        process_relay_wire_message, relay_fee_hint, request_job_id_from_declarator,
+        request_template_from_provider, run_add_peer, run_config_scaffold, run_reindex_runtime,
+        run_sv2_job_declarator, run_sv2_template_provider, run_sv2_translator, run_sync_book,
+        select_utxos_for_amount, translate_remote_job_with_service, try_find_share_for_job,
     };
 
     fn utxo(seed: u8, value: u64) -> SpendableUtxo {
@@ -4693,6 +6393,14 @@ mod tests {
             .expect("time")
             .as_nanos();
         PathBuf::from(format!("target/{prefix}-{ts}"))
+    }
+
+    fn allocate_local_addr() -> Option<String> {
+        match TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener.local_addr().ok().map(|addr| addr.to_string()),
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => None,
+            Err(err) => panic!("bind failed: {err}"),
+        }
     }
 
     #[test]
@@ -4783,6 +6491,11 @@ mod tests {
             max_orphan_txs: 5_000,
             orphan_ttl_sec: 1_200,
             p2p_max_outbound_per_bucket: 2,
+            p2p_max_inv_items: 2_000,
+            p2p_ban_threshold: 100,
+            p2p_replacement_window_sec: 60,
+            p2p_replacement_max_per_peer: 20,
+            p2p_replacement_penalty: 25,
             dns_seeds: vec![
                 "seed1.example.org".to_owned(),
                 "seed2.example.org".to_owned(),
@@ -4806,6 +6519,7 @@ mod tests {
             stratum_max_jobs_per_channel: 64,
             stratum_max_active_clients: 256,
             stratum_secure_transport: false,
+            stratum_secure_transport_mode: super::SecureTransportModeArg::NoiseXx,
             stratum_secure_rekey_interval_messages: 10_000,
             genesis_message: "fork genesis".to_owned(),
             genesis_timestamp: Some(1_800_000_000),
@@ -4825,12 +6539,18 @@ mod tests {
             scam_core::DifficultyAlgorithm::Lwma
         );
         assert_eq!(cfg.p2p_max_outbound_per_bucket, 2);
+        assert_eq!(cfg.p2p_max_inv_items, 2_000);
+        assert_eq!(cfg.p2p_ban_threshold, 100);
+        assert_eq!(cfg.p2p_replacement_window_sec, 60);
+        assert_eq!(cfg.p2p_replacement_max_per_peer, 20);
+        assert_eq!(cfg.p2p_replacement_penalty, 25);
         assert_eq!(cfg.dns_seeds.len(), 2);
         assert_eq!(cfg.stratum_vardiff_target_shares_per_minute, 6);
         assert_eq!(cfg.stratum_vardiff_retarget_interval_shares, 24);
         assert_eq!(cfg.stratum_max_jobs_per_channel, 64);
         assert_eq!(cfg.stratum_max_active_clients, 256);
         assert!(!cfg.stratum_secure_transport);
+        assert_eq!(cfg.stratum_secure_transport_mode, "noise_xx");
         assert_eq!(cfg.stratum_secure_rekey_interval_messages, 10_000);
 
         let _ = fs::remove_dir_all(work_dir);
@@ -5072,10 +6792,11 @@ mod tests {
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
         cfg.validate().expect("config validate");
         let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
-        let (base_outpoint, _) = runtime
+        let base_outpoint = runtime
             .utxo_set()
-            .iter()
+            .keys()
             .next()
+            .cloned()
             .expect("genesis utxo must exist");
 
         let mut gossip = GossipEngine::with_limits_and_replacement(
@@ -5090,7 +6811,7 @@ mod tests {
         .expect("gossip");
         gossip.connect_peer(1);
 
-        let mut relay = SoakRelayState {
+        let mut relay = RelayAdmissionState {
             mempool: Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
@@ -5114,5 +6835,187 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn relay_runtime_wire_path_enforces_peer_replacement_quota() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        cfg.validate().expect("config validate");
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let base_outpoint = runtime
+            .utxo_set()
+            .keys()
+            .next()
+            .cloned()
+            .expect("genesis utxo must exist");
+
+        let mut gossip = GossipEngine::with_limits_and_replacement(
+            256,
+            50,
+            ReplacementRateLimit {
+                window_sec: 60,
+                max_replacements: 1,
+                penalty: 60,
+            },
+        )
+        .expect("gossip");
+        gossip.connect_peer(7);
+        let relay = RelayAdmissionState {
+            mempool: Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip,
+        };
+        let mut state = RelayServerState { runtime, relay };
+
+        let mut txs = [
+            relay_tx(base_outpoint.clone(), 1, 11),
+            relay_tx(base_outpoint.clone(), 2, 12),
+            relay_tx(base_outpoint, 3, 13),
+        ];
+        txs.sort_by_key(relay_fee_hint);
+
+        let _ = process_relay_wire_message(
+            &mut state,
+            7,
+            WireMessage::Tx { tx: txs[0].clone() },
+            1_000,
+        )
+        .expect("first");
+        let _ = process_relay_wire_message(
+            &mut state,
+            7,
+            WireMessage::Tx { tx: txs[1].clone() },
+            1_001,
+        )
+        .expect("replacement 1");
+        let out = process_relay_wire_message(
+            &mut state,
+            7,
+            WireMessage::Tx { tx: txs[2].clone() },
+            1_002,
+        )
+        .expect("rate-limited response");
+
+        assert!(
+            out.iter().any(|msg| matches!(
+                msg,
+                WireMessage::NotFound { items }
+                    if items.contains(&InventoryItem::Tx(txs[2].txid()))
+            )),
+            "expected notfound response for rate-limited replacement"
+        );
+        assert_eq!(
+            state
+                .relay
+                .gossip
+                .telemetry()
+                .replacement_rate_limited_total,
+            1
+        );
+    }
+
+    #[test]
+    fn template_provider_service_roundtrip() {
+        let Some(addr) = allocate_local_addr() else {
+            return;
+        };
+        let server = thread::spawn({
+            let addr = addr.clone();
+            move || {
+                run_sv2_template_provider(Sv2TemplateProviderArgs {
+                    bind: addr,
+                    max_requests: 1,
+                    telemetry_out: None,
+                })
+            }
+        });
+        thread::sleep(Duration::from_millis(25));
+
+        let request = TemplateProviderRequest {
+            channel_id: 1,
+            version: 1,
+            prev_hash_hex: Hash256::ZERO.to_hex(),
+            ntime: 1_800_000_000,
+            network_target_hex: scam_core::Target::MAX.to_hex(),
+            block_subsidy: 5_000_000_000,
+            reward_key_hash20_hex: "0000000000000000000000000000000000000000".to_owned(),
+            coinbase_label: "svc".to_owned(),
+        };
+        let response = request_template_from_provider(&addr, &request).expect("provider response");
+        assert_eq!(response.template.version, 1);
+        assert_eq!(response.template.prev_hash, Hash256::ZERO);
+        assert_eq!(response.template.ntime, 1_800_000_000);
+        server.join().expect("template provider").expect("ok");
+    }
+
+    #[test]
+    fn job_declarator_service_roundtrip() {
+        let Some(addr) = allocate_local_addr() else {
+            return;
+        };
+        let server = thread::spawn({
+            let addr = addr.clone();
+            move || {
+                run_sv2_job_declarator(Sv2JobDeclaratorArgs {
+                    bind: addr,
+                    max_requests: 2,
+                    start_job_id: 41,
+                    telemetry_out: None,
+                })
+            }
+        });
+        thread::sleep(Duration::from_millis(25));
+
+        let template = scam_stratum::MiningTemplate {
+            version: 1,
+            prev_hash: Hash256::ZERO,
+            merkle_root: Hash256::ZERO,
+            ntime: 1_800_000_000,
+            network_target: scam_core::Target::MAX,
+        };
+        let first = request_job_id_from_declarator(&addr, 1, &template).expect("first");
+        let second = request_job_id_from_declarator(&addr, 1, &template).expect("second");
+        assert_eq!(first, 42);
+        assert_eq!(second, 43);
+        server.join().expect("job declarator").expect("ok");
+    }
+
+    #[test]
+    fn translator_service_roundtrip() {
+        let Some(addr) = allocate_local_addr() else {
+            return;
+        };
+        let server = thread::spawn({
+            let addr = addr.clone();
+            move || {
+                run_sv2_translator(Sv2TranslatorArgs {
+                    bind: addr,
+                    max_requests: 1,
+                    telemetry_out: None,
+                })
+            }
+        });
+        thread::sleep(Duration::from_millis(25));
+
+        let job = translate_remote_job_with_service(
+            &addr,
+            Sv2Message::NewMiningJob {
+                channel_id: 3,
+                job_id: 9,
+                version: 1,
+                prev_hash_hex: Hash256::ZERO.to_hex(),
+                merkle_root_hex: Hash256::ZERO.to_hex(),
+                ntime: 1_800_000_000,
+                network_target_hex: scam_core::Target::MAX.to_hex(),
+            },
+        )
+        .expect("translated")
+        .expect("job");
+        assert_eq!(job.channel_id, 3);
+        assert_eq!(job.job_id, 9);
+        server.join().expect("translator").expect("ok");
     }
 }

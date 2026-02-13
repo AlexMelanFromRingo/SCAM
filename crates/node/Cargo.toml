@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+bincode.workspace = true
 clap.workspace = true
 hex.workspace = true
 scam-chain = { path = "../chain" }

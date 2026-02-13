@@ -14,4 +14,5 @@ rand.workspace = true
 scam-core = { path = "../core" }
 secp256k1.workspace = true
 serde.workspace = true
+snow.workspace = true
 thiserror.workspace = true
