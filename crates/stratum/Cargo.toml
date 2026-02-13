@@ -6,8 +6,12 @@ license.workspace = true
 
 [dependencies]
 bincode.workspace = true
+blake3.workspace = true
+chacha20poly1305.workspace = true
 num-bigint.workspace = true
 num-traits.workspace = true
+rand.workspace = true
 scam-core = { path = "../core" }
+secp256k1.workspace = true
 serde.workspace = true
 thiserror.workspace = true

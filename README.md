@@ -10,7 +10,7 @@ SCAM is a Rust 2024 workspace implementing a PoW L1 cryptocurrency with a produc
 - wallet mnemonic/restore, encrypted vault, QR,
 - mempool with fee-aware replacement + CPFP-aware mining selection,
 - P2P inventory relay and headers-first sync,
-- Stratum v2 subset pool endpoint and worker client.
+- Stratum v2 subset pool endpoint and worker client with optional encrypted transport.
 
 ## Workspace
 
@@ -60,6 +60,13 @@ Connect worker using manual pool address (no DNS required):
 
 ```bash
 cargo run -p scam-node -- stratum-mine --pool 127.0.0.1:3347 --user miner01 --max-shares 10
+```
+
+Enable encrypted transport on both sides:
+
+```bash
+cargo run -p scam-node -- stratum-serve --network devnet --config config/devnet.toml --secure-transport
+cargo run -p scam-node -- stratum-mine --pool 127.0.0.1:3347 --user miner01 --secure-transport
 ```
 
 ## Manual Peer Connectivity
@@ -123,7 +130,7 @@ scripts/telemetry-alert-check.py --input data/soak.telemetry.jsonl
 Generate a new network config:
 
 ```bash
-cargo run -p scam-node -- config-scaffold --network-id myfork --hrp sc --out config/myfork.toml
+cargo run -p scam-node -- config-scaffold --network-id myfork --hrp sc --stratum-secure-transport --out config/myfork.toml
 ```
 
 See `docs/FORKING_GUIDE.md` for full constructor options.
@@ -139,9 +146,9 @@ MVP production-style baseline is implemented. Remaining major program item:
 Current implementation is a robust SV2 subset suitable for local/integration mining flows.
 A full pool-grade SV2 deployment still needs:
 
-- full role split (Template Provider / Job Declarator / Translator),
-- production transport security (Noise-based encrypted channels),
-- exhaustive interoperability matrix testing with third-party SV2 stacks.
+- external service deployment hardening for Template Provider / Job Declarator / Translator roles,
+- full Noise-spec transport compatibility and key lifecycle hardening,
+- exhaustive interoperability/conformance matrix against third-party SV2 stacks.
 
 ## Documentation
 

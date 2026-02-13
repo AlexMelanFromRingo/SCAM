@@ -14,6 +14,11 @@ Current implementation provides a production-oriented baseline with:
 - multi-client threaded server in `scam-node stratum-serve`,
 - tip-change driven job refresh for connected clients,
 - automatic new-job issue after valid block share.
+- explicit local role split wiring:
+- Template Provider (`RuntimeTemplateProvider`) in node runtime path,
+- Job Declarator (`SequentialJobDeclarator`) for monotonic job IDs,
+- Translator (`IdentityTranslator`) for remote job message decoding.
+- optional encrypted transport channel (`--secure-transport` + `stratum_secure_transport`) using ECDH + AEAD framing.
 
 All operational defaults are available in network config as `stratum_*` fields.
 CLI flags in `stratum-serve` override config values when provided.
@@ -38,7 +43,8 @@ cargo run -p scam-node -- stratum-serve \
   --keepalive-sec 30 \
   --idle-timeout-sec 180 \
   --max-jobs-per-channel 64 \
-  --max-active-clients 256
+  --max-active-clients 256 \
+  --secure-transport
 ```
 
 Worker (manual pool endpoint, no DNS requirement):
@@ -47,7 +53,8 @@ Worker (manual pool endpoint, no DNS requirement):
 cargo run -p scam-node -- stratum-mine \
   --pool 127.0.0.1:3347 \
   --user miner01 \
-  --max-shares 10
+  --max-shares 10 \
+  --secure-transport
 ```
 
 ## Scope
@@ -55,8 +62,8 @@ cargo run -p scam-node -- stratum-mine \
 This is a robust SV2 subset suitable for integration testing and external miner connectivity.
 A full pool-grade SV2 deployment still needs:
 
-- full role split (Template Provider / Job Declarator / Translator),
-- production transport security (Noise-based encrypted channels),
+- externalized role services and failure-domain split across independent pool components,
+- production Noise-spec transport security (current encrypted mode is a Noise-like baseline),
 - exhaustive interoperability matrix testing with third-party SV2 stacks.
 
 Tracking file: `docs/SV2_POOL_GRADE_GAP.md`.

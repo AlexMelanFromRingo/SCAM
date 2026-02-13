@@ -36,6 +36,13 @@ Worker client (manual pool endpoint):
 cargo run -p scam-node -- stratum-mine --pool 127.0.0.1:3347 --user miner01 --max-shares 100
 ```
 
+Encrypted transport mode:
+
+```bash
+cargo run -p scam-node -- stratum-serve --network devnet --config config/devnet.toml --secure-transport
+cargo run -p scam-node -- stratum-mine --pool 127.0.0.1:3347 --user miner01 --secure-transport
+```
+
 ## 4) Backup, Reindex, Recovery
 
 Backup runtime DB before risky operations:

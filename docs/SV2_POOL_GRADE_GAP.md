@@ -5,14 +5,16 @@ This file tracks the remaining items for full pool-grade SV2 readiness.
 
 ## 1) Role Split
 
-- [ ] Introduce explicit Template Provider role.
-- [ ] Introduce explicit Job Declarator role.
-- [ ] Introduce explicit Translator role.
+- [x] Introduce explicit Template Provider role (local runtime provider baseline).
+- [x] Introduce explicit Job Declarator role (monotonic sequential declarator).
+- [x] Introduce explicit Translator role (remote job message translator).
+- [ ] Externalize roles into independent pool services with network boundaries.
 - [ ] Define role interfaces and failure domains.
 
 ## 2) Transport Security
 
-- [ ] Integrate Noise-based encrypted channels.
+- [x] Add encrypted transport baseline (ECDH handshake + AEAD frame protection).
+- [ ] Integrate full Noise-spec encrypted channels.
 - [ ] Add key lifecycle and rotation policy.
 - [ ] Add secure handshake/error handling tests.
 

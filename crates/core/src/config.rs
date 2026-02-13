@@ -69,6 +69,8 @@ pub struct ChainConfig {
     pub stratum_max_jobs_per_channel: usize,
     #[serde(default = "default_stratum_max_active_clients")]
     pub stratum_max_active_clients: usize,
+    #[serde(default = "default_stratum_secure_transport")]
+    pub stratum_secure_transport: bool,
     pub genesis_message: String,
     pub genesis_timestamp: u64,
     pub genesis_target: String,
@@ -372,6 +374,10 @@ const fn default_stratum_max_active_clients() -> usize {
     256
 }
 
+const fn default_stratum_secure_transport() -> bool {
+    false
+}
+
 #[derive(Debug, Error)]
 pub enum ChainConfigError {
     #[error("{0}")]
@@ -421,6 +427,7 @@ mod tests {
             stratum_idle_timeout_sec: 180,
             stratum_max_jobs_per_channel: 64,
             stratum_max_active_clients: 256,
+            stratum_secure_transport: false,
             genesis_message: "SCAM genesis".to_owned(),
             genesis_timestamp: 1_770_763_200,
             genesis_target: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
@@ -471,6 +478,7 @@ mod tests {
             stratum_idle_timeout_sec: 180,
             stratum_max_jobs_per_channel: 64,
             stratum_max_active_clients: 256,
+            stratum_secure_transport: false,
             genesis_message: "SCAM genesis".to_owned(),
             genesis_timestamp: 1_770_763_200,
             genesis_target: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
@@ -533,6 +541,7 @@ genesis_reward_key_hash20 = "0000000000000000000000000000000000000000"
         assert_eq!(cfg.stratum_idle_timeout_sec, 180);
         assert_eq!(cfg.stratum_max_jobs_per_channel, 64);
         assert_eq!(cfg.stratum_max_active_clients, 256);
+        assert!(!cfg.stratum_secure_transport);
         cfg.validate().expect("validate");
     }
 }
