@@ -1,0 +1,105 @@
+# Future Plan: Full-Spec SV2 + External Interop
+
+Status: post-MVP roadmap.  
+Scope: future work only.  
+Note: this file does not change or replace current completed TODO files.
+Clarification: consensus is already functionally implemented; future items touching consensus are hardening/audit/test-depth tasks, not a redesign.
+
+## 0) Immediate Execution Order (Requested)
+
+- [ ] Wait for the running mutation baseline to finish and freeze report artifacts.
+- [ ] Create a private GitHub repository and push the project with full commit history (no squashing).
+- [ ] Verify remote integrity (`git log`, tags/branches if present, and repository visibility).
+- [ ] Continue post-publish hardening work:
+- mutation-gap closure in `core/consensus/node`,
+- expanded external SV2 interoperability matrix,
+- final launch hardening and operator runbook polish.
+
+## 1) Target Outcome
+
+- Deliver full-spec Stratum V2 behavior (not only subset flows).
+- Prove interoperability with external SV2 stacks in repeatable CI runs.
+- Reach pool-grade readiness for mixed-vendor miners and operators.
+
+## 2) Workstreams
+
+### A. Protocol Completeness
+
+- Build a strict spec map: each required message, state transition, and error path.
+- Implement all required channel types and lifecycle paths.
+- Add complete capability negotiation and version/feature compatibility handling.
+- Add full negative-path handling for malformed/unsupported/out-of-order messages.
+
+### B. Transport and Security
+
+- Keep `noise_xx` as default secure mode and harden all edge cases.
+- Add replay/ordering abuse tests for encrypted channels.
+- Expand key lifecycle policy: rotation playbooks, rollback, and emergency revoke.
+- Add stricter limits for handshake floods and malformed frame storms.
+
+### C. External Interoperability
+
+- Define external target matrix (vendor, version, mode, role, expected behavior).
+- Run automated compatibility scenarios against each target stack.
+- Maintain golden corpus of cross-stack captures and expected outcomes.
+- Track compatibility quirks by stack/version with explicit workarounds.
+
+### D. Scale and Reliability
+
+- Stress test high-connection scenarios (1k, 5k, 10k workers).
+- Add long-run soak for SV2 role split with fault injection.
+- Add performance budgets and regressions gates in CI.
+
+### E. Validation and Quality
+
+- Expand mutation targets in `core/consensus/node` where missed mutants are highest (consensus hardening only).
+- Add property tests for protocol invariants and message ordering invariants.
+- Add deterministic replay harness for protocol transcripts.
+
+### F. External Security Review
+
+- Commission external audit for:
+- consensus-critical paths,
+- wallet/signing/vault paths,
+- p2p/stratum transport and abuse resistance.
+- Run bug bounty after audit fixes are merged.
+
+## 3) Delivery Phases
+
+### Phase 1: Spec Coverage Baseline (2-4 weeks)
+
+- Freeze protocol checklist.
+- Implement missing required message/state paths.
+- Add protocol conformance unit/integration tests.
+
+Exit criteria:
+- Spec checklist shows no uncovered required paths.
+- Conformance suite passes locally and in CI.
+
+### Phase 2: Interop Matrix (3-6 weeks)
+
+- Integrate external stacks into automated matrix runs.
+- Resolve incompatibilities and document vendor quirks.
+
+Exit criteria:
+- Stable pass-rate across supported external stacks.
+- Published compatibility matrix with versions and known limits.
+
+### Phase 3: Pool-Grade Hardening (3-6 weeks)
+
+- High-load/stability/perf runs.
+- External audit + remediation.
+- Public testnet dress rehearsal with mixed clients.
+
+Exit criteria:
+- Soak/perf targets met.
+- Audit critical/high findings resolved.
+- Public rehearsal success without sev-1 incidents.
+
+## 4) Release Gate (Go / No-Go)
+
+- Full-spec checklist complete.
+- Interop matrix green for supported targets.
+- Security audit closed for blocking findings.
+- Long-run soak and chaos criteria met.
+- Operator runbook updated for all final flows.
