@@ -3595,7 +3595,7 @@ fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
         }));
 
         served = served.saturating_add(1);
-        if args.max_clients > 0 && served >= args.max_clients {
+        if max_requests_reached(args.max_clients, served) {
             break;
         }
     }
@@ -5159,6 +5159,10 @@ fn write_role_response<T: Serialize>(
         .map_err(|e| NodeError::Runtime(format!("role response flush failed: {e}")))
 }
 
+fn max_requests_reached(max_requests: u32, served: u32) -> bool {
+    max_requests > 0 && served >= max_requests
+}
+
 fn run_sv2_template_provider(args: Sv2TemplateProviderArgs) -> Result<(), NodeError> {
     let listener = TcpListener::bind(&args.bind).map_err(|e| {
         NodeError::Runtime(format!(
@@ -5229,7 +5233,7 @@ fn run_sv2_template_provider(args: Sv2TemplateProviderArgs) -> Result<(), NodeEr
         }
 
         served = served.saturating_add(1);
-        if args.max_requests > 0 && served >= args.max_requests {
+        if max_requests_reached(args.max_requests, served) {
             break;
         }
     }
@@ -5292,7 +5296,7 @@ fn run_sv2_job_declarator(args: Sv2JobDeclaratorArgs) -> Result<(), NodeError> {
         }
 
         served = served.saturating_add(1);
-        if args.max_requests > 0 && served >= args.max_requests {
+        if max_requests_reached(args.max_requests, served) {
             break;
         }
     }
@@ -5360,7 +5364,7 @@ fn run_sv2_translator(args: Sv2TranslatorArgs) -> Result<(), NodeError> {
         }
 
         served = served.saturating_add(1);
-        if args.max_requests > 0 && served >= args.max_requests {
+        if max_requests_reached(args.max_requests, served) {
             break;
         }
     }
@@ -5605,7 +5609,7 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
             });
 
             served = served.saturating_add(1);
-            if max_clients > 0 && served >= max_clients {
+            if max_requests_reached(max_clients, served) {
                 break;
             }
         }
@@ -7554,6 +7558,319 @@ mod tests {
             }
         }
         panic!("connect retry exhausted for {addr}");
+    }
+
+    #[test]
+    fn max_requests_guard_logic_is_strict() {
+        assert!(!super::max_requests_reached(0, 0));
+        assert!(!super::max_requests_reached(0, 100));
+        assert!(!super::max_requests_reached(2, 0));
+        assert!(!super::max_requests_reached(2, 1));
+        assert!(super::max_requests_reached(2, 2));
+        assert!(super::max_requests_reached(2, 3));
+    }
+
+    #[test]
+    fn default_runtime_db_path_uses_network_name() {
+        let path = super::default_runtime_db_path(Network::Testnet);
+        assert_eq!(path, PathBuf::from("data/testnet.runtime.redb"));
+    }
+
+    #[test]
+    fn runtime_commands_fail_fast_when_config_is_missing() {
+        let missing_cfg = temp_dir("test-missing-config").join("missing.toml");
+
+        let node_err = super::run_node(Network::Devnet, Some(missing_cfg.clone()), None, false)
+            .expect_err("missing config must fail node startup");
+        assert!(node_err.to_string().contains("config"));
+
+        let status_err = super::run_status(super::StatusArgs {
+            network: Network::Devnet,
+            config: Some(missing_cfg.clone()),
+            mine_blocks: 0,
+            interval_sec: 120,
+            max_nonce: 1,
+            json: true,
+        })
+        .expect_err("missing config must fail status");
+        assert!(status_err.to_string().contains("config"));
+
+        let block_err = super::run_get_block(super::GetBlockArgs {
+            network: Network::Devnet,
+            config: Some(missing_cfg.clone()),
+            height: 0,
+            interval_sec: 120,
+            max_nonce: 1,
+            json: true,
+        })
+        .expect_err("missing config must fail get-block");
+        assert!(block_err.to_string().contains("config"));
+
+        let tx_err = super::run_get_tx(super::GetTxArgs {
+            network: Network::Devnet,
+            config: Some(missing_cfg),
+            height: 0,
+            tx_index: 0,
+            interval_sec: 120,
+            max_nonce: 1,
+            json: true,
+        })
+        .expect_err("missing config must fail get-tx");
+        assert!(tx_err.to_string().contains("config"));
+    }
+
+    #[test]
+    fn decode_helpers_validate_lengths_and_optional_behavior() {
+        let full = "11".repeat(32);
+        let with_prefix = format!("0x{full}");
+        let parsed =
+            super::decode_fixed_hex::<32>("digest", &with_prefix).expect("decode fixed hex");
+        assert_eq!(parsed, [0x11; 32]);
+
+        let err =
+            super::decode_fixed_hex::<32>("digest", "0x1234").expect_err("short digest must fail");
+        assert!(err.to_string().contains("must be 32 bytes"));
+
+        let empty = super::decode_optional_hex32("opt", &None).expect("none");
+        assert_eq!(empty, None);
+
+        let some = super::decode_optional_hex32("opt", &Some(full)).expect("some");
+        assert_eq!(some, Some([0x11; 32]));
+    }
+
+    #[test]
+    fn time_dns_bucket_and_cap_helpers_behave() {
+        let now = super::current_unix_sec().expect("current unix sec");
+        assert!(
+            now > 1_700_000_000,
+            "unexpected unix timestamp: {now}; clock likely broken"
+        );
+
+        let parsed = super::resolve_dns_seed("127.0.0.1:18444");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(
+            parsed[0],
+            "127.0.0.1:18444"
+                .parse::<std::net::SocketAddr>()
+                .expect("socket addr parse")
+        );
+        assert!(super::resolve_dns_seed("").is_empty());
+
+        let v4 = "203.0.113.77:8333"
+            .parse::<std::net::SocketAddr>()
+            .expect("v4 parse");
+        let v6 = "[2001:db8::1]:8333"
+            .parse::<std::net::SocketAddr>()
+            .expect("v6 parse");
+        assert_eq!(super::peer_diversity_bucket(v4), "v4-203.0");
+        assert_eq!(super::peer_diversity_bucket(v6), "v6-2001:db8");
+
+        let capped = super::apply_bucket_cap(
+            vec![
+                "203.0.113.1:8333".parse().expect("addr1"),
+                "198.51.100.1:8333".parse().expect("addr2"),
+                "203.0.113.2:8333".parse().expect("addr3"),
+            ],
+            1,
+        );
+        assert_eq!(capped.len(), 2);
+        assert!(super::apply_bucket_cap(capped.clone(), 0).is_empty());
+        assert_eq!(super::apply_bucket_cap(capped.clone(), 10), capped);
+    }
+
+    #[test]
+    fn hash_visual_and_json_helpers_handle_errors_and_escaping() {
+        let err = super::run_hash_visual(super::HashVisualArgs {
+            hash_hex: "xyz".to_owned(),
+        })
+        .expect_err("invalid hash must fail");
+        assert!(err.to_string().contains("bad hash"));
+
+        let json = super::json_error_body("line1\nquote\"slash\\");
+        assert_eq!(json, "{\"error\":\"line1\\nquote\\\"slash\\\\\"}");
+
+        let input = b"GET / HTTP/1.1\r\nHost: local\r\n\r\nbody";
+        let pos = super::find_http_header_terminator(input).expect("terminator");
+        assert_eq!(&input[pos..pos + 4], b"\r\n\r\n");
+        assert!(super::find_http_header_terminator(b"GET / HTTP/1.1\r\n").is_none());
+    }
+
+    #[test]
+    fn soak_argument_validation_rejects_invalid_limits() {
+        let work_dir = temp_dir("test-soak-invalid");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let config_path = work_dir.join("devnet.toml");
+        fs::write(&config_path, include_str!("../../../config/devnet.toml")).expect("write cfg");
+
+        let base = || super::SoakArgs {
+            network: Network::Devnet,
+            config: Some(config_path.clone()),
+            runtime_db: None,
+            rounds: 1,
+            blocks_per_round: 1,
+            interval_sec: 1,
+            max_nonce: 1_000,
+            persist_every_rounds: 1,
+            txs_per_round: 0,
+            tx_amount: 1,
+            tx_fee: 1,
+            sleep_per_round_sec: 0,
+            telemetry_out: None,
+            telemetry_every_rounds: 1,
+            simulated_peers: 1,
+            replacement_window_sec: 1,
+            replacement_max_per_peer: 1,
+            replacement_penalty: 1,
+        };
+
+        let tx_amount_err = super::run_soak(super::SoakArgs {
+            txs_per_round: 1,
+            tx_amount: 0,
+            ..base()
+        })
+        .expect_err("zero tx amount must fail");
+        assert!(tx_amount_err.to_string().contains("tx_amount must be > 0"));
+
+        let telemetry_err = super::run_soak(super::SoakArgs {
+            telemetry_every_rounds: 0,
+            ..base()
+        })
+        .expect_err("telemetry cadence must fail");
+        assert!(
+            telemetry_err
+                .to_string()
+                .contains("telemetry_every_rounds must be > 0")
+        );
+
+        let peers_err = super::run_soak(super::SoakArgs {
+            simulated_peers: 0,
+            ..base()
+        })
+        .expect_err("simulated peers zero must fail");
+        assert!(
+            peers_err
+                .to_string()
+                .contains("simulated_peers must be > 0")
+        );
+
+        let window_err = super::run_soak(super::SoakArgs {
+            replacement_window_sec: 0,
+            ..base()
+        })
+        .expect_err("replacement window zero must fail");
+        assert!(
+            window_err
+                .to_string()
+                .contains("replacement_window_sec must be > 0")
+        );
+
+        let max_per_peer_err = super::run_soak(super::SoakArgs {
+            replacement_max_per_peer: 0,
+            ..base()
+        })
+        .expect_err("replacement max per peer zero must fail");
+        assert!(
+            max_per_peer_err
+                .to_string()
+                .contains("replacement_max_per_peer must be > 0")
+        );
+
+        let penalty_err = super::run_soak(super::SoakArgs {
+            replacement_penalty: 0,
+            ..base()
+        })
+        .expect_err("replacement penalty zero must fail");
+        assert!(
+            penalty_err
+                .to_string()
+                .contains("replacement_penalty must be > 0")
+        );
+
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
+    fn stratum_share_target_validation_checks_bounds_before_network_bind() {
+        let work_dir = temp_dir("test-stratum-target-bounds");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let config_path = work_dir.join("devnet.toml");
+        fs::write(&config_path, include_str!("../../../config/devnet.toml")).expect("write cfg");
+        let runtime_db = work_dir.join("runtime.redb");
+
+        let min_target = format!("00{}", "ff".repeat(31));
+        let below_min_target = "00".repeat(32);
+
+        let out_of_range_err = run_stratum_serve(StratumServeArgs {
+            network: Network::Devnet,
+            config: Some(config_path.clone()),
+            runtime_db: Some(runtime_db.clone()),
+            bind: "not-an-addr".to_owned(),
+            share_target_hex: Some(below_min_target),
+            max_jobs_per_channel: None,
+            max_clients: 0,
+            max_active_clients: None,
+            read_timeout_sec: None,
+            keepalive_sec: Some(5),
+            idle_timeout_sec: Some(6),
+            vardiff_target_shares_per_minute: None,
+            vardiff_retarget_interval_shares: None,
+            vardiff_clamp_up: None,
+            vardiff_clamp_down: None,
+            max_rejected_shares: None,
+            min_share_target_hex: Some(min_target.clone()),
+            max_share_target_hex: Some(scam_core::Target::MAX.to_hex()),
+            secure_transport: false,
+            secure_transport_mode: None,
+            secure_rekey_interval_messages: None,
+            secure_static_secret_key_hex: None,
+            secure_expected_remote_static_pubkey_hex: None,
+            template_provider_addr: None,
+            job_declarator_addr: None,
+        })
+        .expect_err("share target below min must fail");
+        assert!(
+            out_of_range_err
+                .to_string()
+                .contains("share_target_hex must be within"),
+            "unexpected error: {out_of_range_err}"
+        );
+
+        let boundary_err = run_stratum_serve(StratumServeArgs {
+            network: Network::Devnet,
+            config: Some(config_path),
+            runtime_db: Some(runtime_db),
+            bind: "not-an-addr".to_owned(),
+            share_target_hex: Some(min_target.clone()),
+            max_jobs_per_channel: None,
+            max_clients: 0,
+            max_active_clients: None,
+            read_timeout_sec: None,
+            keepalive_sec: Some(10),
+            idle_timeout_sec: Some(10),
+            vardiff_target_shares_per_minute: None,
+            vardiff_retarget_interval_shares: None,
+            vardiff_clamp_up: None,
+            vardiff_clamp_down: None,
+            max_rejected_shares: None,
+            min_share_target_hex: Some(min_target.clone()),
+            max_share_target_hex: Some(min_target),
+            secure_transport: false,
+            secure_transport_mode: None,
+            secure_rekey_interval_messages: None,
+            secure_static_secret_key_hex: None,
+            secure_expected_remote_static_pubkey_hex: None,
+            template_provider_addr: None,
+            job_declarator_addr: None,
+        })
+        .expect_err("idle timeout validation must trigger after valid share bounds");
+        assert!(
+            boundary_err
+                .to_string()
+                .contains("idle_timeout_sec must be greater than keepalive_sec"),
+            "unexpected error: {boundary_err}"
+        );
+
+        let _ = fs::remove_dir_all(work_dir);
     }
 
     #[test]
