@@ -92,4 +92,17 @@ mod tests {
         let decoded = decode_message(&encoded, 1024).expect("decode");
         assert_eq!(msg, decoded);
     }
+
+    #[test]
+    fn decode_message_enforces_size_limit_boundary() {
+        let msg = WireMessage::Ping { nonce: 42 };
+        let encoded = encode_message(&msg).expect("encode");
+
+        let decoded = decode_message(&encoded, encoded.len()).expect("equal limit must decode");
+        assert_eq!(decoded, msg);
+
+        let err = decode_message(&encoded, encoded.len().saturating_sub(1))
+            .expect_err("smaller limit must reject");
+        assert!(matches!(err, super::WireError::MessageTooLarge { .. }));
+    }
 }

@@ -399,6 +399,7 @@ pub enum TransportError {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
     use std::net::{TcpListener, TcpStream};
     use std::thread;
     use std::time::Duration;
@@ -592,6 +593,140 @@ mod tests {
                 u32::from_be_bytes([header[4], header[5], header[6], header[7]]) as usize;
             assert!(payload_len > 0);
         });
+    }
+
+    #[test]
+    fn send_message_size_limit_boundary_is_enforced() {
+        let listener = match TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("bind failed: {err}"),
+        };
+        let addr = listener.local_addr().expect("local addr");
+        let server = thread::spawn(move || {
+            let (_stream, _) = listener.accept().expect("accept");
+            thread::sleep(Duration::from_millis(200));
+        });
+
+        let mut stream = TcpStream::connect(addr).expect("connect");
+        let message = WireMessage::Ping { nonce: 7 };
+        let payload_len = crate::wire::encode_message(&message).expect("encode").len();
+        let exact_cfg = FramingConfig {
+            max_message_size: payload_len,
+            ..FramingConfig::default()
+        };
+        send_message(&mut stream, &message, &exact_cfg).expect("equal limit must pass");
+
+        let reject_cfg = FramingConfig {
+            max_message_size: payload_len.saturating_sub(1),
+            ..FramingConfig::default()
+        };
+        let err = send_message(&mut stream, &message, &reject_cfg)
+            .expect_err("smaller limit must reject");
+        assert!(matches!(
+            err,
+            crate::transport::TransportError::MessageTooLarge { .. }
+        ));
+        server.join().expect("server join");
+    }
+
+    #[test]
+    fn send_message_async_size_limit_boundary_is_enforced() {
+        let runtime = Runtime::new().expect("tokio runtime");
+        runtime.block_on(async {
+            let message = WireMessage::Ping { nonce: 9 };
+            let payload_len = crate::wire::encode_message(&message).expect("encode").len();
+            let exact_cfg = FramingConfig {
+                max_message_size: payload_len,
+                ..FramingConfig::default()
+            };
+            let reject_cfg = FramingConfig {
+                max_message_size: payload_len.saturating_sub(1),
+                ..FramingConfig::default()
+            };
+            let (mut tx, _rx) = tokio::io::duplex(4096);
+            send_message_async(&mut tx, &message, &exact_cfg)
+                .await
+                .expect("equal limit must pass");
+            let err = send_message_async(&mut tx, &message, &reject_cfg)
+                .await
+                .expect_err("smaller limit must reject");
+            assert!(matches!(
+                err,
+                crate::transport::TransportError::MessageTooLarge { .. }
+            ));
+        });
+    }
+
+    #[test]
+    fn read_message_size_limit_boundary_is_enforced() {
+        let listener = match TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("bind failed: {err}"),
+        };
+        let addr = listener.local_addr().expect("local addr");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let message = WireMessage::Ping { nonce: 11 };
+            let payload = crate::wire::encode_message(&message).expect("encode");
+            let mut header = [0u8; 8];
+            header[..4].copy_from_slice(&FramingConfig::default().magic.to_be_bytes());
+            header[4..].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+            stream.write_all(&header).expect("write header");
+            stream.write_all(&payload).expect("write payload");
+        });
+
+        let mut stream = TcpStream::connect(addr).expect("connect");
+        let max = crate::wire::encode_message(&WireMessage::Ping { nonce: 11 })
+            .expect("encode")
+            .len();
+        let cfg = FramingConfig {
+            max_message_size: max,
+            ..FramingConfig::default()
+        };
+        let msg = read_message(&mut stream, &cfg).expect("equal max must pass");
+        assert!(matches!(msg, WireMessage::Ping { nonce: 11 }));
+        server.join().expect("server join");
+    }
+
+    #[test]
+    fn request_headers_and_blocks_error_on_unexpected_responses() {
+        let cfg = FramingConfig::default();
+        let listener = match TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("bind failed: {err}"),
+        };
+        let addr = listener.local_addr().expect("local addr");
+
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let _ = read_message(&mut stream, &cfg).expect("first request");
+            send_message(&mut stream, &WireMessage::Ping { nonce: 1 }, &cfg)
+                .expect("send unexpected headers response");
+
+            let _ = read_message(&mut stream, &cfg).expect("second request");
+            let item = crate::wire::InventoryItem::Tx(hash256(b"tx"));
+            send_message(&mut stream, &WireMessage::Inv { items: vec![item] }, &cfg)
+                .expect("send unexpected inv response");
+        });
+
+        let mut stream = TcpStream::connect(addr).expect("connect");
+        let err = request_headers(&mut stream, &FramingConfig::default(), Vec::new(), None)
+            .expect_err("unexpected response must fail");
+        assert!(matches!(
+            err,
+            crate::transport::TransportError::UnexpectedMessage { .. }
+        ));
+
+        let err = request_blocks(&mut stream, &FramingConfig::default(), Vec::new(), None)
+            .expect_err("tx inventory must fail");
+        assert!(matches!(
+            err,
+            crate::transport::TransportError::UnexpectedInventoryItem { .. }
+        ));
+        server.join().expect("server join");
     }
 
     fn chain_headers(

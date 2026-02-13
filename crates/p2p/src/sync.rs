@@ -155,6 +155,21 @@ mod tests {
     }
 
     #[test]
+    fn locator_is_empty_for_empty_chain() {
+        let locator = build_block_locator(&[]);
+        assert!(locator.is_empty());
+    }
+
+    #[test]
+    fn locator_soft_limit_keeps_genesis_and_compresses_history() {
+        let (chain, _) = chain_headers(300);
+        let locator = build_block_locator(&chain);
+        assert_eq!(locator[0], *chain.last().expect("tip"));
+        assert_eq!(locator.last().copied(), Some(chain[0]));
+        assert!(locator.len() < chain.len());
+    }
+
+    #[test]
     fn select_headers_after_common_fork() {
         let (chain, headers) = chain_headers(50);
         let locator = vec![chain[20], chain[10], chain[0]];
@@ -192,5 +207,29 @@ mod tests {
         assert_eq!(hashes.len(), 3);
         assert_eq!(hashes[0], chain[11]);
         assert_eq!(hashes[2], chain[13]);
+    }
+
+    #[test]
+    fn select_headers_and_hashes_return_empty_for_zero_limits_or_empty_chain() {
+        let (chain, headers) = chain_headers(10);
+        let locator = vec![chain[0]];
+        assert!(select_headers_for_peer(&chain, &headers, &locator, None, 0).is_empty());
+        assert!(select_block_hashes_for_peer(&chain, &locator, None, 0).is_empty());
+
+        let empty_chain = Vec::<Hash256>::new();
+        let empty_headers = HashMap::<Hash256, BlockHeader>::new();
+        assert!(
+            select_headers_for_peer(&empty_chain, &empty_headers, &locator, None, 8).is_empty()
+        );
+        assert!(select_block_hashes_for_peer(&empty_chain, &locator, None, 8).is_empty());
+    }
+
+    #[test]
+    fn select_headers_without_common_locator_starts_after_genesis() {
+        let (chain, headers) = chain_headers(12);
+        let locator = vec![hash256(b"unknown-locator")];
+        let selected = select_headers_for_peer(&chain, &headers, &locator, None, 2);
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].prev_block, chain[0]);
     }
 }

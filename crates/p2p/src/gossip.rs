@@ -572,6 +572,41 @@ mod tests {
     }
 
     #[test]
+    fn peer_connect_disconnect_and_ban_tracking_are_consistent() {
+        let mut engine = GossipEngine::new(256).expect("engine");
+        engine.connect_peer(1);
+        engine.connect_peer(2);
+        assert_eq!(engine.peer_count(), 2);
+        assert!(!engine.is_banned(1));
+
+        engine.disconnect_peer(2);
+        assert_eq!(engine.peer_count(), 1);
+        assert_eq!(engine.peer_score(2), None);
+    }
+
+    #[test]
+    fn announce_block_fanouts_inventory_to_connected_peers() {
+        let mut engine = GossipEngine::new(256).expect("engine");
+        engine.connect_peer(10);
+        engine.connect_peer(11);
+        let block = scam_core::Block {
+            header: scam_core::BlockHeader {
+                version: 1,
+                prev_block: scam_core::Hash256::ZERO,
+                merkle_root: scam_core::hash::hash256(b"mrkl"),
+                timestamp: 1_770_763_200,
+                target: scam_core::Target::MAX,
+                nonce: 1,
+            },
+            transactions: Vec::new(),
+        };
+        let block_hash = block.header.block_hash();
+        let out = engine.announce_block(block);
+        assert_eq!(out.len(), 2);
+        assert!(engine.has_inventory(&InventoryItem::Block(block_hash)));
+    }
+
+    #[test]
     fn oversized_inventory_is_penalized_and_banned() {
         let mut engine = GossipEngine::with_limits(2, 50).expect("engine");
         engine.connect_peer(42);
@@ -730,6 +765,42 @@ mod tests {
                 1_010,
             )
             .expect("window elapsed, replacement accepted");
+    }
+
+    #[test]
+    fn replacement_rate_window_boundary_is_inclusive() {
+        let mut engine = GossipEngine::with_limits_and_replacement(
+            256,
+            100,
+            ReplacementRateLimit {
+                window_sec: 5,
+                max_replacements: 1,
+                penalty: 5,
+            },
+        )
+        .expect("engine");
+        engine.connect_peer(1);
+
+        let _ = engine
+            .apply_mempool_inventory_delta_from_peer(
+                1,
+                vec![sample_tx(140)],
+                &[scam_core::hash::hash256(b"old-a")],
+                1_000,
+            )
+            .expect("first replacement accepted");
+        let err = engine
+            .apply_mempool_inventory_delta_from_peer(
+                1,
+                vec![sample_tx(141)],
+                &[scam_core::hash::hash256(b"old-b")],
+                1_005,
+            )
+            .expect_err("exact boundary should still count inside window");
+        assert!(matches!(
+            err,
+            super::GossipError::ReplacementRateLimited { peer_id: 1, .. }
+        ));
     }
 
     #[test]

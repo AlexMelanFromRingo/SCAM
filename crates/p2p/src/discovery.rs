@@ -159,4 +159,61 @@ mod tests {
         assert!(selected.contains(&addr("12.3.1.1:8333")));
         assert!(!selected.contains(&addr("10.1.1.1:8333")));
     }
+
+    #[test]
+    fn select_outbound_peers_returns_empty_for_zero_limit_or_empty_input() {
+        let selected = select_outbound_peers(&[], 8, 60, 1_000);
+        assert!(selected.is_empty());
+
+        let candidates = vec![PeerCandidate {
+            addr: addr("10.1.1.1:8333"),
+            last_connected_unix_sec: 0,
+            failure_count: 0,
+        }];
+        let selected = select_outbound_peers(&candidates, 0, 60, 1_000);
+        assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn fallback_path_allows_same_subnet_when_diversity_is_exhausted() {
+        let candidates = vec![
+            PeerCandidate {
+                addr: addr("10.1.1.1:8333"),
+                last_connected_unix_sec: 0,
+                failure_count: 0,
+            },
+            PeerCandidate {
+                addr: addr("10.1.2.2:8333"),
+                last_connected_unix_sec: 1,
+                failure_count: 0,
+            },
+            PeerCandidate {
+                addr: addr("10.1.3.3:8333"),
+                last_connected_unix_sec: 2,
+                failure_count: 0,
+            },
+        ];
+
+        let selected = select_outbound_peers(&candidates, 3, 60, 1_000);
+        assert_eq!(selected.len(), 3);
+    }
+
+    #[test]
+    fn staleness_boundary_prefers_older_peer_on_exact_rotate_threshold() {
+        let candidates = vec![
+            PeerCandidate {
+                addr: addr("10.1.1.1:8333"),
+                last_connected_unix_sec: 940,
+                failure_count: 0,
+            },
+            PeerCandidate {
+                addr: addr("11.2.1.1:8333"),
+                last_connected_unix_sec: 939,
+                failure_count: 0,
+            },
+        ];
+
+        let selected = select_outbound_peers(&candidates, 1, 60, 1_000);
+        assert_eq!(selected, vec![addr("11.2.1.1:8333")]);
+    }
 }
