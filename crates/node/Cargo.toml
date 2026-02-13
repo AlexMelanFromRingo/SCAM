@@ -14,6 +14,7 @@ scam-miner = { path = "../miner" }
 scam-p2p = { path = "../p2p" }
 scam-rpc = { path = "../rpc" }
 scam-storage = { path = "../storage" }
+scam-stratum = { path = "../stratum" }
 scam-wallet = { path = "../wallet" }
 thiserror.workspace = true
 toml.workspace = true

@@ -1,6 +1,8 @@
 network_id = "devnet"
 target_block_time_sec = 120
 difficulty_adjustment_window = 20
+difficulty_algorithm = "windowed"
+asert_half_life_sec = 3_600
 difficulty_clamp_up = 4.0
 difficulty_clamp_down = 0.25
 max_block_size = 1_000_000
@@ -9,6 +11,8 @@ max_mempool_txs = 50_000
 min_relay_fee_per_kb = 1_000
 max_orphan_txs = 5_000
 orphan_ttl_sec = 1_200
+p2p_max_outbound_per_bucket = 2
+dns_seeds = []
 coinbase_maturity = 100
 block_subsidy = 5_000_000_000
 hrp = "sd"

@@ -7,12 +7,24 @@ use crate::merkle::merkle_root;
 use crate::target::Target;
 use crate::types::{Block, BlockHeader, OutPoint, Transaction, TxIn, TxOut};
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum DifficultyAlgorithm {
+    Windowed,
+    Lwma,
+    Asert,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChainConfig {
     pub network_id: String,
     pub target_block_time_sec: u64,
     pub difficulty_adjustment_window: u32,
+    #[serde(default = "default_difficulty_algorithm")]
+    pub difficulty_algorithm: DifficultyAlgorithm,
+    #[serde(default = "default_asert_half_life_sec")]
+    pub asert_half_life_sec: u64,
     pub difficulty_clamp_up: f64,
     pub difficulty_clamp_down: f64,
     pub max_block_size: u32,
@@ -24,6 +36,10 @@ pub struct ChainConfig {
     pub max_orphan_txs: u32,
     #[serde(default = "default_orphan_ttl_sec")]
     pub orphan_ttl_sec: u64,
+    #[serde(default = "default_p2p_max_outbound_per_bucket")]
+    pub p2p_max_outbound_per_bucket: u32,
+    #[serde(default = "default_dns_seeds")]
+    pub dns_seeds: Vec<String>,
     pub coinbase_maturity: u32,
     pub block_subsidy: u64,
     pub hrp: String,
@@ -49,6 +65,11 @@ impl ChainConfig {
         if self.difficulty_adjustment_window == 0 {
             return Err(ChainConfigError::InvalidField(
                 "difficulty_adjustment_window must be > 0".to_owned(),
+            ));
+        }
+        if self.asert_half_life_sec == 0 {
+            return Err(ChainConfigError::InvalidField(
+                "asert_half_life_sec must be > 0".to_owned(),
             ));
         }
         if self.difficulty_clamp_up < 1.0 {
@@ -84,6 +105,16 @@ impl ChainConfig {
         if self.orphan_ttl_sec == 0 {
             return Err(ChainConfigError::InvalidField(
                 "orphan_ttl_sec must be > 0".to_owned(),
+            ));
+        }
+        if self.p2p_max_outbound_per_bucket == 0 {
+            return Err(ChainConfigError::InvalidField(
+                "p2p_max_outbound_per_bucket must be > 0".to_owned(),
+            ));
+        }
+        if self.dns_seeds.iter().any(|seed| seed.trim().is_empty()) {
+            return Err(ChainConfigError::InvalidField(
+                "dns_seeds must not contain empty entries".to_owned(),
             ));
         }
         if self.hrp.trim().is_empty() {
@@ -156,12 +187,28 @@ const fn default_min_relay_fee_per_kb() -> u64 {
     1_000
 }
 
+const fn default_difficulty_algorithm() -> DifficultyAlgorithm {
+    DifficultyAlgorithm::Windowed
+}
+
+const fn default_asert_half_life_sec() -> u64 {
+    3_600
+}
+
 const fn default_max_orphan_txs() -> u32 {
     5_000
 }
 
 const fn default_orphan_ttl_sec() -> u64 {
     20 * 60
+}
+
+const fn default_p2p_max_outbound_per_bucket() -> u32 {
+    2
+}
+
+fn default_dns_seeds() -> Vec<String> {
+    Vec::new()
 }
 
 #[derive(Debug, Error)]
@@ -174,7 +221,7 @@ pub enum ChainConfigError {
 
 #[cfg(test)]
 mod tests {
-    use crate::ChainConfig;
+    use crate::{ChainConfig, DifficultyAlgorithm};
 
     #[test]
     fn config_builds_genesis_block() {
@@ -182,6 +229,8 @@ mod tests {
             network_id: "devnet".to_owned(),
             target_block_time_sec: 120,
             difficulty_adjustment_window: 20,
+            difficulty_algorithm: DifficultyAlgorithm::Windowed,
+            asert_half_life_sec: 3_600,
             difficulty_clamp_up: 4.0,
             difficulty_clamp_down: 0.25,
             max_block_size: 1_000_000,
@@ -190,6 +239,8 @@ mod tests {
             min_relay_fee_per_kb: 1_000,
             max_orphan_txs: 5_000,
             orphan_ttl_sec: 1_200,
+            p2p_max_outbound_per_bucket: 2,
+            dns_seeds: Vec::new(),
             coinbase_maturity: 100,
             block_subsidy: 5_000_000_000,
             hrp: "sd".to_owned(),
@@ -212,6 +263,8 @@ mod tests {
             network_id: "devnet".to_owned(),
             target_block_time_sec: 120,
             difficulty_adjustment_window: 20,
+            difficulty_algorithm: DifficultyAlgorithm::Windowed,
+            asert_half_life_sec: 3_600,
             difficulty_clamp_up: 4.0,
             difficulty_clamp_down: 0.25,
             max_block_size: 1_000_000,
@@ -220,6 +273,8 @@ mod tests {
             min_relay_fee_per_kb: 1_000,
             max_orphan_txs: 5_000,
             orphan_ttl_sec: 1_200,
+            p2p_max_outbound_per_bucket: 2,
+            dns_seeds: Vec::new(),
             coinbase_maturity: 100,
             block_subsidy: 5_000_000_000,
             hrp: "sd".to_owned(),
@@ -256,9 +311,13 @@ genesis_nonce = 0
 genesis_reward_key_hash20 = "0000000000000000000000000000000000000000"
 "#;
         let cfg: ChainConfig = toml::from_str(raw).expect("config parse");
+        assert_eq!(cfg.difficulty_algorithm, DifficultyAlgorithm::Windowed);
+        assert_eq!(cfg.asert_half_life_sec, 3_600);
         assert_eq!(cfg.min_relay_fee_per_kb, 1_000);
         assert_eq!(cfg.max_orphan_txs, 5_000);
         assert_eq!(cfg.orphan_ttl_sec, 1_200);
+        assert_eq!(cfg.p2p_max_outbound_per_bucket, 2);
+        assert!(cfg.dns_seeds.is_empty());
         cfg.validate().expect("validate");
     }
 }

@@ -7,7 +7,7 @@ pub mod target;
 pub mod types;
 pub mod visual;
 
-pub use config::{ChainConfig, ChainConfigError};
+pub use config::{ChainConfig, ChainConfigError, DifficultyAlgorithm};
 pub use hash::{Hash256, hash160_blake3, hash256, tagged_hash256};
 pub use pow::{block_meets_pow, header_meets_pow};
 pub use target::Target;

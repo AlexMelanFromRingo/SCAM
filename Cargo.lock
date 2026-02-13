@@ -908,6 +908,7 @@ dependencies = [
  "scam-p2p",
  "scam-rpc",
  "scam-storage",
+ "scam-stratum",
  "scam-wallet",
  "thiserror",
  "toml",
@@ -941,6 +942,16 @@ dependencies = [
  "scam-consensus",
  "scam-core",
  "serde",
+ "thiserror",
+]
+
+[[package]]
+name = "scam-stratum"
+version = "0.1.0"
+dependencies = [
+ "scam-core",
+ "serde",
+ "serde_json",
  "thiserror",
 ]
 

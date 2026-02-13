@@ -3,10 +3,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use num_bigint::BigUint;
 use scam_consensus::{
-    BlockApplySummary, BlockValidationError, UtxoSet, chainwork_for_target, retarget_next,
-    validate_and_apply_block, validate_block_basic,
+    BlockApplySummary, BlockValidationError, UtxoSet, asert_next, chainwork_for_target, lwma_next,
+    retarget_next, validate_and_apply_block, validate_block_basic,
 };
-use scam_core::{Block, BlockHeader, ChainConfig, Hash256, Target};
+use scam_core::{Block, BlockHeader, ChainConfig, DifficultyAlgorithm, Hash256, Target};
 use thiserror::Error;
 
 const MEDIAN_TIME_PAST_WINDOW: usize = 11;
@@ -227,34 +227,84 @@ impl ChainRuntime {
         }
 
         let tip_header = self.tip_header();
-        if !next_height.is_multiple_of(window) {
-            return Ok(tip_header.target);
-        }
-
-        let start_height = next_height - window;
-        let start_hash = self.main_chain[start_height as usize];
-        let start_header = self
-            .headers
-            .get(&start_hash)
-            .expect("header for start height must exist");
-        let actual_timespan = tip_header
-            .timestamp
-            .saturating_sub(start_header.timestamp)
-            .max(1);
-        let expected_timespan = window * self.config.target_block_time_sec;
         let max_target = self.config.genesis_target()?;
+        match self.config.difficulty_algorithm {
+            DifficultyAlgorithm::Windowed => {
+                if !next_height.is_multiple_of(window) {
+                    return Ok(tip_header.target);
+                }
 
-        let next_target = retarget_next(
-            tip_header.target,
-            actual_timespan,
-            expected_timespan,
-            self.config.difficulty_clamp_down,
-            self.config.difficulty_clamp_up,
-            max_target,
-        )
-        .map_err(ChainError::Difficulty)?;
+                let start_height = next_height - window;
+                let start_hash = self.main_chain[start_height as usize];
+                let start_header = self
+                    .headers
+                    .get(&start_hash)
+                    .expect("header for start height must exist");
+                let actual_timespan = tip_header
+                    .timestamp
+                    .saturating_sub(start_header.timestamp)
+                    .max(1);
+                let expected_timespan = window * self.config.target_block_time_sec;
 
-        Ok(next_target)
+                retarget_next(
+                    tip_header.target,
+                    actual_timespan,
+                    expected_timespan,
+                    self.config.difficulty_clamp_down,
+                    self.config.difficulty_clamp_up,
+                    max_target,
+                )
+                .map_err(ChainError::Difficulty)
+            }
+            DifficultyAlgorithm::Lwma => {
+                let history = self.main_chain.len();
+                let window = self.config.difficulty_adjustment_window as usize;
+                if history < window + 1 {
+                    return Ok(tip_header.target);
+                }
+                let start = history - (window + 1);
+                let mut targets = Vec::with_capacity(window + 1);
+                let mut timestamps = Vec::with_capacity(window + 1);
+                for height in start..history {
+                    let hash = self.main_chain[height];
+                    let header = self
+                        .headers
+                        .get(&hash)
+                        .expect("header at chain height must exist");
+                    targets.push(header.target);
+                    timestamps.push(header.timestamp);
+                }
+
+                lwma_next(
+                    &targets,
+                    &timestamps,
+                    self.config.target_block_time_sec,
+                    max_target,
+                )
+                .map_err(ChainError::Difficulty)
+            }
+            DifficultyAlgorithm::Asert => {
+                if self.main_chain.len() < 2 {
+                    return Ok(tip_header.target);
+                }
+                let parent_header = self
+                    .headers
+                    .get(&tip_header.prev_block)
+                    .expect("parent header for tip must exist");
+                let observed = tip_header
+                    .timestamp
+                    .saturating_sub(parent_header.timestamp)
+                    .max(1);
+                asert_next(
+                    tip_header.target,
+                    observed,
+                    self.config.target_block_time_sec,
+                    self.config.asert_half_life_sec,
+                    max_target,
+                )
+                .map_err(ChainError::Difficulty)
+            }
+        }
     }
 
     pub fn apply_next_block(&mut self, block: Block) -> Result<BlockApplySummary, ChainError> {

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -10,8 +10,8 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use scam_chain::{BlockSubmissionOutcome, ChainError, ChainRuntime};
 use scam_consensus::{TxValidationError, UtxoSet, validate_and_apply_block};
 use scam_core::{
-    ChainConfig, ChainConfigError, Hash256, OutPoint, Transaction, TxIn, TxOut, block_meets_pow,
-    render_hash_bitmap_16x16,
+    ChainConfig, ChainConfigError, DifficultyAlgorithm, Hash256, OutPoint, Target, Transaction,
+    TxIn, TxOut, block_meets_pow, render_hash_bitmap_16x16,
 };
 use scam_miner::{BlockTemplate, mine_block};
 use scam_p2p::{
@@ -25,6 +25,10 @@ use scam_storage::{
     ChainArchive, ChainStateSnapshot, PeerAddressBook, PeerAddressRecord, StorageError,
     load_chain_archive_db, load_peer_book_db, load_snapshot, load_snapshot_db,
     save_chain_archive_db, save_peer_book_db, save_snapshot, save_snapshot_db,
+};
+use scam_stratum::{
+    MiningJob, ShareSubmission, ShareValidation, Sv2Message, decode_line as decode_sv2_line,
+    encode_line as encode_sv2_line, validate_share,
 };
 use scam_wallet::{
     AddressError, DeriveKeyError, MnemonicError, QrError, RescanError, SchnorrError, WalletKey,
@@ -58,6 +62,7 @@ enum Command {
     Status(StatusArgs),
     GetBlock(GetBlockArgs),
     GetTx(GetTxArgs),
+    ConfigScaffold(ConfigScaffoldArgs),
     AddPeer(AddPeerArgs),
     HashVisual(HashVisualArgs),
     Wallet(WalletArgs),
@@ -70,6 +75,7 @@ enum Command {
     ReindexRuntime(ReindexRuntimeArgs),
     Soak(SoakArgs),
     ReorgDemo(ReorgDemoArgs),
+    StratumServe(StratumServeArgs),
     RpcServe(RpcServeArgs),
     Snapshot(SnapshotArgs),
     P2pDemo,
@@ -135,6 +141,61 @@ struct GetTxArgs {
     max_nonce: u64,
     #[arg(long, default_value_t = true)]
     json: bool,
+}
+
+#[derive(Debug, Args)]
+struct ConfigScaffoldArgs {
+    #[arg(long)]
+    network_id: String,
+    #[arg(long, default_value = "s")]
+    hrp: String,
+    #[arg(long, default_value_t = 120)]
+    target_block_time_sec: u64,
+    #[arg(long, default_value_t = 20)]
+    difficulty_adjustment_window: u32,
+    #[arg(long, value_enum, default_value_t = DifficultyAlgoArg::Windowed)]
+    difficulty_algorithm: DifficultyAlgoArg,
+    #[arg(long, default_value_t = 3_600)]
+    asert_half_life_sec: u64,
+    #[arg(long, default_value_t = 4.0)]
+    difficulty_clamp_up: f64,
+    #[arg(long, default_value_t = 0.25)]
+    difficulty_clamp_down: f64,
+    #[arg(long, default_value_t = 1_000_000)]
+    max_block_size: u32,
+    #[arg(long, default_value_t = 100_000)]
+    max_tx_size: u32,
+    #[arg(long, default_value_t = 50_000)]
+    max_mempool_txs: u32,
+    #[arg(long, default_value_t = 1_000)]
+    min_relay_fee_per_kb: u64,
+    #[arg(long, default_value_t = 5_000)]
+    max_orphan_txs: u32,
+    #[arg(long, default_value_t = 1_200)]
+    orphan_ttl_sec: u64,
+    #[arg(long, default_value_t = 2)]
+    p2p_max_outbound_per_bucket: u32,
+    #[arg(long = "dns-seed")]
+    dns_seeds: Vec<String>,
+    #[arg(long, default_value_t = 100)]
+    coinbase_maturity: u32,
+    #[arg(long, default_value_t = 5_000_000_000)]
+    block_subsidy: u64,
+    #[arg(long, default_value = "SCAM custom genesis block")]
+    genesis_message: String,
+    #[arg(long)]
+    genesis_timestamp: Option<u64>,
+    #[arg(
+        long,
+        default_value = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+    )]
+    genesis_target: String,
+    #[arg(long, default_value_t = 0)]
+    genesis_nonce: u64,
+    #[arg(long, default_value = "0000000000000000000000000000000000000000")]
+    genesis_reward_key_hash20: String,
+    #[arg(long, default_value = "config/custom.toml")]
+    out: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -307,6 +368,25 @@ struct ReorgDemoArgs {
     fork_interval_sec: u64,
     #[arg(long, default_value_t = 500_000)]
     max_nonce: u64,
+}
+
+#[derive(Debug, Args)]
+struct StratumServeArgs {
+    #[arg(long, value_enum, default_value_t = Network::Devnet)]
+    network: Network,
+    #[arg(long)]
+    config: Option<PathBuf>,
+    #[arg(long)]
+    runtime_db: Option<PathBuf>,
+    #[arg(long, default_value = "127.0.0.1:3347")]
+    bind: String,
+    #[arg(
+        long,
+        default_value = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+    )]
+    share_target_hex: String,
+    #[arg(long, default_value_t = 1)]
+    max_clients: u32,
 }
 
 #[derive(Debug, Args)]
@@ -576,6 +656,23 @@ enum Network {
     Mainnet,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum DifficultyAlgoArg {
+    Windowed,
+    Lwma,
+    Asert,
+}
+
+impl From<DifficultyAlgoArg> for DifficultyAlgorithm {
+    fn from(value: DifficultyAlgoArg) -> Self {
+        match value {
+            DifficultyAlgoArg::Windowed => DifficultyAlgorithm::Windowed,
+            DifficultyAlgoArg::Lwma => DifficultyAlgorithm::Lwma,
+            DifficultyAlgoArg::Asert => DifficultyAlgorithm::Asert,
+        }
+    }
+}
+
 impl Network {
     fn as_str(self) -> &'static str {
         match self {
@@ -631,6 +728,8 @@ enum NodeError {
     Address(#[from] AddressError),
     #[error("schnorr error: {0}")]
     Schnorr(#[from] SchnorrError),
+    #[error("stratum error: {0}")]
+    Stratum(#[from] scam_stratum::StratumError),
     #[error("wallet rescan error: {0}")]
     Rescan(#[from] RescanError),
     #[error("qr error: {0}")]
@@ -906,6 +1005,57 @@ fn run_get_tx(args: GetTxArgs) -> Result<(), NodeError> {
     Ok(())
 }
 
+fn run_config_scaffold(args: ConfigScaffoldArgs) -> Result<(), NodeError> {
+    let genesis_timestamp = match args.genesis_timestamp {
+        Some(ts) => ts,
+        None => current_unix_sec()?,
+    };
+    let cfg = ChainConfig {
+        network_id: args.network_id.clone(),
+        target_block_time_sec: args.target_block_time_sec,
+        difficulty_adjustment_window: args.difficulty_adjustment_window,
+        difficulty_algorithm: args.difficulty_algorithm.into(),
+        asert_half_life_sec: args.asert_half_life_sec,
+        difficulty_clamp_up: args.difficulty_clamp_up,
+        difficulty_clamp_down: args.difficulty_clamp_down,
+        max_block_size: args.max_block_size,
+        max_tx_size: args.max_tx_size,
+        max_mempool_txs: args.max_mempool_txs,
+        min_relay_fee_per_kb: args.min_relay_fee_per_kb,
+        max_orphan_txs: args.max_orphan_txs,
+        orphan_ttl_sec: args.orphan_ttl_sec,
+        p2p_max_outbound_per_bucket: args.p2p_max_outbound_per_bucket,
+        dns_seeds: args.dns_seeds.clone(),
+        coinbase_maturity: args.coinbase_maturity,
+        block_subsidy: args.block_subsidy,
+        hrp: args.hrp.clone(),
+        genesis_message: args.genesis_message.clone(),
+        genesis_timestamp,
+        genesis_target: args.genesis_target.clone(),
+        genesis_nonce: args.genesis_nonce,
+        genesis_reward_key_hash20: args.genesis_reward_key_hash20.clone(),
+    };
+    cfg.validate()?;
+    let rendered = toml::to_string_pretty(&cfg)
+        .map_err(|e| NodeError::Runtime(format!("cannot render config toml: {e}")))?;
+    if let Some(parent) = args.out.parent() {
+        fs::create_dir_all(parent).map_err(|e| NodeError::Runtime(e.to_string()))?;
+    }
+    fs::write(&args.out, rendered).map_err(|e| NodeError::Runtime(e.to_string()))?;
+
+    let genesis_hash = cfg.build_genesis_block()?.header.block_hash();
+    println!("Config scaffold written: {}", args.out.display());
+    println!("Network: {}", cfg.network_id);
+    println!("HRP: {}", cfg.hrp);
+    println!(
+        "Difficulty: {:?} (window={} half_life_sec={})",
+        cfg.difficulty_algorithm, cfg.difficulty_adjustment_window, cfg.asert_half_life_sec
+    );
+    println!("Genesis timestamp: {}", cfg.genesis_timestamp);
+    println!("Genesis hash: {}", genesis_hash);
+    Ok(())
+}
+
 fn peer_book_paths(peers_dir: &Path, network_name: &str) -> (PathBuf, PathBuf) {
     (
         peers_dir.join(format!("{network_name}.redb")),
@@ -964,6 +1114,56 @@ fn current_unix_sec() -> Result<u64, NodeError> {
         .duration_since(UNIX_EPOCH)
         .map_err(|e| NodeError::Runtime(format!("system clock error: {e}")))?;
     Ok(now.as_secs())
+}
+
+fn resolve_dns_seed(seed: &str) -> Vec<SocketAddr> {
+    let raw = seed.trim();
+    if raw.is_empty() {
+        return Vec::new();
+    }
+    if let Ok(addr) = raw.parse::<SocketAddr>() {
+        return vec![addr];
+    }
+    let with_port = if raw.contains(':') {
+        raw.to_owned()
+    } else {
+        format!("{raw}:8333")
+    };
+    with_port
+        .to_socket_addrs()
+        .map(|iter| iter.collect::<Vec<_>>())
+        .unwrap_or_default()
+}
+
+fn peer_diversity_bucket(addr: SocketAddr) -> String {
+    match addr.ip() {
+        IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            format!("v4-{}.{}", octets[0], octets[1])
+        }
+        IpAddr::V6(v6) => {
+            let seg = v6.segments();
+            format!("v6-{:x}:{:x}", seg[0], seg[1])
+        }
+    }
+}
+
+fn apply_bucket_cap(addrs: Vec<SocketAddr>, max_per_bucket: u32) -> Vec<SocketAddr> {
+    if max_per_bucket == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(addrs.len());
+    let mut counts = HashMap::<String, u32>::new();
+    for addr in addrs {
+        let key = peer_diversity_bucket(addr);
+        let count = counts.entry(key).or_insert(0);
+        if *count >= max_per_bucket {
+            continue;
+        }
+        *count = count.saturating_add(1);
+        out.push(addr);
+    }
+    out
 }
 
 fn run_add_peer(args: AddPeerArgs) -> Result<(), NodeError> {
@@ -2459,11 +2659,24 @@ fn run_sync_book(args: SyncBookArgs) -> Result<(), NodeError> {
         fs::create_dir_all(parent).map_err(|e| NodeError::Runtime(e.to_string()))?;
     }
     let mut peer_book = load_or_init_peer_book(network_name, &peers_db_path, &legacy_txt_path)?;
-    if peer_book.peers.is_empty() {
-        return Err(NodeError::Runtime(format!(
-            "no peers available in {}",
-            peers_db_path.display()
-        )));
+    let mut seed_imported = 0usize;
+    for seed in &cfg.dns_seeds {
+        for addr in resolve_dns_seed(seed) {
+            let addr_string = addr.to_string();
+            if peer_book
+                .peers
+                .iter()
+                .any(|peer| peer.address == addr_string)
+            {
+                continue;
+            }
+            peer_book.peers.push(PeerAddressRecord {
+                address: addr_string,
+                last_seen_unix_sec: 0,
+                ban_score: 0,
+            });
+            seed_imported = seed_imported.saturating_add(1);
+        }
     }
 
     let now = current_unix_sec()?;
@@ -2483,8 +2696,11 @@ fn run_sync_book(args: SyncBookArgs) -> Result<(), NodeError> {
             "peer book has no parseable socket addresses".to_owned(),
         ));
     }
+    peer_book.peers.sort_by(|a, b| a.address.cmp(&b.address));
+    peer_book.peers.dedup_by(|a, b| a.address == b.address);
 
     let selected = select_outbound_peers(&candidates, args.max_peers, args.rotate_after_sec, now);
+    let selected = apply_bucket_cap(selected, cfg.p2p_max_outbound_per_bucket);
     if selected.is_empty() {
         return Err(NodeError::Runtime(
             "peer selection produced zero candidates".to_owned(),
@@ -2499,6 +2715,7 @@ fn run_sync_book(args: SyncBookArgs) -> Result<(), NodeError> {
     let mut total_downloaded = 0usize;
     let mut total_applied = 0usize;
 
+    let peers_tried = selected.len();
     for addr in selected {
         let addr_string = addr.to_string();
         let attempt_now = current_unix_sec()?;
@@ -2557,7 +2774,8 @@ fn run_sync_book(args: SyncBookArgs) -> Result<(), NodeError> {
         runtime.tip_height(),
         runtime.tip_hash()
     );
-    println!("Peers tried: {}", peer_book.peers.len());
+    println!("Seeds imported: {}", seed_imported);
+    println!("Peers tried: {}", peers_tried);
     println!("Peers succeeded: {}", success_count);
     println!("Headers received: {}", total_headers);
     println!("Blocks announced: {}", total_announced);
@@ -2892,6 +3110,224 @@ fn run_reorg_demo(args: ReorgDemoArgs) -> Result<(), NodeError> {
     Ok(())
 }
 
+#[derive(Clone)]
+struct StratumWork {
+    job: MiningJob,
+    coinbase: Transaction,
+}
+
+fn build_stratum_work(
+    runtime: &ChainRuntime,
+    cfg: &ChainConfig,
+    channel_id: u32,
+    job_id: u32,
+) -> Result<StratumWork, NodeError> {
+    let target = runtime.expected_target_for_next_block()?;
+    let coinbase = build_coinbase_tx(
+        format!("stratum-job-{job_id}"),
+        cfg.block_subsidy,
+        cfg.genesis_reward_key_hash20()?,
+    );
+    let merkle_root = scam_core::merkle::merkle_root(&[coinbase.txid()]);
+    let job = MiningJob {
+        channel_id,
+        job_id,
+        version: 1,
+        prev_hash: runtime.tip_hash(),
+        merkle_root,
+        ntime: runtime
+            .tip_header()
+            .timestamp
+            .saturating_add(cfg.target_block_time_sec),
+        network_target: target,
+    };
+    Ok(StratumWork { job, coinbase })
+}
+
+fn write_sv2_message(stream: &mut TcpStream, message: &Sv2Message) -> Result<(), NodeError> {
+    let line = encode_sv2_line(message)?;
+    stream
+        .write_all(line.as_bytes())
+        .map_err(|e| NodeError::Runtime(format!("stratum write failed: {e}")))
+}
+
+fn read_sv2_message(reader: &mut BufReader<TcpStream>) -> Result<Sv2Message, NodeError> {
+    let mut line = String::new();
+    let bytes = reader
+        .read_line(&mut line)
+        .map_err(|e| NodeError::Runtime(format!("stratum read failed: {e}")))?;
+    if bytes == 0 {
+        return Err(NodeError::Runtime(
+            "stratum peer closed the connection".to_owned(),
+        ));
+    }
+    decode_sv2_line(line.trim())
+        .map_err(|e| NodeError::Runtime(format!("stratum decode failed: {e}")))
+}
+
+fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
+    let config_path = args
+        .config
+        .unwrap_or_else(|| PathBuf::from(format!("config/{}.toml", args.network.as_str())));
+    let cfg = load_chain_config(&config_path)?;
+    let runtime_db_path = args
+        .runtime_db
+        .unwrap_or_else(|| default_runtime_db_path(args.network));
+    let (mut runtime, source) = load_runtime_from_db_or_genesis(&cfg, &runtime_db_path)?;
+    let share_target = Target::from_hex(&args.share_target_hex)
+        .map_err(|e| NodeError::Runtime(format!("invalid share_target_hex: {e}")))?;
+
+    let listener = TcpListener::bind(&args.bind)
+        .map_err(|e| NodeError::Runtime(format!("stratum bind failed on {}: {e}", args.bind)))?;
+    println!(
+        "Stratum (SV2-subset) listening on {} network={} source={} tip_h={} tip_hash={}",
+        args.bind,
+        cfg.network_id,
+        source,
+        runtime.tip_height(),
+        runtime.tip_hash()
+    );
+    println!("Share target: {share_target}");
+    if args.max_clients > 0 {
+        println!("Max clients before exit: {}", args.max_clients);
+    }
+
+    let mut served = 0u32;
+    for incoming in listener.incoming() {
+        let mut stream =
+            incoming.map_err(|e| NodeError::Runtime(format!("stratum accept failed: {e}")))?;
+        configure_stream_timeouts(&stream)?;
+        let mut reader = BufReader::new(
+            stream
+                .try_clone()
+                .map_err(|e| NodeError::Runtime(format!("stratum stream clone failed: {e}")))?,
+        );
+
+        let setup = read_sv2_message(&mut reader)?;
+        if !matches!(setup, Sv2Message::SetupConnection { .. }) {
+            return Err(NodeError::Runtime(
+                "expected setup_connection as first stratum message".to_owned(),
+            ));
+        }
+        write_sv2_message(
+            &mut stream,
+            &Sv2Message::SetupConnectionSuccess {
+                used_version: 2,
+                flags: 0,
+            },
+        )?;
+
+        let open = read_sv2_message(&mut reader)?;
+        let (request_id, _user) = match open {
+            Sv2Message::OpenStandardMiningChannel { request_id, user } => (request_id, user),
+            other => {
+                return Err(NodeError::Runtime(format!(
+                    "expected open_standard_mining_channel, got {other:?}"
+                )));
+            }
+        };
+        let channel_id = served.saturating_add(1);
+        write_sv2_message(
+            &mut stream,
+            &Sv2Message::OpenStandardMiningChannelSuccess {
+                request_id,
+                channel_id,
+                target_hex: share_target.to_hex(),
+            },
+        )?;
+
+        let mut next_job_id = 1u32;
+        let mut work = build_stratum_work(&runtime, &cfg, channel_id, next_job_id)?;
+        write_sv2_message(
+            &mut stream,
+            &Sv2Message::NewMiningJob {
+                channel_id,
+                job_id: work.job.job_id,
+                version: work.job.version,
+                prev_hash_hex: work.job.prev_hash.to_hex(),
+                merkle_root_hex: work.job.merkle_root.to_hex(),
+                ntime: work.job.ntime,
+                network_target_hex: work.job.network_target.to_hex(),
+            },
+        )?;
+
+        while let Ok(msg) = read_sv2_message(&mut reader) {
+            let inbound = msg;
+            let submission = match inbound {
+                Sv2Message::SubmitSharesStandard {
+                    channel_id,
+                    job_id,
+                    nonce,
+                    ntime,
+                } => ShareSubmission {
+                    channel_id,
+                    job_id,
+                    nonce,
+                    ntime,
+                },
+                _ => continue,
+            };
+
+            match validate_share(&work.job, submission, share_target) {
+                Ok(ShareValidation::AcceptedShare { is_block, .. }) => {
+                    write_sv2_message(
+                        &mut stream,
+                        &Sv2Message::SubmitSharesSuccess {
+                            channel_id: work.job.channel_id,
+                            accepted: 1,
+                        },
+                    )?;
+                    if is_block {
+                        let block = scam_core::Block {
+                            header: scam_core::BlockHeader {
+                                version: work.job.version,
+                                prev_block: work.job.prev_hash,
+                                merkle_root: work.job.merkle_root,
+                                timestamp: submission.ntime,
+                                target: work.job.network_target,
+                                nonce: submission.nonce,
+                            },
+                            transactions: vec![work.coinbase.clone()],
+                        };
+                        runtime.submit_block(block)?;
+                        persist_runtime_db(&runtime, &runtime_db_path)?;
+                        next_job_id = next_job_id.saturating_add(1);
+                        work = build_stratum_work(&runtime, &cfg, channel_id, next_job_id)?;
+                        write_sv2_message(
+                            &mut stream,
+                            &Sv2Message::NewMiningJob {
+                                channel_id,
+                                job_id: work.job.job_id,
+                                version: work.job.version,
+                                prev_hash_hex: work.job.prev_hash.to_hex(),
+                                merkle_root_hex: work.job.merkle_root.to_hex(),
+                                ntime: work.job.ntime,
+                                network_target_hex: work.job.network_target.to_hex(),
+                            },
+                        )?;
+                    }
+                }
+                Err(err) => {
+                    write_sv2_message(
+                        &mut stream,
+                        &Sv2Message::SubmitSharesError {
+                            channel_id: work.job.channel_id,
+                            code: "share_rejected".to_owned(),
+                            reason: err.to_string(),
+                        },
+                    )?;
+                }
+            }
+        }
+
+        served = served.saturating_add(1);
+        if args.max_clients > 0 && served >= args.max_clients {
+            break;
+        }
+    }
+    Ok(())
+}
+
 fn json_error_body(message: &str) -> String {
     let escaped = message
         .replace('\\', "\\\\")
@@ -3112,6 +3548,7 @@ fn run() -> Result<(), NodeError> {
         Some(Command::Status(args)) => run_status(args),
         Some(Command::GetBlock(args)) => run_get_block(args),
         Some(Command::GetTx(args)) => run_get_tx(args),
+        Some(Command::ConfigScaffold(args)) => run_config_scaffold(args),
         Some(Command::AddPeer(args)) => run_add_peer(args),
         Some(Command::HashVisual(args)) => run_hash_visual(args),
         Some(Command::Wallet(args)) => run_wallet(args.command),
@@ -3124,6 +3561,7 @@ fn run() -> Result<(), NodeError> {
         Some(Command::ReindexRuntime(args)) => run_reindex_runtime(args),
         Some(Command::Soak(args)) => run_soak(args),
         Some(Command::ReorgDemo(args)) => run_reorg_demo(args),
+        Some(Command::StratumServe(args)) => run_stratum_serve(args),
         Some(Command::RpcServe(args)) => run_rpc_serve(args),
         Some(Command::Snapshot(args)) => run_snapshot(args.command),
         Some(Command::P2pDemo) => run_p2p_demo(),
@@ -3151,11 +3589,11 @@ mod tests {
     use scam_wallet::{WalletMnemonic, derive_wallet_key};
 
     use super::{
-        AddPeerArgs, Network, ReindexRuntimeArgs, SOAK_FLOW_MNEMONIC, SpendableUtxo, SyncBookArgs,
-        accepted_hrps_for_network, build_coinbase_tx, build_signed_transfer_tx,
-        execute_soak_rounds, load_chain_config, mine_block_with_transactions,
-        mine_blocks_on_runtime, persist_runtime_db, run_add_peer, run_reindex_runtime,
-        run_sync_book, select_utxos_for_amount,
+        AddPeerArgs, ConfigScaffoldArgs, DifficultyAlgoArg, Network, ReindexRuntimeArgs,
+        SOAK_FLOW_MNEMONIC, SpendableUtxo, SyncBookArgs, accepted_hrps_for_network,
+        build_coinbase_tx, build_signed_transfer_tx, execute_soak_rounds, load_chain_config,
+        mine_block_with_transactions, mine_blocks_on_runtime, persist_runtime_db, run_add_peer,
+        run_config_scaffold, run_reindex_runtime, run_sync_book, select_utxos_for_amount,
     };
 
     fn utxo(seed: u8, value: u64) -> SpendableUtxo {
@@ -3280,6 +3718,57 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(peers_dir);
+    }
+
+    #[test]
+    fn config_scaffold_writes_valid_custom_config() {
+        let work_dir = temp_dir("test-config-scaffold");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let out = work_dir.join("custom.toml");
+
+        run_config_scaffold(ConfigScaffoldArgs {
+            network_id: "forknet".to_owned(),
+            hrp: "sc".to_owned(),
+            target_block_time_sec: 90,
+            difficulty_adjustment_window: 30,
+            difficulty_algorithm: DifficultyAlgoArg::Lwma,
+            asert_half_life_sec: 1800,
+            difficulty_clamp_up: 4.0,
+            difficulty_clamp_down: 0.25,
+            max_block_size: 2_000_000,
+            max_tx_size: 200_000,
+            max_mempool_txs: 75_000,
+            min_relay_fee_per_kb: 1_000,
+            max_orphan_txs: 5_000,
+            orphan_ttl_sec: 1_200,
+            p2p_max_outbound_per_bucket: 2,
+            dns_seeds: vec![
+                "seed1.example.org".to_owned(),
+                "seed2.example.org".to_owned(),
+            ],
+            coinbase_maturity: 100,
+            block_subsidy: 5_000_000_000,
+            genesis_message: "fork genesis".to_owned(),
+            genesis_timestamp: Some(1_800_000_000),
+            genesis_target: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                .to_owned(),
+            genesis_nonce: 0,
+            genesis_reward_key_hash20: "0000000000000000000000000000000000000000".to_owned(),
+            out: out.clone(),
+        })
+        .expect("scaffold");
+
+        let cfg = load_chain_config(&out).expect("load");
+        assert_eq!(cfg.network_id, "forknet");
+        assert_eq!(cfg.hrp, "sc");
+        assert_eq!(
+            cfg.difficulty_algorithm,
+            scam_core::DifficultyAlgorithm::Lwma
+        );
+        assert_eq!(cfg.p2p_max_outbound_per_bucket, 2);
+        assert_eq!(cfg.dns_seeds.len(), 2);
+
+        let _ = fs::remove_dir_all(work_dir);
     }
 
     #[test]

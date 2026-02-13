@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use scam_core::{
     Block, BlockHeader, Hash256, OutPoint, Target, Transaction, TxIn, TxOut, header_meets_pow,
@@ -81,51 +81,105 @@ pub fn build_template_from_mempool(
     mempool: &Mempool,
 ) -> Result<(BlockTemplate, TemplateBuildSummary), MinerError> {
     let ranked = mempool.txids_by_feerate_desc();
-    let mut pending = ranked
-        .into_iter()
-        .take(params.max_txs)
-        .collect::<Vec<Hash256>>();
-    let candidate_set = pending.iter().copied().collect::<HashSet<Hash256>>();
+    let mut entries = HashMap::<Hash256, CandidateEntry>::new();
+    for txid in &ranked {
+        let Some((tx, fee)) = mempool.get_with_fee(txid) else {
+            continue;
+        };
+        let parents = tx
+            .inputs
+            .iter()
+            .filter_map(|input| {
+                if input.prev_out.is_coinbase() {
+                    return None;
+                }
+                let parent = input.prev_out.txid;
+                mempool.contains(&parent).then_some(parent)
+            })
+            .collect::<Vec<_>>();
+        entries.insert(
+            *txid,
+            CandidateEntry {
+                fee,
+                size: tx.encode_for_hash().len(),
+                parents,
+            },
+        );
+    }
+
+    let mut children = HashMap::<Hash256, Vec<Hash256>>::new();
+    for (txid, entry) in &entries {
+        for parent in &entry.parents {
+            children.entry(*parent).or_default().push(*txid);
+        }
+    }
+
     let mut included = Vec::<Hash256>::new();
     let mut included_set = HashSet::<Hash256>::new();
 
-    while !pending.is_empty() {
-        let mut progressed = false;
-        let mut next_pending = Vec::<Hash256>::new();
-
-        for txid in pending {
-            let Some((tx, _fee)) = mempool.get_with_fee(&txid) else {
-                continue;
-            };
-
-            let has_parent_outside_candidates = tx.inputs.iter().any(|input| {
-                !input.prev_out.is_coinbase()
-                    && mempool.contains(&input.prev_out.txid)
-                    && !candidate_set.contains(&input.prev_out.txid)
-            });
-            if has_parent_outside_candidates {
-                continue;
-            }
-
-            let has_unmet_parent = tx.inputs.iter().any(|input| {
-                !input.prev_out.is_coinbase()
-                    && mempool.contains(&input.prev_out.txid)
-                    && !included_set.contains(&input.prev_out.txid)
-            });
-            if has_unmet_parent {
-                next_pending.push(txid);
-                continue;
-            }
-
-            included.push(txid);
-            included_set.insert(txid);
-            progressed = true;
-        }
-
-        if !progressed {
+    while included.len() < params.max_txs {
+        let ready_roots = ranked
+            .iter()
+            .copied()
+            .filter(|txid| {
+                if included_set.contains(txid) {
+                    return false;
+                }
+                entries
+                    .get(txid)
+                    .map(|entry| {
+                        entry
+                            .parents
+                            .iter()
+                            .all(|parent| included_set.contains(parent))
+                    })
+                    .unwrap_or(false)
+            })
+            .collect::<Vec<_>>();
+        if ready_roots.is_empty() {
             break;
         }
-        pending = next_pending;
+
+        let mut best: Option<PackageCandidate> = None;
+        for root in ready_roots {
+            let package = build_cpfp_package(
+                root,
+                &ranked,
+                &entries,
+                &children,
+                &included_set,
+                params.max_txs.saturating_sub(included.len()),
+            );
+            if package.ordered_txids.is_empty() {
+                continue;
+            }
+            match &best {
+                Some(current) => {
+                    if package.score_key > current.score_key
+                        || (package.score_key == current.score_key
+                            && package.total_fee > current.total_fee)
+                        || (package.score_key == current.score_key
+                            && package.total_fee == current.total_fee
+                            && package.root < current.root)
+                    {
+                        best = Some(package);
+                    }
+                }
+                None => best = Some(package),
+            }
+        }
+
+        let Some(best_package) = best else {
+            break;
+        };
+        for txid in best_package.ordered_txids {
+            if included_set.insert(txid) {
+                included.push(txid);
+            }
+            if included.len() >= params.max_txs {
+                break;
+            }
+        }
     }
 
     let mut total_fees = 0u64;
@@ -170,6 +224,111 @@ pub fn build_template_from_mempool(
         total_fees,
     };
     Ok((template, summary))
+}
+
+#[derive(Clone)]
+struct CandidateEntry {
+    fee: u64,
+    size: usize,
+    parents: Vec<Hash256>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PackageCandidate {
+    root: Hash256,
+    ordered_txids: Vec<Hash256>,
+    total_fee: u64,
+    total_size: usize,
+    score_key: u128,
+}
+
+fn build_cpfp_package(
+    root: Hash256,
+    ranked: &[Hash256],
+    entries: &HashMap<Hash256, CandidateEntry>,
+    children: &HashMap<Hash256, Vec<Hash256>>,
+    included_set: &HashSet<Hash256>,
+    max_package_txs: usize,
+) -> PackageCandidate {
+    let mut package = HashSet::<Hash256>::new();
+    package.insert(root);
+
+    loop {
+        let mut changed = false;
+        let current = package.iter().copied().collect::<Vec<_>>();
+        for txid in current {
+            let Some(descendants) = children.get(&txid) else {
+                continue;
+            };
+            for child in descendants {
+                if included_set.contains(child) || package.contains(child) {
+                    continue;
+                }
+                let Some(entry) = entries.get(child) else {
+                    continue;
+                };
+                let all_parents_ready = entry
+                    .parents
+                    .iter()
+                    .all(|parent| included_set.contains(parent) || package.contains(parent));
+                if all_parents_ready {
+                    package.insert(*child);
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let mut remaining = package.clone();
+    let mut ordered = Vec::<Hash256>::new();
+    let mut total_fee = 0u64;
+    let mut total_size = 0usize;
+
+    while !remaining.is_empty() && ordered.len() < max_package_txs {
+        let mut progressed = false;
+        for txid in ranked {
+            if !remaining.contains(txid) {
+                continue;
+            }
+            let Some(entry) = entries.get(txid) else {
+                continue;
+            };
+            let parents_ready = entry
+                .parents
+                .iter()
+                .all(|parent| included_set.contains(parent) || !remaining.contains(parent));
+            if !parents_ready {
+                continue;
+            }
+            remaining.remove(txid);
+            ordered.push(*txid);
+            total_fee = total_fee.saturating_add(entry.fee);
+            total_size = total_size.saturating_add(entry.size);
+            progressed = true;
+            if ordered.len() >= max_package_txs {
+                break;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+
+    let score_key = if total_size == 0 {
+        0
+    } else {
+        ((total_fee as u128) * 1000) / (total_size as u128)
+    };
+    PackageCandidate {
+        root,
+        ordered_txids: ordered,
+        total_fee,
+        total_size,
+        score_key,
+    }
 }
 
 impl TemplateManager {
@@ -399,6 +558,38 @@ mod tests {
         assert_eq!(summary.total_fees, 101);
         assert_eq!(template.transactions[1].txid(), parent_id);
         assert_eq!(template.transactions[2].txid(), child_id);
+    }
+
+    #[test]
+    fn template_builder_applies_cpfp_package_selection() {
+        let mut mempool = Mempool::with_policy(100, 0).expect("mempool");
+        let parent = spend_tx([10u8; 32], 0, b"cpfp-parent", 10);
+        let parent_id = parent.txid();
+        let child = spend_tx(parent_id.0, 0, b"cpfp-child", 11);
+        let child_id = child.txid();
+        let unrelated = spend_tx([12u8; 32], 0, b"unrelated", 12);
+        let unrelated_id = unrelated.txid();
+
+        mempool.insert_with_fee(parent, 1).expect("insert parent");
+        mempool.insert_with_fee(child, 1_000).expect("insert child");
+        mempool
+            .insert_with_fee(unrelated, 100)
+            .expect("insert unrelated");
+
+        let params = MempoolTemplateParams {
+            version: 1,
+            prev_block: scam_core::Hash256::ZERO,
+            timestamp: 1_770_763_200,
+            target: Target::MAX,
+            block_subsidy: 50,
+            miner_key_hash20: [3u8; 20],
+            coinbase_tag: "cpfp".to_owned(),
+            max_txs: 2,
+        };
+        let (_template, summary) =
+            build_template_from_mempool(&params, &mempool).expect("template");
+        assert_eq!(summary.included_txids, vec![parent_id, child_id]);
+        assert!(!summary.included_txids.contains(&unrelated_id));
     }
 
     #[test]
