@@ -381,7 +381,8 @@ impl Mempool {
         let mut to_remove = HashSet::<Hash256>::new();
         to_remove.insert(root_txid);
 
-        loop {
+        // Safety bound: each pass must add at least one txid or terminate.
+        for _ in 0..=self.txs.len() {
             let mut changed = false;
             for (txid, entry) in &self.txs {
                 if to_remove.contains(txid) {
@@ -920,6 +921,44 @@ mod tests {
         assert!(mempool.contains(&parent_new_id));
         assert!(!mempool.contains(&parent_old_id));
         assert!(!mempool.contains(&child_id));
+    }
+
+    #[test]
+    fn replacement_removes_long_descendant_chain_without_hanging() {
+        let mut mempool =
+            Mempool::with_policy_and_replacement(256, 0, 1, 200).expect("mempool must initialize");
+        let root = [15u8; 32];
+        let parent_old = mk_tx(root, 0, b"parent-old", 10);
+        let parent_old_id = parent_old.txid();
+        mempool
+            .insert_with_fee(parent_old, 10)
+            .expect("insert parent old");
+
+        let mut chain = vec![parent_old_id];
+        for i in 0..40u8 {
+            let prev = chain.last().copied().expect("previous txid");
+            let sig = format!("child-{i}").into_bytes();
+            let child = mk_tx(prev.0, 0, &sig, i);
+            let child_id = child.txid();
+            mempool.insert_with_fee(child, 10).expect("insert child");
+            chain.push(child_id);
+        }
+
+        let parent_new = mk_tx(root, 0, b"parent-new", 11);
+        let parent_new_id = parent_new.txid();
+        let outcome = mempool
+            .insert_with_fee(parent_new, 500)
+            .expect("replacement must succeed");
+
+        let removed = match outcome {
+            InsertOutcome::Replaced { removed, .. } => removed,
+            other => panic!("unexpected outcome: {other:?}"),
+        };
+        assert_eq!(removed.len(), 41);
+        assert!(mempool.contains(&parent_new_id));
+        for txid in chain {
+            assert!(!mempool.contains(&txid));
+        }
     }
 
     #[test]

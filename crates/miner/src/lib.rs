@@ -253,7 +253,8 @@ fn build_cpfp_package(
     let mut package = HashSet::<Hash256>::new();
     package.insert(root);
 
-    loop {
+    // Safety bound: package membership is monotonic and cannot grow beyond candidate count.
+    for _ in 0..=entries.len() {
         let mut changed = false;
         let current = package.iter().copied().collect::<Vec<_>>();
         for txid in current {
@@ -287,7 +288,11 @@ fn build_cpfp_package(
     let mut total_fee = 0u64;
     let mut total_size = 0usize;
 
-    while !remaining.is_empty() && ordered.len() < max_package_txs {
+    // Safety bound: each pass must either order at least one txid or terminate.
+    for _ in 0..=entries.len() {
+        if remaining.is_empty() || ordered.len() >= max_package_txs {
+            break;
+        }
         let mut progressed = false;
         for txid in ranked {
             if !remaining.contains(txid) {
@@ -429,9 +434,12 @@ pub enum MinerError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{HashMap, HashSet};
+
     use scam_core::{OutPoint, Target, Transaction, TxIn, TxOut};
     use scam_mempool::Mempool;
 
+    use super::{CandidateEntry, build_cpfp_package};
     use crate::{
         BlockTemplate, MempoolTemplateParams, TemplateManager, TemplateRefresh,
         build_template_from_mempool, mine_block, mine_block_with_extra_nonce,
@@ -627,6 +635,96 @@ mod tests {
         assert!(summary.included_txids.contains(&parent_id));
         assert!(summary.included_txids.contains(&child_id));
         assert!(summary.included_txids.contains(&mid_a_id));
+    }
+
+    #[test]
+    fn cpfp_package_builder_terminates_on_cyclic_dependencies() {
+        let a = scam_core::Hash256([1u8; 32]);
+        let b = scam_core::Hash256([2u8; 32]);
+
+        let ranked = vec![a, b];
+        let mut entries = HashMap::<scam_core::Hash256, CandidateEntry>::new();
+        entries.insert(
+            a,
+            CandidateEntry {
+                fee: 10,
+                size: 100,
+                parents: vec![b],
+            },
+        );
+        entries.insert(
+            b,
+            CandidateEntry {
+                fee: 10,
+                size: 100,
+                parents: vec![a],
+            },
+        );
+
+        let mut children = HashMap::<scam_core::Hash256, Vec<scam_core::Hash256>>::new();
+        children.insert(a, vec![b]);
+        children.insert(b, vec![a]);
+        let included = HashSet::new();
+
+        let package = build_cpfp_package(a, &ranked, &entries, &children, &included, 8);
+        assert!(package.ordered_txids.is_empty());
+        assert_eq!(package.total_fee, 0);
+        assert_eq!(package.total_size, 0);
+        assert_eq!(package.score_key, 0);
+    }
+
+    #[test]
+    fn cpfp_package_builder_orders_dependencies_before_descendants() {
+        let root = scam_core::Hash256([11u8; 32]);
+        let c1 = scam_core::Hash256([12u8; 32]);
+        let c2 = scam_core::Hash256([13u8; 32]);
+        let c3 = scam_core::Hash256([14u8; 32]);
+
+        let ranked = vec![c3, c2, c1, root];
+        let mut entries = HashMap::<scam_core::Hash256, CandidateEntry>::new();
+        entries.insert(
+            root,
+            CandidateEntry {
+                fee: 1,
+                size: 100,
+                parents: vec![],
+            },
+        );
+        entries.insert(
+            c1,
+            CandidateEntry {
+                fee: 2,
+                size: 100,
+                parents: vec![root],
+            },
+        );
+        entries.insert(
+            c2,
+            CandidateEntry {
+                fee: 3,
+                size: 100,
+                parents: vec![c1],
+            },
+        );
+        entries.insert(
+            c3,
+            CandidateEntry {
+                fee: 4,
+                size: 100,
+                parents: vec![c2],
+            },
+        );
+
+        let mut children = HashMap::<scam_core::Hash256, Vec<scam_core::Hash256>>::new();
+        children.insert(root, vec![c1]);
+        children.insert(c1, vec![c2]);
+        children.insert(c2, vec![c3]);
+        let included = HashSet::new();
+
+        let package = build_cpfp_package(root, &ranked, &entries, &children, &included, 8);
+        assert_eq!(package.ordered_txids, vec![root, c1, c2, c3]);
+        assert_eq!(package.total_fee, 10);
+        assert_eq!(package.total_size, 400);
     }
 
     #[test]

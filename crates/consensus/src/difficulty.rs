@@ -259,4 +259,111 @@ mod tests {
         let next = asert_next(target, 240, 120, 600, Target::MAX).expect("asert");
         assert!(next > target);
     }
+
+    #[test]
+    fn retarget_rejects_invalid_expected_timespan() {
+        let target =
+            Target::from_hex("00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+                .expect("target parse");
+        let err = retarget_next(target, 10, 0, 0.25, 4.0, Target::MAX).expect_err("must fail");
+        assert!(matches!(
+            err,
+            crate::difficulty::DifficultyError::InvalidExpectedTimespan
+        ));
+    }
+
+    #[test]
+    fn retarget_rejects_invalid_clamps() {
+        let target =
+            Target::from_hex("00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+                .expect("target parse");
+
+        let up_err = retarget_next(target, 10, 20, 0.25, 0.99, Target::MAX).expect_err("must fail");
+        assert!(matches!(
+            up_err,
+            crate::difficulty::DifficultyError::InvalidClamp(_)
+        ));
+
+        let down_err = retarget_next(target, 10, 20, 0.0, 4.0, Target::MAX).expect_err("must fail");
+        assert!(matches!(
+            down_err,
+            crate::difficulty::DifficultyError::InvalidClamp(_)
+        ));
+    }
+
+    #[test]
+    fn retarget_clamps_actual_timespan_to_minimum_bound() {
+        let old =
+            Target::from_hex("00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+                .expect("target parse");
+        let next = retarget_next(old, 0, 2400, 0.25, 4.0, Target::MAX).expect("retarget");
+        let min_bound = retarget_next(old, 600, 2400, 0.25, 4.0, Target::MAX).expect("retarget");
+        assert_eq!(next, min_bound);
+    }
+
+    #[test]
+    fn lwma_rejects_invalid_inputs() {
+        let target =
+            Target::from_hex("00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+                .expect("target parse");
+        let err_time = lwma_next(&[target, target], &[1, 2], 0, Target::MAX).expect_err("fail");
+        assert!(matches!(
+            err_time,
+            crate::difficulty::DifficultyError::InvalidExpectedTimespan
+        ));
+
+        let err_layout = lwma_next(&[target, target], &[1], 120, Target::MAX).expect_err("fail");
+        assert!(matches!(
+            err_layout,
+            crate::difficulty::DifficultyError::InsufficientHistory { .. }
+                | crate::difficulty::DifficultyError::InvalidHistoryLayout
+        ));
+
+        let err_insufficient = lwma_next(&[target], &[1], 120, Target::MAX).expect_err("fail");
+        assert!(matches!(
+            err_insufficient,
+            crate::difficulty::DifficultyError::InsufficientHistory { .. }
+        ));
+    }
+
+    #[test]
+    fn lwma_caps_extreme_solve_time_and_respects_max_target() {
+        let target =
+            Target::from_hex("00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+                .expect("target parse");
+        let targets = vec![target; 4];
+        let timestamps = vec![1_000, 2_000_000, 4_000_000, 8_000_000];
+        let capped_max =
+            Target::from_hex("00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+                .expect("target parse");
+        let next = lwma_next(&targets, &timestamps, 120, capped_max).expect("lwma");
+        assert!(next <= capped_max);
+    }
+
+    #[test]
+    fn asert_rejects_invalid_parameters() {
+        let target =
+            Target::from_hex("00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+                .expect("target parse");
+        let err_half = asert_next(target, 120, 120, 0, Target::MAX).expect_err("must fail");
+        assert!(matches!(
+            err_half,
+            crate::difficulty::DifficultyError::InvalidClamp(_)
+        ));
+
+        let err_time = asert_next(target, 120, 0, 600, Target::MAX).expect_err("must fail");
+        assert!(matches!(
+            err_time,
+            crate::difficulty::DifficultyError::InvalidExpectedTimespan
+        ));
+    }
+
+    #[test]
+    fn asert_large_negative_delta_never_underflows_to_zero() {
+        let target =
+            Target::from_hex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+                .expect("target parse");
+        let next = asert_next(target, 1, 10_000, 1, Target::MAX).expect("asert");
+        assert!(next > Target::MIN);
+    }
 }

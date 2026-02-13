@@ -15,12 +15,12 @@ Run window: `2026-02-13T16:10:10Z` -> `2026-02-13T17:09:00Z`
 
 ## P0: Consensus / Safety / Infinite-Loop Risk
 
-- [ ] Add explicit tests for `merkle_root` termination and correctness on odd/even leaf counts (`crates/core/src/merkle.rs`).
-- [ ] Add regression tests for replacement graph traversal termination in `Mempool::collect_replacement_set` (`crates/mempool/src/lib.rs`).
-- [ ] Add regression tests for CPFP package traversal termination in `build_cpfp_package` (`crates/miner/src/lib.rs`).
-- [ ] Add boundary tests for `ChainRuntime::expected_target_for_next_block` math and branch conditions (`crates/chain/src/lib.rs`).
-- [ ] Add strict branch/boundary tests for `retarget_next`, `lwma_next`, `asert_next` (`crates/consensus/src/difficulty.rs`).
-- [ ] Add negative-path tests for `validate_contextual_timestamps` and block acceptance/rejection toggles (`crates/chain/src/lib.rs`).
+- [x] Add explicit tests for `merkle_root` termination and correctness on odd/even leaf counts (`crates/core/src/merkle.rs`).
+- [x] Add regression tests for replacement graph traversal termination in `Mempool::collect_replacement_set` (`crates/mempool/src/lib.rs`).
+- [x] Add regression tests for CPFP package traversal termination in `build_cpfp_package` (`crates/miner/src/lib.rs`).
+- [x] Add boundary tests for `ChainRuntime::expected_target_for_next_block` math and branch conditions (`crates/chain/src/lib.rs`).
+- [x] Add strict branch/boundary tests for `retarget_next`, `lwma_next`, `asert_next` (`crates/consensus/src/difficulty.rs`).
+- [x] Add negative-path tests for `validate_contextual_timestamps` and block acceptance/rejection toggles (`crates/chain/src/lib.rs`).
 
 ## P1: Stratum / P2P Protocol Robustness
 
@@ -48,7 +48,7 @@ Run window: `2026-02-13T16:10:10Z` -> `2026-02-13T17:09:00Z`
 
 ## Timeout-Specific Actions
 
-- [ ] Add explicit max-iteration guards (test-side or helper-side) for loops touched by timeout mutants:
+- [x] Add explicit max-iteration guards (test-side or helper-side) for loops touched by timeout mutants:
 - `core::merkle_root`
 - `mempool::collect_replacement_set`
 - `miner::build_cpfp_package`
@@ -59,4 +59,3 @@ Run window: `2026-02-13T16:10:10Z` -> `2026-02-13T17:09:00Z`
 - [ ] Stage 1: close all P0 items and re-run mutation on `core/consensus/chain/mempool/miner`.
 - [ ] Stage 2: close P1 items and re-run mutation on `stratum/p2p/node` protocol subset.
 - [ ] Stage 3: close P2/P3 items and run full workspace mutation baseline again.
-

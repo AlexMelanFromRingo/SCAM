@@ -532,6 +532,7 @@ mod tests {
     use scam_core::{OutPoint, Transaction, TxIn, TxOut};
     use scam_miner::{BlockTemplate, mine_block};
 
+    use super::{asert_next, lwma_next, retarget_next};
     use crate::{BlockSubmissionOutcome, ChainError, ChainRuntime};
 
     fn coinbase(value: u64, key_hash20: [u8; 20], tag: &[u8]) -> Transaction {
@@ -556,6 +557,256 @@ mod tests {
         assert_eq!(runtime.tip_height(), 0);
         assert_eq!(runtime.block_hashes().len(), 1);
         assert_eq!(runtime.utxo_len(), 1);
+    }
+
+    #[test]
+    fn expected_target_windowed_returns_tip_target_between_boundaries() {
+        let mut config: scam_core::ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        config.difficulty_algorithm = scam_core::DifficultyAlgorithm::Windowed;
+        config.difficulty_adjustment_window = 20;
+        let runtime = ChainRuntime::from_config(config).expect("runtime");
+        let expected = runtime.expected_target_for_next_block().expect("target");
+        assert_eq!(expected, runtime.tip_header().target);
+    }
+
+    #[test]
+    fn expected_target_windowed_uses_retarget_math_at_boundary() {
+        let mut config: scam_core::ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        config.difficulty_algorithm = scam_core::DifficultyAlgorithm::Windowed;
+        config.difficulty_adjustment_window = 2;
+        let reward = config.genesis_reward_key_hash20().expect("key");
+        let mut runtime = ChainRuntime::from_config(config.clone()).expect("runtime");
+
+        let template = BlockTemplate {
+            version: 1,
+            prev_block: runtime.tip_hash(),
+            timestamp: runtime.tip_header().timestamp.saturating_add(30),
+            target: runtime.expected_target_for_next_block().expect("target"),
+            transactions: vec![coinbase(config.block_subsidy, reward, b"w1")],
+        };
+        let block = mine_block(&template, 200_000).expect("mine");
+        runtime.apply_next_block(block).expect("apply");
+
+        let tip_hash = runtime.tip_hash();
+        let overridden_tip_target = scam_core::Target::from_hex(
+            "00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        )
+        .expect("target parse");
+        runtime
+            .headers
+            .get_mut(&tip_hash)
+            .expect("tip header")
+            .target = overridden_tip_target;
+
+        let start_hash = runtime.block_hash_at_height(0).expect("genesis");
+        let start_ts = runtime
+            .headers
+            .get(&start_hash)
+            .expect("genesis header")
+            .timestamp;
+        let tip_ts = runtime.tip_header().timestamp;
+        let expected = retarget_next(
+            overridden_tip_target,
+            tip_ts.saturating_sub(start_ts).max(1),
+            2 * config.target_block_time_sec,
+            config.difficulty_clamp_down,
+            config.difficulty_clamp_up,
+            config.genesis_target().expect("max target"),
+        )
+        .expect("retarget");
+
+        assert_eq!(
+            runtime.expected_target_for_next_block().expect("target"),
+            expected
+        );
+    }
+
+    #[test]
+    fn expected_target_lwma_uses_tip_target_until_history_is_ready() {
+        let mut config: scam_core::ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        config.difficulty_algorithm = scam_core::DifficultyAlgorithm::Lwma;
+        config.difficulty_adjustment_window = 20;
+        let runtime = ChainRuntime::from_config(config).expect("runtime");
+        assert_eq!(
+            runtime.expected_target_for_next_block().expect("target"),
+            runtime.tip_header().target
+        );
+    }
+
+    #[test]
+    fn expected_target_lwma_matches_formula_when_history_available() {
+        let mut config: scam_core::ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        config.difficulty_algorithm = scam_core::DifficultyAlgorithm::Lwma;
+        config.difficulty_adjustment_window = 3;
+        let reward = config.genesis_reward_key_hash20().expect("key");
+        let mut runtime = ChainRuntime::from_config(config.clone()).expect("runtime");
+
+        for i in 0..3 {
+            let template = BlockTemplate {
+                version: 1,
+                prev_block: runtime.tip_hash(),
+                timestamp: runtime.tip_header().timestamp + (i + 1) as u64 * 15,
+                target: runtime.expected_target_for_next_block().expect("target"),
+                transactions: vec![coinbase(
+                    config.block_subsidy,
+                    reward,
+                    format!("lwma-{i}").as_bytes(),
+                )],
+            };
+            let block = mine_block(&template, 200_000).expect("mine");
+            runtime.apply_next_block(block).expect("apply");
+        }
+
+        let window = config.difficulty_adjustment_window as usize;
+        let history = runtime.main_chain.len();
+        let start = history - (window + 1);
+        let target_override = scam_core::Target::from_hex(
+            "00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        )
+        .expect("target parse");
+        let base_ts = 1_700_000_000u64;
+        for (idx, height) in (start..history).enumerate() {
+            let hash = runtime.main_chain[height];
+            let header = runtime.headers.get_mut(&hash).expect("header");
+            header.target = target_override;
+            header.timestamp = base_ts + (idx as u64) * 30;
+        }
+
+        let mut targets = Vec::with_capacity(window + 1);
+        let mut timestamps = Vec::with_capacity(window + 1);
+        for height in start..history {
+            let hash = runtime.main_chain[height];
+            let header = runtime.headers.get(&hash).expect("header");
+            targets.push(header.target);
+            timestamps.push(header.timestamp);
+        }
+        let expected = lwma_next(
+            &targets,
+            &timestamps,
+            config.target_block_time_sec,
+            config.genesis_target().expect("max target"),
+        )
+        .expect("lwma");
+        assert_eq!(
+            runtime.expected_target_for_next_block().expect("target"),
+            expected
+        );
+    }
+
+    #[test]
+    fn expected_target_asert_matches_formula_after_first_block() {
+        let mut config: scam_core::ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        config.difficulty_algorithm = scam_core::DifficultyAlgorithm::Asert;
+        let reward = config.genesis_reward_key_hash20().expect("key");
+        let mut runtime = ChainRuntime::from_config(config.clone()).expect("runtime");
+
+        let template = BlockTemplate {
+            version: 1,
+            prev_block: runtime.tip_hash(),
+            timestamp: runtime.tip_header().timestamp.saturating_add(45),
+            target: runtime.expected_target_for_next_block().expect("target"),
+            transactions: vec![coinbase(config.block_subsidy, reward, b"asert-1")],
+        };
+        let block = mine_block(&template, 200_000).expect("mine");
+        runtime.apply_next_block(block).expect("apply");
+
+        let tip_hash = runtime.tip_hash();
+        let override_target = scam_core::Target::from_hex(
+            "00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        )
+        .expect("target parse");
+        runtime
+            .headers
+            .get_mut(&tip_hash)
+            .expect("tip header")
+            .target = override_target;
+
+        let tip_header = runtime.tip_header().clone();
+        let parent = runtime
+            .headers
+            .get(&tip_header.prev_block)
+            .expect("parent header");
+        let expected = asert_next(
+            override_target,
+            tip_header.timestamp.saturating_sub(parent.timestamp).max(1),
+            config.target_block_time_sec,
+            config.asert_half_life_sec,
+            config.genesis_target().expect("max target"),
+        )
+        .expect("asert");
+        assert_eq!(
+            runtime.expected_target_for_next_block().expect("target"),
+            expected
+        );
+    }
+
+    #[test]
+    fn validate_contextual_timestamps_rejects_unknown_parent() {
+        let config: scam_core::ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let runtime = ChainRuntime::from_config(config.clone()).expect("runtime");
+        let block = scam_core::Block {
+            header: scam_core::BlockHeader {
+                version: 1,
+                prev_block: scam_core::Hash256([9u8; 32]),
+                merkle_root: scam_core::Hash256::ZERO,
+                timestamp: runtime.tip_header().timestamp.saturating_add(1),
+                target: config.genesis_target().expect("target"),
+                nonce: 0,
+            },
+            transactions: vec![coinbase(
+                config.block_subsidy,
+                config.genesis_reward_key_hash20().expect("key"),
+                b"unknown-parent",
+            )],
+        };
+        let err = runtime
+            .validate_contextual_timestamps(&block)
+            .expect_err("must reject unknown parent");
+        assert!(matches!(err, ChainError::MissingHeader { .. }));
+    }
+
+    #[test]
+    fn apply_next_block_rejects_unexpected_target_and_accepts_expected_target() {
+        let config: scam_core::ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let reward = config.genesis_reward_key_hash20().expect("key");
+        let mut runtime = ChainRuntime::from_config(config.clone()).expect("runtime");
+
+        let expected_target = runtime.expected_target_for_next_block().expect("target");
+        let wrong_target = scam_core::Target::from_hex(
+            "00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        )
+        .expect("target parse");
+        assert_ne!(wrong_target, expected_target);
+
+        let wrong_block = BlockTemplate {
+            version: 1,
+            prev_block: runtime.tip_hash(),
+            timestamp: runtime.tip_header().timestamp.saturating_add(30),
+            target: wrong_target,
+            transactions: vec![coinbase(config.block_subsidy, reward, b"wrong-target")],
+        }
+        .build_with_nonce(0);
+        let err = runtime
+            .apply_next_block(wrong_block)
+            .expect_err("must reject unexpected target");
+        assert!(matches!(err, ChainError::UnexpectedTarget { .. }));
+
+        let ok_block = BlockTemplate {
+            version: 1,
+            prev_block: runtime.tip_hash(),
+            timestamp: runtime.tip_header().timestamp.saturating_add(30),
+            target: expected_target,
+            transactions: vec![coinbase(config.block_subsidy, reward, b"right-target")],
+        };
+        let mined = mine_block(&ok_block, 200_000).expect("mine");
+        runtime.apply_next_block(mined).expect("accept block");
     }
 
     #[test]
