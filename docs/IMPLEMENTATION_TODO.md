@@ -46,6 +46,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] Added per-peer replacement rate limit in gossip path for mempool-delta relay (`apply_mempool_inventory_delta_from_peer`) with ban-score penalties.
 - [x] Added telemetry hooks for mempool replacement and orphan churn (`MempoolTelemetry`, `OrphanPoolTelemetry`) and gossip replacement counters.
 - [x] Added Stratum worker client command (`scam-node stratum-mine --pool <addr>`) for manual pool endpoint connectivity without DNS dependency.
+- [x] Added operator runbook document (`docs/OPERATOR_RUNBOOK.md`) covering bootstrap, sync, mining endpoint, reindex/recovery, and soak/chaos procedures.
 - [x] Config now explicitly freezes relay/orphan policy constants across network preset files.
 - [x] Miner template + nonce search loop implemented (`mine-once` CLI).
 - [x] Chainstate snapshot save/load implemented.
@@ -53,7 +54,7 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] redb chain archive persistence implemented (`blocks/headers/block-index`) with runtime restore path in `node run`.
 - [x] Reorg-safe best-chain selection by cumulative work implemented in chain runtime.
 - [x] Minimal HTTP JSON RPC transport implemented (`scam-node rpc-serve`).
-- [ ] Remaining major items: final launch hardening and operator runbook polish.
+- [ ] Remaining major items: final launch hardening + public testnet dress rehearsal.
 
 ## 1) Frozen Design Decisions
 
