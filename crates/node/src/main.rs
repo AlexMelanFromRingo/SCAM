@@ -1132,6 +1132,10 @@ fn run_node(
     Ok(())
 }
 
+fn should_mine_query_blocks(mine_blocks: u32) -> bool {
+    mine_blocks != 0
+}
+
 fn build_runtime_for_query(
     network: Network,
     config: Option<PathBuf>,
@@ -1146,7 +1150,7 @@ fn build_runtime_for_query(
     let cfg = load_chain_config(&config_path)?;
     let runtime_db_path = runtime_db.unwrap_or_else(|| default_runtime_db_path(network));
     let (mut runtime, _) = load_runtime_from_db_or_genesis(&cfg, &runtime_db_path)?;
-    if mine_blocks > 0 {
+    if should_mine_query_blocks(mine_blocks) {
         let params = MiningLoopParams {
             count: mine_blocks,
             interval_sec,
@@ -7620,6 +7624,183 @@ mod tests {
     }
 
     #[test]
+    fn other_command_entrypoints_fail_fast_with_missing_config_or_inputs() {
+        let missing_cfg = temp_dir("test-other-missing-config").join("missing.toml");
+
+        let mine_err = super::run_mine_once(super::MineOnceArgs {
+            network: Network::Devnet,
+            config: Some(missing_cfg.clone()),
+            max_nonce: 1,
+        })
+        .expect_err("missing config must fail mine-once");
+        assert!(mine_err.to_string().contains("config"));
+
+        let chain_err = super::run_chain_demo(super::ChainDemoArgs {
+            network: Network::Devnet,
+            config: Some(missing_cfg.clone()),
+            blocks: 1,
+            max_nonce: 1,
+            interval_sec: 1,
+        })
+        .expect_err("missing config must fail chain-demo");
+        assert!(chain_err.to_string().contains("config"));
+
+        let sync_demo_err = super::run_sync_demo(super::SyncDemoArgs {
+            network: Network::Devnet,
+            config: Some(missing_cfg.clone()),
+            local_blocks: 1,
+            remote_blocks: 1,
+            max_headers: 1,
+            interval_sec: 1,
+            max_nonce: 1,
+        })
+        .expect_err("missing config must fail sync-demo");
+        assert!(sync_demo_err.to_string().contains("config"));
+
+        let net_demo_err = super::run_net_demo(super::NetDemoArgs {
+            network: Network::Devnet,
+            config: Some(missing_cfg.clone()),
+            local_blocks: 1,
+            remote_blocks: 1,
+            max_headers: 1,
+            interval_sec: 1,
+            max_nonce: 1,
+        })
+        .expect_err("missing config must fail net-demo");
+        assert!(net_demo_err.to_string().contains("config"));
+
+        let sync_peer_err = super::run_sync_peer(super::SyncPeerArgs {
+            network: Network::Devnet,
+            config: Some(missing_cfg.clone()),
+            runtime_db: None,
+            peer: "127.0.0.1:18444".to_owned(),
+            max_batches: 1,
+        })
+        .expect_err("missing config must fail sync-peer");
+        assert!(sync_peer_err.to_string().contains("config"));
+
+        let sync_book_err = run_sync_book(SyncBookArgs {
+            network: Network::Devnet,
+            config: Some(missing_cfg.clone()),
+            runtime_db: None,
+            peers_dir: temp_dir("test-other-sync-book"),
+            max_peers: 1,
+            max_batches_per_peer: 1,
+            rotate_after_sec: 1,
+        })
+        .expect_err("missing config must fail sync-book");
+        assert!(sync_book_err.to_string().contains("config"));
+
+        let reorg_err = super::run_reorg_demo(super::ReorgDemoArgs {
+            network: Network::Devnet,
+            config: Some(missing_cfg.clone()),
+            main_blocks: 1,
+            fork_blocks: 1,
+            fork_from_height: 0,
+            main_interval_sec: 1,
+            fork_interval_sec: 1,
+            max_nonce: 1,
+        })
+        .expect_err("missing config must fail reorg-demo");
+        assert!(reorg_err.to_string().contains("config"));
+
+        let relay_err = super::run_relay_serve(super::RelayServeArgs {
+            network: Network::Devnet,
+            config: Some(missing_cfg),
+            runtime_db: None,
+            bind: "127.0.0.1:0".to_owned(),
+            max_clients: 1,
+            max_messages_per_peer: 1,
+            read_timeout_sec: 1,
+            write_timeout_sec: 1,
+            max_inv_items: None,
+            ban_threshold: None,
+            replacement_window_sec: None,
+            replacement_max_per_peer: None,
+            replacement_penalty: None,
+            telemetry_out: None,
+            telemetry_every_sec: 1,
+        })
+        .expect_err("missing config must fail relay-serve");
+        assert!(relay_err.to_string().contains("config"));
+
+        let snapshot_err = super::run_snapshot(super::SnapshotCommand::Show {
+            path: temp_dir("test-snapshot-missing").join("missing.snapshot"),
+        })
+        .expect_err("missing snapshot file must fail");
+        assert!(snapshot_err.to_string().contains("snapshot"));
+    }
+
+    #[test]
+    fn load_runtime_from_db_validates_network_id_and_db_source() {
+        let work_dir = temp_dir("test-load-runtime-db");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let runtime_db_path = work_dir.join("runtime.redb");
+
+        let cfg_devnet: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("devnet config");
+        let runtime = ChainRuntime::from_config(cfg_devnet.clone()).expect("runtime");
+        persist_runtime_db(&runtime, &runtime_db_path).expect("persist runtime db");
+
+        let (_loaded, source) =
+            super::load_runtime_from_db_or_genesis(&cfg_devnet, &runtime_db_path)
+                .expect("load from matching db");
+        assert_eq!(source, "db");
+
+        let cfg_testnet: ChainConfig =
+            toml::from_str(include_str!("../../../config/testnet.toml")).expect("testnet config");
+        let mismatch = match super::load_runtime_from_db_or_genesis(&cfg_testnet, &runtime_db_path)
+        {
+            Ok(_) => panic!("network mismatch must fail"),
+            Err(err) => err,
+        };
+        assert!(
+            mismatch.to_string().contains("runtime db network mismatch"),
+            "unexpected mismatch error: {mismatch}"
+        );
+
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
+    fn query_runtime_mining_guard_uses_nonzero_semantics() {
+        assert!(!super::should_mine_query_blocks(0));
+        assert!(super::should_mine_query_blocks(1));
+
+        let work_dir = temp_dir("test-query-runtime-mining");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let config_path = work_dir.join("devnet.toml");
+        fs::write(&config_path, include_str!("../../../config/devnet.toml")).expect("write cfg");
+        let runtime_db = work_dir.join("runtime.redb");
+
+        let (_cfg_zero, runtime_zero) = super::build_runtime_for_query(
+            Network::Devnet,
+            Some(config_path.clone()),
+            Some(runtime_db.clone()),
+            0,
+            30,
+            500_000,
+            "query-zero",
+        )
+        .expect("build runtime zero");
+        assert_eq!(runtime_zero.tip_height(), 0);
+
+        let (_cfg_two, runtime_two) = super::build_runtime_for_query(
+            Network::Devnet,
+            Some(config_path),
+            Some(runtime_db),
+            2,
+            30,
+            500_000,
+            "query-two",
+        )
+        .expect("build runtime two");
+        assert_eq!(runtime_two.tip_height(), 2);
+
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
     fn decode_helpers_validate_lengths_and_optional_behavior() {
         let full = "11".repeat(32);
         let with_prefix = format!("0x{full}");
@@ -7874,6 +8055,134 @@ mod tests {
     }
 
     #[test]
+    fn stratum_keygen_and_rotate_validate_paths_and_archive_old_keys() {
+        let work_dir = temp_dir("test-stratum-keygen-rotate");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let secret = work_dir.join("server.secret.hex");
+        let public = work_dir.join("server.public.hex");
+        let archive = work_dir.join("archive");
+
+        super::run_stratum_keygen(super::StratumKeygenArgs {
+            secret_out: secret.clone(),
+            public_out: public.clone(),
+            force: false,
+        })
+        .expect("first keygen");
+        assert!(secret.exists());
+        assert!(public.exists());
+
+        let secret_before = fs::read_to_string(&secret).expect("read secret before");
+        let public_before = fs::read_to_string(&public).expect("read public before");
+        assert!(!secret_before.trim().is_empty());
+        assert!(!public_before.trim().is_empty());
+
+        let overwrite_err = super::run_stratum_keygen(super::StratumKeygenArgs {
+            secret_out: secret.clone(),
+            public_out: public.clone(),
+            force: false,
+        })
+        .expect_err("second keygen without force must fail");
+        assert!(overwrite_err.to_string().contains("already exists"));
+
+        super::run_stratum_keygen(super::StratumKeygenArgs {
+            secret_out: secret.clone(),
+            public_out: public.clone(),
+            force: true,
+        })
+        .expect("forced keygen");
+        let secret_after = fs::read_to_string(&secret).expect("read secret after");
+        let public_after = fs::read_to_string(&public).expect("read public after");
+        assert!(!secret_after.trim().is_empty());
+        assert!(!public_after.trim().is_empty());
+
+        super::run_stratum_key_rotate(super::StratumKeyRotateArgs {
+            secret_path: secret.clone(),
+            public_path: public.clone(),
+            archive_dir: archive.clone(),
+        })
+        .expect("rotate keys");
+        assert!(secret.exists());
+        assert!(public.exists());
+
+        let archived = fs::read_dir(&archive)
+            .expect("read archive")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            archived
+                .iter()
+                .any(|name| name.starts_with("server.secret.") && name.ends_with(".hex"))
+        );
+        assert!(
+            archived
+                .iter()
+                .any(|name| name.starts_with("server.public.") && name.ends_with(".hex"))
+        );
+
+        let missing_secret_err = super::run_stratum_key_rotate(super::StratumKeyRotateArgs {
+            secret_path: work_dir.join("missing.secret"),
+            public_path: public,
+            archive_dir: archive,
+        })
+        .expect_err("rotate must reject missing secret file");
+        assert!(
+            missing_secret_err
+                .to_string()
+                .contains("secret key file does not exist")
+        );
+
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
+    fn sv2_message_kind_covers_all_public_messages() {
+        let setup = super::sv2_message_kind(&Sv2Message::SetupConnection {
+            protocol: 2,
+            min_version: 2,
+            max_version: 2,
+            flags: 0,
+            user_agent: "ua".to_owned(),
+        });
+        let open = super::sv2_message_kind(&Sv2Message::OpenStandardMiningChannel {
+            request_id: 1,
+            user: "miner".to_owned(),
+        });
+        let job = super::sv2_message_kind(&Sv2Message::NewMiningJob {
+            channel_id: 1,
+            job_id: 1,
+            version: 1,
+            prev_hash_hex: Hash256::ZERO.to_hex(),
+            merkle_root_hex: Hash256::ZERO.to_hex(),
+            ntime: 1_800_000_000,
+            network_target_hex: scam_core::Target::MAX.to_hex(),
+        });
+        let target = super::sv2_message_kind(&Sv2Message::SetTarget {
+            channel_id: 1,
+            maximum_target_hex: scam_core::Target::MAX.to_hex(),
+        });
+        let submit = super::sv2_message_kind(&Sv2Message::SubmitSharesStandard {
+            channel_id: 1,
+            job_id: 1,
+            nonce: 42,
+            ntime: 1_800_000_000,
+        });
+        let keepalive = super::sv2_message_kind(&Sv2Message::KeepAlive);
+
+        assert_eq!(setup, "SetupConnection");
+        assert_eq!(open, "OpenStandardMiningChannel");
+        assert_eq!(job, "NewMiningJob");
+        assert_eq!(target, "SetTarget");
+        assert_eq!(submit, "SubmitSharesStandard");
+        assert_eq!(keepalive, "KeepAlive");
+    }
+
+    #[test]
     fn read_http_request_rejects_invalid_content_length_header() {
         let raw = b"POST /wallet/new HTTP/1.1\r\nHost: localhost\r\nContent-Length: nope\r\n\r\n";
         let result = read_http_request_from_raw(raw);
@@ -7932,6 +8241,42 @@ mod tests {
         assert_eq!(immature.immature_utxo_count, 1);
         assert_eq!(immature.total, cfg.block_subsidy as u128);
         assert_eq!(immature.immature, cfg.block_subsidy as u128);
+    }
+
+    #[test]
+    fn wallet_balance_maturity_boundary_moves_coinbase_to_spendable() {
+        let mut cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        cfg.coinbase_maturity = 2;
+        cfg.validate().expect("config validate");
+
+        let mut runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let miner_key_hash = cfg.genesis_reward_key_hash20().expect("key hash");
+        let params = super::MiningLoopParams {
+            count: cfg.coinbase_maturity,
+            interval_sec: cfg.target_block_time_sec,
+            max_nonce: 500_000,
+            subsidy: cfg.block_subsidy,
+            miner_key_hash,
+            label_prefix: "maturity-boundary",
+            print_each: false,
+        };
+        mine_blocks_on_runtime(&mut runtime, &params).expect("mine maturity blocks");
+
+        let balance = super::wallet_balance_response(
+            &runtime,
+            &cfg,
+            0,
+            0,
+            "sd1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqpk5fg".to_owned(),
+            miner_key_hash,
+        );
+        assert!(balance.total > 0);
+        assert!(
+            balance.spendable > 0,
+            "expected at least one matured coinbase at boundary"
+        );
+        assert!(balance.spendable_utxo_count > 0);
     }
 
     #[test]
