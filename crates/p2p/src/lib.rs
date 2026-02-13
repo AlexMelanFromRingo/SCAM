@@ -5,7 +5,9 @@ pub mod transport;
 pub mod wire;
 
 pub use discovery::{PeerCandidate, select_outbound_peers};
-pub use gossip::{GossipEngine, GossipError, OutboundMessage, PeerId};
+pub use gossip::{
+    GossipEngine, GossipError, GossipTelemetry, OutboundMessage, PeerId, ReplacementRateLimit,
+};
 pub use sync::{build_block_locator, select_block_hashes_for_peer, select_headers_for_peer};
 pub use transport::{
     FramingConfig, LocalHandshake, RemoteHandshake, TransportError, client_handshake, read_message,

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use scam_core::{Block, Hash256, Transaction};
 use thiserror::Error;
@@ -17,6 +17,32 @@ pub struct OutboundMessage {
 struct PeerState {
     known_inventory: HashSet<InventoryItem>,
     score: u32,
+    replacement_events: VecDeque<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReplacementRateLimit {
+    pub window_sec: u64,
+    pub max_replacements: usize,
+    pub penalty: u32,
+}
+
+impl Default for ReplacementRateLimit {
+    fn default() -> Self {
+        Self {
+            window_sec: 60,
+            max_replacements: 20,
+            penalty: 25,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct GossipTelemetry {
+    pub announced_txs_total: u64,
+    pub removed_txs_total: u64,
+    pub inbound_replacement_events_total: u64,
+    pub replacement_rate_limited_total: u64,
 }
 
 pub struct GossipEngine {
@@ -27,14 +53,28 @@ pub struct GossipEngine {
     local_inventory: HashSet<InventoryItem>,
     tx_store: HashMap<Hash256, Transaction>,
     block_store: HashMap<Hash256, Block>,
+    replacement_rate_limit: ReplacementRateLimit,
+    telemetry: GossipTelemetry,
 }
 
 impl GossipEngine {
     pub fn new(max_inv_items: usize) -> Result<Self, GossipError> {
-        Self::with_limits(max_inv_items, 100)
+        Self::with_limits_and_replacement(max_inv_items, 100, ReplacementRateLimit::default())
     }
 
     pub fn with_limits(max_inv_items: usize, ban_threshold: u32) -> Result<Self, GossipError> {
+        Self::with_limits_and_replacement(
+            max_inv_items,
+            ban_threshold,
+            ReplacementRateLimit::default(),
+        )
+    }
+
+    pub fn with_limits_and_replacement(
+        max_inv_items: usize,
+        ban_threshold: u32,
+        replacement_rate_limit: ReplacementRateLimit,
+    ) -> Result<Self, GossipError> {
         if max_inv_items == 0 {
             return Err(GossipError::InvalidConfig(
                 "max_inv_items must be greater than zero".to_owned(),
@@ -45,6 +85,21 @@ impl GossipEngine {
                 "ban_threshold must be greater than zero".to_owned(),
             ));
         }
+        if replacement_rate_limit.window_sec == 0 {
+            return Err(GossipError::InvalidConfig(
+                "replacement window must be greater than zero".to_owned(),
+            ));
+        }
+        if replacement_rate_limit.max_replacements == 0 {
+            return Err(GossipError::InvalidConfig(
+                "replacement max_replacements must be greater than zero".to_owned(),
+            ));
+        }
+        if replacement_rate_limit.penalty == 0 {
+            return Err(GossipError::InvalidConfig(
+                "replacement penalty must be greater than zero".to_owned(),
+            ));
+        }
         Ok(Self {
             max_inv_items,
             ban_threshold,
@@ -53,6 +108,8 @@ impl GossipEngine {
             local_inventory: HashSet::new(),
             tx_store: HashMap::new(),
             block_store: HashMap::new(),
+            replacement_rate_limit,
+            telemetry: GossipTelemetry::default(),
         })
     }
 
@@ -83,6 +140,10 @@ impl GossipEngine {
         self.local_inventory.contains(item)
     }
 
+    pub fn telemetry(&self) -> GossipTelemetry {
+        self.telemetry
+    }
+
     pub fn announce_tx(&mut self, tx: Transaction) -> Vec<OutboundMessage> {
         let txid = tx.txid();
         self.tx_store.insert(txid, tx);
@@ -104,13 +165,52 @@ impl GossipEngine {
         announced_txs: Vec<Transaction>,
         removed_txids: &[Hash256],
     ) -> Vec<OutboundMessage> {
+        self.apply_mempool_inventory_delta_inner(announced_txs, removed_txids)
+    }
+
+    pub fn apply_mempool_inventory_delta_from_peer(
+        &mut self,
+        from_peer: PeerId,
+        announced_txs: Vec<Transaction>,
+        removed_txids: &[Hash256],
+        now_unix_sec: u64,
+    ) -> Result<Vec<OutboundMessage>, GossipError> {
+        if self.banned_peers.contains(&from_peer) {
+            return Err(GossipError::BannedPeer { peer_id: from_peer });
+        }
+        if !self.peers.contains_key(&from_peer) {
+            return Err(GossipError::UnknownPeer { peer_id: from_peer });
+        }
+
+        if !removed_txids.is_empty() {
+            self.enforce_replacement_rate(from_peer, now_unix_sec)?;
+            self.telemetry.inbound_replacement_events_total = self
+                .telemetry
+                .inbound_replacement_events_total
+                .saturating_add(1);
+        }
+
+        Ok(self.apply_mempool_inventory_delta_inner(announced_txs, removed_txids))
+    }
+
+    fn apply_mempool_inventory_delta_inner(
+        &mut self,
+        announced_txs: Vec<Transaction>,
+        removed_txids: &[Hash256],
+    ) -> Vec<OutboundMessage> {
         for txid in removed_txids {
             self.forget_tx(*txid);
         }
+        self.telemetry.removed_txs_total = self
+            .telemetry
+            .removed_txs_total
+            .saturating_add(removed_txids.len() as u64);
 
         let mut outbound = Vec::<OutboundMessage>::new();
         for tx in announced_txs {
             outbound.extend(self.announce_tx(tx));
+            self.telemetry.announced_txs_total =
+                self.telemetry.announced_txs_total.saturating_add(1);
         }
         outbound
     }
@@ -315,6 +415,45 @@ impl GossipEngine {
             }
         }
     }
+
+    fn enforce_replacement_rate(
+        &mut self,
+        peer_id: PeerId,
+        now_unix_sec: u64,
+    ) -> Result<(), GossipError> {
+        let window_sec = self.replacement_rate_limit.window_sec;
+        let max_replacements = self.replacement_rate_limit.max_replacements;
+        let penalty = self.replacement_rate_limit.penalty;
+
+        let Some(state) = self.peers.get_mut(&peer_id) else {
+            return Err(GossipError::UnknownPeer { peer_id });
+        };
+        while let Some(ts) = state.replacement_events.front().copied() {
+            if now_unix_sec.saturating_sub(ts) > window_sec {
+                state.replacement_events.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        if state.replacement_events.len() >= max_replacements {
+            self.telemetry.replacement_rate_limited_total = self
+                .telemetry
+                .replacement_rate_limited_total
+                .saturating_add(1);
+            self.penalize_peer(peer_id, penalty);
+            return Err(GossipError::ReplacementRateLimited {
+                peer_id,
+                max_replacements,
+                window_sec,
+            });
+        }
+
+        if let Some(state) = self.peers.get_mut(&peer_id) {
+            state.replacement_events.push_back(now_unix_sec);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Error)]
@@ -323,6 +462,14 @@ pub enum GossipError {
     UnknownPeer { peer_id: PeerId },
     #[error("peer is banned: {peer_id}")]
     BannedPeer { peer_id: PeerId },
+    #[error(
+        "replacement rate limit exceeded for peer={peer_id}: max={max_replacements} within {window_sec}s"
+    )]
+    ReplacementRateLimited {
+        peer_id: PeerId,
+        max_replacements: usize,
+        window_sec: u64,
+    },
     #[error("too many inventory items: limit={limit}, got={got}")]
     TooManyInventoryItems { limit: usize, got: usize },
     #[error("{0}")]
@@ -331,7 +478,7 @@ pub enum GossipError {
 
 #[cfg(test)]
 mod tests {
-    use super::{GossipEngine, OutboundMessage};
+    use super::{GossipEngine, OutboundMessage, ReplacementRateLimit};
     use crate::wire::{InventoryItem, WireMessage};
     use scam_core::{OutPoint, Transaction, TxIn, TxOut};
 
@@ -510,5 +657,99 @@ mod tests {
                 },
             }]
         );
+    }
+
+    #[test]
+    fn per_peer_replacement_rate_limit_penalizes_sender() {
+        let mut engine = GossipEngine::with_limits_and_replacement(
+            256,
+            50,
+            ReplacementRateLimit {
+                window_sec: 60,
+                max_replacements: 1,
+                penalty: 60,
+            },
+        )
+        .expect("engine");
+        engine.connect_peer(1);
+        engine.connect_peer(2);
+
+        let first_tx = sample_tx(100);
+        let _ = engine
+            .apply_mempool_inventory_delta_from_peer(
+                1,
+                vec![first_tx],
+                &[scam_core::hash::hash256(b"old-a")],
+                1_000,
+            )
+            .expect("first replacement accepted");
+
+        let second_tx = sample_tx(101);
+        let err = engine
+            .apply_mempool_inventory_delta_from_peer(
+                1,
+                vec![second_tx],
+                &[scam_core::hash::hash256(b"old-b")],
+                1_010,
+            )
+            .expect_err("second replacement in window must be rate limited");
+        assert!(matches!(
+            err,
+            super::GossipError::ReplacementRateLimited { peer_id: 1, .. }
+        ));
+        assert!(engine.is_banned(1));
+    }
+
+    #[test]
+    fn replacement_rate_limit_window_allows_later_replacement() {
+        let mut engine = GossipEngine::with_limits_and_replacement(
+            256,
+            100,
+            ReplacementRateLimit {
+                window_sec: 5,
+                max_replacements: 1,
+                penalty: 5,
+            },
+        )
+        .expect("engine");
+        engine.connect_peer(1);
+
+        let _ = engine
+            .apply_mempool_inventory_delta_from_peer(
+                1,
+                vec![sample_tx(120)],
+                &[scam_core::hash::hash256(b"old")],
+                1_000,
+            )
+            .expect("first replacement accepted");
+        let _ = engine
+            .apply_mempool_inventory_delta_from_peer(
+                1,
+                vec![sample_tx(121)],
+                &[scam_core::hash::hash256(b"old2")],
+                1_010,
+            )
+            .expect("window elapsed, replacement accepted");
+    }
+
+    #[test]
+    fn telemetry_counts_replacements_and_delta_activity() {
+        let mut engine = GossipEngine::new(256).expect("engine");
+        engine.connect_peer(1);
+
+        let _ = engine
+            .apply_mempool_inventory_delta_from_peer(
+                1,
+                vec![sample_tx(130)],
+                &[scam_core::hash::hash256(b"remove-a")],
+                2_000,
+            )
+            .expect("accepted");
+        let _ = engine.apply_mempool_inventory_delta(vec![sample_tx(131)], &[]);
+
+        let telemetry = engine.telemetry();
+        assert_eq!(telemetry.inbound_replacement_events_total, 1);
+        assert_eq!(telemetry.announced_txs_total, 2);
+        assert_eq!(telemetry.removed_txs_total, 1);
     }
 }

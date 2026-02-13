@@ -15,6 +15,7 @@ pub struct Mempool {
     revision: u64,
     txs: HashMap<Hash256, MempoolEntry>,
     spent_outpoints: HashMap<OutPoint, Hash256>,
+    telemetry: MempoolTelemetry,
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +54,26 @@ pub struct OrphanPool {
     entries: HashMap<Hash256, OrphanEntry>,
     by_missing_outpoint: HashMap<OutPoint, HashSet<Hash256>>,
     insertion_order: VecDeque<Hash256>,
+    telemetry: OrphanPoolTelemetry,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MempoolTelemetry {
+    pub accepted_total: u64,
+    pub replaced_total: u64,
+    pub removed_by_replacement_total: u64,
+    pub evicted_total: u64,
+    pub rejected_conflict_total: u64,
+    pub duplicate_total: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct OrphanPoolTelemetry {
+    pub accepted_total: u64,
+    pub evicted_total: u64,
+    pub expired_total: u64,
+    pub promoted_total: u64,
+    pub duplicate_total: u64,
 }
 
 impl Mempool {
@@ -94,6 +115,7 @@ impl Mempool {
             revision: 0,
             txs: HashMap::new(),
             spent_outpoints: HashMap::new(),
+            telemetry: MempoolTelemetry::default(),
         })
     }
 
@@ -107,6 +129,10 @@ impl Mempool {
 
     pub fn revision(&self) -> u64 {
         self.revision
+    }
+
+    pub fn telemetry(&self) -> MempoolTelemetry {
+        self.telemetry
     }
 
     pub fn get(&self, txid: &Hash256) -> Option<&Transaction> {
@@ -156,6 +182,7 @@ impl Mempool {
         let txid = tx.txid();
         validate_transaction_for_mempool(&tx, txid)?;
         if self.txs.contains_key(&txid) {
+            self.telemetry.duplicate_total = self.telemetry.duplicate_total.saturating_add(1);
             return Ok(InsertOutcome::AlreadyPresent { txid });
         }
         let serialized_size = tx.encode_for_hash().len();
@@ -197,6 +224,8 @@ impl Mempool {
             let existing_rate = feerate_key(existing.fee, existing.serialized_size);
             let incoming_rate = feerate_key(fee, serialized_size);
             if incoming_rate <= existing_rate {
+                self.telemetry.rejected_conflict_total =
+                    self.telemetry.rejected_conflict_total.saturating_add(1);
                 return Ok(InsertOutcome::RejectedConflictInsufficientFeerate {
                     inserted: txid,
                     existing: existing_txid,
@@ -214,6 +243,8 @@ impl Mempool {
                     )
                 })?;
             if fee < required_fee {
+                self.telemetry.rejected_conflict_total =
+                    self.telemetry.rejected_conflict_total.saturating_add(1);
                 return Ok(InsertOutcome::RejectedConflictInsufficientFee {
                     inserted: txid,
                     existing: existing_txid,
@@ -244,6 +275,11 @@ impl Mempool {
             );
             self.rebuild_spent_outpoints();
             self.bump_revision();
+            self.telemetry.replaced_total = self.telemetry.replaced_total.saturating_add(1);
+            self.telemetry.removed_by_replacement_total = self
+                .telemetry
+                .removed_by_replacement_total
+                .saturating_add(removed.len() as u64);
             return Ok(InsertOutcome::Replaced {
                 inserted: txid,
                 removed,
@@ -276,6 +312,11 @@ impl Mempool {
             );
             self.rebuild_spent_outpoints();
             self.bump_revision();
+            self.telemetry.accepted_total = self.telemetry.accepted_total.saturating_add(1);
+            self.telemetry.evicted_total = self
+                .telemetry
+                .evicted_total
+                .saturating_add(removed.len() as u64);
             return Ok(InsertOutcome::AcceptedWithEviction {
                 inserted: txid,
                 removed,
@@ -292,6 +333,7 @@ impl Mempool {
         );
         self.rebuild_spent_outpoints();
         self.bump_revision();
+        self.telemetry.accepted_total = self.telemetry.accepted_total.saturating_add(1);
         Ok(InsertOutcome::Accepted { txid })
     }
 
@@ -378,6 +420,7 @@ impl OrphanPool {
             entries: HashMap::new(),
             by_missing_outpoint: HashMap::new(),
             insertion_order: VecDeque::new(),
+            telemetry: OrphanPoolTelemetry::default(),
         })
     }
 
@@ -391,6 +434,10 @@ impl OrphanPool {
 
     pub fn contains(&self, txid: &Hash256) -> bool {
         self.entries.contains_key(txid)
+    }
+
+    pub fn telemetry(&self) -> OrphanPoolTelemetry {
+        self.telemetry
     }
 
     pub fn insert(
@@ -407,6 +454,7 @@ impl OrphanPool {
         }
 
         if self.entries.contains_key(&txid) {
+            self.telemetry.duplicate_total = self.telemetry.duplicate_total.saturating_add(1);
             return Ok(OrphanInsertOutcome::AlreadyPresent { txid });
         }
 
@@ -439,11 +487,14 @@ impl OrphanPool {
         }
 
         if let Some(evicted) = evicted {
+            self.telemetry.accepted_total = self.telemetry.accepted_total.saturating_add(1);
+            self.telemetry.evicted_total = self.telemetry.evicted_total.saturating_add(1);
             return Ok(OrphanInsertOutcome::AcceptedWithEviction {
                 inserted: txid,
                 evicted,
             });
         }
+        self.telemetry.accepted_total = self.telemetry.accepted_total.saturating_add(1);
         Ok(OrphanInsertOutcome::Accepted { txid })
     }
 
@@ -463,6 +514,10 @@ impl OrphanPool {
         for txid in &expired {
             self.remove_entry(*txid);
         }
+        self.telemetry.expired_total = self
+            .telemetry
+            .expired_total
+            .saturating_add(expired.len() as u64);
         expired.len()
     }
 
@@ -496,6 +551,10 @@ impl OrphanPool {
             }
         }
         ready.sort_unstable_by(|a, b| a.txid.cmp(&b.txid));
+        self.telemetry.promoted_total = self
+            .telemetry
+            .promoted_total
+            .saturating_add(ready.len() as u64);
         ready
     }
 
@@ -1255,5 +1314,66 @@ mod tests {
                 removed_txids: Vec::new()
             }
         );
+    }
+
+    #[test]
+    fn mempool_telemetry_tracks_replacement_and_conflict_rejections() {
+        let mut mempool = Mempool::with_policy_and_replacement(100, 0, 1, 25).expect("mempool");
+        let tx_low = mk_tx([151u8; 32], 0, b"low", 1);
+        let tx_high = mk_tx([151u8; 32], 0, b"high", 2);
+        let tx_reject = mk_tx([151u8; 32], 0, b"reject", 3);
+
+        mempool.insert_with_fee(tx_low, 10).expect("insert low");
+        let rejected = mempool
+            .insert_with_fee(tx_reject, 10)
+            .expect("replacement feerate check");
+        assert!(matches!(
+            rejected,
+            InsertOutcome::RejectedConflictInsufficientFeerate { .. }
+        ));
+        let replaced = mempool
+            .insert_with_fee(tx_high, 100)
+            .expect("replacement accepted");
+        assert!(matches!(replaced, InsertOutcome::Replaced { .. }));
+
+        let telemetry = mempool.telemetry();
+        assert_eq!(telemetry.accepted_total, 1);
+        assert_eq!(telemetry.replaced_total, 1);
+        assert_eq!(telemetry.removed_by_replacement_total, 1);
+        assert_eq!(telemetry.rejected_conflict_total, 1);
+    }
+
+    #[test]
+    fn orphan_pool_telemetry_tracks_churn() {
+        let mut pool = OrphanPool::new(1, 5).expect("pool");
+        let dep_a = OutPoint {
+            txid: scam_core::Hash256([161u8; 32]),
+            vout: 0,
+        };
+        let dep_b = OutPoint {
+            txid: scam_core::Hash256([162u8; 32]),
+            vout: 0,
+        };
+        let tx_a = mk_tx([163u8; 32], 0, b"a", 1);
+        let tx_b = mk_tx([164u8; 32], 0, b"b", 2);
+
+        let _ = pool
+            .insert(tx_a.clone(), 1, vec![dep_a.clone()], 100)
+            .expect("insert a");
+        let _ = pool
+            .insert(tx_a, 1, vec![dep_a.clone()], 101)
+            .expect("duplicate a");
+        let _ = pool
+            .insert(tx_b, 1, vec![dep_b], 102)
+            .expect("insert b with eviction");
+        let _ = pool.resolve_outpoint(&dep_a);
+        let _ = pool.expire(200);
+
+        let telemetry = pool.telemetry();
+        assert_eq!(telemetry.accepted_total, 2);
+        assert_eq!(telemetry.duplicate_total, 1);
+        assert_eq!(telemetry.evicted_total, 1);
+        assert_eq!(telemetry.promoted_total, 0);
+        assert_eq!(telemetry.expired_total, 1);
     }
 }
