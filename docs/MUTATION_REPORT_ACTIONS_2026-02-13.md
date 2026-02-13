@@ -58,6 +58,9 @@ Run window: `2026-02-13T16:10:10Z` -> `2026-02-13T17:09:00Z`
 
 ## Execution Order (After Repo Publish)
 
-- [ ] Stage 1: close all P0 items and re-run mutation on `core/consensus/chain/mempool/miner`.
+- [x] Stage 1: close all P0 items and re-run mutation on `core/consensus/chain/mempool/miner`.
+  - Re-run finished: `target/mutants-stage/stage1/mutants.out/outcomes.json`
+  - Result snapshot (`2026-02-13T21:05:37Z`): `total=558`, `caught=440`, `missed=59`, `timeout=1`, `unviable=58`.
+  - Current timeout hotspot: `crates/miner/src/lib.rs:308:16: delete ! in build_cpfp_package`.
 - [ ] Stage 2: close P1 items and re-run mutation on `stratum/p2p/node` protocol subset.
 - [ ] Stage 3: close P2/P3 items and run full workspace mutation baseline again.

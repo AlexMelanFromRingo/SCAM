@@ -7,7 +7,9 @@ Clarification: consensus is already functionally implemented; future items touch
 
 ## 0) Immediate Execution Order (Requested)
 
-- [ ] Wait for the running mutation baseline to finish and freeze report artifacts.
+- [x] Wait for the running mutation baseline to finish and freeze report artifacts.
+  - Latest staged baseline artifact frozen at:
+    `target/mutants-stage/stage1/mutants.out/outcomes.json` (`end_time=2026-02-13T21:05:37Z`).
 - [x] Create a private GitHub repository and push the project with full commit history (no squashing).
   - Remote: `https://github.com/AlexMelanFromRingo/SCAM` (private).
 - [x] Verify remote integrity (`git log`, tags/branches if present, and repository visibility).
