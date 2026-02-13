@@ -1551,10 +1551,6 @@ fn run_hash_visual(args: HashVisualArgs) -> Result<(), NodeError> {
 }
 
 fn run_wallet(command: WalletCommand) -> Result<(), NodeError> {
-    fn key_hash20_from_pubkey(pubkey_compressed: [u8; 33]) -> [u8; 20] {
-        scam_core::hash160_blake3(&pubkey_compressed)
-    }
-
     fn derive_and_print_address(
         mnemonic_phrase: &str,
         passphrase: &str,
@@ -1630,18 +1626,13 @@ fn run_wallet(command: WalletCommand) -> Result<(), NodeError> {
         println!("Immature total: {}", report.immature_total);
         println!("Unspent outputs: {}", report.unspent_count);
 
-        let non_empty_balances = report
-            .balances
-            .iter()
-            .filter(|entry| entry.total > 0)
-            .collect::<Vec<_>>();
-        if non_empty_balances.is_empty() {
+        if report.unspent_total == 0 {
             println!("No funds found in watched derivation range.");
             return Ok(());
         }
 
         println!("Balances by derived address:");
-        for balance in non_empty_balances {
+        for balance in &report.balances {
             let key = (balance.account, balance.index, balance.key_hash20);
             let address = address_by_key
                 .get(&key)
@@ -1827,42 +1818,27 @@ fn run_wallet(command: WalletCommand) -> Result<(), NodeError> {
             let mnemonic = WalletMnemonic::parse(&mnemonic)?;
             let seed = mnemonic.to_seed(&passphrase);
             let key = derive_wallet_key(&seed, account, index)?;
-            let key_hash20 = key_hash20_from_pubkey(key.pubkey_compressed());
-
-            let mut total: u128 = 0;
-            let mut spendable: u128 = 0;
-            let mut immature: u128 = 0;
-            let mut utxo_count = 0usize;
-            let mut spendable_count = 0usize;
-            let mut immature_count = 0usize;
-
-            let tip_height = runtime.tip_height();
-            let coinbase_maturity = runtime.config().coinbase_maturity as u64;
-            for utxo in runtime.utxo_set().values() {
-                if utxo.key_hash20 != key_hash20 {
-                    continue;
-                }
-                utxo_count += 1;
-                total = total.saturating_add(utxo.value as u128);
-
-                let is_immature_coinbase = utxo.is_coinbase
-                    && tip_height < utxo.created_height.saturating_add(coinbase_maturity);
-                if is_immature_coinbase {
-                    immature_count += 1;
-                    immature = immature.saturating_add(utxo.value as u128);
-                } else {
-                    spendable_count += 1;
-                    spendable = spendable.saturating_add(utxo.value as u128);
-                }
-            }
+            let key_hash20 = scam_core::hash160_blake3(&key.pubkey_compressed());
+            let address = to_address(&runtime.config().hrp, key.pubkey_compressed())?;
+            let summary = wallet_balance_response(
+                &runtime,
+                runtime.config(),
+                account,
+                index,
+                address,
+                key_hash20,
+            );
 
             println!("Wallet balance:");
-            println!("Tip height: {}", tip_height);
-            println!("Address key hash20: {}", hex::encode(key_hash20));
-            println!("UTXOs: {}", utxo_count);
-            println!("Total: {}", total);
-            println!("Spendable: {} ({} utxos)", spendable, spendable_count);
-            println!("Immature: {} ({} utxos)", immature, immature_count);
+            println!("Tip height: {}", summary.tip_height);
+            println!("Address: {}", summary.address);
+            println!("Address key hash20: {}", summary.key_hash20_hex);
+            println!("UTXOs: {}", summary.utxo_count);
+            println!("Spendable UTXOs: {}", summary.spendable_utxo_count);
+            println!("Immature UTXOs: {}", summary.immature_utxo_count);
+            println!("Total: {}", summary.total);
+            println!("Spendable: {}", summary.spendable);
+            println!("Immature: {}", summary.immature);
         }
         WalletCommand::Send {
             network,
@@ -8535,6 +8511,63 @@ mod tests {
             send_err.to_string().contains("is not valid for network"),
             "unexpected send error: {send_err}"
         );
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
+    fn run_wallet_address_secure_address_and_rescan_propagate_errors() {
+        let address_err = run_wallet(super::WalletCommand::Address {
+            mnemonic: "invalid mnemonic words".to_owned(),
+            passphrase: "".to_owned(),
+            account: 0,
+            index: 0,
+            hrp: "sd".to_owned(),
+        })
+        .expect_err("invalid mnemonic must fail address derivation");
+        assert!(address_err.to_string().contains("mnemonic"));
+
+        let work_dir = temp_dir("test-wallet-secure-address-rescan-errors");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let config_path = work_dir.join("devnet.toml");
+        fs::write(&config_path, include_str!("../../../config/devnet.toml")).expect("write cfg");
+        let wallet_path = work_dir.join("wallet.vault");
+
+        let vault =
+            scam_wallet::new_encrypted_wallet_vault(SOAK_FLOW_MNEMONIC, "", "correct-password")
+                .expect("new vault");
+        scam_wallet::save_wallet_vault(&wallet_path, &vault).expect("save vault");
+
+        let secure_addr_err = run_wallet(super::WalletCommand::SecureAddress {
+            wallet: wallet_path,
+            password: "wrong-password".to_owned(),
+            account: 0,
+            index: 0,
+            hrp: "sd".to_owned(),
+        })
+        .expect_err("wrong password must fail secure-address");
+        assert!(
+            secure_addr_err.to_string().contains("wallet vault"),
+            "unexpected secure-address error: {secure_addr_err}"
+        );
+
+        let rescan_err = run_wallet(super::WalletCommand::Rescan {
+            network: Network::Devnet,
+            config: Some(config_path),
+            mnemonic: SOAK_FLOW_MNEMONIC.to_owned(),
+            passphrase: "".to_owned(),
+            account: 0,
+            start_index: 5,
+            end_index: 4,
+            mine_blocks: 0,
+            interval_sec: 120,
+            max_nonce: 500_000,
+        })
+        .expect_err("invalid range must fail rescan");
+        assert!(
+            rescan_err.to_string().contains("invalid index range"),
+            "unexpected rescan error: {rescan_err}"
+        );
+
         let _ = fs::remove_dir_all(work_dir);
     }
 
