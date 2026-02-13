@@ -7747,7 +7747,10 @@ mod tests {
         unknown_stream
             .read_to_string(&mut unknown_response)
             .expect("read unknown");
-        assert!(unknown_response.starts_with("HTTP/1.1 404 Not Found"));
+        // With a present UI directory, unknown GET paths are intentionally served
+        // through index.html (SPA-style fallback), not 404.
+        assert!(unknown_response.starts_with("HTTP/1.1 200 OK"));
+        assert!(unknown_response.contains("<html>ui</html>"));
 
         server.join().expect("server join");
         let _ = fs::remove_dir_all(work_dir);
