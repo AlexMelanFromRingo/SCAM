@@ -16,3 +16,4 @@ secp256k1.workspace = true
 serde.workspace = true
 snow.workspace = true
 thiserror.workspace = true
+tokio.workspace = true

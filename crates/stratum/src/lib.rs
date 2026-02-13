@@ -15,6 +15,7 @@ use snow::Builder as NoiseBuilder;
 use snow::params::NoiseParams;
 use snow::{HandshakeState as NoiseHandshakeState, TransportState as NoiseTransportState};
 use thiserror::Error;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const SUPPORTED_SV2_VERSION: u16 = 2;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
@@ -807,6 +808,29 @@ impl SecureSv2Transport {
         ))
     }
 
+    pub async fn handshake_client_async<IO: AsyncRead + AsyncWrite + Unpin>(
+        io: &mut IO,
+    ) -> Result<Self, StratumError> {
+        let secp = Secp256k1::new();
+        let (local_sk, local_pk) = secp.generate_keypair(&mut OsRng);
+        let handshake = encode_secure_handshake_packet(&local_pk);
+        io.write_all(&handshake).await.map_err(StratumError::Io)?;
+        io.flush().await.map_err(StratumError::Io)?;
+
+        let mut remote_handshake = [0u8; SECURE_HANDSHAKE_SIZE];
+        io.read_exact(&mut remote_handshake)
+            .await
+            .map_err(StratumError::Io)?;
+        let remote_pk = decode_secure_handshake_packet(&remote_handshake)?;
+
+        Ok(Self::from_handshake(
+            local_sk,
+            local_pk,
+            remote_pk,
+            SecureRole::Client,
+        ))
+    }
+
     pub fn handshake_server<IO: Read + Write>(io: &mut IO) -> Result<Self, StratumError> {
         let secp = Secp256k1::new();
         let (local_sk, local_pk) = secp.generate_keypair(&mut OsRng);
@@ -819,6 +843,30 @@ impl SecureSv2Transport {
         let handshake = encode_secure_handshake_packet(&local_pk);
         io.write_all(&handshake).map_err(StratumError::Io)?;
         io.flush().map_err(StratumError::Io)?;
+
+        Ok(Self::from_handshake(
+            local_sk,
+            local_pk,
+            remote_pk,
+            SecureRole::Server,
+        ))
+    }
+
+    pub async fn handshake_server_async<IO: AsyncRead + AsyncWrite + Unpin>(
+        io: &mut IO,
+    ) -> Result<Self, StratumError> {
+        let secp = Secp256k1::new();
+        let (local_sk, local_pk) = secp.generate_keypair(&mut OsRng);
+
+        let mut remote_handshake = [0u8; SECURE_HANDSHAKE_SIZE];
+        io.read_exact(&mut remote_handshake)
+            .await
+            .map_err(StratumError::Io)?;
+        let remote_pk = decode_secure_handshake_packet(&remote_handshake)?;
+
+        let handshake = encode_secure_handshake_packet(&local_pk);
+        io.write_all(&handshake).await.map_err(StratumError::Io)?;
+        io.flush().await.map_err(StratumError::Io)?;
 
         Ok(Self::from_handshake(
             local_sk,
@@ -865,6 +913,37 @@ impl SecureSv2Transport {
         writer.flush().map_err(StratumError::Io)
     }
 
+    pub async fn write_message_async<W: AsyncWrite + Unpin>(
+        &mut self,
+        writer: &mut W,
+        message: &Sv2Message,
+    ) -> Result<(), StratumError> {
+        let mut plaintext = Vec::new();
+        write_frame(&mut plaintext, message)?;
+
+        let ciphertext = self.encrypt_payload(&plaintext)?;
+        if ciphertext.len() > SECURE_MAX_FRAME_SIZE {
+            return Err(StratumError::FrameTooLarge {
+                got: ciphertext.len(),
+                max: SECURE_MAX_FRAME_SIZE,
+            });
+        }
+
+        let len = u32::try_from(ciphertext.len()).map_err(|_| StratumError::FrameTooLarge {
+            got: ciphertext.len(),
+            max: SECURE_MAX_FRAME_SIZE,
+        })?;
+        writer
+            .write_all(&len.to_le_bytes())
+            .await
+            .map_err(StratumError::Io)?;
+        writer
+            .write_all(&ciphertext)
+            .await
+            .map_err(StratumError::Io)?;
+        writer.flush().await.map_err(StratumError::Io)
+    }
+
     pub fn read_message<R: Read>(
         &mut self,
         reader: &mut R,
@@ -894,6 +973,24 @@ impl SecureSv2Transport {
         let mut ciphertext = vec![0u8; len];
         reader
             .read_exact(&mut ciphertext)
+            .map_err(StratumError::Io)?;
+        let plaintext = self.decrypt_payload(&ciphertext)?;
+        decode_single_frame_bytes(&plaintext).map(Some)
+    }
+
+    pub async fn read_message_async<R: AsyncRead + Unpin>(
+        &mut self,
+        reader: &mut R,
+    ) -> Result<Option<Sv2Message>, StratumError> {
+        let len = match read_secure_frame_length_async(reader).await? {
+            Some(len) => len,
+            None => return Ok(None),
+        };
+
+        let mut ciphertext = vec![0u8; len];
+        reader
+            .read_exact(&mut ciphertext)
+            .await
             .map_err(StratumError::Io)?;
         let plaintext = self.decrypt_payload(&ciphertext)?;
         decode_single_frame_bytes(&plaintext).map(Some)
@@ -1053,6 +1150,58 @@ impl NoiseSv2Transport {
         })
     }
 
+    pub async fn handshake_client_async<IO: AsyncRead + AsyncWrite + Unpin>(
+        io: &mut IO,
+        local_static_private_key: Option<[u8; 32]>,
+        expected_remote_static_public_key: Option<[u8; 32]>,
+    ) -> Result<Self, StratumError> {
+        let local_static = resolve_noise_private_key(local_static_private_key)?;
+        let mut state = build_noise_handshake_state(true, local_static)?;
+        let mut out_buf = vec![0u8; NOISE_HANDSHAKE_MAX_PACKET_SIZE];
+        let mut in_buf = vec![0u8; NOISE_HANDSHAKE_MAX_PACKET_SIZE];
+
+        let first_len = state.write_message(&[], &mut out_buf).map_err(|e| {
+            StratumError::SecureHandshake(format!("noise initiator write m1 failed: {e}"))
+        })?;
+        write_noise_handshake_packet_async(io, &out_buf[..first_len]).await?;
+
+        let second = read_noise_handshake_packet_async(io).await?;
+        state.read_message(&second, &mut in_buf).map_err(|e| {
+            StratumError::SecureHandshake(format!("noise initiator read m2 failed: {e}"))
+        })?;
+
+        let third_len = state.write_message(&[], &mut out_buf).map_err(|e| {
+            StratumError::SecureHandshake(format!("noise initiator write m3 failed: {e}"))
+        })?;
+        write_noise_handshake_packet_async(io, &out_buf[..third_len]).await?;
+
+        if let Some(expected) = expected_remote_static_public_key {
+            match state.get_remote_static() {
+                Some(remote) if remote == expected => {}
+                Some(_) => {
+                    return Err(StratumError::SecureHandshake(
+                        "noise remote static key mismatch".to_owned(),
+                    ));
+                }
+                None => {
+                    return Err(StratumError::SecureHandshake(
+                        "noise remote static key missing".to_owned(),
+                    ));
+                }
+            }
+        }
+
+        let transport = state.into_transport_mode().map_err(|e| {
+            StratumError::SecureHandshake(format!("noise initiator transport upgrade failed: {e}"))
+        })?;
+        Ok(Self {
+            transport,
+            rekey_interval_messages: DEFAULT_SECURE_REKEY_INTERVAL_MESSAGES,
+            sent_messages: 0,
+            received_messages: 0,
+        })
+    }
+
     pub fn handshake_server<IO: Read + Write>(
         io: &mut IO,
         local_static_private_key: Option<[u8; 32]>,
@@ -1074,6 +1223,58 @@ impl NoiseSv2Transport {
         write_noise_handshake_packet(io, &out_buf[..second_len])?;
 
         let third = read_noise_handshake_packet(io)?;
+        state.read_message(&third, &mut in_buf).map_err(|e| {
+            StratumError::SecureHandshake(format!("noise responder read m3 failed: {e}"))
+        })?;
+
+        if let Some(expected) = expected_remote_static_public_key {
+            match state.get_remote_static() {
+                Some(remote) if remote == expected => {}
+                Some(_) => {
+                    return Err(StratumError::SecureHandshake(
+                        "noise remote static key mismatch".to_owned(),
+                    ));
+                }
+                None => {
+                    return Err(StratumError::SecureHandshake(
+                        "noise remote static key missing".to_owned(),
+                    ));
+                }
+            }
+        }
+
+        let transport = state.into_transport_mode().map_err(|e| {
+            StratumError::SecureHandshake(format!("noise responder transport upgrade failed: {e}"))
+        })?;
+        Ok(Self {
+            transport,
+            rekey_interval_messages: DEFAULT_SECURE_REKEY_INTERVAL_MESSAGES,
+            sent_messages: 0,
+            received_messages: 0,
+        })
+    }
+
+    pub async fn handshake_server_async<IO: AsyncRead + AsyncWrite + Unpin>(
+        io: &mut IO,
+        local_static_private_key: Option<[u8; 32]>,
+        expected_remote_static_public_key: Option<[u8; 32]>,
+    ) -> Result<Self, StratumError> {
+        let local_static = resolve_noise_private_key(local_static_private_key)?;
+        let mut state = build_noise_handshake_state(false, local_static)?;
+        let mut out_buf = vec![0u8; NOISE_HANDSHAKE_MAX_PACKET_SIZE];
+        let mut in_buf = vec![0u8; NOISE_HANDSHAKE_MAX_PACKET_SIZE];
+
+        let first = read_noise_handshake_packet_async(io).await?;
+        state.read_message(&first, &mut in_buf).map_err(|e| {
+            StratumError::SecureHandshake(format!("noise responder read m1 failed: {e}"))
+        })?;
+
+        let second_len = state.write_message(&[], &mut out_buf).map_err(|e| {
+            StratumError::SecureHandshake(format!("noise responder write m2 failed: {e}"))
+        })?;
+        write_noise_handshake_packet_async(io, &out_buf[..second_len]).await?;
+
+        let third = read_noise_handshake_packet_async(io).await?;
         state.read_message(&third, &mut in_buf).map_err(|e| {
             StratumError::SecureHandshake(format!("noise responder read m3 failed: {e}"))
         })?;
@@ -1149,6 +1350,44 @@ impl NoiseSv2Transport {
         self.maybe_rekey_outgoing()
     }
 
+    pub async fn write_message_async<W: AsyncWrite + Unpin>(
+        &mut self,
+        writer: &mut W,
+        message: &Sv2Message,
+    ) -> Result<(), StratumError> {
+        let mut plaintext = Vec::new();
+        write_frame(&mut plaintext, message)?;
+
+        let mut ciphertext = vec![0u8; plaintext.len() + 64];
+        let encrypted_len = self
+            .transport
+            .write_message(&plaintext, &mut ciphertext)
+            .map_err(|e| StratumError::SecureTransport(format!("noise encrypt failed: {e}")))?;
+        ciphertext.truncate(encrypted_len);
+        if ciphertext.len() > SECURE_MAX_FRAME_SIZE {
+            return Err(StratumError::FrameTooLarge {
+                got: ciphertext.len(),
+                max: SECURE_MAX_FRAME_SIZE,
+            });
+        }
+
+        let len = u32::try_from(ciphertext.len()).map_err(|_| StratumError::FrameTooLarge {
+            got: ciphertext.len(),
+            max: SECURE_MAX_FRAME_SIZE,
+        })?;
+        writer
+            .write_all(&len.to_le_bytes())
+            .await
+            .map_err(StratumError::Io)?;
+        writer
+            .write_all(&ciphertext)
+            .await
+            .map_err(StratumError::Io)?;
+        writer.flush().await.map_err(StratumError::Io)?;
+        self.sent_messages = self.sent_messages.saturating_add(1);
+        self.maybe_rekey_outgoing()
+    }
+
     pub fn read_message<R: Read>(
         &mut self,
         reader: &mut R,
@@ -1178,6 +1417,32 @@ impl NoiseSv2Transport {
         let mut ciphertext = vec![0u8; len];
         reader
             .read_exact(&mut ciphertext)
+            .map_err(StratumError::Io)?;
+
+        let mut plaintext = vec![0u8; len];
+        let decrypted_len = self
+            .transport
+            .read_message(&ciphertext, &mut plaintext)
+            .map_err(|e| StratumError::SecureTransport(format!("noise decrypt failed: {e}")))?;
+        plaintext.truncate(decrypted_len);
+        self.received_messages = self.received_messages.saturating_add(1);
+        self.maybe_rekey_incoming()?;
+        decode_single_frame_bytes(&plaintext).map(Some)
+    }
+
+    pub async fn read_message_async<R: AsyncRead + Unpin>(
+        &mut self,
+        reader: &mut R,
+    ) -> Result<Option<Sv2Message>, StratumError> {
+        let len = match read_secure_frame_length_async(reader).await? {
+            Some(len) => len,
+            None => return Ok(None),
+        };
+
+        let mut ciphertext = vec![0u8; len];
+        reader
+            .read_exact(&mut ciphertext)
+            .await
             .map_err(StratumError::Io)?;
 
         let mut plaintext = vec![0u8; len];
@@ -1276,6 +1541,33 @@ fn write_noise_handshake_packet<IO: Write>(
     Ok(())
 }
 
+async fn write_noise_handshake_packet_async<IO: AsyncWrite + Unpin>(
+    io: &mut IO,
+    payload: &[u8],
+) -> Result<(), StratumError> {
+    if payload.is_empty() {
+        return Err(StratumError::SecureHandshake(
+            "noise handshake payload cannot be empty".to_owned(),
+        ));
+    }
+    if payload.len() > NOISE_HANDSHAKE_MAX_PACKET_SIZE {
+        return Err(StratumError::FrameTooLarge {
+            got: payload.len(),
+            max: NOISE_HANDSHAKE_MAX_PACKET_SIZE,
+        });
+    }
+    let len = u16::try_from(payload.len()).map_err(|_| StratumError::FrameTooLarge {
+        got: payload.len(),
+        max: NOISE_HANDSHAKE_MAX_PACKET_SIZE,
+    })?;
+    io.write_all(&len.to_le_bytes())
+        .await
+        .map_err(StratumError::Io)?;
+    io.write_all(payload).await.map_err(StratumError::Io)?;
+    io.flush().await.map_err(StratumError::Io)?;
+    Ok(())
+}
+
 fn read_noise_handshake_packet<IO: Read>(io: &mut IO) -> Result<Vec<u8>, StratumError> {
     let mut len_buf = [0u8; 2];
     io.read_exact(&mut len_buf).map_err(StratumError::Io)?;
@@ -1294,6 +1586,60 @@ fn read_noise_handshake_packet<IO: Read>(io: &mut IO) -> Result<Vec<u8>, Stratum
     let mut payload = vec![0u8; len];
     io.read_exact(&mut payload).map_err(StratumError::Io)?;
     Ok(payload)
+}
+
+async fn read_noise_handshake_packet_async<IO: AsyncRead + Unpin>(
+    io: &mut IO,
+) -> Result<Vec<u8>, StratumError> {
+    let mut len_buf = [0u8; 2];
+    io.read_exact(&mut len_buf)
+        .await
+        .map_err(StratumError::Io)?;
+    let len = u16::from_le_bytes(len_buf) as usize;
+    if len == 0 {
+        return Err(StratumError::SecureHandshake(
+            "noise handshake payload cannot be empty".to_owned(),
+        ));
+    }
+    if len > NOISE_HANDSHAKE_MAX_PACKET_SIZE {
+        return Err(StratumError::FrameTooLarge {
+            got: len,
+            max: NOISE_HANDSHAKE_MAX_PACKET_SIZE,
+        });
+    }
+    let mut payload = vec![0u8; len];
+    io.read_exact(&mut payload)
+        .await
+        .map_err(StratumError::Io)?;
+    Ok(payload)
+}
+
+async fn read_secure_frame_length_async<R: AsyncRead + Unpin>(
+    reader: &mut R,
+) -> Result<Option<usize>, StratumError> {
+    let mut first = [0u8; 1];
+    match reader.read_exact(&mut first).await {
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(err) => return Err(StratumError::Io(err)),
+    }
+
+    let mut rest = [0u8; 3];
+    reader
+        .read_exact(&mut rest)
+        .await
+        .map_err(StratumError::Io)?;
+    let len = u32::from_le_bytes([first[0], rest[0], rest[1], rest[2]]) as usize;
+    if len == 0 {
+        return Err(StratumError::InvalidFrameLength(0));
+    }
+    if len > SECURE_MAX_FRAME_SIZE {
+        return Err(StratumError::FrameTooLarge {
+            got: len,
+            max: SECURE_MAX_FRAME_SIZE,
+        });
+    }
+    Ok(Some(len))
 }
 
 fn encode_secure_handshake_packet(pubkey: &PublicKey) -> [u8; SECURE_HANDSHAKE_SIZE] {
@@ -1416,6 +1762,102 @@ pub fn read_frame<R: Read>(reader: &mut R) -> Result<Option<Sv2Message>, Stratum
 
     let mut payload = vec![0u8; len];
     reader.read_exact(&mut payload).map_err(StratumError::Io)?;
+    let message: Sv2Message = bincode::deserialize(&payload).map_err(StratumError::Codec)?;
+
+    let payload_type = message_type(&message);
+    if payload_type != msg_type {
+        return Err(StratumError::MessageTypeMismatch {
+            header_type: msg_type,
+            payload_type,
+        });
+    }
+
+    Ok(Some(message))
+}
+
+pub async fn write_frame_async<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    message: &Sv2Message,
+) -> Result<(), StratumError> {
+    let payload = bincode::serialize(message).map_err(StratumError::Codec)?;
+    if payload.is_empty() {
+        return Err(StratumError::InvalidFrameLength(0));
+    }
+    if payload.len() > MAX_FRAME_SIZE {
+        return Err(StratumError::FrameTooLarge {
+            got: payload.len(),
+            max: MAX_FRAME_SIZE,
+        });
+    }
+    if payload.len() > U24_MAX {
+        return Err(StratumError::FrameTooLarge {
+            got: payload.len(),
+            max: U24_MAX,
+        });
+    }
+
+    writer
+        .write_all(&SV2_EXTENSION_MINING.to_le_bytes())
+        .await
+        .map_err(StratumError::Io)?;
+    writer
+        .write_all(&[message_type(message)])
+        .await
+        .map_err(StratumError::Io)?;
+
+    let len = payload.len() as u32;
+    let len_buf = [
+        (len & 0xff) as u8,
+        ((len >> 8) & 0xff) as u8,
+        ((len >> 16) & 0xff) as u8,
+    ];
+    writer.write_all(&len_buf).await.map_err(StratumError::Io)?;
+    writer.write_all(&payload).await.map_err(StratumError::Io)?;
+    writer.flush().await.map_err(StratumError::Io)
+}
+
+pub async fn read_frame_async<R: AsyncRead + Unpin>(
+    reader: &mut R,
+) -> Result<Option<Sv2Message>, StratumError> {
+    let mut first = [0u8; 1];
+    match reader.read_exact(&mut first).await {
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(err) => return Err(StratumError::Io(err)),
+    }
+
+    let mut rest = [0u8; SV2_HEADER_LEN - 1];
+    reader
+        .read_exact(&mut rest)
+        .await
+        .map_err(StratumError::Io)?;
+
+    let extension = u16::from_le_bytes([first[0], rest[0]]);
+    if extension != SV2_EXTENSION_MINING {
+        return Err(StratumError::UnsupportedExtension(extension));
+    }
+
+    let msg_type = rest[1];
+    if !is_known_message_type(msg_type) {
+        return Err(StratumError::UnsupportedMessageType(msg_type));
+    }
+
+    let len = (rest[2] as usize) | ((rest[3] as usize) << 8) | ((rest[4] as usize) << 16);
+    if len == 0 {
+        return Err(StratumError::InvalidFrameLength(0));
+    }
+    if len > MAX_FRAME_SIZE {
+        return Err(StratumError::FrameTooLarge {
+            got: len,
+            max: MAX_FRAME_SIZE,
+        });
+    }
+
+    let mut payload = vec![0u8; len];
+    reader
+        .read_exact(&mut payload)
+        .await
+        .map_err(StratumError::Io)?;
     let message: Sv2Message = bincode::deserialize(&payload).map_err(StratumError::Codec)?;
 
     let payload_type = message_type(&message);
@@ -1587,12 +2029,14 @@ mod tests {
 
     use scam_core::{Hash256, Target};
     use secp256k1::{PublicKey, Secp256k1, SecretKey};
+    use tokio::runtime::Runtime;
 
     use crate::{
         IdentityTranslator, JobDeclarator, MiningJob, MiningTemplate, NoiseSv2Transport,
         SUPPORTED_SV2_VERSION, SecureRole, SecureSv2Transport, SequentialJobDeclarator,
         SessionConfig, SessionEvent, ShareSubmission, ShareValidation, Sv2Message, Sv2Session,
-        Translator, decode_secure_handshake_packet, read_frame, validate_share, write_frame,
+        Translator, decode_secure_handshake_packet, read_frame, read_frame_async, validate_share,
+        write_frame, write_frame_async,
     };
 
     fn test_session_config() -> SessionConfig {
@@ -2001,6 +2445,74 @@ mod tests {
                 .expect("write keepalive");
         }
         server.join().expect("server thread").expect("server ok");
+    }
+
+    #[test]
+    fn async_frame_roundtrip_matches_sync_codec() {
+        let runtime = Runtime::new().expect("tokio runtime");
+        runtime.block_on(async {
+            let (mut tx, mut rx) = tokio::io::duplex(4 * 1024);
+            let message = Sv2Message::KeepAlive;
+
+            let writer = tokio::spawn(async move {
+                write_frame_async(&mut tx, &message)
+                    .await
+                    .expect("write frame");
+            });
+            let reader = tokio::spawn(async move {
+                read_frame_async(&mut rx)
+                    .await
+                    .expect("read frame")
+                    .expect("frame payload")
+            });
+
+            writer.await.expect("writer join");
+            let decoded = reader.await.expect("reader join");
+            assert_eq!(decoded, Sv2Message::KeepAlive);
+        });
+    }
+
+    #[test]
+    fn async_secure_transport_roundtrip() {
+        let runtime = Runtime::new().expect("tokio runtime");
+        runtime.block_on(async {
+            let (mut client_io, mut server_io) = tokio::io::duplex(8 * 1024);
+
+            let client = tokio::spawn(async move {
+                let mut transport = SecureSv2Transport::handshake_client_async(&mut client_io)
+                    .await
+                    .expect("client handshake");
+                transport
+                    .write_message_async(&mut client_io, &Sv2Message::KeepAlive)
+                    .await
+                    .expect("client write");
+                transport
+                    .read_message_async(&mut client_io)
+                    .await
+                    .expect("client read")
+                    .expect("client message")
+            });
+
+            let server = tokio::spawn(async move {
+                let mut transport = SecureSv2Transport::handshake_server_async(&mut server_io)
+                    .await
+                    .expect("server handshake");
+                let inbound = transport
+                    .read_message_async(&mut server_io)
+                    .await
+                    .expect("server read")
+                    .expect("server message");
+                assert_eq!(inbound, Sv2Message::KeepAlive);
+                transport
+                    .write_message_async(&mut server_io, &Sv2Message::KeepAlive)
+                    .await
+                    .expect("server write");
+            });
+
+            let echoed = client.await.expect("client join");
+            server.await.expect("server join");
+            assert_eq!(echoed, Sv2Message::KeepAlive);
+        });
     }
 
     #[test]

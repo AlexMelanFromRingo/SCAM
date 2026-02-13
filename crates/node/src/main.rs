@@ -3,7 +3,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -33,7 +33,9 @@ use scam_stratum::{
     IdentityTranslator, JobDeclarator, MiningJob, MiningTemplate, NoiseSv2Transport,
     SUPPORTED_SV2_VERSION, SecureSv2Transport, SecureTransportMode, SequentialJobDeclarator,
     SessionConfig as Sv2SessionConfig, SessionEvent, Sv2Message, Sv2Session, Translator,
-    generate_noise_static_keypair, read_frame as read_sv2_frame, write_frame as write_sv2_frame,
+    generate_noise_static_keypair, read_frame as read_sv2_frame,
+    read_frame_async as read_sv2_frame_async, write_frame as write_sv2_frame,
+    write_frame_async as write_sv2_frame_async,
 };
 use scam_wallet::{
     AddressError, DeriveKeyError, MnemonicError, QrError, RescanError, SchnorrError, WalletKey,
@@ -44,6 +46,10 @@ use scam_wallet::{
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tokio::runtime::Builder as TokioRuntimeBuilder;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::task::JoinSet;
+use tokio::time::timeout;
 
 #[derive(Debug, Parser)]
 #[command(name = "scam-node")]
@@ -4501,6 +4507,26 @@ fn write_sv2_message(
     }
 }
 
+async fn write_sv2_message_async(
+    stream: &mut tokio::net::TcpStream,
+    secure: Option<&mut StratumSecureTransport>,
+    message: &Sv2Message,
+) -> Result<(), NodeError> {
+    match secure {
+        Some(StratumSecureTransport::Legacy(transport)) => transport
+            .write_message_async(stream, message)
+            .await
+            .map_err(|e| NodeError::Runtime(format!("stratum secure(legacy) write failed: {e}"))),
+        Some(StratumSecureTransport::Noise(transport)) => transport
+            .write_message_async(stream, message)
+            .await
+            .map_err(|e| NodeError::Runtime(format!("stratum secure(noise_xx) write failed: {e}"))),
+        None => write_sv2_frame_async(stream, message)
+            .await
+            .map_err(|e| NodeError::Runtime(format!("stratum write failed: {e}"))),
+    }
+}
+
 enum StratumReadOutcome {
     Message(Sv2Message),
     Timeout,
@@ -4533,6 +4559,32 @@ fn read_sv2_message(
     }
 }
 
+async fn read_sv2_message_async(
+    stream: &mut tokio::net::TcpStream,
+    secure: Option<&mut StratumSecureTransport>,
+    read_timeout: Duration,
+) -> Result<StratumReadOutcome, NodeError> {
+    let read_result = timeout(read_timeout, async {
+        match secure {
+            Some(StratumSecureTransport::Legacy(transport)) => {
+                transport.read_message_async(stream).await
+            }
+            Some(StratumSecureTransport::Noise(transport)) => {
+                transport.read_message_async(stream).await
+            }
+            None => read_sv2_frame_async(stream).await,
+        }
+    })
+    .await;
+
+    match read_result {
+        Ok(Ok(Some(message))) => Ok(StratumReadOutcome::Message(message)),
+        Ok(Ok(None)) => Ok(StratumReadOutcome::Closed),
+        Err(_) => Ok(StratumReadOutcome::Timeout),
+        Ok(Err(err)) => Err(NodeError::Runtime(format!("stratum read failed: {err}"))),
+    }
+}
+
 #[derive(Clone)]
 struct StratumServerContext {
     cfg: ChainConfig,
@@ -4553,7 +4605,7 @@ struct StratumServerContext {
     template_provider: RuntimeTemplateProvider,
     job_declarator: Arc<Mutex<SequentialJobDeclarator>>,
     max_jobs_per_channel: usize,
-    active_clients: Arc<Mutex<usize>>,
+    active_clients: Arc<AtomicUsize>,
     secure_transport: bool,
     secure_transport_mode: SecureTransportMode,
     secure_rekey_interval_messages: u64,
@@ -4571,6 +4623,7 @@ fn lock_runtime<'a>(
         .map_err(|_| NodeError::Runtime("stratum runtime mutex poisoned".to_owned()))
 }
 
+#[allow(dead_code)]
 fn issue_new_stratum_job(
     session: &mut Sv2Session,
     ctx: &StratumServerContext,
@@ -4578,31 +4631,33 @@ fn issue_new_stratum_job(
     secure: &mut Option<StratumSecureTransport>,
     jobs: &mut HashMap<u32, StratumWork>,
 ) -> Result<Hash256, NodeError> {
-    let runtime = lock_runtime(&ctx.runtime)?;
-    let tip_hash = runtime.tip_hash();
-    let template_work = if let Some(addr) = &ctx.template_provider_addr {
-        let target = runtime.expected_target_for_next_block()?;
-        let request = TemplateProviderRequest {
-            channel_id: session.channel_id(),
-            version: 1,
-            prev_hash_hex: runtime.tip_hash().to_hex(),
-            ntime: runtime
-                .tip_header()
-                .timestamp
-                .saturating_add(ctx.cfg.target_block_time_sec),
-            network_target_hex: target.to_hex(),
-            block_subsidy: ctx.cfg.block_subsidy,
-            reward_key_hash20_hex: hex::encode(ctx.cfg.genesis_reward_key_hash20()?),
-            coinbase_label: format!(
-                "stratum-template-h{}",
-                runtime.tip_height().saturating_add(1)
-            ),
+    let (tip_hash, template_work) = {
+        let runtime = lock_runtime(&ctx.runtime)?;
+        let tip_hash = runtime.tip_hash();
+        let template_work = if let Some(addr) = &ctx.template_provider_addr {
+            let target = runtime.expected_target_for_next_block()?;
+            let request = TemplateProviderRequest {
+                channel_id: session.channel_id(),
+                version: 1,
+                prev_hash_hex: runtime.tip_hash().to_hex(),
+                ntime: runtime
+                    .tip_header()
+                    .timestamp
+                    .saturating_add(ctx.cfg.target_block_time_sec),
+                network_target_hex: target.to_hex(),
+                block_subsidy: ctx.cfg.block_subsidy,
+                reward_key_hash20_hex: hex::encode(ctx.cfg.genesis_reward_key_hash20()?),
+                coinbase_label: format!(
+                    "stratum-template-h{}",
+                    runtime.tip_height().saturating_add(1)
+                ),
+            };
+            request_template_from_provider(addr, &request)?
+        } else {
+            ctx.template_provider.build_template(&runtime, &ctx.cfg)?
         };
-        request_template_from_provider(addr, &request)?
-    } else {
-        ctx.template_provider.build_template(&runtime, &ctx.cfg)?
+        (tip_hash, template_work)
     };
-    drop(runtime);
 
     let template = template_work.template;
     let job_id = if let Some(addr) = &ctx.job_declarator_addr {
@@ -4637,11 +4692,80 @@ fn issue_new_stratum_job(
     Ok(tip_hash)
 }
 
+async fn issue_new_stratum_job_async(
+    session: &mut Sv2Session,
+    ctx: &StratumServerContext,
+    stream: &mut tokio::net::TcpStream,
+    secure: &mut Option<StratumSecureTransport>,
+    jobs: &mut HashMap<u32, StratumWork>,
+) -> Result<Hash256, NodeError> {
+    let (tip_hash, template_work) = {
+        let runtime = lock_runtime(&ctx.runtime)?;
+        let tip_hash = runtime.tip_hash();
+        let template_work = if let Some(addr) = &ctx.template_provider_addr {
+            let target = runtime.expected_target_for_next_block()?;
+            let request = TemplateProviderRequest {
+                channel_id: session.channel_id(),
+                version: 1,
+                prev_hash_hex: runtime.tip_hash().to_hex(),
+                ntime: runtime
+                    .tip_header()
+                    .timestamp
+                    .saturating_add(ctx.cfg.target_block_time_sec),
+                network_target_hex: target.to_hex(),
+                block_subsidy: ctx.cfg.block_subsidy,
+                reward_key_hash20_hex: hex::encode(ctx.cfg.genesis_reward_key_hash20()?),
+                coinbase_label: format!(
+                    "stratum-template-h{}",
+                    runtime.tip_height().saturating_add(1)
+                ),
+            };
+            request_template_from_provider(addr, &request)?
+        } else {
+            ctx.template_provider.build_template(&runtime, &ctx.cfg)?
+        };
+        (tip_hash, template_work)
+    };
+
+    let template = template_work.template;
+    let job_id = if let Some(addr) = &ctx.job_declarator_addr {
+        request_job_id_from_declarator(addr, session.channel_id(), &template)?
+    } else {
+        let mut declarator = ctx
+            .job_declarator
+            .lock()
+            .map_err(|_| NodeError::Runtime("stratum job declarator mutex poisoned".to_owned()))?;
+        declarator.next_job_id()
+    };
+    let job = MiningJob {
+        channel_id: session.channel_id(),
+        job_id,
+        version: template.version,
+        prev_hash: template.prev_hash,
+        merkle_root: template.merkle_root,
+        ntime: template.ntime,
+        network_target: template.network_target,
+    };
+    let work = StratumWork {
+        job,
+        coinbase: template_work.coinbase,
+    };
+
+    let new_job = session.install_job(work.job.clone())?;
+    write_sv2_message_async(stream, secure.as_mut(), &new_job).await?;
+    let prev = session.set_new_prev_hash(&work.job)?;
+    write_sv2_message_async(stream, secure.as_mut(), &prev).await?;
+    jobs.insert(work.job.job_id, work);
+    jobs.retain(|job_id, _| session.job(*job_id).is_some());
+    Ok(tip_hash)
+}
+
 fn load_runtime_tip_hash(ctx: &StratumServerContext) -> Result<Hash256, NodeError> {
     let runtime = lock_runtime(&ctx.runtime)?;
     Ok(runtime.tip_hash())
 }
 
+#[allow(dead_code)]
 fn run_stratum_client(mut stream: TcpStream, ctx: StratumServerContext) -> Result<(), NodeError> {
     let read_timeout = Duration::from_secs(ctx.read_timeout_sec.max(1));
     configure_stream_timeouts_with(&stream, read_timeout, read_timeout)?;
@@ -4780,11 +4904,12 @@ fn run_stratum_client(mut stream: TcpStream, ctx: StratumServerContext) -> Resul
                                 transactions: vec![work.coinbase],
                             };
 
-                            let mut runtime = lock_runtime(&ctx.runtime)?;
-                            let _ = runtime.submit_block(block)?;
-                            persist_runtime_db(&runtime, &ctx.runtime_db_path)?;
-                            last_tip_hash = runtime.tip_hash();
-                            drop(runtime);
+                            {
+                                let mut runtime = lock_runtime(&ctx.runtime)?;
+                                let _ = runtime.submit_block(block)?;
+                                persist_runtime_db(&runtime, &ctx.runtime_db_path)?;
+                                last_tip_hash = runtime.tip_hash();
+                            }
 
                             jobs.clear();
                             if channel_id == session.channel_id() {
@@ -4795,6 +4920,187 @@ fn run_stratum_client(mut stream: TcpStream, ctx: StratumServerContext) -> Resul
                                     &mut secure_transport,
                                     &mut jobs,
                                 )?;
+                            }
+                        }
+                        SessionEvent::ShareRejected { .. } => {}
+                        SessionEvent::ShareTargetChanged { .. } => {}
+                        SessionEvent::ChannelClosed { .. } => {
+                            session.close();
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    session.close();
+    Ok(())
+}
+
+async fn run_stratum_client_async(
+    mut stream: tokio::net::TcpStream,
+    ctx: StratumServerContext,
+    _permit: OwnedSemaphorePermit,
+) -> Result<(), NodeError> {
+    let read_timeout = Duration::from_secs(ctx.read_timeout_sec.max(1));
+    let mut secure_transport = if ctx.secure_transport {
+        let transport = match ctx.secure_transport_mode {
+            SecureTransportMode::Legacy => {
+                let mut legacy = SecureSv2Transport::handshake_server_async(&mut stream)
+                    .await
+                    .map_err(|e| {
+                        NodeError::Runtime(format!("stratum secure(legacy) handshake failed: {e}"))
+                    })?;
+                legacy
+                    .set_rekey_interval_messages(ctx.secure_rekey_interval_messages)
+                    .map_err(|e| {
+                        NodeError::Runtime(format!(
+                            "stratum secure(legacy) transport config failed: {e}"
+                        ))
+                    })?;
+                StratumSecureTransport::Legacy(legacy)
+            }
+            SecureTransportMode::NoiseXx => {
+                let mut noise = NoiseSv2Transport::handshake_server_async(
+                    &mut stream,
+                    ctx.secure_static_private_key,
+                    ctx.secure_expected_remote_static_public_key,
+                )
+                .await
+                .map_err(|e| {
+                    NodeError::Runtime(format!("stratum secure(noise_xx) handshake failed: {e}"))
+                })?;
+                noise
+                    .set_rekey_interval_messages(ctx.secure_rekey_interval_messages)
+                    .map_err(|e| {
+                        NodeError::Runtime(format!(
+                            "stratum secure(noise_xx) transport config failed: {e}"
+                        ))
+                    })?;
+                StratumSecureTransport::Noise(noise)
+            }
+        };
+        Some(transport)
+    } else {
+        None
+    };
+    let channel_id = ctx
+        .next_channel_id
+        .fetch_add(1, Ordering::Relaxed)
+        .saturating_add(1);
+    let mut session = Sv2Session::new(Sv2SessionConfig {
+        channel_id,
+        share_target: ctx.share_target,
+        min_share_target: ctx.min_share_target,
+        max_share_target: ctx.max_share_target,
+        max_jobs: ctx.max_jobs_per_channel,
+        supported_version: SUPPORTED_SV2_VERSION,
+        vardiff_target_shares_per_minute: ctx.vardiff_target_shares_per_minute,
+        vardiff_retarget_interval_shares: ctx.vardiff_retarget_interval_shares,
+        vardiff_clamp_up: ctx.vardiff_clamp_up,
+        vardiff_clamp_down: ctx.vardiff_clamp_down,
+        max_rejected_shares: ctx.max_rejected_shares,
+    })?;
+    let mut jobs = HashMap::<u32, StratumWork>::new();
+    let mut last_keepalive = Instant::now();
+    let mut last_activity = Instant::now();
+    let mut last_tip_hash = load_runtime_tip_hash(&ctx)?;
+
+    loop {
+        match read_sv2_message_async(&mut stream, secure_transport.as_mut(), read_timeout).await? {
+            StratumReadOutcome::Closed => break,
+            StratumReadOutcome::Timeout => {
+                if session.is_active() {
+                    let current_tip = load_runtime_tip_hash(&ctx)?;
+                    if current_tip != last_tip_hash {
+                        jobs.clear();
+                        last_tip_hash = issue_new_stratum_job_async(
+                            &mut session,
+                            &ctx,
+                            &mut stream,
+                            &mut secure_transport,
+                            &mut jobs,
+                        )
+                        .await?;
+                    }
+                    if last_keepalive.elapsed().as_secs() >= ctx.keepalive_sec {
+                        write_sv2_message_async(
+                            &mut stream,
+                            secure_transport.as_mut(),
+                            &Sv2Message::KeepAlive,
+                        )
+                        .await?;
+                        last_keepalive = Instant::now();
+                    }
+                }
+                if last_activity.elapsed().as_secs() >= ctx.idle_timeout_sec {
+                    break;
+                }
+            }
+            StratumReadOutcome::Message(inbound) => {
+                last_activity = Instant::now();
+                let response = session.handle_message(inbound)?;
+                for outbound in response.outbound {
+                    write_sv2_message_async(&mut stream, secure_transport.as_mut(), &outbound)
+                        .await?;
+                }
+
+                for event in response.events {
+                    match event {
+                        SessionEvent::SetupAccepted => {}
+                        SessionEvent::ChannelOpened { .. } => {
+                            last_tip_hash = issue_new_stratum_job_async(
+                                &mut session,
+                                &ctx,
+                                &mut stream,
+                                &mut secure_transport,
+                                &mut jobs,
+                            )
+                            .await?;
+                        }
+                        SessionEvent::ShareAccepted {
+                            channel_id,
+                            job_id,
+                            nonce,
+                            ntime,
+                            is_block,
+                            ..
+                        } => {
+                            if !is_block {
+                                continue;
+                            }
+                            let Some(work) = jobs.get(&job_id).cloned() else {
+                                continue;
+                            };
+                            let block = scam_core::Block {
+                                header: scam_core::BlockHeader {
+                                    version: work.job.version,
+                                    prev_block: work.job.prev_hash,
+                                    merkle_root: work.job.merkle_root,
+                                    timestamp: ntime,
+                                    target: work.job.network_target,
+                                    nonce,
+                                },
+                                transactions: vec![work.coinbase],
+                            };
+
+                            {
+                                let mut runtime = lock_runtime(&ctx.runtime)?;
+                                let _ = runtime.submit_block(block)?;
+                                persist_runtime_db(&runtime, &ctx.runtime_db_path)?;
+                                last_tip_hash = runtime.tip_hash();
+                            }
+
+                            jobs.clear();
+                            if channel_id == session.channel_id() {
+                                last_tip_hash = issue_new_stratum_job_async(
+                                    &mut session,
+                                    &ctx,
+                                    &mut stream,
+                                    &mut secure_transport,
+                                    &mut jobs,
+                                )
+                                .await?;
                             }
                         }
                         SessionEvent::ShareRejected { .. } => {}
@@ -5171,8 +5477,6 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
         ));
     }
 
-    let listener = TcpListener::bind(&args.bind)
-        .map_err(|e| NodeError::Runtime(format!("stratum bind failed on {}: {e}", args.bind)))?;
     println!(
         "Stratum (SV2 framed) listening on {} network={} source={} tip_h={} tip_hash={}",
         args.bind,
@@ -5196,6 +5500,7 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
     );
     println!("Max jobs/channel: {}", max_jobs_per_channel);
     println!("Max active clients: {}", max_active_clients);
+    println!("I/O model: async tokio");
     println!(
         "Read timeout={}s keepalive={}s idle timeout={}s",
         read_timeout_sec, keepalive_sec, idle_timeout_sec
@@ -5243,7 +5548,7 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
         template_provider: RuntimeTemplateProvider,
         job_declarator: Arc::new(Mutex::new(SequentialJobDeclarator::default())),
         max_jobs_per_channel,
-        active_clients: Arc::new(Mutex::new(0)),
+        active_clients: Arc::new(AtomicUsize::new(0)),
         secure_transport,
         secure_transport_mode,
         secure_rekey_interval_messages,
@@ -5252,59 +5557,72 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
         template_provider_addr: args.template_provider_addr.clone(),
         job_declarator_addr: args.job_declarator_addr.clone(),
     };
+    let worker_threads = std::thread::available_parallelism()
+        .map(|n| n.get().max(2))
+        .unwrap_or(4);
+    let runtime = TokioRuntimeBuilder::new_multi_thread()
+        .enable_all()
+        .worker_threads(worker_threads)
+        .build()
+        .map_err(|e| NodeError::Runtime(format!("stratum async runtime init failed: {e}")))?;
 
-    let mut served = 0u32;
-    let mut handles = Vec::new();
-    for incoming in listener.incoming() {
-        let stream =
-            incoming.map_err(|e| NodeError::Runtime(format!("stratum accept failed: {e}")))?;
-        let current_active = {
-            let active = ctx.active_clients.lock().map_err(|_| {
-                NodeError::Runtime("stratum active client mutex poisoned".to_owned())
-            })?;
-            *active
-        };
-        if current_active >= max_active_clients {
-            println!(
-                "stratum dropping connection (active={} max_active={})",
-                current_active, max_active_clients
-            );
-            drop(stream);
-            continue;
-        }
+    let bind = args.bind.clone();
+    let max_clients = args.max_clients;
+    runtime.block_on(async move {
+        let listener = tokio::net::TcpListener::bind(&bind)
+            .await
+            .map_err(|e| NodeError::Runtime(format!("stratum bind failed on {bind}: {e}")))?;
+        let permits = Arc::new(Semaphore::new(max_active_clients));
+        let mut workers = JoinSet::<Result<(), NodeError>>::new();
+        let mut served = 0u32;
 
-        {
-            let mut active = ctx.active_clients.lock().map_err(|_| {
-                NodeError::Runtime("stratum active client mutex poisoned".to_owned())
-            })?;
-            *active = active.saturating_add(1);
-        }
+        loop {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .map_err(|e| NodeError::Runtime(format!("stratum accept failed: {e}")))?;
 
-        let client_ctx = ctx.clone();
-        let active_clients = ctx.active_clients.clone();
-        handles.push(thread::spawn(move || {
-            let result = run_stratum_client(stream, client_ctx);
-            if let Ok(mut active) = active_clients.lock() {
-                *active = active.saturating_sub(1);
+            let permit = match permits.clone().try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    let current_active = ctx.active_clients.load(Ordering::Relaxed);
+                    println!(
+                        "stratum dropping connection (active={} max_active={})",
+                        current_active, max_active_clients
+                    );
+                    drop(stream);
+                    continue;
+                }
+            };
+
+            let client_ctx = ctx.clone();
+            let active_clients = ctx.active_clients.clone();
+            active_clients.fetch_add(1, Ordering::Relaxed);
+            workers.spawn(async move {
+                let result = run_stratum_client_async(stream, client_ctx, permit).await;
+                active_clients.fetch_sub(1, Ordering::Relaxed);
+                result
+            });
+
+            served = served.saturating_add(1);
+            if max_clients > 0 && served >= max_clients {
+                break;
             }
-            result
-        }));
-
-        served = served.saturating_add(1);
-        if args.max_clients > 0 && served >= args.max_clients {
-            break;
         }
-    }
 
-    for handle in handles {
-        let result = handle
-            .join()
-            .map_err(|_| NodeError::Runtime("stratum worker thread panicked".to_owned()))?;
-        if let Err(err) = result {
-            return Err(NodeError::Runtime(format!("stratum worker error: {err}")));
+        while let Some(join_result) = workers.join_next().await {
+            match join_result {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => return Err(err),
+                Err(err) => {
+                    return Err(NodeError::Runtime(format!(
+                        "stratum worker task panicked/cancelled: {err}"
+                    )));
+                }
+            }
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 fn try_find_share_for_job(

@@ -9,3 +9,4 @@ bincode.workspace = true
 scam-core = { path = "../core" }
 serde.workspace = true
 thiserror.workspace = true
+tokio.workspace = true

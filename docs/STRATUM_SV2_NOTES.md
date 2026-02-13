@@ -8,6 +8,7 @@ Current SCAM implementation provides:
 - per-session stats and reject-budget close policy,
 - VarDiff target retuning + target bounds,
 - multi-client server (`stratum-serve`) and worker client (`stratum-mine`),
+- async tokio socket loop in `stratum-serve` with bounded concurrent sessions (no unbounded thread-per-connection growth),
 - explicit role-split services:
   - `sv2-template-provider`
   - `sv2-job-declarator`
@@ -82,4 +83,3 @@ Tracking docs:
 - `docs/SV2_POOL_GRADE_GAP.md`
 - `docs/SV2_ROLE_INTERFACES.md`
 - `docs/SV2_INTEROP_MATRIX.md`
-

@@ -49,6 +49,7 @@ This README is written as an operator+developer manual: what the protocol does, 
 
 ### P2P and sync
 - Wire primitives: `version/verack`, `ping/pong`, `inv/getdata`, `tx/block`, `getheaders/headers`, `getblocks`.
+- Transport module exposes both blocking and async framing/handshake APIs.
 - Headers-first sync + block download/apply.
 - Peer book persistence (`redb`) + DNS seed ingestion.
 - Outbound diversity and rotation for eclipse-risk reduction.
@@ -57,6 +58,7 @@ This README is written as an operator+developer manual: what the protocol does, 
 ### Stratum / SV2 subset
 - Binary framing + typed message state machine.
 - Pool endpoint (`stratum-serve`) + worker client (`stratum-mine`).
+- `stratum-serve` uses async tokio socket I/O with bounded concurrent sessions.
 - Role split services:
   - `sv2-template-provider`
   - `sv2-job-declarator`

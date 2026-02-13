@@ -21,12 +21,15 @@ Stratum coverage is included in workspace tests (`scam-stratum`):
 - secure transport encrypted frame roundtrip and handshake magic rejection.
 - secure transport rekey-interval rotation behavior.
 - noise_xx secure transport handshake + rekey behavior.
+- async frame/secure-transport roundtrips (`tokio` path).
 - role-split primitives (`SequentialJobDeclarator`, `IdentityTranslator`) unit coverage.
 
 Networking/mempool hardening coverage includes:
 
 - per-peer replacement rate limit tests in `scam-p2p`,
+- async transport handshake/request roundtrip tests in `scam-p2p`,
 - telemetry counters for replacement and orphan churn in `scam-mempool`,
+- replacement boundary tests (multi-conflict, required-fee equality, descendant-limit equality) in `scam-mempool`,
 - gossip telemetry counters for replacement-driven relay paths.
 
 ## Fuzzing Baseline

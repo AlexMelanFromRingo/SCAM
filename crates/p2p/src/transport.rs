@@ -3,6 +3,7 @@ use std::net::TcpStream;
 
 use scam_core::{BlockHeader, Hash256};
 use thiserror::Error;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::wire::{InventoryItem, WireMessage, decode_message, encode_message};
 
@@ -58,6 +59,34 @@ pub fn send_message(
     Ok(())
 }
 
+pub async fn send_message_async<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    message: &WireMessage,
+    cfg: &FramingConfig,
+) -> Result<(), TransportError> {
+    let payload = encode_message(message).map_err(TransportError::Wire)?;
+    if payload.len() > cfg.max_message_size {
+        return Err(TransportError::MessageTooLarge {
+            limit: cfg.max_message_size,
+            got: payload.len(),
+        });
+    }
+
+    let mut header = [0u8; 8];
+    header[..4].copy_from_slice(&cfg.magic.to_be_bytes());
+    header[4..].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+    stream
+        .write_all(&header)
+        .await
+        .map_err(TransportError::Io)?;
+    stream
+        .write_all(&payload)
+        .await
+        .map_err(TransportError::Io)?;
+    stream.flush().await.map_err(TransportError::Io)?;
+    Ok(())
+}
+
 pub fn read_message(
     stream: &mut TcpStream,
     cfg: &FramingConfig,
@@ -87,6 +116,39 @@ pub fn read_message(
     decode_message(&payload, cfg.max_message_size).map_err(TransportError::Wire)
 }
 
+pub async fn read_message_async<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    cfg: &FramingConfig,
+) -> Result<WireMessage, TransportError> {
+    let mut header = [0u8; 8];
+    stream
+        .read_exact(&mut header)
+        .await
+        .map_err(TransportError::Io)?;
+
+    let magic = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
+    if magic != cfg.magic {
+        return Err(TransportError::InvalidMagic {
+            expected: cfg.magic,
+            got: magic,
+        });
+    }
+    let payload_len = u32::from_be_bytes([header[4], header[5], header[6], header[7]]) as usize;
+    if payload_len > cfg.max_message_size {
+        return Err(TransportError::MessageTooLarge {
+            limit: cfg.max_message_size,
+            got: payload_len,
+        });
+    }
+
+    let mut payload = vec![0u8; payload_len];
+    stream
+        .read_exact(&mut payload)
+        .await
+        .map_err(TransportError::Io)?;
+    decode_message(&payload, cfg.max_message_size).map_err(TransportError::Wire)
+}
+
 pub fn client_handshake(
     stream: &mut TcpStream,
     cfg: &FramingConfig,
@@ -107,6 +169,36 @@ pub fn client_handshake(
     let remote = parse_version(version)?;
     send_message(stream, &WireMessage::Verack, cfg)?;
     let verack = read_message(stream, cfg)?;
+    if !matches!(verack, WireMessage::Verack) {
+        return Err(TransportError::UnexpectedMessage {
+            expected: "verack",
+            got: format!("{verack:?}"),
+        });
+    }
+    Ok(remote)
+}
+
+pub async fn client_handshake_async<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    cfg: &FramingConfig,
+    local: &LocalHandshake,
+) -> Result<RemoteHandshake, TransportError> {
+    send_message_async(
+        stream,
+        &WireMessage::Version {
+            protocol_version: local.protocol_version,
+            network_id: local.network_id.clone(),
+            user_agent: local.user_agent.clone(),
+            start_height: local.start_height,
+        },
+        cfg,
+    )
+    .await?;
+
+    let version = read_message_async(stream, cfg).await?;
+    let remote = parse_version(version)?;
+    send_message_async(stream, &WireMessage::Verack, cfg).await?;
+    let verack = read_message_async(stream, cfg).await?;
     if !matches!(verack, WireMessage::Verack) {
         return Err(TransportError::UnexpectedMessage {
             expected: "verack",
@@ -144,6 +236,35 @@ pub fn server_handshake(
     Ok(remote)
 }
 
+pub async fn server_handshake_async<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    cfg: &FramingConfig,
+    local: &LocalHandshake,
+) -> Result<RemoteHandshake, TransportError> {
+    let version = read_message_async(stream, cfg).await?;
+    let remote = parse_version(version)?;
+    send_message_async(
+        stream,
+        &WireMessage::Version {
+            protocol_version: local.protocol_version,
+            network_id: local.network_id.clone(),
+            user_agent: local.user_agent.clone(),
+            start_height: local.start_height,
+        },
+        cfg,
+    )
+    .await?;
+    let verack = read_message_async(stream, cfg).await?;
+    if !matches!(verack, WireMessage::Verack) {
+        return Err(TransportError::UnexpectedMessage {
+            expected: "verack",
+            got: format!("{verack:?}"),
+        });
+    }
+    send_message_async(stream, &WireMessage::Verack, cfg).await?;
+    Ok(remote)
+}
+
 pub fn request_headers(
     stream: &mut TcpStream,
     cfg: &FramingConfig,
@@ -161,6 +282,23 @@ pub fn request_headers(
     }
 }
 
+pub async fn request_headers_async<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    cfg: &FramingConfig,
+    locator: Vec<Hash256>,
+    stop: Option<Hash256>,
+) -> Result<Vec<BlockHeader>, TransportError> {
+    send_message_async(stream, &WireMessage::GetHeaders { locator, stop }, cfg).await?;
+    let response = read_message_async(stream, cfg).await?;
+    match response {
+        WireMessage::Headers { headers } => Ok(headers),
+        other => Err(TransportError::UnexpectedMessage {
+            expected: "headers",
+            got: format!("{other:?}"),
+        }),
+    }
+}
+
 pub fn request_blocks(
     stream: &mut TcpStream,
     cfg: &FramingConfig,
@@ -169,6 +307,37 @@ pub fn request_blocks(
 ) -> Result<Vec<Hash256>, TransportError> {
     send_message(stream, &WireMessage::GetBlocks { locator, stop }, cfg)?;
     let response = read_message(stream, cfg)?;
+    match response {
+        WireMessage::Inv { items } => {
+            let mut hashes = Vec::<Hash256>::new();
+            for item in items {
+                match item {
+                    InventoryItem::Block(hash) => hashes.push(hash),
+                    InventoryItem::Tx(hash) => {
+                        return Err(TransportError::UnexpectedInventoryItem {
+                            expected: "block hash inventory",
+                            got: format!("tx:{hash}"),
+                        });
+                    }
+                }
+            }
+            Ok(hashes)
+        }
+        other => Err(TransportError::UnexpectedMessage {
+            expected: "inv",
+            got: format!("{other:?}"),
+        }),
+    }
+}
+
+pub async fn request_blocks_async<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    cfg: &FramingConfig,
+    locator: Vec<Hash256>,
+    stop: Option<Hash256>,
+) -> Result<Vec<Hash256>, TransportError> {
+    send_message_async(stream, &WireMessage::GetBlocks { locator, stop }, cfg).await?;
+    let response = read_message_async(stream, cfg).await?;
     match response {
         WireMessage::Inv { items } => {
             let mut hashes = Vec::<Hash256>::new();
@@ -235,11 +404,14 @@ mod tests {
     use std::time::Duration;
 
     use scam_core::{Hash256, Target, hash::hash256};
+    use tokio::runtime::Runtime;
 
     use crate::sync::{build_block_locator, select_block_hashes_for_peer, select_headers_for_peer};
     use crate::transport::{
-        FramingConfig, LocalHandshake, WireMessage, client_handshake, read_message, request_blocks,
-        request_headers, send_message, server_handshake,
+        FramingConfig, LocalHandshake, WireMessage, client_handshake, client_handshake_async,
+        read_message, read_message_async, request_blocks, request_blocks_async, request_headers,
+        request_headers_async, send_message, send_message_async, server_handshake,
+        server_handshake_async,
     };
 
     fn handshake() -> LocalHandshake {
@@ -316,6 +488,74 @@ mod tests {
         assert!(!blocks.is_empty());
 
         server.join().expect("server join");
+    }
+
+    #[test]
+    fn async_handshake_and_headers_roundtrip() {
+        let runtime = Runtime::new().expect("tokio runtime");
+        runtime.block_on(async {
+            let cfg = FramingConfig::default();
+            let (mut client_stream, mut server_stream) = tokio::io::duplex(16 * 1024);
+            let server_cfg = cfg.clone();
+
+            let server = tokio::spawn(async move {
+                let remote = server_handshake_async(&mut server_stream, &server_cfg, &handshake())
+                    .await
+                    .expect("server hs");
+                assert_eq!(remote.network_id, "devnet");
+
+                let (chain, headers_map) = chain_headers(8);
+                let request = read_message_async(&mut server_stream, &server_cfg)
+                    .await
+                    .expect("read req");
+                let WireMessage::GetHeaders { locator, stop } = request else {
+                    panic!("expected getheaders");
+                };
+                let headers = select_headers_for_peer(&chain, &headers_map, &locator, stop, 2000);
+                send_message_async(
+                    &mut server_stream,
+                    &WireMessage::Headers { headers },
+                    &server_cfg,
+                )
+                .await
+                .expect("send headers");
+
+                let request = read_message_async(&mut server_stream, &server_cfg)
+                    .await
+                    .expect("read req");
+                let WireMessage::GetBlocks { locator, stop } = request else {
+                    panic!("expected getblocks");
+                };
+                let hashes = select_block_hashes_for_peer(&chain, &locator, stop, 2000);
+                let items = hashes
+                    .into_iter()
+                    .map(crate::wire::InventoryItem::Block)
+                    .collect();
+                send_message_async(&mut server_stream, &WireMessage::Inv { items }, &server_cfg)
+                    .await
+                    .expect("send inv");
+            });
+
+            let remote = client_handshake_async(&mut client_stream, &cfg, &handshake())
+                .await
+                .expect("client hs");
+            assert_eq!(remote.network_id, "devnet");
+
+            let (local_chain, _) = chain_headers(3);
+            let locator = build_block_locator(&local_chain);
+            let headers = request_headers_async(&mut client_stream, &cfg, locator, None)
+                .await
+                .expect("headers");
+            assert!(!headers.is_empty());
+
+            let locator = build_block_locator(&local_chain);
+            let blocks = request_blocks_async(&mut client_stream, &cfg, locator, None)
+                .await
+                .expect("blocks");
+            assert!(!blocks.is_empty());
+
+            server.await.expect("server join");
+        });
     }
 
     fn chain_headers(
