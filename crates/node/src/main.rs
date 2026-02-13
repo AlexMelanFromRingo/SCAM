@@ -1136,6 +1136,10 @@ fn should_mine_query_blocks(mine_blocks: u32) -> bool {
     mine_blocks != 0
 }
 
+fn has_unspent_wallet_balance(unspent_total: u128) -> bool {
+    unspent_total > 0
+}
+
 fn build_runtime_for_query(
     network: Network,
     config: Option<PathBuf>,
@@ -1626,7 +1630,7 @@ fn run_wallet(command: WalletCommand) -> Result<(), NodeError> {
         println!("Immature total: {}", report.immature_total);
         println!("Unspent outputs: {}", report.unspent_count);
 
-        if report.unspent_total == 0 {
+        if !has_unspent_wallet_balance(report.unspent_total) {
             println!("No funds found in watched derivation range.");
             return Ok(());
         }
@@ -1959,7 +1963,15 @@ fn run_wallet(command: WalletCommand) -> Result<(), NodeError> {
     Ok(())
 }
 
-fn run_p2p_demo() -> Result<(), NodeError> {
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct P2pDemoSummary {
+    inbound_peer_id: u64,
+    outbound_messages: usize,
+    outbound_peer_ids: Vec<u64>,
+    only_inv_messages: bool,
+}
+
+fn run_p2p_demo() -> Result<P2pDemoSummary, NodeError> {
     let mut engine = GossipEngine::new(256)
         .map_err(|e| NodeError::Runtime(format!("cannot create gossip engine: {e}")))?;
     engine.connect_peer(1);
@@ -1987,15 +1999,29 @@ fn run_p2p_demo() -> Result<(), NodeError> {
     let fanout = engine
         .on_message(1, WireMessage::Tx { tx })
         .map_err(|e| NodeError::Runtime(format!("gossip processing failed: {e}")))?;
+    let mut outbound_peer_ids = fanout.iter().map(|msg| msg.peer_id).collect::<Vec<_>>();
+    outbound_peer_ids.sort_unstable();
+    let only_inv_messages = fanout
+        .iter()
+        .all(|msg| matches!(msg.message, WireMessage::Inv { .. }));
+    let summary = P2pDemoSummary {
+        inbound_peer_id: 1,
+        outbound_messages: fanout.len(),
+        outbound_peer_ids,
+        only_inv_messages,
+    };
 
     println!("P2P gossip demo:");
     println!("Incoming: peer #1 sent tx object");
-    println!("Engine produced {} outbound messages", fanout.len());
+    println!(
+        "Engine produced {} outbound messages",
+        summary.outbound_messages
+    );
     for outbound in fanout {
         println!(" -> to peer #{}: {:?}", outbound.peer_id, outbound.message);
     }
     println!("Pattern: inv/getdata/object relay with peer-level dedup");
-    Ok(())
+    Ok(summary)
 }
 
 fn run_snapshot(command: SnapshotCommand) -> Result<(), NodeError> {
@@ -7382,7 +7408,7 @@ fn run() -> Result<(), NodeError> {
         Some(Command::Sv2Conformance(args)) => run_sv2_conformance(args),
         Some(Command::RpcServe(args)) => run_rpc_serve(args),
         Some(Command::Snapshot(args)) => run_snapshot(args.command),
-        Some(Command::P2pDemo) => run_p2p_demo(),
+        Some(Command::P2pDemo) => run_p2p_demo().map(|_| ()),
         None => run_node(cli.network, cli.config, cli.runtime_db, cli.print_genesis),
     }
 }
@@ -7742,6 +7768,8 @@ mod tests {
     fn query_runtime_mining_guard_uses_nonzero_semantics() {
         assert!(!super::should_mine_query_blocks(0));
         assert!(super::should_mine_query_blocks(1));
+        assert!(!super::has_unspent_wallet_balance(0));
+        assert!(super::has_unspent_wallet_balance(1));
 
         let work_dir = temp_dir("test-query-runtime-mining");
         fs::create_dir_all(&work_dir).expect("mkdir");
@@ -7774,6 +7802,15 @@ mod tests {
         assert_eq!(runtime_two.tip_height(), 2);
 
         let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
+    fn run_p2p_demo_returns_expected_fanout_summary() {
+        let summary = super::run_p2p_demo().expect("p2p demo");
+        assert_eq!(summary.inbound_peer_id, 1);
+        assert_eq!(summary.outbound_messages, 2);
+        assert_eq!(summary.outbound_peer_ids, vec![2, 3]);
+        assert!(summary.only_inv_messages);
     }
 
     #[test]
