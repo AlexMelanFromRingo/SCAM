@@ -1,8 +1,8 @@
 # SCAM Implementation TODO (MVP but Production-Style Base)
 
-Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
+Status: v3 (hardening + SV2 pool-grade gap closure on 2026-02-13)
 
-## Progress Snapshot (2026-02-11)
+## Progress Snapshot (2026-02-13)
 
 - [x] Workspace crates created: `core`, `consensus`, `mempool`, `wallet`, `p2p`, `miner`, `storage`, `stratum`, `node`.
 - [x] Core block/tx/header structures + deterministic serialization + BLAKE3 hash API.
@@ -51,16 +51,23 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] Added Stratum local role-split baseline (Template Provider / Job Declarator / Translator wiring) in runtime server/worker flows.
 - [x] Added optional encrypted Stratum transport mode (`--secure-transport`, `stratum_secure_transport`) with ECDH+AEAD framing baseline.
 - [x] Added configurable secure rekey interval policy (`stratum_secure_rekey_interval_messages`) in encrypted Stratum mode.
+- [x] Added long-lived socket relay runtime (`node relay-serve`) with peer-scoped mempool replacement quotas + relay telemetry snapshots.
+- [x] Added external SV2 role services with network boundaries (`sv2-template-provider`, `sv2-job-declarator`, `sv2-translator`) and per-role telemetry output.
+- [x] Added Noise-spec secure transport mode (`noise_xx`) with configurable selection (`stratum_secure_transport_mode`, `--secure-transport-mode`).
+- [x] Added secure key lifecycle operations (`stratum-keygen`, `stratum-key-rotate`) for Noise static keys.
+- [x] Added SV2 conformance/corpus replay tooling (`sv2-conformance`, `scripts/sv2-corpus-replay.sh`, `scripts/sv2-conformance-matrix.sh`) and CI conformance artifact upload.
+- [x] Added SV2 role interface/failure-domain docs and operator policy docs (`SV2_ROLE_INTERFACES`, rollout policy, incident runbook).
+- [x] Added mainnet parameter freeze artifact flow (`scripts/mainnet-freeze-lock.sh`, `docs/mainnet-freeze.lock.json`).
 - [x] Added operator runbook document (`docs/OPERATOR_RUNBOOK.md`) covering bootstrap, sync, mining endpoint, reindex/recovery, and soak/chaos procedures.
 - [x] Added public-testnet dress rehearsal helper script (`scripts/testnet-dress-rehearsal.sh`) and explicit SV2 pool-grade gap tracker (`docs/SV2_POOL_GRADE_GAP.md`).
 - [x] Config now explicitly freezes relay/orphan policy constants across network preset files.
 - [x] Miner template + nonce search loop implemented (`mine-once` CLI).
 - [x] Chainstate snapshot save/load implemented.
 - [x] redb-backed snapshot persistence implemented (`snapshot save-genesis-db` / `snapshot show-db`).
-- [x] redb chain archive persistence implemented (`blocks/headers/block-index`) with runtime restore path in `node run`.
+- [x] redb chain archive persistence implemented (`blocks/headers/block-index`) with runtime restore path in `node`.
 - [x] Reorg-safe best-chain selection by cumulative work implemented in chain runtime.
 - [x] Minimal HTTP JSON RPC transport implemented (`scam-node rpc-serve`).
-- [ ] Remaining major items: final launch hardening + public testnet dress rehearsal.
+- [x] Remaining major items: final launch hardening + public testnet dress rehearsal.
 
 ## 1) Frozen Design Decisions
 
@@ -264,8 +271,8 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 ## 15) Node and RPC TODO
 
 - [x] Node CLI:
-- [x] `node run --network <devnet|testnet|mainnet>`
-- [x] `node status`
+- [x] `node --network <devnet|testnet|mainnet>`
+- [x] `status`
 - [x] `node add-peer <addr>`
 - [x] `node get-block <hash>`
 - [x] `node get-tx <txid>`
@@ -313,8 +320,8 @@ Status: draft v2 (updated from review notes + user clarifications on 2026-02-11)
 - [x] Phase 2: mempool + mining + persistent chainstate.
 - [x] Phase 3: P2P gossip and headers-first sync.
 - [x] Phase 4: wallet, mnemonic, QR, send/receive UX.
-- [ ] Phase 5: hardening, tests, docs, public testnet.
-- [ ] Phase 6: mainnet parameter freeze and genesis lock-in.
+- [x] Phase 5: hardening, tests, docs, public testnet.
+- [x] Phase 6: mainnet parameter freeze and genesis lock-in.
 
 ## 18) Open Constants to Revisit Later
 

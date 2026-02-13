@@ -20,6 +20,7 @@ Stratum coverage is included in workspace tests (`scam-stratum`):
 - VarDiff target retune behavior.
 - secure transport encrypted frame roundtrip and handshake magic rejection.
 - secure transport rekey-interval rotation behavior.
+- noise_xx secure transport handshake + rekey behavior.
 - role-split primitives (`SequentialJobDeclarator`, `IdentityTranslator`) unit coverage.
 
 Networking/mempool hardening coverage includes:
@@ -109,3 +110,26 @@ scripts/testnet-dress-rehearsal.sh
 ```
 
 This runs bootstrap/sync/short-soak/reindex/status checks in sequence.
+
+## SV2 Conformance Matrix
+
+Generate local + external stack conformance reports:
+
+```bash
+scripts/sv2-conformance-matrix.sh
+```
+
+Replay corpus against one endpoint:
+
+```bash
+POOL=127.0.0.1:3347 scripts/sv2-corpus-replay.sh
+```
+
+Aggregate report artifacts:
+
+```bash
+python3 scripts/sv2-conformance-report.py \
+  --input-dir target/sv2-conformance \
+  --summary-out target/sv2-conformance/summary.json \
+  --matrix-out target/sv2-conformance/matrix.md
+```

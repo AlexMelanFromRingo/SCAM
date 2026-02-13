@@ -6,17 +6,18 @@ CONFIG="${CONFIG:-config/${NETWORK}.toml}"
 RUNTIME_DB="${RUNTIME_DB:-data/${NETWORK}.runtime.redb}"
 TELEMETRY_OUT="${TELEMETRY_OUT:-data/${NETWORK}.dress.telemetry.jsonl}"
 PEER="${PEER:-}"
+STRICT_SYNC_BOOK="${STRICT_SYNC_BOOK:-false}"
 
 echo "[dress] network=${NETWORK} config=${CONFIG} runtime_db=${RUNTIME_DB}"
 
-echo "[dress] step 1/6: bootstrap runtime"
-cargo run -p scam-node -- node run \
+echo "[dress] step 1/7: bootstrap runtime"
+cargo run -p scam-node -- node \
   --network "${NETWORK}" \
   --config "${CONFIG}" \
   --runtime-db "${RUNTIME_DB}"
 
 if [[ -n "${PEER}" ]]; then
-  echo "[dress] step 2/6: manual peer bootstrap (${PEER})"
+  echo "[dress] step 2/7: manual peer bootstrap (${PEER})"
   cargo run -p scam-node -- add-peer --network "${NETWORK}" --peer "${PEER}"
   cargo run -p scam-node -- sync-peer \
     --network "${NETWORK}" \
@@ -25,18 +26,28 @@ if [[ -n "${PEER}" ]]; then
     --peer "${PEER}" \
     --max-batches 8
 else
-  echo "[dress] step 2/6: manual peer bootstrap skipped (set PEER=host:port to enable)"
+  echo "[dress] step 2/7: manual peer bootstrap skipped (set PEER=host:port to enable)"
 fi
 
-echo "[dress] step 3/6: multi-peer sync-book"
+echo "[dress] step 3/7: multi-peer sync-book"
+set +e
 cargo run -p scam-node -- sync-book \
   --network "${NETWORK}" \
   --config "${CONFIG}" \
   --runtime-db "${RUNTIME_DB}" \
   --max-peers 8 \
   --max-batches-per-peer 8
+sync_book_rc=$?
+set -e
+if [[ "${sync_book_rc}" -ne 0 ]]; then
+  if [[ "${STRICT_SYNC_BOOK}" == "true" ]]; then
+    echo "[dress] sync-book failed and STRICT_SYNC_BOOK=true, aborting" >&2
+    exit "${sync_book_rc}"
+  fi
+  echo "[dress] sync-book failed but continuing (STRICT_SYNC_BOOK=false)"
+fi
 
-echo "[dress] step 4/6: short soak with telemetry"
+echo "[dress] step 4/7: short soak with telemetry"
 cargo run -p scam-node -- soak \
   --network "${NETWORK}" \
   --config "${CONFIG}" \
@@ -51,7 +62,7 @@ cargo run -p scam-node -- soak \
   --telemetry-out "${TELEMETRY_OUT}" \
   --telemetry-every-rounds 1
 
-echo "[dress] step 5/6: reindex integrity"
+echo "[dress] step 5/7: reindex integrity"
 cargo run -p scam-node -- reindex-runtime \
   --network "${NETWORK}" \
   --config "${CONFIG}" \

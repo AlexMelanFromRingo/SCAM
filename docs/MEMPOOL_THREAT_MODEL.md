@@ -64,9 +64,10 @@ Scope: double-spend race behavior and DoS pressure around conflicting UTXO spend
 - Added per-peer replacement rate limits in networking path (`scam-p2p` gossip delta path with peer penalty/banning).
 - Added metrics/telemetry hooks for replacement and orphan churn (`MempoolTelemetry`, `OrphanPoolTelemetry`, `GossipTelemetry`).
 - Added peer-scoped replacement quota integration in soak runtime admission path (`node soak`) where tx admission uses mempool + orphan pool + gossip relay limits.
+- Extended peer-scoped replacement quotas into long-lived socket runtime admission path (`node relay-serve`) for per-peer mempool replacement control in live P2P flow.
 - Added telemetry snapshot persistence for long-run soak analysis (`node soak --telemetry-out <file>` JSONL snapshots).
 - Added threshold-check helper (`scripts/telemetry-alert-check.py`) for churn alert gating over telemetry snapshots.
 
-## Recommended Next Hardening
+## Next Optional Hardening
 
-- Extend peer-scoped replacement quotas from soak admission loop to long-lived socket P2P mempool runtime as that path is expanded.
+- Add peer-identity reputation persistence across restarts for replacement-spam history.

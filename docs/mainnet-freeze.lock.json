@@ -1,0 +1,7 @@
+{
+  "network": "mainnet",
+  "config_path": "config/mainnet.toml",
+  "config_sha256": "685f362b942568caeed356d7613e44f53b1cd959edcd1dcf4ffef9266ee90482",
+  "genesis_hash": "6b1641b623ffb2141051f97b5f9a9315baa6666e45f2fe1e2be5190573c6b99b",
+  "generated_at_utc": "2026-02-13T06:18:01Z"
+}

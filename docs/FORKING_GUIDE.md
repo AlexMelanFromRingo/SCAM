@@ -15,6 +15,7 @@ cargo run -p scam-node -- config-scaffold \
   --difficulty-adjustment-window 20 \
   --asert-half-life-sec 3600 \
   --stratum-secure-transport \
+  --stratum-secure-transport-mode noise-xx \
   --stratum-secure-rekey-interval-messages 10000 \
   --stratum-vardiff-target-shares-per-minute 6 \
   --stratum-vardiff-retarget-interval-shares 24 \
@@ -26,7 +27,7 @@ cargo run -p scam-node -- config-scaffold \
 ## 2) Boot the New Chain
 
 ```bash
-cargo run -p scam-node -- node run --network devnet --config config/myfork.toml --runtime-db data/myfork.runtime.redb
+cargo run -p scam-node -- node --network devnet --config config/myfork.toml --runtime-db data/myfork.runtime.redb
 ```
 
 ## 3) Start SV2 Mining Endpoint
@@ -38,6 +39,8 @@ cargo run -p scam-node -- stratum-serve \
   --runtime-db data/myfork.runtime.redb \
   --bind 0.0.0.0:3347 \
   --secure-transport \
+  --secure-transport-mode noise-xx \
+  --secure-static-secret-key-hex <server_hex32> \
   --secure-rekey-interval-messages 10000 \
   --vardiff-target-shares-per-minute 6 \
   --vardiff-retarget-interval-shares 24 \
@@ -47,7 +50,16 @@ cargo run -p scam-node -- stratum-serve \
 cargo run -p scam-node -- stratum-mine \
   --pool 127.0.0.1:3347 \
   --user my-miner \
+  --secure-transport \
+  --secure-transport-mode noise-xx \
+  --secure-static-secret-key-hex <client_hex32> \
   --max-shares 5
+```
+
+Generate secure transport keys:
+
+```bash
+cargo run -p scam-node -- stratum-keygen --secret-out data/myfork.server.secret.hex --public-out data/myfork.server.public.hex
 ```
 
 ## What Is Safe To Change In Config
@@ -57,7 +69,7 @@ cargo run -p scam-node -- stratum-mine \
 - `difficulty_algorithm`: yes (`windowed`, `lwma`, `asert`).
 - `target_block_time_sec`, `difficulty_adjustment_window`, clamps: yes.
 - P2P policy fields (`dns_seeds`, bucket cap): yes.
-- Stratum policy fields (`share_target`, `min/max share target`, VarDiff knobs, client limits, `stratum_secure_transport`, `stratum_secure_rekey_interval_messages`): yes.
+- Stratum policy fields (`share_target`, `min/max share target`, VarDiff knobs, client limits, `stratum_secure_transport`, `stratum_secure_transport_mode`, `stratum_secure_rekey_interval_messages`): yes.
 
 ## Quality Notes
 

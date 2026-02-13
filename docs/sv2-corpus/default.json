@@ -1,0 +1,19 @@
+[
+  {
+    "SetupConnection": {
+      "protocol": 2,
+      "min_version": 2,
+      "max_version": 2,
+      "flags": 0,
+      "user_agent": "scam-corpus/default"
+    }
+  },
+  {
+    "OpenStandardMiningChannel": {
+      "request_id": 1,
+      "user": "corpus-miner"
+    }
+  },
+  "KeepAlive"
+]
+
