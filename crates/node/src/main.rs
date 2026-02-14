@@ -9640,31 +9640,13 @@ mod tests {
             .expect("rpc serve");
         });
 
-        let mut health_stream = connect_with_retry(&addr);
-        health_stream
-            .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
-            .expect("write health");
-        health_stream
-            .shutdown(Shutdown::Write)
-            .expect("shutdown write health");
-        let mut health_response = String::new();
-        health_stream
-            .read_to_string(&mut health_response)
-            .expect("read health");
+        let health_response =
+            send_http_request(&addr, "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n");
         assert!(health_response.starts_with("HTTP/1.1 200 OK"));
         assert!(health_response.contains("{\"ok\":true}"));
 
-        let mut unknown_stream = connect_with_retry(&addr);
-        unknown_stream
-            .write_all(b"GET /nope HTTP/1.1\r\nHost: localhost\r\n\r\n")
-            .expect("write unknown");
-        unknown_stream
-            .shutdown(Shutdown::Write)
-            .expect("shutdown write unknown");
-        let mut unknown_response = String::new();
-        unknown_stream
-            .read_to_string(&mut unknown_response)
-            .expect("read unknown");
+        let unknown_response =
+            send_http_request(&addr, "GET /nope HTTP/1.1\r\nHost: localhost\r\n\r\n");
         // With a present UI directory, unknown GET paths are intentionally served
         // through index.html (SPA-style fallback), not 404.
         assert!(unknown_response.starts_with("HTTP/1.1 200 OK"));
