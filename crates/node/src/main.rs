@@ -7356,14 +7356,14 @@ fn run_rpc_serve(args: RpcServeArgs) -> Result<(), NodeError> {
                 ),
             }
         } else {
-            if should_attempt_ui_asset_serve(method) {
-                if try_serve_ui_asset(&mut stream, &ui_dir, path)? {
-                    served = served.saturating_add(1);
-                    if max_requests_reached(max_requests, served) {
-                        break;
-                    }
-                    continue;
+            if should_attempt_ui_asset_serve(method)
+                && try_serve_ui_asset(&mut stream, &ui_dir, path)?
+            {
+                served = served.saturating_add(1);
+                if max_requests_reached(max_requests, served) {
+                    break;
                 }
+                continue;
             }
             ("404 Not Found", json_error_body("unknown endpoint"))
         };
