@@ -377,6 +377,33 @@ mod tests {
     }
 
     #[test]
+    fn retarget_matches_reference_vectors() {
+        let old =
+            Target::from_hex("00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+                .expect("target parse");
+        let v1 = retarget_next(old, 4_000, 2_400, 0.25, 4.0, Target::MAX).expect("retarget v1");
+        assert_eq!(
+            v1,
+            Target::from_hex("01aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa9")
+                .expect("target parse")
+        );
+
+        let v2 = retarget_next(old, 0, 2_400, 0.25, 4.0, Target::MAX).expect("retarget v2");
+        assert_eq!(
+            v2,
+            Target::from_hex("003fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+                .expect("target parse")
+        );
+
+        let capped_max =
+            Target::from_hex("007fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+                .expect("target parse");
+        let v3 = retarget_next(old, 9_999_999, 2_400, 0.25, 2.0, capped_max)
+            .expect("retarget clamp to max");
+        assert_eq!(v3, capped_max);
+    }
+
+    #[test]
     fn lwma_rejects_layout_mismatch_when_lengths_differ_with_enough_history() {
         let target =
             Target::from_hex("00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
@@ -386,6 +413,28 @@ mod tests {
         assert!(matches!(
             err,
             crate::difficulty::DifficultyError::InvalidHistoryLayout
+        ));
+    }
+
+    #[test]
+    fn lwma_accepts_minimum_valid_history_of_two_entries() {
+        let target =
+            Target::from_hex("00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+                .expect("target parse");
+        let max = Target::MAX;
+        let next = lwma_next(&[target, target], &[1_000, 1_120], 120, max).expect("lwma");
+        assert_eq!(next, target);
+    }
+
+    #[test]
+    fn lwma_reports_insufficient_history_when_only_one_side_is_short() {
+        let target =
+            Target::from_hex("00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+                .expect("target parse");
+        let err = lwma_next(&[target], &[1_000, 1_120], 120, Target::MAX).expect_err("must fail");
+        assert!(matches!(
+            err,
+            crate::difficulty::DifficultyError::InsufficientHistory { needed: 2, got: 1 }
         ));
     }
 
@@ -412,6 +461,138 @@ mod tests {
         assert_eq!(
             chainwork_for_target(Target::MIN),
             num_bigint::BigUint::from(0u8)
+        );
+    }
+
+    #[test]
+    fn chainwork_matches_reference_vectors() {
+        let t1 =
+            Target::from_hex("00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+                .expect("target parse");
+        let t2 =
+            Target::from_hex("0000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+                .expect("target parse");
+        let t3 =
+            Target::from_hex("0000000000000000000000000000000000000000000000000000000000000010")
+                .expect("target parse");
+        assert_eq!(
+            chainwork_for_target(t1),
+            num_bigint::BigUint::from(0x100u64)
+        );
+        assert_eq!(
+            chainwork_for_target(t2),
+            num_bigint::BigUint::from(0x1_0000u64)
+        );
+        assert_eq!(
+            chainwork_for_target(t3),
+            num_bigint::BigUint::parse_bytes(
+                b"f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+                16
+            )
+            .expect("hex parse")
+        );
+    }
+
+    #[test]
+    fn lwma_matches_reference_vectors() {
+        let max = Target::MAX;
+        let targets = vec![
+            Target::from_hex("00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+                .expect("target parse"),
+            Target::from_hex("007fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+                .expect("target parse"),
+            Target::from_hex("003fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+                .expect("target parse"),
+            Target::from_hex("001fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+                .expect("target parse"),
+            Target::from_hex("000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+                .expect("target parse"),
+        ];
+
+        let v1 = lwma_next(&targets, &[1_000, 1_120, 1_240, 1_360, 1_480], 120, max)
+            .expect("lwma vector 1");
+        assert_eq!(
+            v1,
+            Target::from_hex("003bffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+                .expect("target parse")
+        );
+
+        let v2 =
+            lwma_next(&targets, &[1_000, 1_010, 1_030, 1_060, 1_100], 120, max).expect("lwma v2");
+        assert_eq!(
+            v2,
+            Target::from_hex("000effffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+                .expect("target parse")
+        );
+
+        let capped_max =
+            Target::from_hex("00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+                .expect("target parse");
+        let v3 = lwma_next(
+            &targets,
+            &[1_000, 1_005, 1_008, 1_012, 1_016],
+            120,
+            capped_max,
+        )
+        .expect("lwma v3");
+        assert_eq!(
+            v3,
+            Target::from_hex("0001f33333333333333333333333333333333333333333333333333333333333")
+                .expect("target parse")
+        );
+
+        let v4 = lwma_next(&targets, &[1_000, 5_000, 9_000, 15_000, 21_000], 120, max)
+            .expect("lwma vector 4");
+        assert_eq!(
+            v4,
+            Target::from_hex("0167fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffa")
+                .expect("target parse")
+        );
+    }
+
+    #[test]
+    fn asert_matches_reference_vectors() {
+        let max = Target::MAX;
+        let base =
+            Target::from_hex("00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+                .expect("target parse");
+
+        let v1 = asert_next(base, 120, 120, 3_600, max).expect("asert v1");
+        assert_eq!(
+            v1,
+            Target::from_hex("00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+                .expect("target parse")
+        );
+
+        let v2 = asert_next(base, 240, 120, 3_600, max).expect("asert v2");
+        assert_eq!(
+            v2,
+            Target::from_hex("0105fbd4d5b861637ad73f4a206832f7d79b0f9902ce6f16ecb4266b57449309")
+                .expect("target parse")
+        );
+
+        let v3 = asert_next(base, 60, 120, 3_600, max).expect("asert v3");
+        assert_eq!(
+            v3,
+            Target::from_hex("00fd0f413daf5a6d812f36f1a61778b9f276f7d07dfeaae2b99584d96583dfbe")
+                .expect("target parse")
+        );
+
+        let harder =
+            Target::from_hex("0000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+                .expect("target parse");
+        let v4 = asert_next(harder, 7_200, 120, 600, max).expect("asert v4");
+        assert_eq!(
+            v4,
+            Target::from_hex("0dedc66d7bf32f50ea42176b70554169c686fc4cdbea90c6d0f91b2335d3d847")
+                .expect("target parse")
+        );
+
+        let v5 = asert_next(base, 1, 100_000, 1, max).expect("asert v5");
+        assert_eq!(
+            v5,
+            Target::from_hex("0000000000000000000000000000000000000000000000000000000000000001")
+                .expect("target parse")
         );
     }
 }
