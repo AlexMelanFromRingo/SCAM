@@ -25,6 +25,7 @@ const SECURE_HANDSHAKE_MAGIC: &[u8; 8] = b"SCAMSV2N";
 const SECURE_HANDSHAKE_SIZE: usize = 8 + 33;
 const SECURE_AEAD_TAG_LEN: usize = 16;
 const SECURE_MAX_FRAME_SIZE: usize = MAX_FRAME_SIZE + SV2_HEADER_LEN + SECURE_AEAD_TAG_LEN;
+const SECURE_HANDSHAKE_KEY_MATERIAL_LEN: usize = 98;
 const SECURE_KEY_CONTEXT_CLIENT_TO_SERVER: &str = "SCAM-SV2-NoiseLike-c2s-v1";
 const SECURE_KEY_CONTEXT_SERVER_TO_CLIENT: &str = "SCAM-SV2-NoiseLike-s2c-v1";
 const SECURE_KEY_CONTEXT_REKEY: &str = "SCAM-SV2-NoiseLike-rekey-v1";
@@ -500,7 +501,8 @@ impl Sv2Session {
         }
         self.jobs.insert(job.job_id, job.clone());
         self.job_order.push_back(job.job_id);
-        while self.job_order.len() > self.cfg.max_jobs {
+        let trim_count = self.job_order.len().saturating_sub(self.cfg.max_jobs);
+        for _ in 0..trim_count {
             if let Some(evicted) = self.job_order.pop_front() {
                 self.jobs.remove(&evicted);
             }
@@ -725,7 +727,11 @@ impl Sv2Session {
     ) -> Result<Option<Target>, StratumError> {
         self.recent_share_timestamps.push_back(now_unix_sec);
         let max_points = self.cfg.vardiff_retarget_interval_shares + 1;
-        while self.recent_share_timestamps.len() > max_points {
+        let trim_count = self
+            .recent_share_timestamps
+            .len()
+            .saturating_sub(max_points);
+        for _ in 0..trim_count {
             self.recent_share_timestamps.pop_front();
         }
 
@@ -749,7 +755,7 @@ impl Sv2Session {
         let mut ratio = (actual_span as f64) / (expected_span as f64);
         ratio = ratio.clamp(self.cfg.vardiff_clamp_down, self.cfg.vardiff_clamp_up);
 
-        if (ratio - 1.0).abs() < 0.05 {
+        if !vardiff_ratio_requires_retarget(ratio) {
             return Ok(None);
         }
 
@@ -770,6 +776,10 @@ fn current_unix_time_sec() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0)
+}
+
+fn vardiff_ratio_requires_retarget(ratio: f64) -> bool {
+    (ratio - 1.0).abs() >= 0.05
 }
 
 #[derive(Clone, Debug)]
@@ -1012,7 +1022,7 @@ impl SecureSv2Transport {
             SecureRole::Server => (remote_ser, local_ser),
         };
 
-        let mut material = [0u8; 32 + 33 + 33];
+        let mut material = [0u8; SECURE_HANDSHAKE_KEY_MATERIAL_LEN];
         material[..32].copy_from_slice(&shared);
         material[32..65].copy_from_slice(&client_pub);
         material[65..98].copy_from_slice(&server_pub);
@@ -1125,21 +1135,10 @@ impl NoiseSv2Transport {
         })?;
         write_noise_handshake_packet(io, &out_buf[..third_len])?;
 
-        if let Some(expected) = expected_remote_static_public_key {
-            match state.get_remote_static() {
-                Some(remote) if remote == expected => {}
-                Some(_) => {
-                    return Err(StratumError::SecureHandshake(
-                        "noise remote static key mismatch".to_owned(),
-                    ));
-                }
-                None => {
-                    return Err(StratumError::SecureHandshake(
-                        "noise remote static key missing".to_owned(),
-                    ));
-                }
-            }
-        }
+        validate_expected_noise_remote_static(
+            state.get_remote_static(),
+            expected_remote_static_public_key,
+        )?;
 
         let transport = state.into_transport_mode().map_err(|e| {
             StratumError::SecureHandshake(format!("noise initiator transport upgrade failed: {e}"))
@@ -1177,21 +1176,10 @@ impl NoiseSv2Transport {
         })?;
         write_noise_handshake_packet_async(io, &out_buf[..third_len]).await?;
 
-        if let Some(expected) = expected_remote_static_public_key {
-            match state.get_remote_static() {
-                Some(remote) if remote == expected => {}
-                Some(_) => {
-                    return Err(StratumError::SecureHandshake(
-                        "noise remote static key mismatch".to_owned(),
-                    ));
-                }
-                None => {
-                    return Err(StratumError::SecureHandshake(
-                        "noise remote static key missing".to_owned(),
-                    ));
-                }
-            }
-        }
+        validate_expected_noise_remote_static(
+            state.get_remote_static(),
+            expected_remote_static_public_key,
+        )?;
 
         let transport = state.into_transport_mode().map_err(|e| {
             StratumError::SecureHandshake(format!("noise initiator transport upgrade failed: {e}"))
@@ -1229,21 +1217,10 @@ impl NoiseSv2Transport {
             StratumError::SecureHandshake(format!("noise responder read m3 failed: {e}"))
         })?;
 
-        if let Some(expected) = expected_remote_static_public_key {
-            match state.get_remote_static() {
-                Some(remote) if remote == expected => {}
-                Some(_) => {
-                    return Err(StratumError::SecureHandshake(
-                        "noise remote static key mismatch".to_owned(),
-                    ));
-                }
-                None => {
-                    return Err(StratumError::SecureHandshake(
-                        "noise remote static key missing".to_owned(),
-                    ));
-                }
-            }
-        }
+        validate_expected_noise_remote_static(
+            state.get_remote_static(),
+            expected_remote_static_public_key,
+        )?;
 
         let transport = state.into_transport_mode().map_err(|e| {
             StratumError::SecureHandshake(format!("noise responder transport upgrade failed: {e}"))
@@ -1281,21 +1258,10 @@ impl NoiseSv2Transport {
             StratumError::SecureHandshake(format!("noise responder read m3 failed: {e}"))
         })?;
 
-        if let Some(expected) = expected_remote_static_public_key {
-            match state.get_remote_static() {
-                Some(remote) if remote == expected => {}
-                Some(_) => {
-                    return Err(StratumError::SecureHandshake(
-                        "noise remote static key mismatch".to_owned(),
-                    ));
-                }
-                None => {
-                    return Err(StratumError::SecureHandshake(
-                        "noise remote static key missing".to_owned(),
-                    ));
-                }
-            }
-        }
+        validate_expected_noise_remote_static(
+            state.get_remote_static(),
+            expected_remote_static_public_key,
+        )?;
 
         let transport = state.into_transport_mode().map_err(|e| {
             StratumError::SecureHandshake(format!("noise responder transport upgrade failed: {e}"))
@@ -1332,12 +1298,6 @@ impl NoiseSv2Transport {
             .write_message(&plaintext, &mut ciphertext)
             .map_err(|e| StratumError::SecureTransport(format!("noise encrypt failed: {e}")))?;
         ciphertext.truncate(encrypted_len);
-        if ciphertext.len() > SECURE_MAX_FRAME_SIZE {
-            return Err(StratumError::FrameTooLarge {
-                got: ciphertext.len(),
-                max: SECURE_MAX_FRAME_SIZE,
-            });
-        }
 
         let len = u32::try_from(ciphertext.len()).map_err(|_| StratumError::FrameTooLarge {
             got: ciphertext.len(),
@@ -1366,12 +1326,6 @@ impl NoiseSv2Transport {
             .write_message(&plaintext, &mut ciphertext)
             .map_err(|e| StratumError::SecureTransport(format!("noise encrypt failed: {e}")))?;
         ciphertext.truncate(encrypted_len);
-        if ciphertext.len() > SECURE_MAX_FRAME_SIZE {
-            return Err(StratumError::FrameTooLarge {
-                got: ciphertext.len(),
-                max: SECURE_MAX_FRAME_SIZE,
-            });
-        }
 
         let len = u32::try_from(ciphertext.len()).map_err(|_| StratumError::FrameTooLarge {
             got: ciphertext.len(),
@@ -1516,6 +1470,26 @@ fn build_noise_handshake_state(
             StratumError::SecureHandshake(format!("noise build responder failed: {e}"))
         })
     }
+}
+
+fn validate_expected_noise_remote_static(
+    remote_static: Option<&[u8]>,
+    expected_remote_static_public_key: Option<[u8; 32]>,
+) -> Result<(), StratumError> {
+    let Some(expected) = expected_remote_static_public_key else {
+        return Ok(());
+    };
+    let Some(remote) = remote_static else {
+        return Err(StratumError::SecureHandshake(
+            "noise remote static key missing".to_owned(),
+        ));
+    };
+    if remote != expected.as_slice() {
+        return Err(StratumError::SecureHandshake(
+            "noise remote static key mismatch".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn write_noise_handshake_packet<IO: Write>(
@@ -1692,6 +1666,15 @@ fn decode_single_frame_bytes(buf: &[u8]) -> Result<Sv2Message, StratumError> {
     Ok(message)
 }
 
+fn encode_u24_le(len: usize) -> [u8; 3] {
+    let len_le = (len as u32).to_le_bytes();
+    [len_le[0], len_le[1], len_le[2]]
+}
+
+fn decode_u24_le(len_le: [u8; 3]) -> usize {
+    u32::from_le_bytes([len_le[0], len_le[1], len_le[2], 0]) as usize
+}
+
 pub fn write_frame<W: Write>(writer: &mut W, message: &Sv2Message) -> Result<(), StratumError> {
     let payload = bincode::serialize(message).map_err(StratumError::Codec)?;
     if payload.is_empty() {
@@ -1711,12 +1694,7 @@ pub fn write_frame<W: Write>(writer: &mut W, message: &Sv2Message) -> Result<(),
         .write_all(&[message_type(message)])
         .map_err(StratumError::Io)?;
 
-    let len = payload.len() as u32;
-    let len_buf = [
-        (len & 0xff) as u8,
-        ((len >> 8) & 0xff) as u8,
-        ((len >> 16) & 0xff) as u8,
-    ];
+    let len_buf = encode_u24_le(payload.len());
     writer.write_all(&len_buf).map_err(StratumError::Io)?;
     writer.write_all(&payload).map_err(StratumError::Io)?;
     writer.flush().map_err(StratumError::Io)
@@ -1745,7 +1723,7 @@ pub fn read_frame<R: Read>(reader: &mut R) -> Result<Option<Sv2Message>, Stratum
         return Err(StratumError::UnsupportedMessageType(msg_type));
     }
 
-    let len = (rest[2] as usize) | ((rest[3] as usize) << 8) | ((rest[4] as usize) << 16);
+    let len = decode_u24_le([rest[2], rest[3], rest[4]]);
     if len == 0 {
         return Err(StratumError::InvalidFrameLength(0));
     }
@@ -1795,12 +1773,7 @@ pub async fn write_frame_async<W: AsyncWrite + Unpin>(
         .await
         .map_err(StratumError::Io)?;
 
-    let len = payload.len() as u32;
-    let len_buf = [
-        (len & 0xff) as u8,
-        ((len >> 8) & 0xff) as u8,
-        ((len >> 16) & 0xff) as u8,
-    ];
+    let len_buf = encode_u24_le(payload.len());
     writer.write_all(&len_buf).await.map_err(StratumError::Io)?;
     writer.write_all(&payload).await.map_err(StratumError::Io)?;
     writer.flush().await.map_err(StratumError::Io)
@@ -1832,7 +1805,7 @@ pub async fn read_frame_async<R: AsyncRead + Unpin>(
         return Err(StratumError::UnsupportedMessageType(msg_type));
     }
 
-    let len = (rest[2] as usize) | ((rest[3] as usize) << 8) | ((rest[4] as usize) << 16);
+    let len = decode_u24_le([rest[2], rest[3], rest[4]]);
     if len == 0 {
         return Err(StratumError::InvalidFrameLength(0));
     }
@@ -2102,6 +2075,60 @@ mod tests {
         message
     }
 
+    fn build_noise_transport_pair_for_tests() -> (NoiseSv2Transport, NoiseSv2Transport) {
+        let client_keys = super::generate_noise_static_keypair().expect("client keys");
+        let server_keys = super::generate_noise_static_keypair().expect("server keys");
+
+        let mut initiator =
+            super::build_noise_handshake_state(true, client_keys.private).expect("build initiator");
+        let mut responder = super::build_noise_handshake_state(false, server_keys.private)
+            .expect("build responder");
+        let mut initiator_buf = vec![0u8; super::NOISE_HANDSHAKE_MAX_PACKET_SIZE];
+        let mut responder_buf = vec![0u8; super::NOISE_HANDSHAKE_MAX_PACKET_SIZE];
+
+        let m1_len = initiator
+            .write_message(&[], &mut initiator_buf)
+            .expect("initiator m1");
+        responder
+            .read_message(&initiator_buf[..m1_len], &mut responder_buf)
+            .expect("responder m1");
+
+        let m2_len = responder
+            .write_message(&[], &mut responder_buf)
+            .expect("responder m2");
+        initiator
+            .read_message(&responder_buf[..m2_len], &mut initiator_buf)
+            .expect("initiator m2");
+
+        let m3_len = initiator
+            .write_message(&[], &mut initiator_buf)
+            .expect("initiator m3");
+        responder
+            .read_message(&initiator_buf[..m3_len], &mut responder_buf)
+            .expect("responder m3");
+
+        let client_transport = initiator
+            .into_transport_mode()
+            .expect("initiator transport");
+        let server_transport = responder
+            .into_transport_mode()
+            .expect("responder transport");
+        (
+            NoiseSv2Transport {
+                transport: client_transport,
+                rekey_interval_messages: super::DEFAULT_SECURE_REKEY_INTERVAL_MESSAGES,
+                sent_messages: 0,
+                received_messages: 0,
+            },
+            NoiseSv2Transport {
+                transport: server_transport,
+                rekey_interval_messages: super::DEFAULT_SECURE_REKEY_INTERVAL_MESSAGES,
+                sent_messages: 0,
+                received_messages: 0,
+            },
+        )
+    }
+
     #[cfg(unix)]
     fn apply_test_socket_timeouts(stream: &UnixStream) -> bool {
         let timeout = Some(Duration::from_millis(250));
@@ -2228,6 +2255,34 @@ mod tests {
     }
 
     #[test]
+    fn session_stats_accessor_returns_live_state() {
+        let mut session = activate_session(test_session_config());
+        let job = MiningJob {
+            channel_id: 7,
+            job_id: 77,
+            version: 1,
+            prev_hash: Hash256::ZERO,
+            merkle_root: Hash256::ZERO,
+            ntime: 1_770_763_200,
+            network_target: Target::MAX,
+        };
+        session.install_job(job).expect("install");
+
+        let _ = session
+            .handle_message_at(
+                Sv2Message::SubmitSharesStandard {
+                    channel_id: 7,
+                    job_id: 77,
+                    nonce: 0,
+                    ntime: 1_770_763_200,
+                },
+                1_770_763_200,
+            )
+            .expect("submit");
+        assert_eq!(session.stats().accepted_shares, 1);
+    }
+
+    #[test]
     fn read_frame_rejects_invalid_extension() {
         let mut frame = keepalive_frame_bytes();
         frame[0] = 1;
@@ -2344,6 +2399,15 @@ mod tests {
         let err = write_frame(&mut Vec::<u8>::new(), &above_limit)
             .expect_err("payload above max must fail");
         assert!(matches!(err, StratumError::FrameTooLarge { .. }));
+    }
+
+    #[test]
+    fn u24_length_helpers_roundtrip_for_boundary_and_midrange_values() {
+        for len in [1usize, 0xff, 0x100, 0x1234, 0x10_000, crate::MAX_FRAME_SIZE] {
+            let encoded = super::encode_u24_le(len);
+            let decoded = super::decode_u24_le(encoded);
+            assert_eq!(decoded, len);
+        }
     }
 
     #[test]
@@ -2503,6 +2567,28 @@ mod tests {
         assert_eq!(session.jobs.len(), 1);
         assert_eq!(session.job_order, VecDeque::from(vec![42]));
         assert_eq!(session.job(42).expect("job"), &second);
+    }
+
+    #[test]
+    fn install_job_under_capacity_does_not_trim_existing_jobs() {
+        let mut cfg = test_session_config();
+        cfg.max_jobs = 4;
+        let mut session = activate_session(cfg);
+
+        let mk_job = |job_id: u32| MiningJob {
+            channel_id: 7,
+            job_id,
+            version: 1,
+            prev_hash: Hash256::ZERO,
+            merkle_root: Hash256::ZERO,
+            ntime: 1_770_763_200 + job_id as u64,
+            network_target: Target::MAX,
+        };
+
+        session.install_job(mk_job(1)).expect("job 1");
+        session.install_job(mk_job(2)).expect("job 2");
+        assert_eq!(session.job_order, VecDeque::from(vec![1, 2]));
+        assert_eq!(session.jobs.len(), 2);
     }
 
     #[test]
@@ -2670,6 +2756,66 @@ mod tests {
     }
 
     #[test]
+    fn vardiff_within_deadband_does_not_retarget() {
+        let mut session = Sv2Session::new(test_session_config()).expect("session");
+        let initial_target = session.share_target();
+
+        let _ = session.record_share_timestamp(1_000).expect("record 1");
+        let _ = session.record_share_timestamp(1_010).expect("record 2");
+        let _ = session.record_share_timestamp(1_020).expect("record 3");
+        let updated = session.record_share_timestamp(1_031).expect("record 4");
+
+        assert_eq!(updated, None);
+        assert_eq!(session.share_target(), initial_target);
+    }
+
+    #[test]
+    fn vardiff_retargets_at_exact_deadband_boundary() {
+        let mut cfg = test_session_config();
+        cfg.vardiff_retarget_interval_shares = 2;
+        cfg.vardiff_target_shares_per_minute = 6;
+        cfg.share_target =
+            Target::from_hex("20ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+                .expect("share target");
+        cfg.max_share_target =
+            Target::from_hex("40ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+                .expect("max target");
+        let mut session = Sv2Session::new(cfg).expect("session");
+
+        let _ = session.record_share_timestamp(1_000).expect("record 1");
+        let _ = session.record_share_timestamp(1_010).expect("record 2");
+        let updated = session.record_share_timestamp(1_021).expect("record 3");
+
+        assert!(updated.is_some(), "ratio=1.05 should retarget at boundary");
+    }
+
+    #[test]
+    fn vardiff_ratio_deadband_helper_matches_threshold_contract() {
+        assert!(!super::vardiff_ratio_requires_retarget(1.0));
+        assert!(!super::vardiff_ratio_requires_retarget(1.03));
+        assert!(super::vardiff_ratio_requires_retarget(1.05));
+        assert!(super::vardiff_ratio_requires_retarget(0.95));
+    }
+
+    #[test]
+    fn vardiff_sliding_window_discards_oldest_points_on_overflow() {
+        let mut session = Sv2Session::new(test_session_config()).expect("session");
+
+        let _ = session.record_share_timestamp(1_000).expect("record 1");
+        let _ = session.record_share_timestamp(1_010).expect("record 2");
+        let _ = session.record_share_timestamp(1_020).expect("record 3");
+        let _ = session.record_share_timestamp(1_030).expect("record 4");
+        let _ = session.record_share_timestamp(1_040).expect("record 5");
+
+        assert_eq!(session.recent_share_timestamps.len(), 4);
+        assert_eq!(
+            session.recent_share_timestamps.front().copied(),
+            Some(1_010)
+        );
+        assert_eq!(session.recent_share_timestamps.back().copied(), Some(1_040));
+    }
+
+    #[test]
     fn share_validation_accepts_max_target_job() {
         let job = MiningJob {
             channel_id: 1,
@@ -2745,6 +2891,35 @@ mod tests {
                 job_id: 43
             }
         ));
+    }
+
+    #[test]
+    fn secure_transport_constants_and_handshake_key_material_are_stable() {
+        assert_eq!(
+            super::SECURE_MAX_FRAME_SIZE,
+            crate::MAX_FRAME_SIZE + crate::SV2_HEADER_LEN + super::SECURE_AEAD_TAG_LEN
+        );
+        assert_eq!(super::SECURE_HANDSHAKE_KEY_MATERIAL_LEN, 98);
+
+        let secp = Secp256k1::new();
+        let client_sk = SecretKey::from_slice(&[41u8; 32]).expect("client sk");
+        let server_sk = SecretKey::from_slice(&[42u8; 32]).expect("server sk");
+        let client_pk = PublicKey::from_secret_key(&secp, &client_sk);
+        let server_pk = PublicKey::from_secret_key(&secp, &server_sk);
+        let transport =
+            SecureSv2Transport::from_handshake(client_sk, client_pk, server_pk, SecureRole::Client);
+
+        let shared = super::SharedSecret::new(&server_pk, &client_sk).secret_bytes();
+        let mut material = [0u8; super::SECURE_HANDSHAKE_KEY_MATERIAL_LEN];
+        material[..32].copy_from_slice(&shared);
+        material[32..65].copy_from_slice(&client_pk.serialize());
+        material[65..98].copy_from_slice(&server_pk.serialize());
+        let expected_send =
+            blake3::derive_key(super::SECURE_KEY_CONTEXT_CLIENT_TO_SERVER, &material);
+        let expected_recv =
+            blake3::derive_key(super::SECURE_KEY_CONTEXT_SERVER_TO_CLIENT, &material);
+        assert_eq!(transport.send_key, expected_send);
+        assert_eq!(transport.recv_key, expected_recv);
     }
 
     #[test]
@@ -3111,6 +3286,77 @@ mod tests {
     }
 
     #[test]
+    fn noise_transport_sync_write_read_paths_cover_large_payloads() {
+        let (mut client, mut server) = build_noise_transport_pair_for_tests();
+
+        let mut keepalive_wire = Vec::new();
+        client
+            .write_message(&mut keepalive_wire, &Sv2Message::KeepAlive)
+            .expect("write keepalive");
+        assert!(
+            !keepalive_wire.is_empty(),
+            "keepalive frame must emit bytes"
+        );
+        let keepalive = server
+            .read_message(&mut Cursor::new(keepalive_wire))
+            .expect("read keepalive")
+            .expect("some keepalive");
+        assert_eq!(keepalive, Sv2Message::KeepAlive);
+
+        let large_message = setup_connection_message_with_exact_payload_len(60_000);
+        let mut large_wire = Vec::new();
+        client
+            .write_message(&mut large_wire, &large_message)
+            .expect("write large frame");
+        let decoded_large = server
+            .read_message(&mut Cursor::new(large_wire))
+            .expect("read large frame")
+            .expect("some large frame");
+        assert_eq!(decoded_large, large_message);
+    }
+
+    #[test]
+    fn noise_transport_read_message_handles_eof_and_length_validation() {
+        let (mut client, _server) = build_noise_transport_pair_for_tests();
+
+        let none = client
+            .read_message(&mut Cursor::new(Vec::<u8>::new()))
+            .expect("clean eof");
+        assert!(none.is_none());
+
+        let eof_none = client
+            .read_message(&mut ErrorOnceReader::new(std::io::ErrorKind::UnexpectedEof))
+            .expect("unexpected eof should map to None");
+        assert!(eof_none.is_none());
+
+        let io_err = client
+            .read_message(&mut ErrorOnceReader::new(
+                std::io::ErrorKind::PermissionDenied,
+            ))
+            .expect_err("non-eof error must propagate");
+        assert!(matches!(io_err, StratumError::Io(_)));
+
+        let zero_err = client
+            .read_message(&mut Cursor::new(vec![0u8, 0u8, 0u8, 0u8]))
+            .expect_err("zero secure frame length must fail");
+        assert!(matches!(zero_err, StratumError::InvalidFrameLength(0)));
+
+        let too_big = (super::SECURE_MAX_FRAME_SIZE + 1) as u32;
+        let big_err = client
+            .read_message(&mut Cursor::new(too_big.to_le_bytes().to_vec()))
+            .expect_err("oversized secure frame length must fail");
+        assert!(matches!(big_err, StratumError::FrameTooLarge { .. }));
+
+        let mut at_limit_wire = Vec::with_capacity(4 + super::SECURE_MAX_FRAME_SIZE);
+        at_limit_wire.extend_from_slice(&(super::SECURE_MAX_FRAME_SIZE as u32).to_le_bytes());
+        at_limit_wire.resize(4 + super::SECURE_MAX_FRAME_SIZE, 0u8);
+        let at_limit_err = client
+            .read_message(&mut Cursor::new(at_limit_wire))
+            .expect_err("at-limit bogus ciphertext should fail decrypt, not length check");
+        assert!(matches!(at_limit_err, StratumError::SecureTransport(_)));
+    }
+
+    #[test]
     fn async_frame_roundtrip_matches_sync_codec() {
         let runtime = Runtime::new().expect("tokio runtime");
         runtime.block_on(async {
@@ -3188,6 +3434,25 @@ mod tests {
     }
 
     #[test]
+    fn async_read_frame_accepts_exact_max_payload_boundary() {
+        let runtime = Runtime::new().expect("tokio runtime");
+        runtime.block_on(async {
+            let at_limit = setup_connection_message_with_exact_payload_len(crate::MAX_FRAME_SIZE);
+            let mut encoded = Vec::new();
+            write_frame(&mut encoded, &at_limit).expect("encode");
+            let (mut tx, mut rx) = tokio::io::duplex(encoded.len() + 16);
+            tx.write_all(&encoded).await.expect("write");
+            tx.flush().await.expect("flush");
+            drop(tx);
+            let decoded = read_frame_async(&mut rx)
+                .await
+                .expect("read")
+                .expect("frame");
+            assert_eq!(decoded, at_limit);
+        });
+    }
+
+    #[test]
     fn async_read_frame_rejects_malformed_headers() {
         let runtime = Runtime::new().expect("tokio runtime");
         runtime.block_on(async {
@@ -3260,22 +3525,28 @@ mod tests {
                     .write_message_async(&mut client_io, &Sv2Message::KeepAlive)
                     .await
                     .expect("client write");
-                transport
-                    .read_message_async(&mut client_io)
-                    .await
-                    .expect("client read")
-                    .expect("client message")
+                tokio::time::timeout(
+                    Duration::from_millis(500),
+                    transport.read_message_async(&mut client_io),
+                )
+                .await
+                .expect("timed out waiting for client response")
+                .expect("client read")
+                .expect("client message")
             });
 
             let server = tokio::spawn(async move {
                 let mut transport = SecureSv2Transport::handshake_server_async(&mut server_io)
                     .await
                     .expect("server handshake");
-                let inbound = transport
-                    .read_message_async(&mut server_io)
-                    .await
-                    .expect("server read")
-                    .expect("server message");
+                let inbound = tokio::time::timeout(
+                    Duration::from_millis(500),
+                    transport.read_message_async(&mut server_io),
+                )
+                .await
+                .expect("timed out waiting for server inbound")
+                .expect("server read")
+                .expect("server message");
                 assert_eq!(inbound, Sv2Message::KeepAlive);
                 transport
                     .write_message_async(&mut server_io, &Sv2Message::KeepAlive)
@@ -3302,15 +3573,22 @@ mod tests {
                 )
                 .await;
             });
-            let err = NoiseSv2Transport::handshake_client_async(
-                &mut client_io,
-                Some([18u8; 32]),
-                Some([1u8; 32]),
+            let err = tokio::time::timeout(
+                Duration::from_millis(500),
+                NoiseSv2Transport::handshake_client_async(
+                    &mut client_io,
+                    Some([18u8; 32]),
+                    Some([1u8; 32]),
+                ),
             )
             .await
+            .expect("timed out waiting for client handshake result")
             .expect_err("mismatched expected remote key must fail");
             assert!(matches!(err, StratumError::SecureHandshake(_)));
-            server.await.expect("server join");
+            tokio::time::timeout(Duration::from_millis(500), server)
+                .await
+                .expect("timed out waiting for server join")
+                .expect("server join");
         });
     }
 
@@ -3325,12 +3603,16 @@ mod tests {
             let expected_client_pub = client_keys.public;
             let expected_server_pub = server_keys.public;
             let server = tokio::spawn(async move {
-                let mut server = NoiseSv2Transport::handshake_server_async(
-                    &mut server_io,
-                    Some(server_keys.private),
-                    Some(expected_client_pub),
+                let mut server = tokio::time::timeout(
+                    Duration::from_millis(500),
+                    NoiseSv2Transport::handshake_server_async(
+                        &mut server_io,
+                        Some(server_keys.private),
+                        Some(expected_client_pub),
+                    ),
                 )
                 .await
+                .expect("timed out waiting for async server handshake")
                 .expect("server handshake");
                 let err = server
                     .set_rekey_interval_messages(0)
@@ -3340,21 +3622,28 @@ mod tests {
                     .set_rekey_interval_messages(2)
                     .expect("server interval");
                 for _ in 0..4 {
-                    let msg = server
-                        .read_message_async(&mut server_io)
-                        .await
-                        .expect("server read")
-                        .expect("server msg");
+                    let msg = tokio::time::timeout(
+                        Duration::from_millis(500),
+                        server.read_message_async(&mut server_io),
+                    )
+                    .await
+                    .expect("timed out waiting for server read")
+                    .expect("server read")
+                    .expect("server msg");
                     assert_eq!(msg, Sv2Message::KeepAlive);
                 }
             });
 
-            let mut client = NoiseSv2Transport::handshake_client_async(
-                &mut client_io,
-                Some(client_keys.private),
-                Some(expected_server_pub),
+            let mut client = tokio::time::timeout(
+                Duration::from_millis(500),
+                NoiseSv2Transport::handshake_client_async(
+                    &mut client_io,
+                    Some(client_keys.private),
+                    Some(expected_server_pub),
+                ),
             )
             .await
+            .expect("timed out waiting for async client handshake")
             .expect("client handshake");
             client
                 .set_rekey_interval_messages(2)
@@ -3440,6 +3729,52 @@ mod tests {
     }
 
     #[test]
+    fn async_noise_transport_write_message_emits_and_accepts_large_frame() {
+        let runtime = Runtime::new().expect("tokio runtime");
+        runtime.block_on(async {
+            let (mut client, mut server) = build_noise_transport_pair_for_tests();
+            let large = setup_connection_message_with_exact_payload_len(60_000);
+            let (mut tx, mut rx) = tokio::io::duplex(2 * 1024 * 1024);
+
+            client
+                .write_message_async(&mut tx, &large)
+                .await
+                .expect("noise async write");
+            let decoded = tokio::time::timeout(
+                Duration::from_millis(500),
+                server.read_message_async(&mut rx),
+            )
+            .await
+            .expect("timed out waiting for async noise read")
+            .expect("noise async read")
+            .expect("noise async message");
+            assert_eq!(decoded, large);
+        });
+    }
+
+    #[test]
+    fn noise_remote_static_validation_accepts_match_and_rejects_mismatch_or_missing() {
+        let expected = [7u8; 32];
+        assert!(
+            super::validate_expected_noise_remote_static(None, None).is_ok(),
+            "unset expectation must be accepted"
+        );
+        assert!(
+            super::validate_expected_noise_remote_static(Some(&expected), Some(expected)).is_ok(),
+            "matching remote static key must be accepted"
+        );
+
+        let mismatch =
+            super::validate_expected_noise_remote_static(Some(&[8u8; 32]), Some(expected))
+                .expect_err("mismatched remote static key must fail");
+        assert!(matches!(mismatch, StratumError::SecureHandshake(_)));
+
+        let missing = super::validate_expected_noise_remote_static(None, Some(expected))
+            .expect_err("missing remote static key must fail");
+        assert!(matches!(missing, StratumError::SecureHandshake(_)));
+    }
+
+    #[test]
     fn noise_helpers_validate_key_input_nonce_and_scaling() {
         assert!(super::decode_noise_key_bytes(&[0u8; 31], "public").is_err());
         assert!(super::resolve_noise_private_key(None).is_err());
@@ -3513,9 +3848,13 @@ mod tests {
                 .await
                 .expect("write");
             drop(tx);
-            let decoded = super::read_noise_handshake_packet_async(&mut rx)
-                .await
-                .expect("read");
+            let decoded = tokio::time::timeout(
+                Duration::from_millis(500),
+                super::read_noise_handshake_packet_async(&mut rx),
+            )
+            .await
+            .expect("timed out waiting for async handshake packet read")
+            .expect("read");
             assert_eq!(decoded, payload);
 
             let small_payload = vec![0x44u8, 0x55u8];
@@ -3524,9 +3863,13 @@ mod tests {
                 .await
                 .expect("write small");
             drop(tx_small);
-            let small_decoded = super::read_noise_handshake_packet_async(&mut rx_small)
-                .await
-                .expect("read small");
+            let small_decoded = tokio::time::timeout(
+                Duration::from_millis(500),
+                super::read_noise_handshake_packet_async(&mut rx_small),
+            )
+            .await
+            .expect("timed out waiting for small async handshake packet read")
+            .expect("read small");
             assert_eq!(small_decoded, small_payload);
         });
     }
