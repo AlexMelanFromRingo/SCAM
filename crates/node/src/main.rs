@@ -3560,12 +3560,7 @@ fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
                     start_height: 0,
                 };
                 let remote = server_handshake(&mut stream, &framing, &local_hello)?;
-                if remote.network_id != cfg_clone.network_id {
-                    return Err(NodeError::Runtime(format!(
-                        "relay peer network mismatch: expected {}, got {}",
-                        cfg_clone.network_id, remote.network_id
-                    )));
-                }
+                ensure_relay_peer_network(&cfg_clone.network_id, &remote.network_id)?;
                 {
                     let mut guard = state_clone
                         .lock()
@@ -3578,12 +3573,8 @@ fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
                     if should_stop_after_seen_messages(read_limit, seen) {
                         break;
                     }
-                    let inbound = match read_message(&mut stream, &framing) {
-                        Ok(msg) => msg,
-                        Err(TransportError::Io(err)) if relay_io_error_is_nonfatal(&err) => {
-                            break;
-                        }
-                        Err(err) => return Err(NodeError::Transport(err)),
+                    let Some(inbound) = read_next_relay_inbound(&mut stream, &framing)? else {
+                        break;
                     };
                     seen = seen.saturating_add(1);
                     let now = current_unix_sec()?;
@@ -4904,7 +4895,7 @@ fn run_stratum_client(mut stream: TcpStream, ctx: StratumServerContext) -> Resul
                             is_block,
                             ..
                         } => {
-                            if !is_block {
+                            if !should_process_share_as_block(is_block) {
                                 continue;
                             }
                             let Some(work) = jobs.get(&job_id).cloned() else {
@@ -5085,7 +5076,7 @@ async fn run_stratum_client_async(
                             is_block,
                             ..
                         } => {
-                            if !is_block {
+                            if !should_process_share_as_block(is_block) {
                                 continue;
                             }
                             let Some(work) = jobs.get(&job_id).cloned() else {
@@ -5204,6 +5195,31 @@ fn relay_io_error_is_nonfatal(err: &std::io::Error) -> bool {
     )
 }
 
+fn ensure_relay_peer_network(
+    expected_network_id: &str,
+    actual_network_id: &str,
+) -> Result<(), NodeError> {
+    if actual_network_id == expected_network_id {
+        Ok(())
+    } else {
+        Err(NodeError::Runtime(format!(
+            "relay peer network mismatch: expected {}, got {}",
+            expected_network_id, actual_network_id
+        )))
+    }
+}
+
+fn read_next_relay_inbound(
+    stream: &mut TcpStream,
+    framing: &FramingConfig,
+) -> Result<Option<WireMessage>, NodeError> {
+    match read_message(stream, framing) {
+        Ok(msg) => Ok(Some(msg)),
+        Err(TransportError::Io(err)) if relay_io_error_is_nonfatal(&err) => Ok(None),
+        Err(err) => Err(NodeError::Transport(err)),
+    }
+}
+
 fn should_require_noise_static_key(
     secure_transport: bool,
     mode: SecureTransportMode,
@@ -5218,6 +5234,18 @@ fn should_apply_set_new_prev_hash(active_channel: Option<u32>, incoming_channel:
 
 fn tip_changed(current: Hash256, previous: Hash256) -> bool {
     current != previous
+}
+
+fn should_process_share_as_block(is_block: bool) -> bool {
+    is_block
+}
+
+fn share_target_in_bounds(
+    share_target: Target,
+    min_share_target: Target,
+    max_share_target: Target,
+) -> bool {
+    share_target >= min_share_target && share_target <= max_share_target
 }
 
 fn nonzero_limit_reached(limit: u64, observed: u64) -> bool {
@@ -5570,7 +5598,7 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
             "min_share_target_hex must be <= max_share_target_hex".to_owned(),
         ));
     }
-    if share_target < min_share_target || share_target > max_share_target {
+    if !share_target_in_bounds(share_target, min_share_target, max_share_target) {
         return Err(NodeError::Runtime(
             "share_target_hex must be within [min_share_target_hex, max_share_target_hex]"
                 .to_owned(),
@@ -6279,6 +6307,16 @@ fn sv2_conformance_pass(setup_success: bool, channel_opened: bool, errors: &[Str
     setup_success && channel_opened && errors.is_empty()
 }
 
+fn ensure_sv2_conformance_pass(pass: bool) -> Result<(), NodeError> {
+    if pass {
+        Ok(())
+    } else {
+        Err(NodeError::Runtime(
+            "sv2 conformance check failed (see report)".to_owned(),
+        ))
+    }
+}
+
 fn load_sv2_corpus(path: &Path, user: &str) -> Result<Vec<Sv2Message>, NodeError> {
     #[derive(Deserialize)]
     struct Envelope {
@@ -6496,12 +6534,7 @@ fn run_sv2_conformance(args: Sv2ConformanceArgs) -> Result<(), NodeError> {
         println!("SV2 conformance report saved: {}", path.display());
     }
     println!("{rendered}");
-    if !report.pass {
-        return Err(NodeError::Runtime(
-            "sv2 conformance check failed (see report)".to_owned(),
-        ));
-    }
-    Ok(())
+    ensure_sv2_conformance_pass(report.pass)
 }
 
 fn json_error_body(message: &str) -> String {
@@ -6944,36 +6977,37 @@ fn try_serve_ui_asset(
     ui_dir: &Path,
     request_path: &str,
 ) -> Result<bool, NodeError> {
-    if !ui_dir_is_servable(ui_dir) {
-        return Ok(false);
-    }
-    let Some(relative) = sanitize_ui_path(request_path) else {
-        write_http_json_response(
-            stream,
-            "400 Bad Request",
-            &json_error_body("invalid asset path"),
-        )?;
-        return Ok(true);
-    };
-    let candidate = ui_dir.join(relative);
-    let asset_path = if candidate.exists() && candidate.is_file() {
-        candidate
-    } else {
-        let index = ui_dir.join("index.html");
-        if index.exists() && index.is_file() {
-            index
+    if ui_dir_is_servable(ui_dir) {
+        let Some(relative) = sanitize_ui_path(request_path) else {
+            write_http_json_response(
+                stream,
+                "400 Bad Request",
+                &json_error_body("invalid asset path"),
+            )?;
+            return Ok(true);
+        };
+        let candidate = ui_dir.join(relative);
+        let asset_path = if candidate.exists() && candidate.is_file() {
+            candidate
         } else {
-            return Ok(false);
-        }
-    };
-    let body = fs::read(&asset_path).map_err(|e| {
-        NodeError::Runtime(format!(
-            "cannot read ui asset {}: {e}",
-            asset_path.display()
-        ))
-    })?;
-    write_http_response(stream, "200 OK", guess_content_type(&asset_path), &body)?;
-    Ok(true)
+            let index = ui_dir.join("index.html");
+            if index.exists() && index.is_file() {
+                index
+            } else {
+                return Ok(false);
+            }
+        };
+        let body = fs::read(&asset_path).map_err(|e| {
+            NodeError::Runtime(format!(
+                "cannot read ui asset {}: {e}",
+                asset_path.display()
+            ))
+        })?;
+        write_http_response(stream, "200 OK", guess_content_type(&asset_path), &body)?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
 }
 
 fn run_rpc_serve(args: RpcServeArgs) -> Result<(), NodeError> {
@@ -7901,6 +7935,26 @@ mod tests {
         let b = Hash256([2u8; 32]);
         assert!(!super::tip_changed(a, a));
         assert!(super::tip_changed(a, b));
+
+        assert!(super::should_process_share_as_block(true));
+        assert!(!super::should_process_share_as_block(false));
+
+        assert!(super::share_target_in_bounds(
+            Target::MAX,
+            Target::MAX,
+            Target::MAX
+        ));
+        let tiny_target = Target::from_hex(&format!("00{}", "ff".repeat(31))).expect("tiny target");
+        assert!(!super::share_target_in_bounds(
+            tiny_target,
+            Target::MAX,
+            Target::MAX
+        ));
+
+        super::ensure_relay_peer_network("devnet", "devnet").expect("network ok");
+        let network_err =
+            super::ensure_relay_peer_network("devnet", "testnet").expect_err("network mismatch");
+        assert!(network_err.to_string().contains("network mismatch"));
     }
 
     #[test]
@@ -8058,6 +8112,44 @@ mod tests {
     }
 
     #[test]
+    fn configure_stream_timeouts_touch_real_tcp_stream_when_sockets_available() {
+        let listener = match TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("bind failed: {err}"),
+        };
+        let addr = listener.local_addr().expect("addr");
+        let acceptor = thread::spawn(move || listener.accept().expect("accept").0);
+        let stream = TcpStream::connect(addr).expect("connect");
+        let _accepted = acceptor.join().expect("join");
+
+        super::configure_stream_timeouts_with(
+            &stream,
+            Duration::from_secs(2),
+            Duration::from_secs(3),
+        )
+        .expect("configure explicit timeouts");
+        assert_eq!(
+            stream.read_timeout().expect("read timeout"),
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(
+            stream.write_timeout().expect("write timeout"),
+            Some(Duration::from_secs(3))
+        );
+
+        super::configure_stream_timeouts(&stream).expect("configure default timeouts");
+        assert_eq!(
+            stream.read_timeout().expect("read timeout"),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(
+            stream.write_timeout().expect("write timeout"),
+            Some(Duration::from_secs(5))
+        );
+    }
+
+    #[test]
     fn telemetry_append_helpers_create_parent_dirs_and_write_jsonl() {
         let work_dir = temp_dir("test-telemetry-append");
         let relay_path = work_dir.join("relay/telemetry.jsonl");
@@ -8139,6 +8231,26 @@ mod tests {
                 .contains("\"role\":\"template-provider\""),
             "role snapshot content mismatch"
         );
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
+    fn load_latest_jsonl_record_reads_last_non_empty_line() {
+        let work_dir = temp_dir("test-load-latest-jsonl");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let path = work_dir.join("telemetry.jsonl");
+        fs::write(&path, b"{\"round\":1}\n\n{\"round\":2}\n").expect("write jsonl");
+
+        let latest = super::load_latest_jsonl_record::<serde_json::Value>(&path)
+            .expect("load latest")
+            .expect("record");
+        assert_eq!(latest["round"], serde_json::json!(2));
+
+        let missing =
+            super::load_latest_jsonl_record::<serde_json::Value>(&work_dir.join("missing.jsonl"))
+                .expect("missing file should be ok");
+        assert!(missing.is_none());
+
         let _ = fs::remove_dir_all(work_dir);
     }
 
@@ -8832,6 +8944,8 @@ mod tests {
 
         let min_target = format!("00{}", "ff".repeat(31));
         let below_min_target = "00".repeat(32);
+        let max_target = min_target.clone();
+        let above_max_target = "ff".repeat(32);
 
         let out_of_range_err = run_stratum_serve(StratumServeArgs {
             network: Network::Devnet,
@@ -8868,6 +8982,41 @@ mod tests {
             "unexpected error: {out_of_range_err}"
         );
 
+        let above_max_err = run_stratum_serve(StratumServeArgs {
+            network: Network::Devnet,
+            config: Some(config_path.clone()),
+            runtime_db: Some(runtime_db.clone()),
+            bind: "not-an-addr".to_owned(),
+            share_target_hex: Some(above_max_target),
+            max_jobs_per_channel: None,
+            max_clients: 0,
+            max_active_clients: None,
+            read_timeout_sec: None,
+            keepalive_sec: Some(5),
+            idle_timeout_sec: Some(6),
+            vardiff_target_shares_per_minute: None,
+            vardiff_retarget_interval_shares: None,
+            vardiff_clamp_up: None,
+            vardiff_clamp_down: None,
+            max_rejected_shares: None,
+            min_share_target_hex: Some(min_target.clone()),
+            max_share_target_hex: Some(max_target.clone()),
+            secure_transport: false,
+            secure_transport_mode: None,
+            secure_rekey_interval_messages: None,
+            secure_static_secret_key_hex: None,
+            secure_expected_remote_static_pubkey_hex: None,
+            template_provider_addr: None,
+            job_declarator_addr: None,
+        })
+        .expect_err("share target above max must fail");
+        assert!(
+            above_max_err
+                .to_string()
+                .contains("share_target_hex must be within"),
+            "unexpected error: {above_max_err}"
+        );
+
         let boundary_err = run_stratum_serve(StratumServeArgs {
             network: Network::Devnet,
             config: Some(config_path),
@@ -8886,7 +9035,7 @@ mod tests {
             vardiff_clamp_down: None,
             max_rejected_shares: None,
             min_share_target_hex: Some(min_target.clone()),
-            max_share_target_hex: Some(min_target),
+            max_share_target_hex: Some(max_target),
             secure_transport: false,
             secure_transport_mode: None,
             secure_rekey_interval_messages: None,
@@ -9121,6 +9270,8 @@ mod tests {
             channel_opened,
             &errors
         ));
+        super::ensure_sv2_conformance_pass(false).expect_err("must fail on false pass flag");
+        super::ensure_sv2_conformance_pass(true).expect("must pass on true flag");
     }
 
     #[test]
@@ -9219,6 +9370,13 @@ mod tests {
     }
 
     #[test]
+    fn read_http_request_rejects_truncated_body_at_eof() {
+        let raw = b"POST /wallet/new HTTP/1.1\r\nHost: localhost\r\nContent-Length: 10\r\n\r\nabc";
+        let err = read_http_request_from_raw(raw).expect_err("truncated body must fail");
+        assert!(err.to_string().contains("expected body length"));
+    }
+
+    #[test]
     fn read_role_request_handles_empty_invalid_and_valid_payloads() {
         let mut empty = std::io::Cursor::new(Vec::<u8>::new());
         let err = super::read_role_request::<serde_json::Value, _>(&mut empty)
@@ -9309,6 +9467,14 @@ mod tests {
 
     #[test]
     fn static_asset_helpers_handle_unknown_suffix_and_traversal() {
+        assert_eq!(
+            super::guess_content_type(std::path::Path::new("index.html")),
+            "text/html; charset=utf-8"
+        );
+        assert_eq!(
+            super::guess_content_type(std::path::Path::new("favicon.ico")),
+            "image/x-icon"
+        );
         assert_eq!(
             super::guess_content_type(std::path::Path::new("bundle.unknown")),
             "application/octet-stream"
@@ -9582,7 +9748,7 @@ mod tests {
                 mine_blocks: 0,
                 interval_sec: 120,
                 max_nonce: 500_000,
-                max_requests: 8,
+                max_requests: 10,
             })
             .expect("rpc serve");
         });
@@ -9600,6 +9766,8 @@ mod tests {
 
         let tx = send_http_request(&addr, "GET /tx/0/0 HTTP/1.1\r\nHost: localhost\r\n\r\n");
         assert!(tx.starts_with("HTTP/1.1 200 OK"));
+        let block = send_http_request(&addr, "GET /block/0 HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        assert!(block.starts_with("HTTP/1.1 200 OK"));
 
         let wallet_address_req = serde_json::json!({
             "mnemonic": SOAK_FLOW_MNEMONIC,
@@ -9622,6 +9790,14 @@ mod tests {
         let wallet_balance = send_http_json_post(&addr, "/wallet/balance", &wallet_balance_req);
         assert!(wallet_balance.starts_with("HTTP/1.1 200 OK"));
         assert!(wallet_balance.contains("\"spendable\""));
+
+        let wallet_decode_req = serde_json::json!({
+            "address": invalid_recipient.clone()
+        })
+        .to_string();
+        let wallet_decode = send_http_json_post(&addr, "/wallet/decode", &wallet_decode_req);
+        assert!(wallet_decode.starts_with("HTTP/1.1 200 OK"));
+        assert!(wallet_decode.contains("\"key_hash20_hex\""));
 
         let valid_send_req = serde_json::json!({
             "mnemonic": SOAK_FLOW_MNEMONIC,
@@ -11039,6 +11215,15 @@ mod tests {
                 .to_string()
                 .contains("connect to role service")
         );
+
+        let declarator_bind_err = run_sv2_job_declarator(Sv2JobDeclaratorArgs {
+            bind: "not-an-addr".to_owned(),
+            max_requests: 1,
+            start_job_id: 1,
+            telemetry_out: None,
+        })
+        .expect_err("invalid bind must fail declarator startup");
+        assert!(declarator_bind_err.to_string().contains("bind failed"));
 
         let bind_err = run_sv2_translator(Sv2TranslatorArgs {
             bind: "not-an-addr".to_owned(),
