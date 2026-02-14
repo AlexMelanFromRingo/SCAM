@@ -2538,21 +2538,36 @@ fn run_sync_demo(args: SyncDemoArgs) -> Result<(), NodeError> {
     Ok(())
 }
 
-fn configure_stream_timeouts_with(
-    stream: &TcpStream,
+trait TimeoutConfigurableStream {
+    fn set_read_timeout_cfg(&self, duration: Option<Duration>) -> std::io::Result<()>;
+    fn set_write_timeout_cfg(&self, duration: Option<Duration>) -> std::io::Result<()>;
+}
+
+impl TimeoutConfigurableStream for TcpStream {
+    fn set_read_timeout_cfg(&self, duration: Option<Duration>) -> std::io::Result<()> {
+        self.set_read_timeout(duration)
+    }
+
+    fn set_write_timeout_cfg(&self, duration: Option<Duration>) -> std::io::Result<()> {
+        self.set_write_timeout(duration)
+    }
+}
+
+fn configure_stream_timeouts_with<S: TimeoutConfigurableStream>(
+    stream: &S,
     read_timeout: Duration,
     write_timeout: Duration,
 ) -> Result<(), NodeError> {
     stream
-        .set_read_timeout(Some(read_timeout))
+        .set_read_timeout_cfg(Some(read_timeout))
         .map_err(|e| NodeError::Runtime(format!("set read timeout failed: {e}")))?;
     stream
-        .set_write_timeout(Some(write_timeout))
+        .set_write_timeout_cfg(Some(write_timeout))
         .map_err(|e| NodeError::Runtime(format!("set write timeout failed: {e}")))?;
     Ok(())
 }
 
-fn configure_stream_timeouts(stream: &TcpStream) -> Result<(), NodeError> {
+fn configure_stream_timeouts<S: TimeoutConfigurableStream>(stream: &S) -> Result<(), NodeError> {
     configure_stream_timeouts_with(stream, Duration::from_secs(5), Duration::from_secs(5))
 }
 
@@ -2572,6 +2587,10 @@ fn ensure_expected_hash(expected: Hash256, got: Hash256, context: &str) -> Resul
     Err(NodeError::Runtime(format!(
         "{context}: expected {expected}, got {got}"
     )))
+}
+
+fn has_unknown_hashes(hashes: &[Hash256]) -> bool {
+    !hashes.is_empty()
 }
 
 fn run_net_demo(args: NetDemoArgs) -> Result<(), NodeError> {
@@ -2775,7 +2794,7 @@ fn run_net_demo(args: NetDemoArgs) -> Result<(), NodeError> {
         .filter(|hash| local.block_by_hash(hash).is_none())
         .collect::<Vec<_>>();
 
-    if !unknown_hashes.is_empty() {
+    if has_unknown_hashes(&unknown_hashes) {
         let items = unknown_hashes
             .iter()
             .copied()
@@ -2957,6 +2976,29 @@ fn sync_runtime_with_peer(
     Ok(stats)
 }
 
+fn peer_book_contains_address(peer_book: &PeerAddressBook, address: &str) -> bool {
+    peer_book.peers.iter().any(|peer| peer.address == address)
+}
+
+fn sort_and_dedup_peer_book(peer_book: &mut PeerAddressBook) {
+    peer_book.peers.sort_by(|a, b| a.address.cmp(&b.address));
+    peer_book.peers.dedup_by(|a, b| a.address == b.address);
+}
+
+fn find_peer_record_mut<'a>(
+    peer_book: &'a mut PeerAddressBook,
+    address: &str,
+) -> Option<&'a mut PeerAddressRecord> {
+    peer_book
+        .peers
+        .iter_mut()
+        .find(|peer| peer.address == address)
+}
+
+fn sync_book_has_success(success_count: u32) -> bool {
+    success_count != 0
+}
+
 fn run_sync_peer(args: SyncPeerArgs) -> Result<(), NodeError> {
     let config_path = args
         .config
@@ -3016,11 +3058,7 @@ fn run_sync_book(args: SyncBookArgs) -> Result<(), NodeError> {
     for seed in &cfg.dns_seeds {
         for addr in resolve_dns_seed(seed) {
             let addr_string = addr.to_string();
-            if peer_book
-                .peers
-                .iter()
-                .any(|peer| peer.address == addr_string)
-            {
+            if peer_book_contains_address(&peer_book, &addr_string) {
                 continue;
             }
             peer_book.peers.push(PeerAddressRecord {
@@ -3049,8 +3087,7 @@ fn run_sync_book(args: SyncBookArgs) -> Result<(), NodeError> {
             "peer book has no parseable socket addresses".to_owned(),
         ));
     }
-    peer_book.peers.sort_by(|a, b| a.address.cmp(&b.address));
-    peer_book.peers.dedup_by(|a, b| a.address == b.address);
+    sort_and_dedup_peer_book(&mut peer_book);
 
     let selected = select_outbound_peers(&candidates, args.max_peers, args.rotate_after_sec, now);
     let selected = apply_bucket_cap(selected, cfg.p2p_max_outbound_per_bucket);
@@ -3086,21 +3123,13 @@ fn run_sync_book(args: SyncBookArgs) -> Result<(), NodeError> {
                 total_announced = total_announced.saturating_add(stats.blocks_announced);
                 total_downloaded = total_downloaded.saturating_add(stats.blocks_downloaded);
                 total_applied = total_applied.saturating_add(stats.blocks_applied);
-                if let Some(peer) = peer_book
-                    .peers
-                    .iter_mut()
-                    .find(|peer| peer.address == addr_string)
-                {
+                if let Some(peer) = find_peer_record_mut(&mut peer_book, &addr_string) {
                     peer.last_seen_unix_sec = attempt_now;
                     peer.ban_score = peer.ban_score.saturating_sub(1);
                 }
             }
             Err(err) => {
-                if let Some(peer) = peer_book
-                    .peers
-                    .iter_mut()
-                    .find(|peer| peer.address == addr_string)
-                {
+                if let Some(peer) = find_peer_record_mut(&mut peer_book, &addr_string) {
                     peer.ban_score = peer.ban_score.saturating_add(1);
                 }
                 println!("Sync peer failed: {} ({err})", addr_string);
@@ -3110,7 +3139,7 @@ fn run_sync_book(args: SyncBookArgs) -> Result<(), NodeError> {
 
     save_peer_book_db(&peers_db_path, &peer_book)?;
     persist_runtime_db(&runtime, &runtime_db_path)?;
-    if success_count == 0 {
+    if !sync_book_has_success(success_count) {
         return Err(NodeError::Runtime(
             "sync-book finished without successful peers".to_owned(),
         ));
@@ -3936,7 +3965,7 @@ fn run_soak(args: SoakArgs) -> Result<(), NodeError> {
         })?;
     }
 
-    let tx_flow_enabled = args.txs_per_round > 0;
+    let tx_flow_enabled = is_tx_flow_enabled(args.txs_per_round);
     let (soak_sender_key, soak_recipient_key_hash20, miner_key_hash) = if tx_flow_enabled {
         let (sender_key, recipient_key_hash20) = derive_soak_flow_keys()?;
         let miner_key_hash = scam_core::hash160_blake3(&sender_key.pubkey_compressed());
@@ -3986,12 +4015,9 @@ fn run_soak(args: SoakArgs) -> Result<(), NodeError> {
                 .as_ref()
                 .expect("tx flow enabled means sender key is present");
             for tx_index in 0..args.txs_per_round {
-                let recipient_key_hash20 = if tx_index % 2 == 0 {
-                    soak_recipient_key_hash20
-                } else {
-                    miner_key_hash
-                };
-                let tx_fee = args.tx_fee.saturating_add((tx_index % 4) as u64);
+                let recipient_key_hash20 =
+                    soak_recipient_key_hash(tx_index, soak_recipient_key_hash20, miner_key_hash);
+                let tx_fee = soak_tx_fee_for_index(args.tx_fee, tx_index);
                 match build_signed_transfer_tx(
                     runtime,
                     &cfg.network_id,
@@ -4001,8 +4027,7 @@ fn run_soak(args: SoakArgs) -> Result<(), NodeError> {
                     tx_fee,
                 ) {
                     Ok(signed) => {
-                        let peer_id =
-                            ((round as u64 + tx_index as u64) % args.simulated_peers as u64) + 1;
+                        let peer_id = soak_peer_id_for_round(round, tx_index, args.simulated_peers);
                         match admit_peer_tx_into_relay(
                             relay_state
                                 .as_mut()
@@ -4123,7 +4148,7 @@ fn run_soak(args: SoakArgs) -> Result<(), NodeError> {
             append_soak_telemetry_snapshot(path, &snapshot)?;
         }
 
-        if round % persist_every_rounds == 0 {
+        if should_persist_round(round, persist_every_rounds) {
             persist_runtime_db(runtime, &runtime_db_path)?;
         }
         Ok(())
@@ -4248,7 +4273,7 @@ fn run_reorg_demo(args: ReorgDemoArgs) -> Result<(), NodeError> {
                 new_tip,
                 new_height,
             } => {
-                reorg_count += 1;
+                reorg_count = reorg_count.saturating_add(1);
                 println!(
                     "reorg occurred: old_tip={} -> new_tip={} at h={}",
                     old_tip, new_tip, new_height
@@ -5178,6 +5203,34 @@ fn blocks_per_second(blocks_mined: u64, elapsed_sec: u64) -> f64 {
     } else {
         blocks_mined as f64 / elapsed_sec as f64
     }
+}
+
+fn is_tx_flow_enabled(txs_per_round: u32) -> bool {
+    txs_per_round > 0
+}
+
+fn soak_recipient_key_hash(
+    tx_index: u32,
+    recipient_key_hash20: [u8; 20],
+    miner_key_hash: [u8; 20],
+) -> [u8; 20] {
+    if tx_index.is_multiple_of(2) {
+        recipient_key_hash20
+    } else {
+        miner_key_hash
+    }
+}
+
+fn soak_tx_fee_for_index(base_fee: u64, tx_index: u32) -> u64 {
+    base_fee.saturating_add((tx_index % 4) as u64)
+}
+
+fn soak_peer_id_for_round(round: u32, tx_index: u32, simulated_peers: u32) -> u64 {
+    ((round as u64 + tx_index as u64) % simulated_peers as u64) + 1
+}
+
+fn should_persist_round(round: u32, persist_every_rounds: u32) -> bool {
+    persist_every_rounds != 0 && round.is_multiple_of(persist_every_rounds)
 }
 
 fn run_sv2_template_provider(args: Sv2TemplateProviderArgs) -> Result<(), NodeError> {
@@ -6695,7 +6748,7 @@ fn parse_content_length(headers: &str) -> Result<usize, NodeError> {
     Ok(0)
 }
 
-fn read_http_request(stream: &mut TcpStream) -> Result<Option<HttpRequest>, NodeError> {
+fn read_http_request<R: Read>(stream: &mut R) -> Result<Option<HttpRequest>, NodeError> {
     let mut buffer = Vec::<u8>::with_capacity(4096);
     let mut chunk = [0u8; 4096];
     let mut header_end = None::<usize>;
@@ -7446,7 +7499,9 @@ mod tests {
     use scam_mempool::{Mempool, OrphanPool};
     use scam_miner::{BlockTemplate, mine_block};
     use scam_p2p::{GossipEngine, InventoryItem, ReplacementRateLimit, WireMessage};
-    use scam_storage::{load_chain_archive_db, load_peer_book_db};
+    use scam_storage::{
+        PeerAddressBook, PeerAddressRecord, load_chain_archive_db, load_peer_book_db,
+    };
     use scam_stratum::{IdentityTranslator, Sv2Message, Translator, read_frame, write_frame};
     use scam_wallet::{WalletMnemonic, derive_wallet_key};
 
@@ -7535,36 +7590,8 @@ mod tests {
     fn read_http_request_from_raw(
         raw: &[u8],
     ) -> Result<Option<super::HttpRequest>, super::NodeError> {
-        let listener = match TcpListener::bind("127.0.0.1:0") {
-            Ok(listener) => listener,
-            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
-                return Err(super::NodeError::Runtime(
-                    "socket bind permission denied".to_owned(),
-                ));
-            }
-            Err(err) => panic!("bind listener: {err}"),
-        };
-        let addr = listener.local_addr().expect("listener addr");
-        let payload = raw.to_vec();
-        let sender = thread::spawn(move || {
-            let mut stream = TcpStream::connect(addr).expect("connect");
-            stream
-                .set_write_timeout(Some(Duration::from_secs(2)))
-                .expect("set write timeout");
-            stream.write_all(&payload).expect("send raw http request");
-            stream.flush().expect("flush request");
-            stream
-                .shutdown(Shutdown::Write)
-                .expect("shutdown write half");
-        });
-
-        let (mut incoming, _) = listener.accept().expect("accept");
-        incoming
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .expect("set read timeout");
-        let request = super::read_http_request(&mut incoming);
-        sender.join().expect("sender join");
-        request
+        let mut cursor = std::io::Cursor::new(raw.to_vec());
+        super::read_http_request(&mut cursor)
     }
 
     fn connect_with_retry(addr: &str) -> TcpStream {
@@ -7621,6 +7648,25 @@ mod tests {
 
         assert_eq!(super::blocks_per_second(10, 0), 10.0);
         assert!((super::blocks_per_second(9, 3) - 3.0).abs() < f64::EPSILON);
+
+        assert!(!super::is_tx_flow_enabled(0));
+        assert!(super::is_tx_flow_enabled(1));
+        let recipient = [0x11u8; 20];
+        let miner = [0x22u8; 20];
+        assert_eq!(
+            super::soak_recipient_key_hash(0, recipient, miner),
+            recipient
+        );
+        assert_eq!(super::soak_recipient_key_hash(1, recipient, miner), miner);
+        assert_eq!(super::soak_tx_fee_for_index(100, 0), 100);
+        assert_eq!(super::soak_tx_fee_for_index(100, 3), 103);
+        assert_eq!(super::soak_peer_id_for_round(1, 0, 4), 2);
+        assert_eq!(super::soak_peer_id_for_round(2, 3, 4), 2);
+        assert!(super::should_persist_round(4, 2));
+        assert!(!super::should_persist_round(3, 2));
+        assert!(!super::should_persist_round(3, 0));
+        assert!(!super::has_unknown_hashes(&[]));
+        assert!(super::has_unknown_hashes(&[Hash256::ZERO]));
     }
 
     #[test]
@@ -7642,17 +7688,77 @@ mod tests {
     }
 
     #[test]
-    fn configure_stream_timeouts_sets_requested_values() {
-        let listener = match TcpListener::bind("127.0.0.1:0") {
-            Ok(listener) => listener,
-            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
-            Err(err) => panic!("bind: {err}"),
+    fn sync_book_helpers_match_addresses_and_dedup_records() {
+        let mut book = PeerAddressBook {
+            network_id: "devnet".to_owned(),
+            peers: vec![
+                PeerAddressRecord {
+                    address: "127.0.0.1:18444".to_owned(),
+                    last_seen_unix_sec: 1,
+                    ban_score: 2,
+                },
+                PeerAddressRecord {
+                    address: "127.0.0.1:18443".to_owned(),
+                    last_seen_unix_sec: 0,
+                    ban_score: 0,
+                },
+                PeerAddressRecord {
+                    address: "127.0.0.1:18444".to_owned(),
+                    last_seen_unix_sec: 9,
+                    ban_score: 9,
+                },
+            ],
         };
-        let addr = listener.local_addr().expect("addr");
-        let client = thread::spawn(move || TcpStream::connect(addr).expect("connect"));
-        let (stream, _) = listener.accept().expect("accept");
-        let _client_stream = client.join().expect("join");
 
+        assert!(super::peer_book_contains_address(&book, "127.0.0.1:18444"));
+        assert!(!super::peer_book_contains_address(&book, "127.0.0.1:29999"));
+
+        super::sort_and_dedup_peer_book(&mut book);
+        assert_eq!(book.peers.len(), 2);
+        assert_eq!(book.peers[0].address, "127.0.0.1:18443");
+        assert_eq!(book.peers[1].address, "127.0.0.1:18444");
+
+        let peer = super::find_peer_record_mut(&mut book, "127.0.0.1:18444").expect("peer");
+        peer.ban_score = 7;
+        assert_eq!(
+            super::find_peer_record_mut(&mut book, "127.0.0.1:18444")
+                .expect("peer")
+                .ban_score,
+            7
+        );
+        assert!(!super::sync_book_has_success(0));
+        assert!(super::sync_book_has_success(1));
+    }
+
+    #[test]
+    fn configure_stream_timeouts_sets_requested_values() {
+        #[derive(Default)]
+        struct MockTimeoutStream {
+            read_timeout: std::sync::Mutex<Option<Duration>>,
+            write_timeout: std::sync::Mutex<Option<Duration>>,
+            fail_read: bool,
+            fail_write: bool,
+        }
+
+        impl super::TimeoutConfigurableStream for MockTimeoutStream {
+            fn set_read_timeout_cfg(&self, duration: Option<Duration>) -> std::io::Result<()> {
+                if self.fail_read {
+                    return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+                }
+                *self.read_timeout.lock().expect("lock read timeout") = duration;
+                Ok(())
+            }
+
+            fn set_write_timeout_cfg(&self, duration: Option<Duration>) -> std::io::Result<()> {
+                if self.fail_write {
+                    return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+                }
+                *self.write_timeout.lock().expect("lock write timeout") = duration;
+                Ok(())
+            }
+        }
+
+        let stream = MockTimeoutStream::default();
         super::configure_stream_timeouts_with(
             &stream,
             Duration::from_secs(2),
@@ -7660,22 +7766,50 @@ mod tests {
         )
         .expect("set explicit timeouts");
         assert_eq!(
-            stream.read_timeout().expect("read timeout"),
+            *stream.read_timeout.lock().expect("read timeout"),
             Some(Duration::from_secs(2))
         );
         assert_eq!(
-            stream.write_timeout().expect("write timeout"),
+            *stream.write_timeout.lock().expect("write timeout"),
             Some(Duration::from_secs(3))
         );
 
         super::configure_stream_timeouts(&stream).expect("set default timeouts");
         assert_eq!(
-            stream.read_timeout().expect("read timeout"),
+            *stream.read_timeout.lock().expect("read timeout"),
             Some(Duration::from_secs(5))
         );
         assert_eq!(
-            stream.write_timeout().expect("write timeout"),
+            *stream.write_timeout.lock().expect("write timeout"),
             Some(Duration::from_secs(5))
+        );
+
+        let fail_read = MockTimeoutStream {
+            fail_read: true,
+            ..MockTimeoutStream::default()
+        };
+        assert!(
+            super::configure_stream_timeouts_with(
+                &fail_read,
+                Duration::from_secs(1),
+                Duration::from_secs(1)
+            )
+            .is_err(),
+            "read timeout error must propagate"
+        );
+
+        let fail_write = MockTimeoutStream {
+            fail_write: true,
+            ..MockTimeoutStream::default()
+        };
+        assert!(
+            super::configure_stream_timeouts_with(
+                &fail_write,
+                Duration::from_secs(1),
+                Duration::from_secs(1)
+            )
+            .is_err(),
+            "write timeout error must propagate"
         );
     }
 
@@ -8446,13 +8580,7 @@ mod tests {
             body.len(),
             body
         );
-        let parsed = read_http_request_from_raw(raw.as_bytes());
-        if let Err(err) = &parsed
-            && err.to_string().contains("permission denied")
-        {
-            return;
-        }
-        let parsed = parsed.expect("parse request");
+        let parsed = read_http_request_from_raw(raw.as_bytes()).expect("parse request");
         let request = parsed.expect("request present");
         assert_eq!(request.method, "POST");
         assert_eq!(request.path, "/wallet/new");

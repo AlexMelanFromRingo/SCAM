@@ -85,3 +85,7 @@ Run window: `2026-02-13T16:10:10Z` -> `2026-02-13T17:09:00Z`
   - Command scope: `scripts/mutation-staged.sh stage2`
   - Result snapshot: `total=847`, `caught=668`, `missed=47`, `timeout=0`, `unviable=132`.
   - Remaining misses are now concentrated in `crates/node/src/main.rs` (runtime sync-book/relay/rpc and auxiliary CLI paths).
+- [ ] Re-ran full Stage 2 after first node hardening batch:
+  - Command scope: `scripts/mutation-staged.sh stage2`
+  - Result snapshot: `total=862`, `caught=690`, `missed=39`, `timeout=0`, `unviable=133`.
+  - Remaining misses are concentrated in node runtime-network integration paths (`sync/relay/rpc/stratum`) and a few stream wrapper helpers.
