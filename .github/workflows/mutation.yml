@@ -1,0 +1,94 @@
+name: Mutation
+
+on:
+  workflow_dispatch:
+    inputs:
+      stage:
+        description: "Mutation stage to run"
+        required: true
+        default: "stage2"
+        type: choice
+        options:
+          - stage1
+          - stage2
+          - stage3
+          - all
+      jobs:
+        description: "Parallel mutant jobs"
+        required: true
+        default: "4"
+        type: string
+      timeout_sec:
+        description: "Per-mutant timeout (seconds)"
+        required: true
+        default: "120"
+        type: string
+      min_test_timeout_sec:
+        description: "Minimum test timeout (seconds)"
+        required: true
+        default: "20"
+        type: string
+      test_tool:
+        description: "cargo-mutants test tool"
+        required: true
+        default: "cargo"
+        type: choice
+        options:
+          - cargo
+          - nextest
+  schedule:
+    - cron: "0 3 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  mutation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-mutants
+        run: |
+          if ! command -v cargo-mutants >/dev/null 2>&1; then
+            cargo install cargo-mutants
+          fi
+
+      - name: Install cargo-nextest (optional)
+        if: github.event_name == 'workflow_dispatch' && inputs.test_tool == 'nextest'
+        run: |
+          if ! command -v cargo-nextest >/dev/null 2>&1; then
+            cargo install cargo-nextest
+          fi
+
+      - name: Run scheduled mutation stage1
+        if: github.event_name == 'schedule'
+        run: |
+          export MUTATION_JOBS=4
+          export MUTATION_TIMEOUT=120
+          export MUTATION_MIN_TEST_TIMEOUT=20
+          export MUTATION_TEST_TOOL=cargo
+          scripts/mutation-staged.sh stage1
+
+      - name: Run manual mutation stage
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          export MUTATION_JOBS="${{ inputs.jobs }}"
+          export MUTATION_TIMEOUT="${{ inputs.timeout_sec }}"
+          export MUTATION_MIN_TEST_TIMEOUT="${{ inputs.min_test_timeout_sec }}"
+          export MUTATION_TEST_TOOL="${{ inputs.test_tool }}"
+          scripts/mutation-staged.sh "${{ inputs.stage }}"
+
+      - name: Upload mutation artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutation-artifacts
+          path: |
+            target/mutants-stage/**/mutants.out
+            target/mutants/**/mutants.out
+            target/mutants-node-main-latest/mutants.out
