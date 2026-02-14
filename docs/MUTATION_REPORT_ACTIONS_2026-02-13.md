@@ -78,4 +78,10 @@ Run window: `2026-02-13T16:10:10Z` -> `2026-02-13T17:09:00Z`
   - noise sync/async branch guards and no-op replacements,
   - algebraically equivalent bitwise compose mutants (`|` vs `^` on non-overlapping shifted bytes),
   - constant-size arithmetic mutants in key-material array definitions.
-- [ ] Next pass: finish remaining `stratum` misses/timeouts, then run full Stage 2 (`stratum+p2p+node`) again.
+- [x] Closed remaining focused `stratum` misses/timeouts:
+  - Command scope: `--package scam-stratum --file crates/stratum/src/lib.rs`
+  - Result snapshot: `total=261`, `caught=232`, `missed=0`, `timeout=0`, `unviable=29`.
+- [ ] Re-ran full Stage 2 (`stratum+p2p+node`) after `stratum` closure:
+  - Command scope: `scripts/mutation-staged.sh stage2`
+  - Result snapshot: `total=847`, `caught=668`, `missed=47`, `timeout=0`, `unviable=132`.
+  - Remaining misses are now concentrated in `crates/node/src/main.rs` (runtime sync-book/relay/rpc and auxiliary CLI paths).
