@@ -7,6 +7,9 @@ use crate::merkle::merkle_root;
 use crate::target::Target;
 use crate::types::{Block, BlockHeader, OutPoint, Transaction, TxIn, TxOut};
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum DifficultyAlgorithm {
@@ -371,7 +374,19 @@ const fn default_p2p_max_outbound_per_bucket() -> u32 {
 }
 
 fn default_dns_seeds() -> Vec<String> {
+    #[cfg(test)]
+    {
+        DEFAULT_DNS_SEED_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
     Vec::new()
+}
+
+#[cfg(test)]
+static DEFAULT_DNS_SEED_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+fn default_dns_seed_call_count() -> usize {
+    DEFAULT_DNS_SEED_CALLS.load(Ordering::Relaxed)
 }
 
 const fn default_p2p_max_inv_items() -> usize {
@@ -735,6 +750,70 @@ genesis_reward_key_hash20 = "0000000000000000000000000000000000000000"
         cfg.stratum_share_target = cfg.stratum_max_share_target.clone();
         cfg.validate()
             .expect("upper-bound targets must be accepted");
+    }
+
+    #[test]
+    fn config_rejects_difficulty_clamp_down_above_one() {
+        let mut cfg = sample_config();
+        cfg.difficulty_clamp_down = 1.01;
+        let err = cfg
+            .validate()
+            .expect_err("difficulty_clamp_down > 1 must fail");
+        assert!(
+            err.to_string()
+                .contains("difficulty_clamp_down must be in (0.0, 1.0]")
+        );
+    }
+
+    #[test]
+    fn config_rejects_zero_sizes_independently() {
+        let mut cfg = sample_config();
+        cfg.max_block_size = 0;
+        cfg.max_tx_size = 100;
+        let err = cfg.validate().expect_err("zero max_block_size must fail");
+        assert!(err.to_string().contains("max sizes must be > 0"));
+
+        let mut cfg = sample_config();
+        cfg.max_block_size = 100;
+        cfg.max_tx_size = 0;
+        let err = cfg.validate().expect_err("zero max_tx_size must fail");
+        assert!(err.to_string().contains("max sizes must be > 0"));
+    }
+
+    #[test]
+    fn config_accepts_equal_block_and_tx_size_bounds() {
+        let mut cfg = sample_config();
+        cfg.max_block_size = 250_000;
+        cfg.max_tx_size = 250_000;
+        cfg.validate()
+            .expect("max_tx_size == max_block_size must be accepted");
+    }
+
+    #[test]
+    fn default_dns_seed_helper_is_used_by_toml_defaults() {
+        let before = super::default_dns_seed_call_count();
+        let raw = r#"
+network_id = "devnet"
+target_block_time_sec = 120
+difficulty_adjustment_window = 20
+difficulty_clamp_up = 4.0
+difficulty_clamp_down = 0.25
+max_block_size = 1_000_000
+max_tx_size = 100_000
+max_mempool_txs = 1_000
+coinbase_maturity = 100
+block_subsidy = 5_000_000_000
+hrp = "sd"
+genesis_message = "SCAM genesis"
+genesis_timestamp = 1_770_763_200
+genesis_target = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+genesis_nonce = 0
+genesis_reward_key_hash20 = "0000000000000000000000000000000000000000"
+"#;
+        let cfg: ChainConfig = toml::from_str(raw).expect("config parse");
+        assert!(cfg.dns_seeds.is_empty());
+        let after = super::default_dns_seed_call_count();
+        assert!(after > before, "default dns helper must be called");
     }
 
     #[test]

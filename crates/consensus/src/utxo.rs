@@ -513,10 +513,17 @@ mod tests {
 
         let err = validate_and_apply_block(&block1, 1, 50, 10, chain_domain, &mut utxos)
             .expect_err("reject");
-        assert!(matches!(
-            err,
-            TxValidationError::ImmatureCoinbaseSpend { .. }
-        ));
+        match err {
+            TxValidationError::ImmatureCoinbaseSpend {
+                spend_height,
+                mature_height,
+                ..
+            } => {
+                assert_eq!(spend_height, 1);
+                assert_eq!(mature_height, 10);
+            }
+            other => panic!("expected ImmatureCoinbaseSpend, got {other:?}"),
+        }
     }
 
     #[test]
@@ -765,5 +772,259 @@ mod tests {
                 .expect_err("overspend must fail");
             assert!(matches!(err, TxValidationError::Overspend { .. }));
         }
+    }
+
+    #[test]
+    fn block_summary_tracks_spent_and_created_counts_exactly() {
+        let chain_domain = b"devnet";
+        let (miner_pubkey, miner_key_hash, miner_secret) = key_material([101u8; 32]);
+        let (_, receiver_key_hash, _) = key_material([102u8; 32]);
+
+        let genesis_coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: OutPoint::coinbase(),
+                signature: b"genesis".to_vec(),
+                pubkey_compressed: vec![],
+                sequence: u32::MAX,
+            }],
+            outputs: vec![
+                TxOut {
+                    value: 30,
+                    key_hash20: miner_key_hash,
+                },
+                TxOut {
+                    value: 20,
+                    key_hash20: miner_key_hash,
+                },
+            ],
+            lock_time: 0,
+        };
+        let genesis = make_block(
+            Hash256::ZERO,
+            100,
+            Target::MAX,
+            vec![genesis_coinbase.clone()],
+        );
+        let mut utxos = UtxoSet::new();
+        validate_and_apply_block(&genesis, 0, 50, 1, chain_domain, &mut utxos)
+            .expect("genesis applies");
+
+        let mut spend = Transaction {
+            version: 1,
+            inputs: vec![
+                TxIn {
+                    prev_out: OutPoint {
+                        txid: genesis_coinbase.txid(),
+                        vout: 0,
+                    },
+                    signature: vec![],
+                    pubkey_compressed: miner_pubkey.to_vec(),
+                    sequence: 0,
+                },
+                TxIn {
+                    prev_out: OutPoint {
+                        txid: genesis_coinbase.txid(),
+                        vout: 1,
+                    },
+                    signature: vec![],
+                    pubkey_compressed: miner_pubkey.to_vec(),
+                    sequence: 0,
+                },
+            ],
+            outputs: vec![TxOut {
+                value: 45,
+                key_hash20: receiver_key_hash,
+            }],
+            lock_time: 0,
+        };
+        sign_input(&mut spend, 0, chain_domain, &miner_secret);
+        sign_input(&mut spend, 1, chain_domain, &miner_secret);
+
+        let block1_coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: OutPoint::coinbase(),
+                signature: b"b1".to_vec(),
+                pubkey_compressed: vec![],
+                sequence: u32::MAX,
+            }],
+            outputs: vec![TxOut {
+                value: 55,
+                key_hash20: receiver_key_hash,
+            }],
+            lock_time: 0,
+        };
+        let block1 = make_block(
+            genesis.header.block_hash(),
+            220,
+            Target::MAX,
+            vec![block1_coinbase, spend],
+        );
+
+        let summary = validate_and_apply_block(&block1, 1, 50, 1, chain_domain, &mut utxos)
+            .expect("block applies");
+        assert_eq!(summary.tx_count, 2);
+        assert_eq!(summary.spent_utxos, 2);
+        assert_eq!(summary.created_utxos, 2);
+        assert_eq!(summary.total_fees, 5);
+        assert_eq!(summary.coinbase_value, 55);
+    }
+
+    #[test]
+    fn coinbase_reward_above_subsidy_plus_fees_is_rejected() {
+        let chain_domain = b"devnet";
+        let (miner_pubkey, miner_key_hash, miner_secret) = key_material([111u8; 32]);
+        let (_, receiver_key_hash, _) = key_material([112u8; 32]);
+
+        let genesis_coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: OutPoint::coinbase(),
+                signature: b"genesis".to_vec(),
+                pubkey_compressed: vec![],
+                sequence: u32::MAX,
+            }],
+            outputs: vec![TxOut {
+                value: 50,
+                key_hash20: miner_key_hash,
+            }],
+            lock_time: 0,
+        };
+        let genesis = make_block(
+            Hash256::ZERO,
+            100,
+            Target::MAX,
+            vec![genesis_coinbase.clone()],
+        );
+        let mut utxos = UtxoSet::new();
+        validate_and_apply_block(&genesis, 0, 50, 1, chain_domain, &mut utxos)
+            .expect("genesis applies");
+
+        let mut spend = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: OutPoint {
+                    txid: genesis_coinbase.txid(),
+                    vout: 0,
+                },
+                signature: vec![],
+                pubkey_compressed: miner_pubkey.to_vec(),
+                sequence: 0,
+            }],
+            outputs: vec![TxOut {
+                value: 45,
+                key_hash20: receiver_key_hash,
+            }],
+            lock_time: 0,
+        };
+        sign_input(&mut spend, 0, chain_domain, &miner_secret);
+
+        let block1_coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: OutPoint::coinbase(),
+                signature: b"b1".to_vec(),
+                pubkey_compressed: vec![],
+                sequence: u32::MAX,
+            }],
+            outputs: vec![TxOut {
+                value: 56,
+                key_hash20: receiver_key_hash,
+            }],
+            lock_time: 0,
+        };
+        let block1 = make_block(
+            genesis.header.block_hash(),
+            220,
+            Target::MAX,
+            vec![block1_coinbase, spend],
+        );
+
+        let err = validate_and_apply_block(&block1, 1, 50, 1, chain_domain, &mut utxos)
+            .expect_err("coinbase above subsidy + fees must fail");
+        match err {
+            TxValidationError::CoinbaseRewardTooHigh { allowed, got } => {
+                assert_eq!(allowed, 55);
+                assert_eq!(got, 56);
+            }
+            other => panic!("expected CoinbaseRewardTooHigh, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zero_fee_spend_is_valid() {
+        let chain_domain = b"devnet";
+        let (miner_pubkey, miner_key_hash, miner_secret) = key_material([121u8; 32]);
+        let (_, receiver_key_hash, _) = key_material([122u8; 32]);
+
+        let genesis_coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: OutPoint::coinbase(),
+                signature: b"genesis".to_vec(),
+                pubkey_compressed: vec![],
+                sequence: u32::MAX,
+            }],
+            outputs: vec![TxOut {
+                value: 50,
+                key_hash20: miner_key_hash,
+            }],
+            lock_time: 0,
+        };
+        let genesis = make_block(
+            Hash256::ZERO,
+            100,
+            Target::MAX,
+            vec![genesis_coinbase.clone()],
+        );
+        let mut utxos = UtxoSet::new();
+        validate_and_apply_block(&genesis, 0, 50, 1, chain_domain, &mut utxos)
+            .expect("genesis applies");
+
+        let mut spend = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: OutPoint {
+                    txid: genesis_coinbase.txid(),
+                    vout: 0,
+                },
+                signature: vec![],
+                pubkey_compressed: miner_pubkey.to_vec(),
+                sequence: 0,
+            }],
+            outputs: vec![TxOut {
+                value: 50,
+                key_hash20: receiver_key_hash,
+            }],
+            lock_time: 0,
+        };
+        sign_input(&mut spend, 0, chain_domain, &miner_secret);
+
+        let block1_coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: OutPoint::coinbase(),
+                signature: b"b1".to_vec(),
+                pubkey_compressed: vec![],
+                sequence: u32::MAX,
+            }],
+            outputs: vec![TxOut {
+                value: 50,
+                key_hash20: receiver_key_hash,
+            }],
+            lock_time: 0,
+        };
+        let block1 = make_block(
+            genesis.header.block_hash(),
+            220,
+            Target::MAX,
+            vec![block1_coinbase, spend],
+        );
+
+        let summary = validate_and_apply_block(&block1, 1, 50, 1, chain_domain, &mut utxos)
+            .expect("zero-fee spend should pass");
+        assert_eq!(summary.total_fees, 0);
+        assert_eq!(summary.coinbase_value, 50);
     }
 }

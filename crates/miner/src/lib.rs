@@ -117,7 +117,10 @@ pub fn build_template_from_mempool(
     let mut included = Vec::<Hash256>::new();
     let mut included_set = HashSet::<Hash256>::new();
 
-    while included.len() < params.max_txs {
+    loop {
+        if included.len() >= params.max_txs {
+            break;
+        }
         let ready_roots = ranked
             .iter()
             .copied()
@@ -155,13 +158,7 @@ pub fn build_template_from_mempool(
             }
             match &best {
                 Some(current) => {
-                    if package.score_key > current.score_key
-                        || (package.score_key == current.score_key
-                            && package.total_fee > current.total_fee)
-                        || (package.score_key == current.score_key
-                            && package.total_fee == current.total_fee
-                            && package.root < current.root)
-                    {
+                    if package_beats_current(&package, current) {
                         best = Some(package);
                     }
                 }
@@ -272,7 +269,7 @@ fn build_cpfp_package(
                 continue;
             };
             for child in descendants {
-                if included_set.contains(child) || package.contains(child) {
+                if included_set.contains(child) {
                     continue;
                 }
                 let Some(entry) = entries.get(child) else {
@@ -283,8 +280,7 @@ fn build_cpfp_package(
                     .iter()
                     .all(|parent| included_set.contains(parent) || package.contains(parent));
                 if all_parents_ready {
-                    package.insert(*child);
-                    changed = true;
+                    changed |= package.insert(*child);
                 }
             }
         }
@@ -297,18 +293,21 @@ fn build_cpfp_package(
     let mut ordered = Vec::<Hash256>::new();
     let mut total_fee = 0u64;
     let mut total_size = 0usize;
+    let package_limit = package.len().min(max_package_txs);
 
     // Safety bound: each pass must either order at least one txid or terminate.
     for _ in 0..=entries.len() {
-        if remaining.is_empty() || ordered.len() >= max_package_txs {
+        if remaining.is_empty() || ordered.len() >= package_limit {
             break;
         }
         let mut progressed = false;
-        for txid in ranked {
-            if !remaining.contains(txid) {
-                continue;
-            }
-            let Some(entry) = entries.get(txid) else {
+        let ready_ranked = ranked
+            .iter()
+            .copied()
+            .filter(|txid| remaining.contains(txid))
+            .collect::<Vec<_>>();
+        for txid in ready_ranked {
+            let Some(entry) = entries.get(&txid) else {
                 continue;
             };
             let parents_ready = entry
@@ -318,12 +317,12 @@ fn build_cpfp_package(
             if !parents_ready {
                 continue;
             }
-            remaining.remove(txid);
-            ordered.push(*txid);
+            remaining.remove(&txid);
+            ordered.push(txid);
             total_fee = total_fee.saturating_add(entry.fee);
             total_size = total_size.saturating_add(entry.size);
             progressed = true;
-            if ordered.len() >= max_package_txs {
+            if ordered.len() >= package_limit {
                 break;
             }
         }
@@ -344,6 +343,18 @@ fn build_cpfp_package(
         total_size,
         score_key,
     }
+}
+
+fn package_beats_current(candidate: &PackageCandidate, current: &PackageCandidate) -> bool {
+    (
+        candidate.score_key,
+        candidate.total_fee,
+        std::cmp::Reverse(candidate.root),
+    ) > (
+        current.score_key,
+        current.total_fee,
+        std::cmp::Reverse(current.root),
+    )
 }
 
 impl TemplateManager {
@@ -449,7 +460,7 @@ mod tests {
     use scam_core::{OutPoint, Target, Transaction, TxIn, TxOut};
     use scam_mempool::Mempool;
 
-    use super::{CandidateEntry, build_cpfp_package};
+    use super::{CandidateEntry, PackageCandidate, build_cpfp_package, package_beats_current};
     use crate::{
         BlockTemplate, MempoolTemplateParams, TemplateManager, TemplateRefresh,
         build_template_from_mempool, mine_block, mine_block_with_extra_nonce,
@@ -549,6 +560,31 @@ mod tests {
         assert_eq!(summary.total_fees, 60);
         assert_eq!(template.transactions.len(), 3);
         assert_eq!(template.transactions[0].outputs[0].value, 160);
+    }
+
+    #[test]
+    fn template_builder_respects_zero_max_txs() {
+        let mut mempool = Mempool::with_policy(100, 0).expect("mempool");
+        let tx_a = spend_tx([61u8; 32], 0, b"zero-limit-a", 1);
+        let tx_b = spend_tx([62u8; 32], 0, b"zero-limit-b", 2);
+        mempool.insert_with_fee(tx_a, 10).expect("insert a");
+        mempool.insert_with_fee(tx_b, 50).expect("insert b");
+
+        let params = MempoolTemplateParams {
+            version: 1,
+            prev_block: scam_core::Hash256::ZERO,
+            timestamp: 1_770_763_200,
+            target: Target::MAX,
+            block_subsidy: 100,
+            miner_key_hash20: [9u8; 20],
+            coinbase_tag: "zero-max-txs".to_owned(),
+            max_txs: 0,
+        };
+        let (template, summary) = build_template_from_mempool(&params, &mempool).expect("template");
+        assert!(summary.included_txids.is_empty());
+        assert_eq!(summary.total_fees, 0);
+        assert_eq!(template.transactions.len(), 1);
+        assert_eq!(template.transactions[0].outputs[0].value, 100);
     }
 
     #[test]
@@ -759,6 +795,103 @@ mod tests {
         assert_eq!(package.total_fee, 0);
         assert_eq!(package.total_size, 0);
         assert_eq!(package.score_key, 0);
+    }
+
+    #[test]
+    fn cpfp_package_builder_ignores_ranked_entries_outside_package() {
+        let root = scam_core::Hash256([41u8; 32]);
+        let child = scam_core::Hash256([42u8; 32]);
+        let outsider_a = scam_core::Hash256([90u8; 32]);
+        let outsider_b = scam_core::Hash256([91u8; 32]);
+
+        let ranked = vec![outsider_a, outsider_b, child, root];
+        let mut entries = HashMap::<scam_core::Hash256, CandidateEntry>::new();
+        entries.insert(
+            root,
+            CandidateEntry {
+                fee: 1,
+                size: 100,
+                parents: vec![],
+            },
+        );
+        entries.insert(
+            child,
+            CandidateEntry {
+                fee: 2,
+                size: 100,
+                parents: vec![root],
+            },
+        );
+        entries.insert(
+            outsider_a,
+            CandidateEntry {
+                fee: 999,
+                size: 100,
+                parents: vec![],
+            },
+        );
+        entries.insert(
+            outsider_b,
+            CandidateEntry {
+                fee: 888,
+                size: 100,
+                parents: vec![],
+            },
+        );
+
+        let mut children = HashMap::<scam_core::Hash256, Vec<scam_core::Hash256>>::new();
+        children.insert(root, vec![child]);
+        let included = HashSet::new();
+
+        let package = build_cpfp_package(root, &ranked, &entries, &children, &included, 2);
+        assert_eq!(package.ordered_txids, vec![root, child]);
+    }
+
+    #[test]
+    fn package_comparator_uses_score_fee_and_root_tiebreak() {
+        let base = PackageCandidate {
+            root: scam_core::Hash256([10u8; 32]),
+            ordered_txids: vec![],
+            total_fee: 100,
+            total_size: 200,
+            score_key: 500,
+        };
+
+        let higher_score = PackageCandidate {
+            root: scam_core::Hash256([11u8; 32]),
+            ordered_txids: vec![],
+            total_fee: 1,
+            total_size: 1,
+            score_key: 501,
+        };
+        assert!(package_beats_current(&higher_score, &base));
+
+        let same_score_higher_fee = PackageCandidate {
+            root: scam_core::Hash256([12u8; 32]),
+            ordered_txids: vec![],
+            total_fee: 101,
+            total_size: 200,
+            score_key: 500,
+        };
+        assert!(package_beats_current(&same_score_higher_fee, &base));
+
+        let same_score_fee_lower_root = PackageCandidate {
+            root: scam_core::Hash256([9u8; 32]),
+            ordered_txids: vec![],
+            total_fee: 100,
+            total_size: 200,
+            score_key: 500,
+        };
+        assert!(package_beats_current(&same_score_fee_lower_root, &base));
+
+        let same_score_fee_higher_root = PackageCandidate {
+            root: scam_core::Hash256([20u8; 32]),
+            ordered_txids: vec![],
+            total_fee: 100,
+            total_size: 200,
+            score_key: 500,
+        };
+        assert!(!package_beats_current(&same_score_fee_higher_root, &base));
     }
 
     #[test]

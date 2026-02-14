@@ -40,9 +40,7 @@ pub fn retarget_next(
     if next.is_zero() {
         next = BigUint::one();
     }
-    if next > max {
-        next = max;
-    }
+    next = next.min(max);
 
     biguint_to_target(&next)
 }
@@ -105,9 +103,7 @@ pub fn lwma_next(
         next = BigUint::one();
     }
     let max = target_to_biguint(max_target);
-    if next > max {
-        next = max;
-    }
+    next = next.min(max);
 
     biguint_to_target(&next)
 }
@@ -157,9 +153,7 @@ pub fn asert_next(
     }
 
     let max = target_to_biguint(max_target);
-    if next > max {
-        next = max;
-    }
+    next = next.min(max);
 
     biguint_to_target(&next)
 }

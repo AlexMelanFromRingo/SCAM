@@ -46,6 +46,7 @@ use scam_wallet::{
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::runtime::Builder as TokioRuntimeBuilder;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
@@ -4522,18 +4523,11 @@ fn read_sv2_message(
         Some(StratumSecureTransport::Noise(transport)) => transport.read_message(stream),
         None => read_sv2_frame(stream),
     };
-    match read_result {
-        Ok(Some(message)) => Ok(StratumReadOutcome::Message(message)),
-        Ok(None) => Ok(StratumReadOutcome::Closed),
-        Err(scam_stratum::StratumError::Io(err)) if sv2_io_error_is_timeout_like(&err) => {
-            Ok(StratumReadOutcome::Timeout)
-        }
-        Err(err) => Err(NodeError::Runtime(format!("stratum read failed: {err}"))),
-    }
+    map_sv2_read_result(read_result)
 }
 
-async fn read_sv2_message_async(
-    stream: &mut tokio::net::TcpStream,
+async fn read_sv2_message_async<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
     secure: Option<&mut StratumSecureTransport>,
     read_timeout: Duration,
 ) -> Result<StratumReadOutcome, NodeError> {
@@ -4597,10 +4591,10 @@ fn lock_runtime<'a>(
 }
 
 #[allow(dead_code)]
-async fn issue_new_stratum_job_async(
+async fn issue_new_stratum_job_async<S: AsyncRead + AsyncWrite + Unpin>(
     session: &mut Sv2Session,
     ctx: &StratumServerContext,
-    stream: &mut tokio::net::TcpStream,
+    stream: &mut S,
     secure: &mut Option<StratumSecureTransport>,
     jobs: &mut HashMap<u32, StratumWork>,
 ) -> Result<Hash256, NodeError> {
@@ -4703,8 +4697,8 @@ fn load_runtime_tip_hash(ctx: &StratumServerContext) -> Result<Hash256, NodeErro
     Ok(runtime.tip_hash())
 }
 
-async fn run_stratum_client_async(
-    mut stream: tokio::net::TcpStream,
+async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: S,
     ctx: StratumServerContext,
     _permit: OwnedSemaphorePermit,
 ) -> Result<(), NodeError> {
@@ -4872,7 +4866,8 @@ async fn run_stratum_client_async(
                                 }
 
                                 jobs.clear();
-                                if channel_id == session.channel_id() {
+                                if should_reissue_job_for_channel(channel_id, session.channel_id())
+                                {
                                     last_tip_hash = issue_new_stratum_job_async(
                                         &mut session,
                                         &ctx,
@@ -4944,6 +4939,19 @@ fn max_requests_reached(max_requests: u32, served: u32) -> bool {
     max_requests > 0 && served >= max_requests
 }
 
+fn map_sv2_read_result(
+    read_result: Result<Option<Sv2Message>, scam_stratum::StratumError>,
+) -> Result<StratumReadOutcome, NodeError> {
+    match read_result {
+        Ok(Some(message)) => Ok(StratumReadOutcome::Message(message)),
+        Ok(None) => Ok(StratumReadOutcome::Closed),
+        Err(scam_stratum::StratumError::Io(err)) if sv2_io_error_is_timeout_like(&err) => {
+            Ok(StratumReadOutcome::Timeout)
+        }
+        Err(err) => Err(NodeError::Runtime(format!("stratum read failed: {err}"))),
+    }
+}
+
 fn has_inventory_delta_changes(announced_len: usize, removed_len: usize) -> bool {
     announced_len != 0 || removed_len != 0
 }
@@ -4963,6 +4971,10 @@ fn relay_io_error_is_nonfatal(err: &std::io::Error) -> bool {
             | std::io::ErrorKind::WouldBlock
             | std::io::ErrorKind::Interrupted
             | std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::NotConnected
     )
 }
 
@@ -5014,8 +5026,20 @@ fn should_process_share_as_block(is_block: bool) -> bool {
     is_block
 }
 
+fn should_reissue_job_for_channel(channel_id: u32, active_channel_id: u32) -> bool {
+    channel_id == active_channel_id
+}
+
+fn should_send_open_standard_channel(open_sent: bool) -> bool {
+    !open_sent
+}
+
 fn should_emit_miner_keepalive(elapsed_sec: u64) -> bool {
     elapsed_sec >= 10
+}
+
+fn wallet_send_preview_has_invalid_amount(amount: u64) -> bool {
+    amount == 0
 }
 
 fn share_target_in_bounds(
@@ -5765,7 +5789,7 @@ fn run_stratum_mine(args: StratumMineArgs) -> Result<(), NodeError> {
             }
             StratumReadOutcome::Message(message) => match message {
                 Sv2Message::SetupConnectionSuccess { .. } => {
-                    if !open_sent {
+                    if should_send_open_standard_channel(open_sent) {
                         send_sv2_sync!(&Sv2Message::OpenStandardMiningChannel {
                             request_id: 1,
                             user: args.user.clone(),
@@ -6639,6 +6663,26 @@ fn parse_content_length(headers: &str) -> Result<usize, NodeError> {
     Ok(0)
 }
 
+fn http_io_error_is_timeout_like(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::Interrupted
+    )
+}
+
+fn http_io_error_is_closed_like(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::NotConnected
+    )
+}
+
 fn read_http_request<R: Read>(stream: &mut R) -> Result<Option<HttpRequest>, NodeError> {
     let mut buffer = Vec::<u8>::with_capacity(4096);
     let mut chunk = [0u8; 4096];
@@ -6646,9 +6690,28 @@ fn read_http_request<R: Read>(stream: &mut R) -> Result<Option<HttpRequest>, Nod
     let mut content_length = 0usize;
 
     loop {
-        let read = stream
-            .read(&mut chunk)
-            .map_err(|e| NodeError::Runtime(format!("http read failed: {e}")))?;
+        let read = match stream.read(&mut chunk) {
+            Ok(read) => read,
+            Err(err) if http_io_error_is_timeout_like(&err) => {
+                if buffer.is_empty() {
+                    return Ok(None);
+                }
+                return Err(NodeError::Runtime(format!(
+                    "http read timeout while waiting for full request: {err}"
+                )));
+            }
+            Err(err) if http_io_error_is_closed_like(&err) => {
+                if buffer.is_empty() {
+                    return Ok(None);
+                }
+                return Err(NodeError::Runtime(format!(
+                    "http connection closed while reading request: {err}"
+                )));
+            }
+            Err(err) => {
+                return Err(NodeError::Runtime(format!("http read failed: {err}")));
+            }
+        };
         if read == 0 {
             if buffer.is_empty() {
                 return Ok(None);
@@ -6858,12 +6921,37 @@ fn rpc_tx_path_is_invalid(height_raw: &str, index_raw: &str, has_extra: bool) ->
     height_raw.is_empty() || index_raw.is_empty() || has_extra
 }
 
+fn parse_tx_height_and_index(height_raw: &str, index_raw: &str) -> Option<(u64, usize)> {
+    match (height_raw.parse::<u64>(), index_raw.parse::<usize>()) {
+        (Ok(height), Ok(index)) => Some((height, index)),
+        _ => None,
+    }
+}
+
 fn address_hrp_is_accepted(accepted_hrps: &[String], hrp: &str) -> bool {
     accepted_hrps.iter().any(|candidate| candidate == hrp)
 }
 
+fn should_reject_send_preview_hrp(accepted_hrps: &[String], hrp: &str) -> bool {
+    !address_hrp_is_accepted(accepted_hrps, hrp)
+}
+
 fn should_attempt_ui_asset_serve(method: &str) -> bool {
     is_get_method(method)
+}
+
+fn should_serve_ui_asset_for_route(method: &str, ui_served: bool) -> bool {
+    should_attempt_ui_asset_serve(method) && ui_served
+}
+
+fn should_reply_bad_http_request(err: &NodeError) -> bool {
+    match err {
+        NodeError::Runtime(msg) => {
+            !(msg.contains("http read timeout while waiting for full request")
+                || msg.contains("http connection closed while reading request"))
+        }
+        _ => true,
+    }
 }
 
 fn run_rpc_serve(args: RpcServeArgs) -> Result<(), NodeError> {
@@ -6924,8 +7012,10 @@ fn run_rpc_serve(args: RpcServeArgs) -> Result<(), NodeError> {
             Ok(Some(request)) => request,
             Ok(None) => continue,
             Err(err) => {
-                let body = json_error_body(&err.to_string());
-                write_http_json_response(&mut stream, "400 Bad Request", &body)?;
+                if should_reply_bad_http_request(&err) {
+                    let body = json_error_body(&err.to_string());
+                    let _ = write_http_json_response(&mut stream, "400 Bad Request", &body);
+                }
                 continue;
             }
         };
@@ -7022,8 +7112,8 @@ fn run_rpc_serve(args: RpcServeArgs) -> Result<(), NodeError> {
                     json_error_body("tx path must be /tx/<height>/<index>"),
                 )
             } else {
-                match (height_raw.parse::<u64>(), index_raw.parse::<usize>()) {
-                    (Ok(height), Ok(index)) => match runtime.block_hash_at_height(height) {
+                match parse_tx_height_and_index(height_raw, index_raw) {
+                    Some((height, index)) => match runtime.block_hash_at_height(height) {
                         Some(hash) => match runtime.block_by_hash(&hash) {
                             Some(block) => match block.transactions.get(index) {
                                 Some(tx) => {
@@ -7055,7 +7145,7 @@ fn run_rpc_serve(args: RpcServeArgs) -> Result<(), NodeError> {
                             json_error_body(&format!("height {height} not found")),
                         ),
                     },
-                    _ => (
+                    None => (
                         "400 Bad Request",
                         json_error_body("invalid tx path numbers, expected /tx/<height>/<index>"),
                     ),
@@ -7243,7 +7333,7 @@ fn run_rpc_serve(args: RpcServeArgs) -> Result<(), NodeError> {
                     continue;
                 }
             };
-            if req.amount == 0 {
+            if wallet_send_preview_has_invalid_amount(req.amount) {
                 let body = json_error_body("amount must be > 0");
                 write_http_json_response(&mut stream, "400 Bad Request", &body)?;
                 continue;
@@ -7257,7 +7347,7 @@ fn run_rpc_serve(args: RpcServeArgs) -> Result<(), NodeError> {
                 }
             };
             let accepted_hrps = accepted_hrps_for_network(network, &cfg.hrp);
-            if !address_hrp_is_accepted(&accepted_hrps, &recipient.hrp) {
+            if should_reject_send_preview_hrp(&accepted_hrps, &recipient.hrp) {
                 let body = json_error_body(&format!(
                     "address hrp '{}' is not valid for network '{}' (accepted: {})",
                     recipient.hrp,
@@ -7356,9 +7446,12 @@ fn run_rpc_serve(args: RpcServeArgs) -> Result<(), NodeError> {
                 ),
             }
         } else {
-            if should_attempt_ui_asset_serve(method)
-                && try_serve_ui_asset(&mut stream, &ui_dir, path)?
-            {
+            let ui_served = if should_attempt_ui_asset_serve(method) {
+                try_serve_ui_asset(&mut stream, &ui_dir, path)?
+            } else {
+                false
+            };
+            if should_serve_ui_asset_for_route(method, ui_served) {
                 served = served.saturating_add(1);
                 if max_requests_reached(max_requests, served) {
                     break;
@@ -7780,8 +7873,10 @@ mod tests {
 
         let io_timeout = std::io::Error::from(std::io::ErrorKind::TimedOut);
         let io_reset = std::io::Error::from(std::io::ErrorKind::ConnectionReset);
+        let io_broken_pipe = std::io::Error::from(std::io::ErrorKind::BrokenPipe);
         assert!(super::relay_io_error_is_nonfatal(&io_timeout));
-        assert!(!super::relay_io_error_is_nonfatal(&io_reset));
+        assert!(super::relay_io_error_is_nonfatal(&io_reset));
+        assert!(super::relay_io_error_is_nonfatal(&io_broken_pipe));
         assert!(super::sv2_io_error_is_timeout_like(&io_timeout));
         assert!(!super::sv2_io_error_is_timeout_like(&io_reset));
 
@@ -7820,9 +7915,28 @@ mod tests {
 
         assert!(super::should_process_share_as_block(true));
         assert!(!super::should_process_share_as_block(false));
+        assert!(super::should_reissue_job_for_channel(7, 7));
+        assert!(!super::should_reissue_job_for_channel(7, 8));
+        assert!(super::should_send_open_standard_channel(false));
+        assert!(!super::should_send_open_standard_channel(true));
         assert!(!super::should_emit_miner_keepalive(9));
         assert!(super::should_emit_miner_keepalive(10));
         assert!(super::should_emit_miner_keepalive(11));
+        assert!(super::wallet_send_preview_has_invalid_amount(0));
+        assert!(!super::wallet_send_preview_has_invalid_amount(1));
+        assert!(!super::should_reply_bad_http_request(
+            &super::NodeError::Runtime(
+                "http read timeout while waiting for full request: timed out".to_owned()
+            )
+        ));
+        assert!(!super::should_reply_bad_http_request(
+            &super::NodeError::Runtime(
+                "http connection closed while reading request: broken pipe".to_owned()
+            )
+        ));
+        assert!(super::should_reply_bad_http_request(
+            &super::NodeError::Runtime("malformed http request".to_owned())
+        ));
 
         assert!(super::share_target_in_bounds(
             Target::MAX,
@@ -7868,8 +7982,47 @@ mod tests {
         let reset = super::map_relay_read_result(Err(scam_p2p::TransportError::Io(
             std::io::Error::from(std::io::ErrorKind::ConnectionReset),
         )))
-        .expect_err("fatal io error must bubble up");
-        assert!(reset.to_string().contains("io error"));
+        .expect("connection reset should be non-fatal");
+        assert!(reset.is_none());
+
+        let broken = super::map_relay_read_result(Err(scam_p2p::TransportError::Io(
+            std::io::Error::from(std::io::ErrorKind::BrokenPipe),
+        )))
+        .expect("broken pipe should be non-fatal");
+        assert!(broken.is_none());
+
+        let denied = super::map_relay_read_result(Err(scam_p2p::TransportError::Io(
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        )))
+        .expect_err("unexpected io errors must bubble up");
+        assert!(denied.to_string().contains("io error"));
+    }
+
+    #[test]
+    fn map_sv2_read_result_handles_timeout_and_fatal_errors() {
+        let timeout = super::map_sv2_read_result(Err(scam_stratum::StratumError::Io(
+            std::io::Error::from(std::io::ErrorKind::TimedOut),
+        )))
+        .expect("timeout maps to read timeout");
+        assert!(matches!(timeout, super::StratumReadOutcome::Timeout));
+
+        let keepalive = super::map_sv2_read_result(Ok(Some(Sv2Message::KeepAlive)))
+            .expect("message pass-through");
+        assert!(matches!(
+            keepalive,
+            super::StratumReadOutcome::Message(Sv2Message::KeepAlive)
+        ));
+
+        let closed = super::map_sv2_read_result(Ok(None)).expect("closed pass-through");
+        assert!(matches!(closed, super::StratumReadOutcome::Closed));
+
+        let fatal = match super::map_sv2_read_result(Err(
+            scam_stratum::StratumError::InvalidFrameLength(17),
+        )) {
+            Ok(_) => panic!("fatal stratum error should bubble up"),
+            Err(err) => err,
+        };
+        assert!(fatal.to_string().contains("stratum read failed"));
     }
 
     #[test]
@@ -7969,15 +8122,96 @@ mod tests {
         assert!(super::rpc_tx_path_is_invalid("", "2", false));
         assert!(super::rpc_tx_path_is_invalid("10", "", false));
         assert!(!super::rpc_tx_path_is_invalid("10", "2", false));
+        assert_eq!(super::parse_tx_height_and_index("10", "2"), Some((10, 2)));
+        assert_eq!(super::parse_tx_height_and_index("ten", "2"), None);
+        assert_eq!(super::parse_tx_height_and_index("10", "two"), None);
 
         let accepted = vec!["sd".to_owned(), "td".to_owned()];
         assert!(super::address_hrp_is_accepted(&accepted, "sd"));
         assert!(!super::address_hrp_is_accepted(&accepted, "s"));
+        assert!(!super::should_reject_send_preview_hrp(&accepted, "sd"));
+        assert!(super::should_reject_send_preview_hrp(&accepted, "s"));
         assert!(super::should_attempt_ui_asset_serve("GET"));
         assert!(!super::should_attempt_ui_asset_serve("POST"));
+        assert!(super::should_serve_ui_asset_for_route("GET", true));
+        assert!(!super::should_serve_ui_asset_for_route("GET", false));
+        assert!(!super::should_serve_ui_asset_for_route("POST", true));
 
         assert!(super::role_service_response_is_empty(0));
         assert!(!super::role_service_response_is_empty(1));
+    }
+
+    #[test]
+    fn run_stratum_client_async_rejects_submit_before_setup_without_tcp_socket() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let runtime_db_path = temp_dir("test-stratum-client-async-logic").join("runtime.redb");
+        let ctx = super::StratumServerContext {
+            cfg: cfg.clone(),
+            runtime: std::sync::Arc::new(std::sync::Mutex::new(runtime)),
+            runtime_db_path,
+            share_target: Target::MAX,
+            min_share_target: Target::from_hex(&cfg.stratum_min_share_target)
+                .expect("min share target parse"),
+            max_share_target: Target::from_hex(&cfg.stratum_max_share_target)
+                .expect("max share target parse"),
+            vardiff_target_shares_per_minute: cfg.stratum_vardiff_target_shares_per_minute,
+            vardiff_retarget_interval_shares: cfg.stratum_vardiff_retarget_interval_shares as usize,
+            vardiff_clamp_up: cfg.stratum_vardiff_clamp_up,
+            vardiff_clamp_down: cfg.stratum_vardiff_clamp_down,
+            max_rejected_shares: cfg.stratum_max_rejected_shares,
+            read_timeout_sec: 1,
+            keepalive_sec: 1,
+            idle_timeout_sec: 3,
+            next_channel_id: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            template_provider: super::RuntimeTemplateProvider,
+            job_declarator: std::sync::Arc::new(std::sync::Mutex::new(
+                scam_stratum::SequentialJobDeclarator::default(),
+            )),
+            max_jobs_per_channel: cfg.stratum_max_jobs_per_channel as usize,
+            active_clients: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            secure_transport: false,
+            secure_transport_mode: super::SecureTransportMode::NoiseXx,
+            secure_rekey_interval_messages: 16,
+            secure_static_private_key: None,
+            secure_expected_remote_static_public_key: None,
+            template_provider_addr: None,
+            job_declarator_addr: None,
+        };
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        rt.block_on(async move {
+            let (mut peer, server_stream) = tokio::io::duplex(8 * 1024);
+            super::write_sv2_frame_async(
+                &mut peer,
+                &Sv2Message::SubmitSharesStandard {
+                    channel_id: 1,
+                    job_id: 7,
+                    nonce: 0,
+                    ntime: 0,
+                },
+            )
+            .await
+            .expect("send malformed-for-state message");
+            drop(peer);
+
+            let permit = std::sync::Arc::new(tokio::sync::Semaphore::new(1))
+                .acquire_owned()
+                .await
+                .expect("permit");
+            let err = super::run_stratum_client_async(server_stream, ctx, permit)
+                .await
+                .expect_err("submit-before-setup must be rejected");
+            assert!(
+                err.to_string()
+                    .contains("submit_share received before active channel"),
+                "unexpected error: {err}"
+            );
+        });
     }
 
     #[test]
@@ -9449,6 +9683,49 @@ mod tests {
     }
 
     #[test]
+    fn read_http_request_timeout_without_bytes_is_treated_as_no_request() {
+        struct TimeoutReader;
+
+        impl Read for TimeoutReader {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(std::io::ErrorKind::TimedOut))
+            }
+        }
+
+        let mut reader = TimeoutReader;
+        let parsed = super::read_http_request(&mut reader).expect("timeout without bytes");
+        assert!(
+            parsed.is_none(),
+            "idle timeout should be treated as empty request"
+        );
+    }
+
+    #[test]
+    fn read_http_request_timeout_after_partial_payload_is_rejected() {
+        #[derive(Default)]
+        struct PartialThenTimeout {
+            calls: usize,
+        }
+
+        impl Read for PartialThenTimeout {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.calls == 0 {
+                    let part = b"POST /wallet/new HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nab";
+                    let len = part.len().min(buf.len());
+                    buf[..len].copy_from_slice(&part[..len]);
+                    self.calls = 1;
+                    return Ok(len);
+                }
+                Err(std::io::Error::from(std::io::ErrorKind::TimedOut))
+            }
+        }
+
+        let mut reader = PartialThenTimeout::default();
+        let err = super::read_http_request(&mut reader).expect_err("partial timeout must fail");
+        assert!(err.to_string().contains("timeout"));
+    }
+
+    #[test]
     fn read_role_request_handles_empty_invalid_and_valid_payloads() {
         let mut empty = std::io::Cursor::new(Vec::<u8>::new());
         let err = super::read_role_request::<serde_json::Value, _>(&mut empty)
@@ -10273,6 +10550,24 @@ mod tests {
         assert_eq!(runtime.tip_height(), 2);
 
         peer_server.join().expect("peer join").expect("peer ok");
+    }
+
+    #[test]
+    fn sync_runtime_with_peer_reports_connect_failure_for_unreachable_peer() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let mut runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let invalid_peer = "invalid-peer-address";
+
+        let err = super::sync_runtime_with_peer(
+            &cfg,
+            &mut runtime,
+            invalid_peer,
+            1,
+            "scam-node/test-sync-unreachable",
+        )
+        .expect_err("invalid peer address must fail");
+        assert!(err.to_string().contains("connect to"));
     }
 
     #[test]
