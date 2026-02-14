@@ -2538,36 +2538,37 @@ fn run_sync_demo(args: SyncDemoArgs) -> Result<(), NodeError> {
     Ok(())
 }
 
-trait TimeoutConfigurableStream {
-    fn set_read_timeout_cfg(&self, duration: Option<Duration>) -> std::io::Result<()>;
-    fn set_write_timeout_cfg(&self, duration: Option<Duration>) -> std::io::Result<()>;
-}
-
-impl TimeoutConfigurableStream for TcpStream {
-    fn set_read_timeout_cfg(&self, duration: Option<Duration>) -> std::io::Result<()> {
-        self.set_read_timeout(duration)
-    }
-
-    fn set_write_timeout_cfg(&self, duration: Option<Duration>) -> std::io::Result<()> {
-        self.set_write_timeout(duration)
-    }
-}
-
-fn configure_stream_timeouts_with<S: TimeoutConfigurableStream>(
-    stream: &S,
+fn configure_stream_timeouts_with_ops<SetRead, SetWrite>(
+    set_read_timeout: SetRead,
+    set_write_timeout: SetWrite,
     read_timeout: Duration,
     write_timeout: Duration,
-) -> Result<(), NodeError> {
-    stream
-        .set_read_timeout_cfg(Some(read_timeout))
+) -> Result<(), NodeError>
+where
+    SetRead: FnOnce(Option<Duration>) -> std::io::Result<()>,
+    SetWrite: FnOnce(Option<Duration>) -> std::io::Result<()>,
+{
+    set_read_timeout(Some(read_timeout))
         .map_err(|e| NodeError::Runtime(format!("set read timeout failed: {e}")))?;
-    stream
-        .set_write_timeout_cfg(Some(write_timeout))
+    set_write_timeout(Some(write_timeout))
         .map_err(|e| NodeError::Runtime(format!("set write timeout failed: {e}")))?;
     Ok(())
 }
 
-fn configure_stream_timeouts<S: TimeoutConfigurableStream>(stream: &S) -> Result<(), NodeError> {
+fn configure_stream_timeouts_with(
+    stream: &TcpStream,
+    read_timeout: Duration,
+    write_timeout: Duration,
+) -> Result<(), NodeError> {
+    configure_stream_timeouts_with_ops(
+        |duration| stream.set_read_timeout(duration),
+        |duration| stream.set_write_timeout(duration),
+        read_timeout,
+        write_timeout,
+    )
+}
+
+fn configure_stream_timeouts(stream: &TcpStream) -> Result<(), NodeError> {
     configure_stream_timeouts_with(stream, Duration::from_secs(5), Duration::from_secs(5))
 }
 
@@ -2931,7 +2932,7 @@ fn sync_runtime_with_peer(
             .copied()
             .filter(|hash| runtime.block_by_hash(hash).is_none())
             .collect::<Vec<_>>();
-        if unknown_hashes.is_empty() {
+        if !has_unknown_hashes(&unknown_hashes) {
             break;
         }
 
@@ -3384,7 +3385,7 @@ fn process_relay_wire_message(
                     }
                 }
             }
-            if !not_found.is_empty() {
+            if has_inventory_delta_changes(0, not_found.len()) {
                 out.push(WireMessage::NotFound { items: not_found });
             }
             Ok(out)
@@ -3504,7 +3505,7 @@ fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
         let stop_clone = stop_flag.clone();
         let every_sec = args.telemetry_every_sec.max(1);
         Some(thread::spawn(move || {
-            while !stop_clone.load(Ordering::Relaxed) {
+            while relay_telemetry_thread_running(&stop_clone) {
                 thread::sleep(Duration::from_secs(every_sec));
                 let now = match current_unix_sec() {
                     Ok(now) => now,
@@ -3574,20 +3575,12 @@ fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
 
                 let mut seen = 0u32;
                 loop {
-                    if read_limit > 0 && seen >= read_limit {
+                    if should_stop_after_seen_messages(read_limit, seen) {
                         break;
                     }
                     let inbound = match read_message(&mut stream, &framing) {
                         Ok(msg) => msg,
-                        Err(TransportError::Io(err))
-                            if matches!(
-                                err.kind(),
-                                std::io::ErrorKind::TimedOut
-                                    | std::io::ErrorKind::WouldBlock
-                                    | std::io::ErrorKind::Interrupted
-                                    | std::io::ErrorKind::UnexpectedEof
-                            ) =>
-                        {
+                        Err(TransportError::Io(err)) if relay_io_error_is_nonfatal(&err) => {
                             break;
                         }
                         Err(err) => return Err(NodeError::Transport(err)),
@@ -3835,7 +3828,7 @@ fn admit_peer_tx_into_relay(
         };
 
         let delta = outcome.inventory_delta();
-        if !delta.announced_txids.is_empty() || !delta.removed_txids.is_empty() {
+        if has_inventory_delta_changes(delta.announced_txids.len(), delta.removed_txids.len()) {
             let announced_txs = delta
                 .announced_txids
                 .iter()
@@ -4860,7 +4853,7 @@ fn run_stratum_client(mut stream: TcpStream, ctx: StratumServerContext) -> Resul
             StratumReadOutcome::Timeout => {
                 if session.is_active() {
                     let current_tip = load_runtime_tip_hash(&ctx)?;
-                    if current_tip != last_tip_hash {
+                    if tip_changed(current_tip, last_tip_hash) {
                         jobs.clear();
                         last_tip_hash = issue_new_stratum_job(
                             &mut session,
@@ -5037,7 +5030,7 @@ async fn run_stratum_client_async(
             StratumReadOutcome::Timeout => {
                 if session.is_active() {
                     let current_tip = load_runtime_tip_hash(&ctx)?;
-                    if current_tip != last_tip_hash {
+                    if tip_changed(current_tip, last_tip_hash) {
                         jobs.clear();
                         last_tip_hash = issue_new_stratum_job_async(
                             &mut session,
@@ -5153,7 +5146,7 @@ struct RoleServiceTelemetry {
     error_total: u64,
 }
 
-fn read_role_request<T: DeserializeOwned>(stream: &mut TcpStream) -> Result<T, NodeError> {
+fn read_role_request<T: DeserializeOwned, R: Read>(stream: &mut R) -> Result<T, NodeError> {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     let bytes = reader
@@ -5187,6 +5180,44 @@ fn write_role_response<T: Serialize>(
 
 fn max_requests_reached(max_requests: u32, served: u32) -> bool {
     max_requests > 0 && served >= max_requests
+}
+
+fn has_inventory_delta_changes(announced_len: usize, removed_len: usize) -> bool {
+    announced_len != 0 || removed_len != 0
+}
+
+fn relay_telemetry_thread_running(stop_flag: &AtomicBool) -> bool {
+    !stop_flag.load(Ordering::Relaxed)
+}
+
+fn should_stop_after_seen_messages(read_limit: u32, seen: u32) -> bool {
+    read_limit != 0 && seen >= read_limit
+}
+
+fn relay_io_error_is_nonfatal(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::UnexpectedEof
+    )
+}
+
+fn should_require_noise_static_key(
+    secure_transport: bool,
+    mode: SecureTransportMode,
+    has_static_private_key: bool,
+) -> bool {
+    secure_transport && matches!(mode, SecureTransportMode::NoiseXx) && !has_static_private_key
+}
+
+fn should_apply_set_new_prev_hash(active_channel: Option<u32>, incoming_channel: u32) -> bool {
+    active_channel == Some(incoming_channel)
+}
+
+fn tip_changed(current: Hash256, previous: Hash256) -> bool {
+    current != previous
 }
 
 fn nonzero_limit_reached(limit: u64, observed: u64) -> bool {
@@ -5749,10 +5780,11 @@ fn run_stratum_mine(args: StratumMineArgs) -> Result<(), NodeError> {
         "secure_expected_remote_static_pubkey_hex",
         &args.secure_expected_remote_static_pubkey_hex,
     )?;
-    if args.secure_transport
-        && matches!(secure_transport_mode, SecureTransportMode::NoiseXx)
-        && secure_static_private_key.is_none()
-    {
+    if should_require_noise_static_key(
+        args.secure_transport,
+        secure_transport_mode,
+        secure_static_private_key.is_some(),
+    ) {
         return Err(NodeError::Runtime(
             "secure transport mode noise_xx requires --secure-static-secret-key-hex \
              (use `scam-node stratum-keygen` to generate keys)"
@@ -5969,7 +6001,7 @@ fn run_stratum_mine(args: StratumMineArgs) -> Result<(), NodeError> {
                     ntime,
                     network_target_hex,
                 } => {
-                    if channel_id == Some(msg_channel)
+                    if should_apply_set_new_prev_hash(channel_id, msg_channel)
                         && let Some(job) = jobs.get_mut(&job_id)
                     {
                         job.prev_hash = Hash256::from_hex(&prev_hash_hex).map_err(|e| {
@@ -6216,6 +6248,37 @@ fn default_sv2_conformance_corpus(user: &str) -> Vec<Sv2Message> {
     ]
 }
 
+fn update_sv2_conformance_state(
+    setup_success: &mut bool,
+    channel_opened: &mut bool,
+    job_messages_seen: &mut u32,
+    set_target_seen: &mut bool,
+    errors: &mut Vec<String>,
+    response: &Sv2Message,
+) {
+    match response {
+        Sv2Message::SetupConnectionSuccess { .. } => *setup_success = true,
+        Sv2Message::SetupConnectionError { code, reason } => {
+            errors.push(format!("setup error: code={code} reason={reason}"));
+        }
+        Sv2Message::OpenStandardMiningChannelSuccess { .. } => *channel_opened = true,
+        Sv2Message::OpenStandardMiningChannelError { code, reason, .. } => {
+            errors.push(format!("open channel error: code={code} reason={reason}"));
+        }
+        Sv2Message::NewMiningJob { .. } | Sv2Message::SetNewPrevHash { .. } => {
+            *job_messages_seen = job_messages_seen.saturating_add(1);
+        }
+        Sv2Message::SetTarget { .. } => {
+            *set_target_seen = true;
+        }
+        _ => {}
+    }
+}
+
+fn sv2_conformance_pass(setup_success: bool, channel_opened: bool, errors: &[String]) -> bool {
+    setup_success && channel_opened && errors.is_empty()
+}
+
 fn load_sv2_corpus(path: &Path, user: &str) -> Result<Vec<Sv2Message>, NodeError> {
     #[derive(Deserialize)]
     struct Envelope {
@@ -6359,23 +6422,14 @@ fn run_sv2_conformance(args: Sv2ConformanceArgs) -> Result<(), NodeError> {
             Some(response) => {
                 let kind = sv2_message_kind(&response).to_owned();
                 observed_messages.push(kind.clone());
-                match response {
-                    Sv2Message::SetupConnectionSuccess { .. } => setup_success = true,
-                    Sv2Message::SetupConnectionError { code, reason } => {
-                        errors.push(format!("setup error: code={code} reason={reason}"));
-                    }
-                    Sv2Message::OpenStandardMiningChannelSuccess { .. } => channel_opened = true,
-                    Sv2Message::OpenStandardMiningChannelError { code, reason, .. } => {
-                        errors.push(format!("open channel error: code={code} reason={reason}"));
-                    }
-                    Sv2Message::NewMiningJob { .. } | Sv2Message::SetNewPrevHash { .. } => {
-                        job_messages_seen = job_messages_seen.saturating_add(1);
-                    }
-                    Sv2Message::SetTarget { .. } => {
-                        set_target_seen = true;
-                    }
-                    _ => {}
-                }
+                update_sv2_conformance_state(
+                    &mut setup_success,
+                    &mut channel_opened,
+                    &mut job_messages_seen,
+                    &mut set_target_seen,
+                    &mut errors,
+                    &response,
+                );
                 Some(kind)
             }
             None => None,
@@ -6389,24 +6443,17 @@ fn run_sv2_conformance(args: Sv2ConformanceArgs) -> Result<(), NodeError> {
         };
         let kind = sv2_message_kind(&msg).to_owned();
         observed_messages.push(kind.clone());
-        match msg {
-            Sv2Message::NewMiningJob { .. } | Sv2Message::SetNewPrevHash { .. } => {
-                job_messages_seen = job_messages_seen.saturating_add(1);
-            }
-            Sv2Message::SetTarget { .. } => set_target_seen = true,
-            Sv2Message::SetupConnectionSuccess { .. } => setup_success = true,
-            Sv2Message::OpenStandardMiningChannelSuccess { .. } => channel_opened = true,
-            Sv2Message::SetupConnectionError { code, reason } => {
-                errors.push(format!("setup error: code={code} reason={reason}"));
-            }
-            Sv2Message::OpenStandardMiningChannelError { code, reason, .. } => {
-                errors.push(format!("open channel error: code={code} reason={reason}"));
-            }
-            _ => {}
-        }
+        update_sv2_conformance_state(
+            &mut setup_success,
+            &mut channel_opened,
+            &mut job_messages_seen,
+            &mut set_target_seen,
+            &mut errors,
+            &msg,
+        );
     }
 
-    let pass = setup_success && channel_opened && errors.is_empty();
+    let pass = sv2_conformance_pass(setup_success, channel_opened, &errors);
     let report = Sv2ConformanceReport {
         timestamp_unix_sec: current_unix_sec()?,
         stack_name: args
@@ -6688,8 +6735,8 @@ fn wallet_balance_response(
     }
 }
 
-fn write_http_response(
-    stream: &mut TcpStream,
+fn write_http_response<W: Write>(
+    stream: &mut W,
     status_line: &str,
     content_type: &str,
     body: &[u8],
@@ -6710,8 +6757,8 @@ fn write_http_response(
     Ok(())
 }
 
-fn write_http_json_response(
-    stream: &mut TcpStream,
+fn write_http_json_response<W: Write>(
+    stream: &mut W,
     status_line: &str,
     body: &str,
 ) -> Result<(), NodeError> {
@@ -6888,12 +6935,16 @@ fn guess_content_type(path: &Path) -> &'static str {
     }
 }
 
+fn ui_dir_is_servable(ui_dir: &Path) -> bool {
+    ui_dir.exists() && ui_dir.is_dir()
+}
+
 fn try_serve_ui_asset(
     stream: &mut TcpStream,
     ui_dir: &Path,
     request_path: &str,
 ) -> Result<bool, NodeError> {
-    if !ui_dir.exists() || !ui_dir.is_dir() {
+    if !ui_dir_is_servable(ui_dir) {
         return Ok(false);
     }
     let Some(relative) = sanitize_ui_path(request_path) else {
@@ -7436,8 +7487,7 @@ fn run_rpc_serve(args: RpcServeArgs) -> Result<(), NodeError> {
     Ok(())
 }
 
-fn run() -> Result<(), NodeError> {
-    let cli = Cli::parse();
+fn run_command(cli: Cli) -> Result<(), NodeError> {
     match cli.command {
         Some(Command::Node(args)) => run_node(
             args.network,
@@ -7477,8 +7527,17 @@ fn run() -> Result<(), NodeError> {
     }
 }
 
+fn run_from_args<I, T>(args: I) -> Result<(), NodeError>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
+    let cli = Cli::try_parse_from(args).map_err(|e| NodeError::Runtime(e.to_string()))?;
+    run_command(cli)
+}
+
 fn main() {
-    if let Err(err) = run() {
+    if let Err(err) = run_from_args(std::env::args_os()) {
         eprintln!("error: {err}");
         std::process::exit(1);
     }
@@ -7495,10 +7554,13 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use scam_chain::ChainRuntime;
-    use scam_core::{ChainConfig, Hash256, OutPoint, Transaction, TxIn, TxOut};
+    use scam_core::{ChainConfig, Hash256, OutPoint, Target, Transaction, TxIn, TxOut};
     use scam_mempool::{Mempool, OrphanPool};
     use scam_miner::{BlockTemplate, mine_block};
-    use scam_p2p::{GossipEngine, InventoryItem, ReplacementRateLimit, WireMessage};
+    use scam_p2p::{
+        FramingConfig, GossipEngine, InventoryItem, LocalHandshake, ReplacementRateLimit,
+        WireMessage, client_handshake, read_message, send_message, server_handshake,
+    };
     use scam_storage::{
         PeerAddressBook, PeerAddressRecord, load_chain_archive_db, load_peer_book_db,
     };
@@ -7607,6 +7669,12 @@ mod tests {
     fn send_http_request(addr: &str, request: &str) -> String {
         let mut stream = connect_with_retry(addr);
         stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("set read timeout");
+        stream
+            .set_write_timeout(Some(Duration::from_secs(10)))
+            .expect("set write timeout");
+        stream
             .write_all(request.as_bytes())
             .expect("write request bytes");
         stream
@@ -7623,6 +7691,124 @@ mod tests {
             body.len()
         );
         send_http_request(addr, &request)
+    }
+
+    fn spawn_sync_peer_server(
+        cfg: &ChainConfig,
+        remote_blocks: u32,
+    ) -> Option<(String, thread::JoinHandle<Result<(), String>>)> {
+        let listener = match TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return None,
+            Err(err) => panic!("bind sync peer: {err}"),
+        };
+        let addr = listener.local_addr().expect("addr").to_string();
+
+        let mut remote = ChainRuntime::from_config(cfg.clone()).expect("remote runtime");
+        let params = super::MiningLoopParams {
+            count: remote_blocks,
+            interval_sec: cfg.target_block_time_sec,
+            max_nonce: 500_000,
+            subsidy: cfg.block_subsidy,
+            miner_key_hash: cfg.genesis_reward_key_hash20().expect("key hash"),
+            label_prefix: "sync-peer-test",
+            print_each: false,
+        };
+        mine_blocks_on_runtime(&mut remote, &params).expect("mine remote chain");
+
+        let remote_tip = remote.tip_height();
+        let remote_chain = remote.block_hashes().to_vec();
+        let network_id = cfg.network_id.clone();
+        let mut remote_headers =
+            std::collections::HashMap::<Hash256, scam_core::BlockHeader>::new();
+        let mut remote_blocks_by_hash =
+            std::collections::HashMap::<Hash256, scam_core::Block>::new();
+        for hash in &remote_chain {
+            if let Some(header) = remote.header_by_hash(hash) {
+                remote_headers.insert(*hash, header.clone());
+            }
+            if let Some(block) = remote.block_by_hash(hash) {
+                remote_blocks_by_hash.insert(*hash, block.clone());
+            }
+        }
+
+        let handle = thread::spawn(move || -> Result<(), String> {
+            let (mut stream, _) = listener.accept().map_err(|e| e.to_string())?;
+            super::configure_stream_timeouts(&stream).map_err(|e| e.to_string())?;
+            let framing = FramingConfig::default();
+            let local_hello = LocalHandshake {
+                protocol_version: 1,
+                network_id: network_id.clone(),
+                user_agent: "scam-node/test-sync-peer".to_owned(),
+                start_height: remote_tip,
+            };
+            let remote_peer =
+                server_handshake(&mut stream, &framing, &local_hello).map_err(|e| e.to_string())?;
+            if remote_peer.network_id != network_id {
+                return Err(format!(
+                    "network mismatch: expected {network_id}, got {}",
+                    remote_peer.network_id
+                ));
+            }
+
+            let request = read_message(&mut stream, &framing).map_err(|e| e.to_string())?;
+            match request {
+                WireMessage::GetHeaders { locator, stop } => {
+                    let headers = super::select_headers_for_peer(
+                        &remote_chain,
+                        &remote_headers,
+                        &locator,
+                        stop,
+                        2_000,
+                    );
+                    send_message(&mut stream, &WireMessage::Headers { headers }, &framing)
+                        .map_err(|e| e.to_string())?;
+                }
+                other => return Err(format!("expected getheaders, got {other:?}")),
+            }
+
+            let request = read_message(&mut stream, &framing).map_err(|e| e.to_string())?;
+            match request {
+                WireMessage::GetBlocks { locator, stop } => {
+                    let hashes =
+                        super::select_block_hashes_for_peer(&remote_chain, &locator, stop, 2_000);
+                    let items = hashes.into_iter().map(InventoryItem::Block).collect();
+                    send_message(&mut stream, &WireMessage::Inv { items }, &framing)
+                        .map_err(|e| e.to_string())?;
+                }
+                other => return Err(format!("expected getblocks, got {other:?}")),
+            }
+
+            let request = read_message(&mut stream, &framing).map_err(|e| e.to_string())?;
+            match request {
+                WireMessage::GetData { items } => {
+                    for item in items {
+                        match item {
+                            InventoryItem::Block(hash) => {
+                                let Some(block) = remote_blocks_by_hash.get(&hash) else {
+                                    return Err(format!("missing requested block {hash}"));
+                                };
+                                send_message(
+                                    &mut stream,
+                                    &WireMessage::Block {
+                                        block: block.clone(),
+                                    },
+                                    &framing,
+                                )
+                                .map_err(|e| e.to_string())?;
+                            }
+                            InventoryItem::Tx(hash) => {
+                                return Err(format!("unexpected tx getdata request {hash}"));
+                            }
+                        }
+                    }
+                }
+                other => return Err(format!("expected getdata, got {other:?}")),
+            }
+            Ok(())
+        });
+
+        Some((addr, handle))
     }
 
     #[test]
@@ -7667,6 +7853,54 @@ mod tests {
         assert!(!super::should_persist_round(3, 0));
         assert!(!super::has_unknown_hashes(&[]));
         assert!(super::has_unknown_hashes(&[Hash256::ZERO]));
+
+        assert!(super::has_inventory_delta_changes(1, 0));
+        assert!(super::has_inventory_delta_changes(0, 1));
+        assert!(!super::has_inventory_delta_changes(0, 0));
+
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        assert!(super::relay_telemetry_thread_running(&stop));
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(!super::relay_telemetry_thread_running(&stop));
+
+        assert!(!super::should_stop_after_seen_messages(0, 100));
+        assert!(!super::should_stop_after_seen_messages(2, 1));
+        assert!(super::should_stop_after_seen_messages(2, 2));
+
+        let io_timeout = std::io::Error::from(std::io::ErrorKind::TimedOut);
+        let io_reset = std::io::Error::from(std::io::ErrorKind::ConnectionReset);
+        assert!(super::relay_io_error_is_nonfatal(&io_timeout));
+        assert!(!super::relay_io_error_is_nonfatal(&io_reset));
+
+        assert!(!super::should_require_noise_static_key(
+            false,
+            super::SecureTransportMode::NoiseXx,
+            false
+        ));
+        assert!(!super::should_require_noise_static_key(
+            true,
+            super::SecureTransportMode::Legacy,
+            false
+        ));
+        assert!(!super::should_require_noise_static_key(
+            true,
+            super::SecureTransportMode::NoiseXx,
+            true
+        ));
+        assert!(super::should_require_noise_static_key(
+            true,
+            super::SecureTransportMode::NoiseXx,
+            false
+        ));
+
+        assert!(super::should_apply_set_new_prev_hash(Some(7), 7));
+        assert!(!super::should_apply_set_new_prev_hash(Some(7), 8));
+        assert!(!super::should_apply_set_new_prev_hash(None, 7));
+
+        let a = Hash256([1u8; 32]);
+        let b = Hash256([2u8; 32]);
+        assert!(!super::tip_changed(a, a));
+        assert!(super::tip_changed(a, b));
     }
 
     #[test]
@@ -7726,6 +7960,23 @@ mod tests {
                 .ban_score,
             7
         );
+        assert_eq!(
+            book.peers
+                .iter()
+                .find(|peer| peer.address == "127.0.0.1:18443")
+                .expect("other peer")
+                .ban_score,
+            0,
+            "mutating a matched peer must not affect other entries"
+        );
+        assert_eq!(
+            book.peers
+                .iter()
+                .find(|peer| peer.address == "127.0.0.1:18444")
+                .expect("target peer")
+                .ban_score,
+            7
+        );
         assert!(!super::sync_book_has_success(0));
         assert!(super::sync_book_has_success(1));
     }
@@ -7733,64 +7984,60 @@ mod tests {
     #[test]
     fn configure_stream_timeouts_sets_requested_values() {
         #[derive(Default)]
-        struct MockTimeoutStream {
+        struct MockTimeoutState {
             read_timeout: std::sync::Mutex<Option<Duration>>,
             write_timeout: std::sync::Mutex<Option<Duration>>,
-            fail_read: bool,
-            fail_write: bool,
         }
 
-        impl super::TimeoutConfigurableStream for MockTimeoutStream {
-            fn set_read_timeout_cfg(&self, duration: Option<Duration>) -> std::io::Result<()> {
-                if self.fail_read {
-                    return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
-                }
-                *self.read_timeout.lock().expect("lock read timeout") = duration;
+        let state = MockTimeoutState::default();
+        super::configure_stream_timeouts_with_ops(
+            |duration| {
+                *state.read_timeout.lock().expect("read timeout") = duration;
                 Ok(())
-            }
-
-            fn set_write_timeout_cfg(&self, duration: Option<Duration>) -> std::io::Result<()> {
-                if self.fail_write {
-                    return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
-                }
-                *self.write_timeout.lock().expect("lock write timeout") = duration;
+            },
+            |duration| {
+                *state.write_timeout.lock().expect("write timeout") = duration;
                 Ok(())
-            }
-        }
-
-        let stream = MockTimeoutStream::default();
-        super::configure_stream_timeouts_with(
-            &stream,
+            },
             Duration::from_secs(2),
             Duration::from_secs(3),
         )
         .expect("set explicit timeouts");
         assert_eq!(
-            *stream.read_timeout.lock().expect("read timeout"),
+            *state.read_timeout.lock().expect("read timeout"),
             Some(Duration::from_secs(2))
         );
         assert_eq!(
-            *stream.write_timeout.lock().expect("write timeout"),
+            *state.write_timeout.lock().expect("write timeout"),
             Some(Duration::from_secs(3))
         );
 
-        super::configure_stream_timeouts(&stream).expect("set default timeouts");
+        super::configure_stream_timeouts_with_ops(
+            |duration| {
+                *state.read_timeout.lock().expect("read timeout") = duration;
+                Ok(())
+            },
+            |duration| {
+                *state.write_timeout.lock().expect("write timeout") = duration;
+                Ok(())
+            },
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        )
+        .expect("set default timeouts");
         assert_eq!(
-            *stream.read_timeout.lock().expect("read timeout"),
+            *state.read_timeout.lock().expect("read timeout"),
             Some(Duration::from_secs(5))
         );
         assert_eq!(
-            *stream.write_timeout.lock().expect("write timeout"),
+            *state.write_timeout.lock().expect("write timeout"),
             Some(Duration::from_secs(5))
         );
 
-        let fail_read = MockTimeoutStream {
-            fail_read: true,
-            ..MockTimeoutStream::default()
-        };
         assert!(
-            super::configure_stream_timeouts_with(
-                &fail_read,
+            super::configure_stream_timeouts_with_ops(
+                |_duration| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+                |_duration| Ok(()),
                 Duration::from_secs(1),
                 Duration::from_secs(1)
             )
@@ -7798,13 +8045,10 @@ mod tests {
             "read timeout error must propagate"
         );
 
-        let fail_write = MockTimeoutStream {
-            fail_write: true,
-            ..MockTimeoutStream::default()
-        };
         assert!(
-            super::configure_stream_timeouts_with(
-                &fail_write,
+            super::configure_stream_timeouts_with_ops(
+                |_duration| Ok(()),
+                |_duration| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
                 Duration::from_secs(1),
                 Duration::from_secs(1)
             )
@@ -8087,6 +8331,190 @@ mod tests {
     }
 
     #[test]
+    fn relay_serve_rejects_network_id_mismatch_after_handshake() {
+        let work_dir = temp_dir("test-relay-network-mismatch");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let config_path = work_dir.join("devnet.toml");
+        fs::write(&config_path, include_str!("../../../config/devnet.toml")).expect("write cfg");
+        let runtime_db = work_dir.join("runtime.redb");
+
+        let Some(bind) = allocate_local_addr() else {
+            return;
+        };
+        let server_bind = bind.clone();
+        let server = thread::spawn(move || {
+            super::run_relay_serve(super::RelayServeArgs {
+                network: Network::Devnet,
+                config: Some(config_path),
+                runtime_db: Some(runtime_db),
+                bind: server_bind,
+                max_clients: 1,
+                max_messages_per_peer: 1,
+                read_timeout_sec: 1,
+                write_timeout_sec: 1,
+                max_inv_items: None,
+                ban_threshold: None,
+                replacement_window_sec: None,
+                replacement_max_per_peer: None,
+                replacement_penalty: None,
+                telemetry_out: None,
+                telemetry_every_sec: 1,
+            })
+        });
+
+        let mut stream = connect_with_retry(&bind);
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("timeout");
+        stream
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .expect("timeout");
+        let framing = FramingConfig::default();
+        let local_hello = LocalHandshake {
+            protocol_version: 1,
+            network_id: "wrongnet".to_owned(),
+            user_agent: "test-client".to_owned(),
+            start_height: 0,
+        };
+        let _ = client_handshake(&mut stream, &framing, &local_hello);
+        drop(stream);
+
+        let result = server.join().expect("server join");
+        let err = result.expect_err("relay must fail on network mismatch");
+        assert!(err.to_string().contains("network mismatch"));
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
+    fn relay_serve_enforces_per_peer_message_limit() {
+        let work_dir = temp_dir("test-relay-message-limit");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let config_path = work_dir.join("devnet.toml");
+        fs::write(&config_path, include_str!("../../../config/devnet.toml")).expect("write cfg");
+        let runtime_db = work_dir.join("runtime.redb");
+        let Some(bind) = allocate_local_addr() else {
+            return;
+        };
+
+        let server_bind = bind.clone();
+        let server = thread::spawn(move || {
+            super::run_relay_serve(super::RelayServeArgs {
+                network: Network::Devnet,
+                config: Some(config_path),
+                runtime_db: Some(runtime_db),
+                bind: server_bind,
+                max_clients: 1,
+                max_messages_per_peer: 1,
+                read_timeout_sec: 2,
+                write_timeout_sec: 2,
+                max_inv_items: None,
+                ban_threshold: None,
+                replacement_window_sec: None,
+                replacement_max_per_peer: None,
+                replacement_penalty: None,
+                telemetry_out: None,
+                telemetry_every_sec: 1,
+            })
+        });
+
+        let mut stream = connect_with_retry(&bind);
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("timeout");
+        stream
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .expect("timeout");
+        let framing = FramingConfig::default();
+        let local_hello = LocalHandshake {
+            protocol_version: 1,
+            network_id: "devnet".to_owned(),
+            user_agent: "test-client".to_owned(),
+            start_height: 0,
+        };
+        let _remote = client_handshake(&mut stream, &framing, &local_hello).expect("handshake");
+
+        send_message(&mut stream, &WireMessage::Ping { nonce: 1 }, &framing).expect("ping1");
+        let first = read_message(&mut stream, &framing).expect("pong1");
+        assert!(matches!(first, WireMessage::Pong { nonce: 1 }));
+
+        send_message(&mut stream, &WireMessage::Ping { nonce: 2 }, &framing).expect("ping2");
+        let second = read_message(&mut stream, &framing);
+        assert!(second.is_err(), "second message must not be processed");
+
+        drop(stream);
+        server
+            .join()
+            .expect("server join")
+            .expect("relay serve should exit cleanly");
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
+    fn relay_serve_persists_telemetry_snapshots_when_enabled() {
+        let work_dir = temp_dir("test-relay-telemetry");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let config_path = work_dir.join("devnet.toml");
+        fs::write(&config_path, include_str!("../../../config/devnet.toml")).expect("write cfg");
+        let runtime_db = work_dir.join("runtime.redb");
+        let telemetry_path = work_dir.join("relay.telemetry.jsonl");
+        let Some(bind) = allocate_local_addr() else {
+            return;
+        };
+
+        let server_bind = bind.clone();
+        let telemetry_out = telemetry_path.clone();
+        let server = thread::spawn(move || {
+            super::run_relay_serve(super::RelayServeArgs {
+                network: Network::Devnet,
+                config: Some(config_path),
+                runtime_db: Some(runtime_db),
+                bind: server_bind,
+                max_clients: 1,
+                max_messages_per_peer: 0,
+                read_timeout_sec: 1,
+                write_timeout_sec: 1,
+                max_inv_items: None,
+                ban_threshold: None,
+                replacement_window_sec: None,
+                replacement_max_per_peer: None,
+                replacement_penalty: None,
+                telemetry_out: Some(telemetry_out),
+                telemetry_every_sec: 1,
+            })
+        });
+
+        let mut stream = connect_with_retry(&bind);
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("timeout");
+        stream
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .expect("timeout");
+        let framing = FramingConfig::default();
+        let local_hello = LocalHandshake {
+            protocol_version: 1,
+            network_id: "devnet".to_owned(),
+            user_agent: "test-client".to_owned(),
+            start_height: 0,
+        };
+        let _remote = client_handshake(&mut stream, &framing, &local_hello).expect("handshake");
+        thread::sleep(Duration::from_millis(1_250));
+        drop(stream);
+
+        server
+            .join()
+            .expect("server join")
+            .expect("relay serve should exit cleanly");
+
+        let content = fs::read_to_string(&telemetry_path).expect("read telemetry");
+        assert!(
+            content.lines().any(|line| !line.trim().is_empty()),
+            "expected at least one telemetry snapshot line"
+        );
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
     fn query_runtime_mining_guard_uses_nonzero_semantics() {
         assert!(!super::should_mine_query_blocks(0));
         assert!(super::should_mine_query_blocks(1));
@@ -8207,6 +8635,24 @@ mod tests {
         let pos = super::find_http_header_terminator(input).expect("terminator");
         assert_eq!(&input[pos..pos + 4], b"\r\n\r\n");
         assert!(super::find_http_header_terminator(b"GET / HTTP/1.1\r\n").is_none());
+    }
+
+    #[test]
+    fn write_http_json_response_propagates_writer_errors() {
+        struct FailWriter;
+        impl Write for FailWriter {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            }
+        }
+
+        let mut writer = FailWriter;
+        let err = super::write_http_json_response(&mut writer, "200 OK", "{\"ok\":true}")
+            .expect_err("writer error must propagate");
+        assert!(err.to_string().contains("http write failed"));
     }
 
     #[test]
@@ -8331,6 +8777,48 @@ mod tests {
             replacement_penalty: 1,
         })
         .expect("soak without tx flow should allow zero tx amount");
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
+    fn soak_does_not_mine_extra_tx_blocks_when_no_transactions_are_available() {
+        let work_dir = temp_dir("test-soak-empty-tx-round");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let config_path = work_dir.join("devnet.toml");
+        fs::write(&config_path, include_str!("../../../config/devnet.toml")).expect("write cfg");
+        let runtime_db = work_dir.join("runtime.redb");
+
+        super::run_soak(super::SoakArgs {
+            network: Network::Devnet,
+            config: Some(config_path.clone()),
+            runtime_db: Some(runtime_db.clone()),
+            rounds: 1,
+            blocks_per_round: 0,
+            interval_sec: 1,
+            max_nonce: 1_000,
+            persist_every_rounds: 1,
+            txs_per_round: 2,
+            tx_amount: u64::MAX / 2,
+            tx_fee: 1,
+            sleep_per_round_sec: 0,
+            telemetry_out: None,
+            telemetry_every_rounds: 1,
+            simulated_peers: 2,
+            replacement_window_sec: 1,
+            replacement_max_per_peer: 1,
+            replacement_penalty: 1,
+        })
+        .expect("soak with empty tx rounds must succeed");
+
+        let cfg = load_chain_config(&config_path).expect("load cfg");
+        let (runtime_after, _) =
+            super::load_runtime_from_db_or_genesis(&cfg, &runtime_db).expect("load runtime");
+        assert_eq!(
+            runtime_after.tip_height(),
+            0,
+            "no base blocks and no accepted txs should keep height unchanged"
+        );
+
         let _ = fs::remove_dir_all(work_dir);
     }
 
@@ -8547,6 +9035,95 @@ mod tests {
     }
 
     #[test]
+    fn sv2_conformance_state_helpers_track_messages_and_pass_gate() {
+        let mut setup_success = false;
+        let mut channel_opened = false;
+        let mut job_messages_seen = 0u32;
+        let mut set_target_seen = false;
+        let mut errors = Vec::<String>::new();
+
+        super::update_sv2_conformance_state(
+            &mut setup_success,
+            &mut channel_opened,
+            &mut job_messages_seen,
+            &mut set_target_seen,
+            &mut errors,
+            &Sv2Message::SetupConnectionSuccess {
+                used_version: 2,
+                flags: 0,
+            },
+        );
+        super::update_sv2_conformance_state(
+            &mut setup_success,
+            &mut channel_opened,
+            &mut job_messages_seen,
+            &mut set_target_seen,
+            &mut errors,
+            &Sv2Message::OpenStandardMiningChannelSuccess {
+                request_id: 1,
+                channel_id: 2,
+                target_hex: Target::MAX.to_hex(),
+                extranonce_prefix_hex: "00".to_owned(),
+            },
+        );
+        super::update_sv2_conformance_state(
+            &mut setup_success,
+            &mut channel_opened,
+            &mut job_messages_seen,
+            &mut set_target_seen,
+            &mut errors,
+            &Sv2Message::NewMiningJob {
+                channel_id: 2,
+                job_id: 42,
+                version: 1,
+                prev_hash_hex: Hash256::ZERO.to_hex(),
+                merkle_root_hex: Hash256::ZERO.to_hex(),
+                ntime: 1_800_000_000,
+                network_target_hex: Target::MAX.to_hex(),
+            },
+        );
+        super::update_sv2_conformance_state(
+            &mut setup_success,
+            &mut channel_opened,
+            &mut job_messages_seen,
+            &mut set_target_seen,
+            &mut errors,
+            &Sv2Message::SetTarget {
+                channel_id: 2,
+                maximum_target_hex: Target::MAX.to_hex(),
+            },
+        );
+        assert!(setup_success);
+        assert!(channel_opened);
+        assert_eq!(job_messages_seen, 1);
+        assert!(set_target_seen);
+        assert!(errors.is_empty());
+        assert!(super::sv2_conformance_pass(
+            setup_success,
+            channel_opened,
+            &errors
+        ));
+
+        super::update_sv2_conformance_state(
+            &mut setup_success,
+            &mut channel_opened,
+            &mut job_messages_seen,
+            &mut set_target_seen,
+            &mut errors,
+            &Sv2Message::SetupConnectionError {
+                code: "bad".to_owned(),
+                reason: "oops".to_owned(),
+            },
+        );
+        assert!(!errors.is_empty());
+        assert!(!super::sv2_conformance_pass(
+            setup_success,
+            channel_opened,
+            &errors
+        ));
+    }
+
+    #[test]
     fn read_http_request_rejects_invalid_content_length_header() {
         let raw = b"POST /wallet/new HTTP/1.1\r\nHost: localhost\r\nContent-Length: nope\r\n\r\n";
         let result = read_http_request_from_raw(raw);
@@ -8585,6 +9162,78 @@ mod tests {
         assert_eq!(request.method, "POST");
         assert_eq!(request.path, "/wallet/new");
         assert_eq!(request.body, body.as_bytes());
+    }
+
+    #[test]
+    fn read_http_request_accepts_payload_larger_than_one_mebibyte() {
+        let body = vec![b'a'; 1_200_000];
+        let mut raw = format!(
+            "POST /wallet/new HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        raw.extend_from_slice(&body);
+        let parsed = read_http_request_from_raw(&raw).expect("parse request");
+        let request = parsed.expect("request");
+        assert_eq!(request.path, "/wallet/new");
+        assert_eq!(request.body.len(), body.len());
+    }
+
+    #[test]
+    fn read_http_request_waits_for_full_body_across_multiple_reads() {
+        #[derive(Default)]
+        struct ChunkReader {
+            chunks: Vec<Vec<u8>>,
+            next: usize,
+        }
+
+        impl Read for ChunkReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.next >= self.chunks.len() {
+                    return Ok(0);
+                }
+                let chunk = &self.chunks[self.next];
+                let len = chunk.len().min(buf.len());
+                buf[..len].copy_from_slice(&chunk[..len]);
+                self.next = self.next.saturating_add(1);
+                Ok(len)
+            }
+        }
+
+        let body = b"{\"k\":1234}".to_vec();
+        let header = format!(
+            "POST /wallet/new HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        let split = body.len() / 2;
+        let mut reader = ChunkReader {
+            chunks: vec![header, body[..split].to_vec(), body[split..].to_vec()],
+            next: 0,
+        };
+        let parsed = super::read_http_request(&mut reader).expect("parse");
+        let request = parsed.expect("request");
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/wallet/new");
+        assert_eq!(request.body, body);
+    }
+
+    #[test]
+    fn read_role_request_handles_empty_invalid_and_valid_payloads() {
+        let mut empty = std::io::Cursor::new(Vec::<u8>::new());
+        let err = super::read_role_request::<serde_json::Value, _>(&mut empty)
+            .expect_err("empty role request must fail");
+        assert!(err.to_string().contains("closed without payload"));
+
+        let mut invalid = std::io::Cursor::new(b"{not-json}\n".to_vec());
+        let err = super::read_role_request::<serde_json::Value, _>(&mut invalid)
+            .expect_err("invalid role request must fail");
+        assert!(err.to_string().contains("decode failed"));
+
+        let mut valid = std::io::Cursor::new(br#"{"job":1}"#.to_vec());
+        let parsed = super::read_role_request::<serde_json::Value, _>(&mut valid)
+            .expect("valid role request");
+        assert_eq!(parsed["job"], serde_json::json!(1));
     }
 
     #[test]
@@ -8737,6 +9386,24 @@ mod tests {
     }
 
     #[test]
+    fn ui_dir_is_servable_requires_existing_directory() {
+        let work_dir = temp_dir("test-ui-dir-servable");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let missing = work_dir.join("missing");
+        assert!(!super::ui_dir_is_servable(&missing));
+
+        let file_path = work_dir.join("single-file.txt");
+        fs::write(&file_path, b"x").expect("write file");
+        assert!(!super::ui_dir_is_servable(&file_path));
+
+        let dir_path = work_dir.join("ui");
+        fs::create_dir_all(&dir_path).expect("mkdir ui");
+        assert!(super::ui_dir_is_servable(&dir_path));
+
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
     fn run_rpc_serve_dispatches_health_and_unknown_routes() {
         let Some(addr) = allocate_local_addr() else {
             return;
@@ -8851,6 +9518,141 @@ mod tests {
         assert!(wallet_send.starts_with("HTTP/1.1 400 Bad Request"));
         let wallet_qr = send_http_json_post(&addr, "/wallet/qr", "{\"address\":\"scam\"}");
         assert!(wallet_qr.starts_with("HTTP/1.1 200 OK"));
+
+        server.join().expect("server join");
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
+    fn run_rpc_serve_rejects_invalid_bind_address() {
+        let work_dir = temp_dir("test-rpc-bind-error");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let config_path = work_dir.join("devnet.toml");
+        fs::write(&config_path, include_str!("../../../config/devnet.toml")).expect("write cfg");
+        let runtime_db = work_dir.join("runtime.redb");
+
+        let err = run_rpc_serve(RpcServeArgs {
+            network: Network::Devnet,
+            config: Some(config_path),
+            runtime_db: Some(runtime_db),
+            bind: "invalid-bind".to_owned(),
+            ui_dir: work_dir.join("ui"),
+            relay_telemetry: None,
+            mine_blocks: 0,
+            interval_sec: 120,
+            max_nonce: 500_000,
+            max_requests: 1,
+        })
+        .expect_err("invalid bind should fail");
+        assert!(err.to_string().contains("rpc bind failed"));
+
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
+    fn run_rpc_serve_route_matching_and_hrp_validation_are_strict() {
+        let Some(addr) = allocate_local_addr() else {
+            return;
+        };
+        let work_dir = temp_dir("test-rpc-serve-strict-routes");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let config_path = work_dir.join("devnet.toml");
+        fs::write(&config_path, include_str!("../../../config/devnet.toml")).expect("write cfg");
+        let runtime_db = work_dir.join("runtime.redb");
+        let ui_dir = work_dir.join("no-ui-assets");
+
+        let seed = WalletMnemonic::parse(SOAK_FLOW_MNEMONIC)
+            .expect("mnemonic")
+            .to_seed("");
+        let recipient_key = derive_wallet_key(&seed, 0, 1).expect("recipient");
+        let valid_recipient =
+            scam_wallet::to_address("sd", recipient_key.pubkey_compressed()).expect("valid addr");
+        let invalid_recipient = scam_wallet::to_address("s", recipient_key.pubkey_compressed())
+            .expect("invalid hrp addr");
+
+        let server_addr = addr.clone();
+        let server = thread::spawn(move || {
+            run_rpc_serve(RpcServeArgs {
+                network: Network::Devnet,
+                config: Some(config_path),
+                runtime_db: Some(runtime_db),
+                bind: server_addr,
+                ui_dir,
+                relay_telemetry: None,
+                mine_blocks: 0,
+                interval_sec: 120,
+                max_nonce: 500_000,
+                max_requests: 8,
+            })
+            .expect("rpc serve");
+        });
+
+        let health = send_http_request(&addr, "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        assert!(health.starts_with("HTTP/1.1 200 OK"));
+
+        let unknown = send_http_request(&addr, "GET /unknown HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        assert!(unknown.starts_with("HTTP/1.1 404 Not Found"));
+        assert!(unknown.contains("\"unknown endpoint\""));
+
+        let mempool = send_http_request(&addr, "GET /mempool HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        assert!(mempool.starts_with("HTTP/1.1 200 OK"));
+        assert!(mempool.contains("\"available\""));
+
+        let tx = send_http_request(&addr, "GET /tx/0/0 HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        assert!(tx.starts_with("HTTP/1.1 200 OK"));
+
+        let wallet_address_req = serde_json::json!({
+            "mnemonic": SOAK_FLOW_MNEMONIC,
+            "passphrase": "",
+            "account": 0,
+            "index": 0
+        })
+        .to_string();
+        let wallet_address = send_http_json_post(&addr, "/wallet/address", &wallet_address_req);
+        assert!(wallet_address.starts_with("HTTP/1.1 200 OK"));
+        assert!(wallet_address.contains("\"address\""));
+
+        let wallet_balance_req = serde_json::json!({
+            "mnemonic": SOAK_FLOW_MNEMONIC,
+            "passphrase": "",
+            "account": 0,
+            "index": 0
+        })
+        .to_string();
+        let wallet_balance = send_http_json_post(&addr, "/wallet/balance", &wallet_balance_req);
+        assert!(wallet_balance.starts_with("HTTP/1.1 200 OK"));
+        assert!(wallet_balance.contains("\"spendable\""));
+
+        let valid_send_req = serde_json::json!({
+            "mnemonic": SOAK_FLOW_MNEMONIC,
+            "passphrase": "",
+            "account": 0,
+            "index": 0,
+            "to": valid_recipient,
+            "amount": 1,
+            "fee": 1
+        })
+        .to_string();
+        let valid_send = send_http_json_post(&addr, "/wallet/send-preview", &valid_send_req);
+        assert!(valid_send.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(
+            !valid_send.contains("address hrp"),
+            "valid network hrp must not be rejected as wrong network"
+        );
+
+        let invalid_send_req = serde_json::json!({
+            "mnemonic": SOAK_FLOW_MNEMONIC,
+            "passphrase": "",
+            "account": 0,
+            "index": 0,
+            "to": invalid_recipient,
+            "amount": 1,
+            "fee": 1
+        })
+        .to_string();
+        let invalid_send = send_http_json_post(&addr, "/wallet/send-preview", &invalid_send_req);
+        assert!(invalid_send.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(invalid_send.contains("address hrp"));
 
         server.join().expect("server join");
         let _ = fs::remove_dir_all(work_dir);
@@ -9187,6 +9989,71 @@ mod tests {
     }
 
     #[test]
+    fn sync_runtime_with_peer_downloads_and_applies_blocks() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let mut runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let Some((peer_addr, peer_server)) = spawn_sync_peer_server(&cfg, 2) else {
+            return;
+        };
+
+        let stats = super::sync_runtime_with_peer(
+            &cfg,
+            &mut runtime,
+            &peer_addr,
+            1,
+            "scam-node/test-sync-runtime",
+        )
+        .expect("sync from peer");
+        assert!(stats.headers_received >= 1);
+        assert!(stats.blocks_announced >= 1);
+        assert!(stats.blocks_downloaded >= 1);
+        assert!(stats.blocks_applied >= 1);
+        assert_eq!(runtime.tip_height(), 2);
+
+        peer_server.join().expect("peer join").expect("peer ok");
+    }
+
+    #[test]
+    fn sync_book_succeeds_with_reachable_peer_and_updates_runtime_db() {
+        let work_dir = temp_dir("test-sync-book-success");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let peers_dir = work_dir.join("peers");
+        fs::create_dir_all(&peers_dir).expect("mkdir peers");
+        let config_path = work_dir.join("devnet.toml");
+        fs::write(&config_path, include_str!("../../../config/devnet.toml")).expect("write cfg");
+        let cfg = load_chain_config(&config_path).expect("load cfg");
+        let runtime_db = work_dir.join("runtime.redb");
+
+        let Some((peer_addr, peer_server)) = spawn_sync_peer_server(&cfg, 1) else {
+            return;
+        };
+        run_add_peer(AddPeerArgs {
+            network: Network::Devnet,
+            peer: peer_addr,
+            peers_dir: peers_dir.clone(),
+        })
+        .expect("add peer");
+
+        run_sync_book(SyncBookArgs {
+            network: Network::Devnet,
+            config: Some(config_path),
+            runtime_db: Some(runtime_db.clone()),
+            peers_dir: peers_dir.clone(),
+            max_peers: 1,
+            max_batches_per_peer: 1,
+            rotate_after_sec: 60,
+        })
+        .expect("sync book");
+
+        let archive = load_chain_archive_db(&runtime_db).expect("load archive");
+        assert!(archive.blocks_by_height.len() >= 2);
+
+        peer_server.join().expect("peer join").expect("peer ok");
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
     fn sync_book_requires_non_empty_peer_book() {
         let work_dir = temp_dir("test-sync-book-empty");
         let peers_dir = work_dir.join("peers");
@@ -9210,6 +10077,25 @@ mod tests {
             message.contains("no peers") || message.contains("peer book"),
             "unexpected sync-book error: {message}"
         );
+
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
+    fn reindex_runtime_requires_existing_db_path() {
+        let work_dir = temp_dir("test-reindex-runtime-missing-db");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let config_path = work_dir.join("devnet.toml");
+        fs::write(&config_path, include_str!("../../../config/devnet.toml")).expect("write config");
+        let missing_db = work_dir.join("missing.redb");
+
+        let err = run_reindex_runtime(ReindexRuntimeArgs {
+            network: Network::Devnet,
+            config: Some(config_path),
+            runtime_db: Some(missing_db),
+        })
+        .expect_err("missing runtime db must fail reindex");
+        assert!(err.to_string().contains("runtime db does not exist"));
 
         let _ = fs::remove_dir_all(work_dir);
     }
@@ -9950,6 +10836,98 @@ mod tests {
     }
 
     #[test]
+    fn relay_getdata_with_known_inventory_does_not_emit_notfound() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        cfg.validate().expect("config validate");
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let spend = runtime.utxo_set().keys().next().cloned().expect("utxo");
+        let tx = relay_tx(spend, 9, 77);
+        let txid = tx.txid();
+
+        let mut relay = RelayAdmissionState {
+            mempool: Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip: GossipEngine::with_limits_and_replacement(
+                64,
+                50,
+                ReplacementRateLimit {
+                    window_sec: 60,
+                    max_replacements: 5,
+                    penalty: 10,
+                },
+            )
+            .expect("gossip"),
+        };
+        relay.gossip.connect_peer(1);
+        relay
+            .mempool
+            .insert_with_fee(tx.clone(), 1_000)
+            .expect("insert tx");
+        let mut state = RelayServerState { runtime, relay };
+
+        let out = process_relay_wire_message(
+            &mut state,
+            1,
+            WireMessage::GetData {
+                items: vec![InventoryItem::Tx(txid)],
+            },
+            1_000,
+        )
+        .expect("process getdata");
+        assert!(
+            out.iter()
+                .any(|msg| matches!(msg, WireMessage::Tx { tx } if tx.txid() == txid))
+        );
+        assert!(
+            !out.iter()
+                .any(|msg| matches!(msg, WireMessage::NotFound { .. })),
+            "known inventory must not generate notfound"
+        );
+    }
+
+    #[test]
+    fn relay_inv_path_keeps_only_messages_for_originating_peer() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        cfg.validate().expect("config validate");
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let mut gossip = GossipEngine::with_limits_and_replacement(
+            64,
+            50,
+            ReplacementRateLimit {
+                window_sec: 60,
+                max_replacements: 5,
+                penalty: 10,
+            },
+        )
+        .expect("gossip");
+        gossip.connect_peer(10);
+        let relay = RelayAdmissionState {
+            mempool: Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip,
+        };
+        let mut state = RelayServerState { runtime, relay };
+
+        let out = process_relay_wire_message(
+            &mut state,
+            10,
+            WireMessage::Inv {
+                items: vec![InventoryItem::Tx(Hash256([0xAB; 32]))],
+            },
+            1_000,
+        )
+        .expect("process inv");
+        assert_eq!(out.len(), 1);
+        assert!(matches!(out[0], WireMessage::GetData { .. }));
+    }
+
+    #[test]
     fn template_provider_service_roundtrip() {
         let Some(addr) = allocate_local_addr() else {
             return;
@@ -10049,5 +11027,52 @@ mod tests {
         assert_eq!(job.channel_id, 3);
         assert_eq!(job.job_id, 9);
         server.join().expect("translator").expect("ok");
+    }
+
+    #[test]
+    fn translator_and_sv2_entrypoints_surface_connect_and_bind_failures() {
+        let translation_err =
+            translate_remote_job_with_service("127.0.0.1:0", Sv2Message::KeepAlive)
+                .expect_err("unreachable translator endpoint must fail");
+        assert!(
+            translation_err
+                .to_string()
+                .contains("connect to role service")
+        );
+
+        let bind_err = run_sv2_translator(Sv2TranslatorArgs {
+            bind: "not-an-addr".to_owned(),
+            max_requests: 1,
+            telemetry_out: None,
+        })
+        .expect_err("invalid bind must fail translator startup");
+        assert!(bind_err.to_string().contains("bind failed"));
+
+        let conformance_err = run_sv2_conformance(Sv2ConformanceArgs {
+            pool: "127.0.0.1:0".to_owned(),
+            user: "u".to_owned(),
+            read_timeout_sec: 1,
+            secure_transport: false,
+            secure_transport_mode: None,
+            secure_rekey_interval_messages: 10_000,
+            secure_static_secret_key_hex: None,
+            secure_expected_remote_static_pubkey_hex: None,
+            corpus: None,
+            out: None,
+            stack_name: None,
+        })
+        .expect_err("unreachable conformance endpoint must fail");
+        assert!(
+            conformance_err
+                .to_string()
+                .contains("sv2 conformance connect failed")
+        );
+    }
+
+    #[test]
+    fn run_from_args_reports_parse_errors() {
+        let err = super::run_from_args(["scam-node", "--definitely-invalid-flag"])
+            .expect_err("invalid args must fail parse");
+        assert!(err.to_string().contains("unexpected argument"));
     }
 }
