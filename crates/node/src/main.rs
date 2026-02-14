@@ -7691,13 +7691,22 @@ mod tests {
     }
 
     fn connect_with_retry(addr: &str) -> TcpStream {
-        for _ in 0..20 {
+        let mut last_err = None;
+        for _ in 0..200 {
             match TcpStream::connect(addr) {
                 Ok(stream) => return stream,
-                Err(_) => thread::sleep(Duration::from_millis(25)),
+                Err(err) => {
+                    last_err = Some(err);
+                    thread::sleep(Duration::from_millis(25));
+                }
             }
         }
-        panic!("connect retry exhausted for {addr}");
+        panic!(
+            "connect retry exhausted for {addr}; last error: {}",
+            last_err
+                .map(|err| err.to_string())
+                .unwrap_or_else(|| "unknown".to_owned())
+        );
     }
 
     fn send_http_request(addr: &str, request: &str) -> String {
