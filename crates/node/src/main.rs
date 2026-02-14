@@ -9683,7 +9683,9 @@ mod tests {
                 mine_blocks: 0,
                 interval_sec: 120,
                 max_nonce: 500_000,
-                max_requests: 9,
+                // run_rpc_serve counts only fully handled request paths in `served`;
+                // several requests below intentionally hit early 400 error paths.
+                max_requests: 5,
             })
             .expect("rpc serve");
         });
@@ -9772,7 +9774,9 @@ mod tests {
                 mine_blocks: 0,
                 interval_sec: 120,
                 max_nonce: 500_000,
-                max_requests: 10,
+                // Two send-preview requests below intentionally return early 400 responses,
+                // which do not increment internal `served`.
+                max_requests: 8,
             })
             .expect("rpc serve");
         });
