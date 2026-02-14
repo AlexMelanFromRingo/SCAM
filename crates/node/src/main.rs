@@ -1136,10 +1136,6 @@ fn should_mine_query_blocks(mine_blocks: u32) -> bool {
     mine_blocks != 0
 }
 
-fn has_unspent_wallet_balance(unspent_total: u128) -> bool {
-    unspent_total > 0
-}
-
 fn build_runtime_for_query(
     network: Network,
     config: Option<PathBuf>,
@@ -7763,8 +7759,6 @@ mod tests {
     fn query_runtime_mining_guard_uses_nonzero_semantics() {
         assert!(!super::should_mine_query_blocks(0));
         assert!(super::should_mine_query_blocks(1));
-        assert!(!super::has_unspent_wallet_balance(0));
-        assert!(super::has_unspent_wallet_balance(1));
 
         let work_dir = temp_dir("test-query-runtime-mining");
         fs::create_dir_all(&work_dir).expect("mkdir");
