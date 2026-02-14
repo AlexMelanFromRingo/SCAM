@@ -7679,7 +7679,7 @@ mod tests {
         static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
         LOCK.get_or_init(|| std::sync::Mutex::new(()))
             .lock()
-            .expect("network test mutex poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn allocate_local_addr() -> Option<String> {
@@ -8567,9 +8567,28 @@ mod tests {
         let first = read_message(&mut stream, &framing).expect("pong1");
         assert!(matches!(first, WireMessage::Pong { nonce: 1 }));
 
-        send_message(&mut stream, &WireMessage::Ping { nonce: 2 }, &framing).expect("ping2");
-        let second = read_message(&mut stream, &framing);
-        assert!(second.is_err(), "second message must not be processed");
+        // The relay may close immediately after the quota is exceeded:
+        // either the second write fails, or write succeeds and read fails.
+        let second_send = send_message(&mut stream, &WireMessage::Ping { nonce: 2 }, &framing);
+        if second_send.is_ok() {
+            let second = read_message(&mut stream, &framing);
+            assert!(second.is_err(), "second message must not be processed");
+        } else {
+            let err = second_send.expect_err("expected second send error");
+            let kind = match err {
+                scam_p2p::TransportError::Io(io_err) => io_err.kind(),
+                other => panic!("unexpected second send error: {other}"),
+            };
+            assert!(
+                matches!(
+                    kind,
+                    std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::NotConnected
+                ),
+                "unexpected io error kind for second ping: {kind:?}"
+            );
+        }
 
         drop(stream);
         server
