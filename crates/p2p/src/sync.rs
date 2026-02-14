@@ -41,7 +41,7 @@ pub fn select_headers_for_peer(
     stop: Option<Hash256>,
     max_headers: usize,
 ) -> Vec<BlockHeader> {
-    if main_chain.is_empty() || max_headers == 0 {
+    if main_chain.is_empty() {
         return Vec::new();
     }
 
@@ -75,7 +75,7 @@ pub fn select_block_hashes_for_peer(
     stop: Option<Hash256>,
     max_hashes: usize,
 ) -> Vec<Hash256> {
-    if main_chain.is_empty() || max_hashes == 0 {
+    if main_chain.is_empty() {
         return Vec::new();
     }
 
@@ -167,6 +167,23 @@ mod tests {
         assert_eq!(locator[0], *chain.last().expect("tip"));
         assert_eq!(locator.last().copied(), Some(chain[0]));
         assert!(locator.len() < chain.len());
+    }
+
+    #[test]
+    fn locator_for_short_chain_is_strictly_consecutive_without_duplicates() {
+        let (chain, _) = chain_headers(4);
+        let locator = build_block_locator(&chain);
+        assert_eq!(locator, vec![chain[3], chain[2], chain[1], chain[0]]);
+    }
+
+    #[test]
+    fn locator_before_soft_limit_advances_by_single_step() {
+        let (chain, _) = chain_headers(64);
+        let locator = build_block_locator(&chain);
+        assert!(locator.len() > 10);
+        for i in 1..10 {
+            assert_eq!(locator[i], chain[63 - i]);
+        }
     }
 
     #[test]

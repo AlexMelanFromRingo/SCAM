@@ -1,5 +1,4 @@
 use std::io::{Read, Write};
-use std::net::TcpStream;
 
 use scam_core::{BlockHeader, Hash256};
 use thiserror::Error;
@@ -38,8 +37,8 @@ pub struct RemoteHandshake {
     pub start_height: u64,
 }
 
-pub fn send_message(
-    stream: &mut TcpStream,
+pub fn send_message<W: Write>(
+    stream: &mut W,
     message: &WireMessage,
     cfg: &FramingConfig,
 ) -> Result<(), TransportError> {
@@ -87,8 +86,8 @@ pub async fn send_message_async<S: AsyncWrite + Unpin>(
     Ok(())
 }
 
-pub fn read_message(
-    stream: &mut TcpStream,
+pub fn read_message<R: Read>(
+    stream: &mut R,
     cfg: &FramingConfig,
 ) -> Result<WireMessage, TransportError> {
     let mut header = [0u8; 8];
@@ -149,8 +148,8 @@ pub async fn read_message_async<S: AsyncRead + Unpin>(
     decode_message(&payload, cfg.max_message_size).map_err(TransportError::Wire)
 }
 
-pub fn client_handshake(
-    stream: &mut TcpStream,
+pub fn client_handshake<IO: Read + Write>(
+    stream: &mut IO,
     cfg: &FramingConfig,
     local: &LocalHandshake,
 ) -> Result<RemoteHandshake, TransportError> {
@@ -208,8 +207,8 @@ pub async fn client_handshake_async<S: AsyncRead + AsyncWrite + Unpin>(
     Ok(remote)
 }
 
-pub fn server_handshake(
-    stream: &mut TcpStream,
+pub fn server_handshake<IO: Read + Write>(
+    stream: &mut IO,
     cfg: &FramingConfig,
     local: &LocalHandshake,
 ) -> Result<RemoteHandshake, TransportError> {
@@ -265,8 +264,8 @@ pub async fn server_handshake_async<S: AsyncRead + AsyncWrite + Unpin>(
     Ok(remote)
 }
 
-pub fn request_headers(
-    stream: &mut TcpStream,
+pub fn request_headers<IO: Read + Write>(
+    stream: &mut IO,
     cfg: &FramingConfig,
     locator: Vec<Hash256>,
     stop: Option<Hash256>,
@@ -299,8 +298,8 @@ pub async fn request_headers_async<S: AsyncRead + AsyncWrite + Unpin>(
     }
 }
 
-pub fn request_blocks(
-    stream: &mut TcpStream,
+pub fn request_blocks<IO: Read + Write>(
+    stream: &mut IO,
     cfg: &FramingConfig,
     locator: Vec<Hash256>,
     stop: Option<Hash256>,
@@ -399,13 +398,13 @@ pub enum TransportError {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
+    use std::io::{Cursor, Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::thread;
     use std::time::Duration;
 
     use scam_core::{Hash256, Target, hash::hash256};
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::runtime::Runtime;
 
     use crate::sync::{build_block_locator, select_block_hashes_for_peer, select_headers_for_peer};
@@ -415,6 +414,47 @@ mod tests {
         request_headers_async, send_message, send_message_async, server_handshake,
         server_handshake_async,
     };
+
+    #[derive(Default)]
+    struct MockIo {
+        read_cursor: Cursor<Vec<u8>>,
+        writes: Vec<u8>,
+    }
+
+    impl MockIo {
+        fn with_reads(bytes: Vec<u8>) -> Self {
+            Self {
+                read_cursor: Cursor::new(bytes),
+                writes: Vec::new(),
+            }
+        }
+    }
+
+    impl Read for MockIo {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            std::io::Read::read(&mut self.read_cursor, buf)
+        }
+    }
+
+    impl Write for MockIo {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.writes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn encode_framed_message_bytes(cfg: &FramingConfig, message: &WireMessage) -> Vec<u8> {
+        let payload = crate::wire::encode_message(message).expect("encode wire payload");
+        let mut out = Vec::with_capacity(8 + payload.len());
+        out.extend_from_slice(&cfg.magic.to_be_bytes());
+        out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        out.extend_from_slice(&payload);
+        out
+    }
 
     fn handshake() -> LocalHandshake {
         LocalHandshake {
@@ -501,30 +541,46 @@ mod tests {
             let server_cfg = cfg.clone();
 
             let server = tokio::spawn(async move {
-                let remote = server_handshake_async(&mut server_stream, &server_cfg, &handshake())
-                    .await
-                    .expect("server hs");
+                let remote = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    server_handshake_async(&mut server_stream, &server_cfg, &handshake()),
+                )
+                .await
+                .expect("server handshake timeout")
+                .expect("server hs");
                 assert_eq!(remote.network_id, "devnet");
 
                 let (chain, headers_map) = chain_headers(8);
-                let request = read_message_async(&mut server_stream, &server_cfg)
-                    .await
-                    .expect("read req");
+                let request = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    read_message_async(&mut server_stream, &server_cfg),
+                )
+                .await
+                .expect("server read request timeout")
+                .expect("read req");
                 let WireMessage::GetHeaders { locator, stop } = request else {
                     panic!("expected getheaders");
                 };
                 let headers = select_headers_for_peer(&chain, &headers_map, &locator, stop, 2000);
-                send_message_async(
-                    &mut server_stream,
-                    &WireMessage::Headers { headers },
-                    &server_cfg,
+                tokio::time::timeout(
+                    Duration::from_secs(2),
+                    send_message_async(
+                        &mut server_stream,
+                        &WireMessage::Headers { headers },
+                        &server_cfg,
+                    ),
                 )
                 .await
+                .expect("server send headers timeout")
                 .expect("send headers");
 
-                let request = read_message_async(&mut server_stream, &server_cfg)
-                    .await
-                    .expect("read req");
+                let request = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    read_message_async(&mut server_stream, &server_cfg),
+                )
+                .await
+                .expect("server read blocks request timeout")
+                .expect("read req");
                 let WireMessage::GetBlocks { locator, stop } = request else {
                     panic!("expected getblocks");
                 };
@@ -533,30 +589,53 @@ mod tests {
                     .into_iter()
                     .map(crate::wire::InventoryItem::Block)
                     .collect();
-                send_message_async(&mut server_stream, &WireMessage::Inv { items }, &server_cfg)
-                    .await
-                    .expect("send inv");
+                tokio::time::timeout(
+                    Duration::from_secs(2),
+                    send_message_async(
+                        &mut server_stream,
+                        &WireMessage::Inv { items },
+                        &server_cfg,
+                    ),
+                )
+                .await
+                .expect("server send inv timeout")
+                .expect("send inv");
             });
 
-            let remote = client_handshake_async(&mut client_stream, &cfg, &handshake())
-                .await
-                .expect("client hs");
+            let remote = tokio::time::timeout(
+                Duration::from_secs(2),
+                client_handshake_async(&mut client_stream, &cfg, &handshake()),
+            )
+            .await
+            .expect("client handshake timeout")
+            .expect("client hs");
             assert_eq!(remote.network_id, "devnet");
 
             let (local_chain, _) = chain_headers(3);
             let locator = build_block_locator(&local_chain);
-            let headers = request_headers_async(&mut client_stream, &cfg, locator, None)
-                .await
-                .expect("headers");
+            let headers = tokio::time::timeout(
+                Duration::from_secs(2),
+                request_headers_async(&mut client_stream, &cfg, locator, None),
+            )
+            .await
+            .expect("client request headers timeout")
+            .expect("headers");
             assert!(!headers.is_empty());
 
             let locator = build_block_locator(&local_chain);
-            let blocks = request_blocks_async(&mut client_stream, &cfg, locator, None)
-                .await
-                .expect("blocks");
+            let blocks = tokio::time::timeout(
+                Duration::from_secs(2),
+                request_blocks_async(&mut client_stream, &cfg, locator, None),
+            )
+            .await
+            .expect("client request blocks timeout")
+            .expect("blocks");
             assert!(!blocks.is_empty());
 
-            server.await.expect("server join");
+            tokio::time::timeout(Duration::from_secs(2), server)
+                .await
+                .expect("server join timeout")
+                .expect("server join");
         });
     }
 
@@ -592,6 +671,126 @@ mod tests {
             let payload_len =
                 u32::from_be_bytes([header[4], header[5], header[6], header[7]]) as usize;
             assert!(payload_len > 0);
+        });
+    }
+
+    #[test]
+    fn send_message_sync_writes_header_and_payload_bytes_without_network() {
+        let cfg = FramingConfig::default();
+        let message = WireMessage::Ping {
+            nonce: 0x1020_3040_5060_7080,
+        };
+        let mut sink = Vec::<u8>::new();
+        send_message(&mut sink, &message, &cfg).expect("send");
+        assert!(sink.len() >= 8);
+
+        let magic = u32::from_be_bytes([sink[0], sink[1], sink[2], sink[3]]);
+        assert_eq!(magic, cfg.magic);
+        let payload_len = u32::from_be_bytes([sink[4], sink[5], sink[6], sink[7]]) as usize;
+        assert_eq!(payload_len, sink.len() - 8);
+        let decoded = crate::wire::decode_message(&sink[8..], cfg.max_message_size).expect("wire");
+        assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn send_message_sync_enforces_size_boundary_without_network() {
+        let message = WireMessage::Ping { nonce: 0x77 };
+        let payload_len = crate::wire::encode_message(&message).expect("encode").len();
+
+        let cfg_ok = FramingConfig {
+            max_message_size: payload_len,
+            ..FramingConfig::default()
+        };
+        let mut sink_ok = Vec::new();
+        send_message(&mut sink_ok, &message, &cfg_ok).expect("equal boundary should pass");
+        assert!(sink_ok.len() >= 8);
+
+        let cfg_reject = FramingConfig {
+            max_message_size: payload_len.saturating_sub(1),
+            ..FramingConfig::default()
+        };
+        let mut sink_reject = Vec::new();
+        let err = send_message(&mut sink_reject, &message, &cfg_reject)
+            .expect_err("smaller boundary should fail");
+        assert!(matches!(
+            err,
+            crate::transport::TransportError::MessageTooLarge { .. }
+        ));
+    }
+
+    #[test]
+    fn read_message_sync_enforces_magic_and_size_boundaries_without_network() {
+        let message = WireMessage::Ping { nonce: 0x42 };
+        let cfg = FramingConfig::default();
+        let framed = encode_framed_message_bytes(&cfg, &message);
+        let decoded = read_message(&mut Cursor::new(framed.clone()), &cfg).expect("decode");
+        assert_eq!(decoded, message);
+
+        let payload_len = framed.len() - 8;
+        let boundary_cfg = FramingConfig {
+            max_message_size: payload_len,
+            ..FramingConfig::default()
+        };
+        let decoded = read_message(&mut Cursor::new(framed.clone()), &boundary_cfg)
+            .expect("equal boundary should pass");
+        assert_eq!(decoded, message);
+
+        let too_small_cfg = FramingConfig {
+            max_message_size: payload_len.saturating_sub(1),
+            ..FramingConfig::default()
+        };
+        let err = read_message(&mut Cursor::new(framed.clone()), &too_small_cfg)
+            .expect_err("smaller boundary must fail");
+        assert!(matches!(
+            err,
+            crate::transport::TransportError::MessageTooLarge { .. }
+        ));
+
+        let mut wrong_magic = framed;
+        wrong_magic[0] ^= 0xff;
+        let err =
+            read_message(&mut Cursor::new(wrong_magic), &cfg).expect_err("wrong magic must fail");
+        assert!(matches!(
+            err,
+            crate::transport::TransportError::InvalidMagic { .. }
+        ));
+    }
+
+    #[test]
+    fn read_message_async_enforces_size_boundary_without_network() {
+        let runtime = Runtime::new().expect("tokio runtime");
+        runtime.block_on(async {
+            let message = WireMessage::Ping { nonce: 0x1234 };
+            let cfg = FramingConfig::default();
+            let framed = encode_framed_message_bytes(&cfg, &message);
+            let payload_len = framed.len() - 8;
+
+            let (mut tx_ok, mut rx_ok) = tokio::io::duplex(framed.len() + 8);
+            tx_ok.write_all(&framed).await.expect("write");
+            drop(tx_ok);
+            let ok_cfg = FramingConfig {
+                max_message_size: payload_len,
+                ..FramingConfig::default()
+            };
+            let decoded = read_message_async(&mut rx_ok, &ok_cfg)
+                .await
+                .expect("decode");
+            assert_eq!(decoded, message);
+
+            let (mut tx_bad, mut rx_bad) = tokio::io::duplex(framed.len() + 8);
+            tx_bad.write_all(&framed).await.expect("write");
+            drop(tx_bad);
+            let bad_cfg = FramingConfig {
+                max_message_size: payload_len.saturating_sub(1),
+                ..FramingConfig::default()
+            };
+            let err = read_message_async(&mut rx_bad, &bad_cfg)
+                .await
+                .expect_err("smaller boundary must fail");
+            assert!(matches!(
+                err,
+                crate::transport::TransportError::MessageTooLarge { .. }
+            ));
         });
     }
 
@@ -727,6 +926,88 @@ mod tests {
             crate::transport::TransportError::UnexpectedInventoryItem { .. }
         ));
         server.join().expect("server join");
+    }
+
+    #[test]
+    fn client_and_server_handshake_reject_non_verack_without_network() {
+        let cfg = FramingConfig::default();
+        let local = handshake();
+
+        let remote_version = WireMessage::Version {
+            protocol_version: 1,
+            network_id: "devnet".to_owned(),
+            user_agent: "remote".to_owned(),
+            start_height: 7,
+        };
+
+        let mut client_reads = Vec::new();
+        client_reads.extend_from_slice(&encode_framed_message_bytes(&cfg, &remote_version));
+        client_reads.extend_from_slice(&encode_framed_message_bytes(
+            &cfg,
+            &WireMessage::Ping { nonce: 1 },
+        ));
+        let mut client_io = MockIo::with_reads(client_reads);
+        let err = client_handshake(&mut client_io, &cfg, &local)
+            .expect_err("client handshake must reject non-verack");
+        assert!(matches!(
+            err,
+            crate::transport::TransportError::UnexpectedMessage {
+                expected: "verack",
+                ..
+            }
+        ));
+
+        let mut server_reads = Vec::new();
+        server_reads.extend_from_slice(&encode_framed_message_bytes(&cfg, &remote_version));
+        server_reads.extend_from_slice(&encode_framed_message_bytes(
+            &cfg,
+            &WireMessage::Ping { nonce: 2 },
+        ));
+        let mut server_io = MockIo::with_reads(server_reads);
+        let err = server_handshake(&mut server_io, &cfg, &local)
+            .expect_err("server handshake must reject non-verack");
+        assert!(matches!(
+            err,
+            crate::transport::TransportError::UnexpectedMessage {
+                expected: "verack",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn request_headers_and_blocks_success_paths_without_network() {
+        let cfg = FramingConfig::default();
+        let (chain, headers_map) = chain_headers(4);
+        let header = headers_map.get(&chain[1]).expect("header").clone();
+        let block_hash = chain[2];
+
+        let mut reads = Vec::new();
+        reads.extend_from_slice(&encode_framed_message_bytes(
+            &cfg,
+            &WireMessage::Headers {
+                headers: vec![header.clone()],
+            },
+        ));
+        reads.extend_from_slice(&encode_framed_message_bytes(
+            &cfg,
+            &WireMessage::Inv {
+                items: vec![crate::wire::InventoryItem::Block(block_hash)],
+            },
+        ));
+        let mut io = MockIo::with_reads(reads);
+
+        let headers = request_headers(&mut io, &cfg, vec![chain[0]], None).expect("headers");
+        assert_eq!(headers, vec![header]);
+
+        let hashes = request_blocks(&mut io, &cfg, vec![chain[0]], None).expect("hashes");
+        assert_eq!(hashes, vec![block_hash]);
+
+        let mut write_cursor = Cursor::new(io.writes);
+        let first = read_message(&mut write_cursor, &cfg).expect("first request");
+        assert!(matches!(first, WireMessage::GetHeaders { .. }));
+        let second = read_message(&mut write_cursor, &cfg).expect("second request");
+        assert!(matches!(second, WireMessage::GetBlocks { .. }));
     }
 
     fn chain_headers(

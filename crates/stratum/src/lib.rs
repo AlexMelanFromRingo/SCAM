@@ -21,7 +21,6 @@ pub const SUPPORTED_SV2_VERSION: u16 = 2;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const SV2_HEADER_LEN: usize = 6;
 pub const SV2_EXTENSION_MINING: u16 = 0;
-const U24_MAX: usize = 0x00ff_ffff;
 const SECURE_HANDSHAKE_MAGIC: &[u8; 8] = b"SCAMSV2N";
 const SECURE_HANDSHAKE_SIZE: usize = 8 + 33;
 const SECURE_AEAD_TAG_LEN: usize = 16;
@@ -1704,12 +1703,6 @@ pub fn write_frame<W: Write>(writer: &mut W, message: &Sv2Message) -> Result<(),
             max: MAX_FRAME_SIZE,
         });
     }
-    if payload.len() > U24_MAX {
-        return Err(StratumError::FrameTooLarge {
-            got: payload.len(),
-            max: U24_MAX,
-        });
-    }
 
     writer
         .write_all(&SV2_EXTENSION_MINING.to_le_bytes())
@@ -1790,12 +1783,6 @@ pub async fn write_frame_async<W: AsyncWrite + Unpin>(
         return Err(StratumError::FrameTooLarge {
             got: payload.len(),
             max: MAX_FRAME_SIZE,
-        });
-    }
-    if payload.len() > U24_MAX {
-        return Err(StratumError::FrameTooLarge {
-            got: payload.len(),
-            max: U24_MAX,
         });
     }
 
@@ -2026,6 +2013,8 @@ mod tests {
     use std::io::Cursor;
     #[cfg(unix)]
     use std::os::unix::net::UnixStream;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
     #[cfg(unix)]
     use std::thread;
     use std::time::Duration;
@@ -2091,6 +2080,28 @@ mod tests {
         buf
     }
 
+    fn setup_connection_message_with_user_agent_len(user_agent_len: usize) -> Sv2Message {
+        Sv2Message::SetupConnection {
+            protocol: 2,
+            min_version: 2,
+            max_version: 2,
+            flags: 0,
+            user_agent: "x".repeat(user_agent_len),
+        }
+    }
+
+    fn setup_connection_message_with_exact_payload_len(target_len: usize) -> Sv2Message {
+        let base_len = bincode::serialize(&setup_connection_message_with_user_agent_len(0))
+            .expect("serialize")
+            .len();
+        assert!(target_len >= base_len);
+        let user_agent_len = target_len - base_len;
+        let message = setup_connection_message_with_user_agent_len(user_agent_len);
+        let payload_len = bincode::serialize(&message).expect("serialize").len();
+        assert_eq!(payload_len, target_len);
+        message
+    }
+
     #[cfg(unix)]
     fn apply_test_socket_timeouts(stream: &UnixStream) -> bool {
         let timeout = Some(Duration::from_millis(250));
@@ -2107,6 +2118,58 @@ mod tests {
             panic!("set_write_timeout failed: {err}");
         }
         true
+    }
+
+    struct ErrorOnceReader {
+        kind: std::io::ErrorKind,
+        emitted: bool,
+    }
+
+    impl ErrorOnceReader {
+        fn new(kind: std::io::ErrorKind) -> Self {
+            Self {
+                kind,
+                emitted: false,
+            }
+        }
+    }
+
+    impl std::io::Read for ErrorOnceReader {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            if !self.emitted {
+                self.emitted = true;
+                return Err(std::io::Error::from(self.kind));
+            }
+            Ok(0)
+        }
+    }
+
+    struct ErrorOnceAsyncReader {
+        kind: std::io::ErrorKind,
+        emitted: bool,
+    }
+
+    impl ErrorOnceAsyncReader {
+        fn new(kind: std::io::ErrorKind) -> Self {
+            Self {
+                kind,
+                emitted: false,
+            }
+        }
+    }
+
+    impl tokio::io::AsyncRead for ErrorOnceAsyncReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if !self.emitted {
+                self.emitted = true;
+                return Poll::Ready(Err(std::io::Error::from(self.kind)));
+            }
+            Poll::Ready(Ok(()))
+        }
     }
 
     #[test]
@@ -2185,6 +2248,19 @@ mod tests {
     }
 
     #[test]
+    fn read_frame_distinguishes_eof_and_non_eof_errors() {
+        let none = read_frame(&mut ErrorOnceReader::new(std::io::ErrorKind::UnexpectedEof))
+            .expect("unexpected eof should map to None");
+        assert!(none.is_none());
+
+        let err = read_frame(&mut ErrorOnceReader::new(
+            std::io::ErrorKind::PermissionDenied,
+        ))
+        .expect_err("non-eof errors must propagate");
+        assert!(matches!(err, StratumError::Io(_)));
+    }
+
+    #[test]
     fn read_frame_rejects_zero_and_oversized_lengths() {
         let mut zero_len = keepalive_frame_bytes();
         zero_len.truncate(crate::SV2_HEADER_LEN);
@@ -2254,6 +2330,23 @@ mod tests {
     }
 
     #[test]
+    fn write_frame_accepts_exact_max_payload_and_rejects_above_limit() {
+        let at_limit = setup_connection_message_with_exact_payload_len(crate::MAX_FRAME_SIZE);
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &at_limit).expect("max payload should encode");
+        let decoded = read_frame(&mut Cursor::new(buf))
+            .expect("decode")
+            .expect("frame");
+        assert_eq!(decoded, at_limit);
+
+        let above_limit =
+            setup_connection_message_with_exact_payload_len(crate::MAX_FRAME_SIZE + 1);
+        let err = write_frame(&mut Vec::<u8>::new(), &above_limit)
+            .expect_err("payload above max must fail");
+        assert!(matches!(err, StratumError::FrameTooLarge { .. }));
+    }
+
+    #[test]
     fn session_state_machine_happy_path() {
         let mut session = Sv2Session::new(test_session_config()).expect("session");
 
@@ -2307,6 +2400,54 @@ mod tests {
         assert!(matches!(
             submit.events.as_slice(),
             [SessionEvent::ShareAccepted { is_block: true, .. }]
+        ));
+    }
+
+    #[test]
+    fn session_setup_rejects_unsupported_protocol_and_version_ranges() {
+        let mut session = Sv2Session::new(test_session_config()).expect("session");
+        let wrong_protocol = session
+            .handle_message(Sv2Message::SetupConnection {
+                protocol: 1,
+                min_version: 2,
+                max_version: 2,
+                flags: 0,
+                user_agent: "miner".to_owned(),
+            })
+            .expect("response");
+        assert!(matches!(
+            wrong_protocol.outbound.as_slice(),
+            [Sv2Message::SetupConnectionError { code, .. }] if code == "unsupported_version"
+        ));
+
+        let mut session = Sv2Session::new(test_session_config()).expect("session");
+        let unsupported_min = session
+            .handle_message(Sv2Message::SetupConnection {
+                protocol: 2,
+                min_version: 3,
+                max_version: 4,
+                flags: 0,
+                user_agent: "miner".to_owned(),
+            })
+            .expect("response");
+        assert!(matches!(
+            unsupported_min.outbound.as_slice(),
+            [Sv2Message::SetupConnectionError { code, .. }] if code == "unsupported_version"
+        ));
+
+        let mut session = Sv2Session::new(test_session_config()).expect("session");
+        let unsupported_max = session
+            .handle_message(Sv2Message::SetupConnection {
+                protocol: 2,
+                min_version: 1,
+                max_version: 1,
+                flags: 0,
+                user_agent: "miner".to_owned(),
+            })
+            .expect("response");
+        assert!(matches!(
+            unsupported_max.outbound.as_slice(),
+            [Sv2Message::SetupConnectionError { code, .. }] if code == "unsupported_version"
         ));
     }
 
@@ -2682,6 +2823,31 @@ mod tests {
     }
 
     #[test]
+    fn secure_transport_read_message_distinguishes_eof_and_non_eof_errors() {
+        let secp = Secp256k1::new();
+        let client_sk = SecretKey::from_slice(&[17u8; 32]).expect("client sk");
+        let server_sk = SecretKey::from_slice(&[18u8; 32]).expect("server sk");
+        let client_pk = PublicKey::from_secret_key(&secp, &client_sk);
+        let server_pk = PublicKey::from_secret_key(&secp, &server_sk);
+        let mut client =
+            SecureSv2Transport::from_handshake(client_sk, client_pk, server_pk, SecureRole::Client);
+        let _server =
+            SecureSv2Transport::from_handshake(server_sk, server_pk, client_pk, SecureRole::Server);
+
+        let none = client
+            .read_message(&mut ErrorOnceReader::new(std::io::ErrorKind::UnexpectedEof))
+            .expect("unexpected eof should map to None");
+        assert!(none.is_none());
+
+        let err = client
+            .read_message(&mut ErrorOnceReader::new(
+                std::io::ErrorKind::PermissionDenied,
+            ))
+            .expect_err("non-eof errors must propagate");
+        assert!(matches!(err, StratumError::Io(_)));
+    }
+
+    #[test]
     fn secure_transport_rejects_invalid_handshake_magic() {
         let mut invalid = [0u8; crate::SECURE_HANDSHAKE_SIZE];
         invalid[..8].copy_from_slice(b"BADMAGIC");
@@ -2715,6 +2881,31 @@ mod tests {
                 .expect("msg");
             assert_eq!(decoded, Sv2Message::KeepAlive);
         }
+    }
+
+    #[test]
+    fn secure_transport_accepts_ciphertext_at_frame_limit_boundary() {
+        let secp = Secp256k1::new();
+        let client_sk = SecretKey::from_slice(&[31u8; 32]).expect("client sk");
+        let server_sk = SecretKey::from_slice(&[32u8; 32]).expect("server sk");
+        let client_pk = PublicKey::from_secret_key(&secp, &client_sk);
+        let server_pk = PublicKey::from_secret_key(&secp, &server_sk);
+        let mut client =
+            SecureSv2Transport::from_handshake(client_sk, client_pk, server_pk, SecureRole::Client);
+        let mut server =
+            SecureSv2Transport::from_handshake(server_sk, server_pk, client_pk, SecureRole::Server);
+
+        let max_payload_message =
+            setup_connection_message_with_exact_payload_len(crate::MAX_FRAME_SIZE);
+        let mut wire = Vec::new();
+        client
+            .write_message(&mut wire, &max_payload_message)
+            .expect("boundary frame should be accepted");
+        let decoded = server
+            .read_message(&mut Cursor::new(wire))
+            .expect("read")
+            .expect("message");
+        assert_eq!(decoded, max_payload_message);
     }
 
     #[cfg(unix)]
@@ -2797,6 +2988,49 @@ mod tests {
         .expect_err("mismatched expected remote key must fail");
         assert!(matches!(err, StratumError::SecureHandshake(_)));
         let _ = server.join();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn noise_transport_expected_remote_key_match_is_accepted() {
+        let client_keys = super::generate_noise_static_keypair().expect("client keys");
+        let server_keys = super::generate_noise_static_keypair().expect("server keys");
+        let (mut client_io, mut server_io) = UnixStream::pair().expect("unix pair");
+        if !apply_test_socket_timeouts(&client_io) || !apply_test_socket_timeouts(&server_io) {
+            return;
+        }
+
+        let expected_client_pub = client_keys.public;
+        let expected_server_pub = server_keys.public;
+        let server = thread::spawn(move || -> Result<(), crate::StratumError> {
+            let mut server = NoiseSv2Transport::handshake_server(
+                &mut server_io,
+                Some(server_keys.private),
+                Some(expected_client_pub),
+            )?;
+            let msg = server.read_message(&mut server_io)?.expect("server msg");
+            assert_eq!(msg, Sv2Message::KeepAlive);
+            Ok(())
+        });
+
+        let mut client = match NoiseSv2Transport::handshake_client(
+            &mut client_io,
+            Some(client_keys.private),
+            Some(expected_server_pub),
+        ) {
+            Ok(client) => client,
+            Err(crate::StratumError::Io(err))
+                if err.kind() == std::io::ErrorKind::PermissionDenied =>
+            {
+                let _ = server.join();
+                return;
+            }
+            Err(other) => panic!("client handshake: {other}"),
+        };
+        client
+            .write_message(&mut client_io, &Sv2Message::KeepAlive)
+            .expect("client write");
+        server.join().expect("server join").expect("server ok");
     }
 
     #[cfg(unix)]
@@ -2931,6 +3165,29 @@ mod tests {
     }
 
     #[test]
+    fn write_frame_async_accepts_exact_max_payload_and_rejects_above_limit() {
+        let runtime = Runtime::new().expect("tokio runtime");
+        runtime.block_on(async {
+            let at_limit = setup_connection_message_with_exact_payload_len(crate::MAX_FRAME_SIZE);
+            let mut sink = Vec::new();
+            write_frame_async(&mut sink, &at_limit)
+                .await
+                .expect("max payload should encode");
+            let decoded = read_frame(&mut Cursor::new(sink))
+                .expect("decode")
+                .expect("frame");
+            assert_eq!(decoded, at_limit);
+
+            let above_limit =
+                setup_connection_message_with_exact_payload_len(crate::MAX_FRAME_SIZE + 1);
+            let err = write_frame_async(&mut Vec::<u8>::new(), &above_limit)
+                .await
+                .expect_err("payload above max must fail");
+            assert!(matches!(err, StratumError::FrameTooLarge { .. }));
+        });
+    }
+
+    #[test]
     fn async_read_frame_rejects_malformed_headers() {
         let runtime = Runtime::new().expect("tokio runtime");
         runtime.block_on(async {
@@ -2966,6 +3223,26 @@ mod tests {
             drop(tx);
             let decoded = read_frame_async(&mut rx).await.expect("decode");
             assert!(decoded.is_none());
+        });
+    }
+
+    #[test]
+    fn async_read_frame_distinguishes_eof_and_non_eof_errors() {
+        let runtime = Runtime::new().expect("tokio runtime");
+        runtime.block_on(async {
+            let none = read_frame_async(&mut ErrorOnceAsyncReader::new(
+                std::io::ErrorKind::UnexpectedEof,
+            ))
+            .await
+            .expect("unexpected eof should map to None");
+            assert!(none.is_none());
+
+            let err = read_frame_async(&mut ErrorOnceAsyncReader::new(
+                std::io::ErrorKind::PermissionDenied,
+            ))
+            .await
+            .expect_err("non-eof errors must propagate");
+            assert!(matches!(err, StratumError::Io(_)));
         });
     }
 
@@ -3038,6 +3315,61 @@ mod tests {
     }
 
     #[test]
+    fn async_noise_transport_roundtrip_and_rekey_interval_validation() {
+        let runtime = Runtime::new().expect("tokio runtime");
+        runtime.block_on(async {
+            let client_keys = super::generate_noise_static_keypair().expect("client keys");
+            let server_keys = super::generate_noise_static_keypair().expect("server keys");
+            let (mut client_io, mut server_io) = tokio::io::duplex(64 * 1024);
+
+            let expected_client_pub = client_keys.public;
+            let expected_server_pub = server_keys.public;
+            let server = tokio::spawn(async move {
+                let mut server = NoiseSv2Transport::handshake_server_async(
+                    &mut server_io,
+                    Some(server_keys.private),
+                    Some(expected_client_pub),
+                )
+                .await
+                .expect("server handshake");
+                let err = server
+                    .set_rekey_interval_messages(0)
+                    .expect_err("zero interval must fail");
+                assert!(matches!(err, StratumError::InvalidConfig(_)));
+                server
+                    .set_rekey_interval_messages(2)
+                    .expect("server interval");
+                for _ in 0..4 {
+                    let msg = server
+                        .read_message_async(&mut server_io)
+                        .await
+                        .expect("server read")
+                        .expect("server msg");
+                    assert_eq!(msg, Sv2Message::KeepAlive);
+                }
+            });
+
+            let mut client = NoiseSv2Transport::handshake_client_async(
+                &mut client_io,
+                Some(client_keys.private),
+                Some(expected_server_pub),
+            )
+            .await
+            .expect("client handshake");
+            client
+                .set_rekey_interval_messages(2)
+                .expect("client interval");
+            for _ in 0..4 {
+                client
+                    .write_message_async(&mut client_io, &Sv2Message::KeepAlive)
+                    .await
+                    .expect("client write");
+            }
+            server.await.expect("server join");
+        });
+    }
+
+    #[test]
     fn async_secure_transport_write_message_emits_bytes() {
         let runtime = Runtime::new().expect("tokio runtime");
         runtime.block_on(async {
@@ -3073,6 +3405,41 @@ mod tests {
     }
 
     #[test]
+    fn async_secure_transport_accepts_ciphertext_at_frame_limit_boundary() {
+        let runtime = Runtime::new().expect("tokio runtime");
+        runtime.block_on(async {
+            let message = setup_connection_message_with_exact_payload_len(crate::MAX_FRAME_SIZE);
+            let (mut client_io, mut server_io) = tokio::io::duplex(2 * 1024 * 1024);
+
+            let message_clone = message.clone();
+            let client = tokio::spawn(async move {
+                let mut transport = SecureSv2Transport::handshake_client_async(&mut client_io)
+                    .await
+                    .expect("client handshake");
+                transport
+                    .write_message_async(&mut client_io, &message_clone)
+                    .await
+                    .expect("client write");
+            });
+
+            let server = tokio::spawn(async move {
+                let mut transport = SecureSv2Transport::handshake_server_async(&mut server_io)
+                    .await
+                    .expect("server handshake");
+                transport
+                    .read_message_async(&mut server_io)
+                    .await
+                    .expect("server read")
+                    .expect("server message")
+            });
+
+            client.await.expect("client join");
+            let decoded = server.await.expect("server join");
+            assert_eq!(decoded, message);
+        });
+    }
+
+    #[test]
     fn noise_helpers_validate_key_input_nonce_and_scaling() {
         assert!(super::decode_noise_key_bytes(&[0u8; 31], "public").is_err());
         assert!(super::resolve_noise_private_key(None).is_err());
@@ -3089,6 +3456,20 @@ mod tests {
         let b = super::derive_rekey_key(key, 2);
         assert_ne!(a, b);
         assert_ne!(a, key);
+        let mut material = [0u8; 40];
+        material[..32].copy_from_slice(&key);
+        material[32..40].copy_from_slice(&1u64.to_le_bytes());
+        let expected = blake3::derive_key(super::SECURE_KEY_CONTEXT_REKEY, &material);
+        assert_eq!(a, expected);
+    }
+
+    #[test]
+    fn current_unix_time_sec_is_recent() {
+        let now = super::current_unix_time_sec();
+        assert!(
+            now > 1_700_000_000,
+            "unix time appears implausibly old: {now}"
+        );
     }
 
     #[test]
@@ -3099,6 +3480,14 @@ mod tests {
         let decoded =
             super::read_noise_handshake_packet(&mut Cursor::new(wire)).expect("read max packet");
         assert_eq!(decoded, payload);
+
+        let small_payload = vec![0x11u8, 0x22u8, 0x33u8];
+        let mut small_wire = Vec::new();
+        super::write_noise_handshake_packet(&mut small_wire, &small_payload)
+            .expect("write small packet");
+        let small_decoded = super::read_noise_handshake_packet(&mut Cursor::new(small_wire))
+            .expect("read small packet");
+        assert_eq!(small_decoded, small_payload);
 
         let empty_err = super::write_noise_handshake_packet(&mut Vec::<u8>::new(), &[])
             .expect_err("empty payload must fail");
@@ -3128,6 +3517,17 @@ mod tests {
                 .await
                 .expect("read");
             assert_eq!(decoded, payload);
+
+            let small_payload = vec![0x44u8, 0x55u8];
+            let (mut tx_small, mut rx_small) = tokio::io::duplex(64);
+            super::write_noise_handshake_packet_async(&mut tx_small, &small_payload)
+                .await
+                .expect("write small");
+            drop(tx_small);
+            let small_decoded = super::read_noise_handshake_packet_async(&mut rx_small)
+                .await
+                .expect("read small");
+            assert_eq!(small_decoded, small_payload);
         });
     }
 
@@ -3153,6 +3553,20 @@ mod tests {
                 .expect_err("zero length must fail");
             assert!(matches!(zero_err, StratumError::InvalidFrameLength(0)));
 
+            let boundary = super::SECURE_MAX_FRAME_SIZE as u32;
+            let boundary_prefix = boundary.to_le_bytes();
+            let (mut tx_boundary, mut rx_boundary) = tokio::io::duplex(16);
+            tx_boundary
+                .write_all(&boundary_prefix)
+                .await
+                .expect("write boundary");
+            drop(tx_boundary);
+            let boundary_len = super::read_secure_frame_length_async(&mut rx_boundary)
+                .await
+                .expect("boundary should pass")
+                .expect("some length");
+            assert_eq!(boundary_len, super::SECURE_MAX_FRAME_SIZE);
+
             let too_large = (super::SECURE_MAX_FRAME_SIZE + 1) as u32;
             let prefix = too_large.to_le_bytes();
             let (mut tx_big, mut rx_big) = tokio::io::duplex(16);
@@ -3162,6 +3576,13 @@ mod tests {
                 .await
                 .expect_err("oversize must fail");
             assert!(matches!(big_err, StratumError::FrameTooLarge { .. }));
+
+            let io_err = super::read_secure_frame_length_async(&mut ErrorOnceAsyncReader::new(
+                std::io::ErrorKind::PermissionDenied,
+            ))
+            .await
+            .expect_err("non-eof errors must propagate");
+            assert!(matches!(io_err, StratumError::Io(_)));
         });
     }
 

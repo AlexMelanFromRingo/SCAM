@@ -14,19 +14,24 @@ pub fn select_outbound_peers(
     rotate_after_sec: u64,
     now_unix_sec: u64,
 ) -> Vec<SocketAddr> {
-    if max_outbound == 0 || candidates.is_empty() {
+    if candidates.is_empty() {
         return Vec::new();
     }
 
     let mut sorted = candidates.to_vec();
     sorted.sort_unstable_by(|a, b| {
-        let a_stale = now_unix_sec.saturating_sub(a.last_connected_unix_sec) >= rotate_after_sec;
-        let b_stale = now_unix_sec.saturating_sub(b.last_connected_unix_sec) >= rotate_after_sec;
-
         a.failure_count
             .cmp(&b.failure_count)
-            .then_with(|| b_stale.cmp(&a_stale))
-            .then_with(|| a.last_connected_unix_sec.cmp(&b.last_connected_unix_sec))
+            .then_with(|| {
+                let a_age = now_unix_sec.saturating_sub(a.last_connected_unix_sec);
+                let b_age = now_unix_sec.saturating_sub(b.last_connected_unix_sec);
+                // Prefer peers that have been disconnected longer than the rotation threshold.
+                let a_is_rotation_candidate = a_age >= rotate_after_sec;
+                let b_is_rotation_candidate = b_age >= rotate_after_sec;
+                b_is_rotation_candidate.cmp(&a_is_rotation_candidate)
+            })
+            // Within the same rotation bucket, prefer fresher peers first.
+            .then_with(|| b.last_connected_unix_sec.cmp(&a.last_connected_unix_sec))
             .then_with(|| a.addr.cmp(&b.addr))
     });
 
@@ -49,14 +54,12 @@ pub fn select_outbound_peers(
         }
     }
 
-    if selected.len() < max_outbound {
-        for candidate in &sorted {
-            if selected.len() >= max_outbound {
-                break;
-            }
-            if selected_addrs.insert(candidate.addr) {
-                selected.push(candidate.addr);
-            }
+    for candidate in &sorted {
+        if selected.len() >= max_outbound {
+            break;
+        }
+        if selected_addrs.insert(candidate.addr) {
+            selected.push(candidate.addr);
         }
     }
 
@@ -203,12 +206,12 @@ mod tests {
         let candidates = vec![
             PeerCandidate {
                 addr: addr("10.1.1.1:8333"),
-                last_connected_unix_sec: 940,
+                last_connected_unix_sec: 941,
                 failure_count: 0,
             },
             PeerCandidate {
                 addr: addr("11.2.1.1:8333"),
-                last_connected_unix_sec: 939,
+                last_connected_unix_sec: 940,
                 failure_count: 0,
             },
         ];

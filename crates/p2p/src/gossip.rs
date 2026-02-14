@@ -804,6 +804,54 @@ mod tests {
     }
 
     #[test]
+    fn inv_and_getdata_accept_exact_max_inv_items_boundary() {
+        let mut engine = GossipEngine::with_limits(2, 100).expect("engine");
+        engine.connect_peer(7);
+
+        let inv_items = vec![
+            InventoryItem::Tx(scam_core::hash::hash256(b"tx-a")),
+            InventoryItem::Tx(scam_core::hash::hash256(b"tx-b")),
+        ];
+        let response = engine
+            .on_message(
+                7,
+                WireMessage::Inv {
+                    items: inv_items.clone(),
+                },
+            )
+            .expect("exact boundary for inv should pass");
+        assert_eq!(
+            response,
+            vec![OutboundMessage {
+                peer_id: 7,
+                message: WireMessage::GetData { items: inv_items },
+            }]
+        );
+
+        let getdata_items = vec![
+            InventoryItem::Tx(scam_core::hash::hash256(b"missing-1")),
+            InventoryItem::Tx(scam_core::hash::hash256(b"missing-2")),
+        ];
+        let response = engine
+            .on_message(
+                7,
+                WireMessage::GetData {
+                    items: getdata_items.clone(),
+                },
+            )
+            .expect("exact boundary for getdata should pass");
+        assert_eq!(
+            response,
+            vec![OutboundMessage {
+                peer_id: 7,
+                message: WireMessage::NotFound {
+                    items: getdata_items
+                },
+            }]
+        );
+    }
+
+    #[test]
     fn telemetry_counts_replacements_and_delta_activity() {
         let mut engine = GossipEngine::new(256).expect("engine");
         engine.connect_peer(1);

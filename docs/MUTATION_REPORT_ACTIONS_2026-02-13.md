@@ -64,3 +64,18 @@ Run window: `2026-02-13T16:10:10Z` -> `2026-02-13T17:09:00Z`
   - Current timeout hotspot: `crates/miner/src/lib.rs:308:16: delete ! in build_cpfp_package`.
 - [ ] Stage 2: close P1 items and re-run mutation on `stratum/p2p/node` protocol subset.
 - [ ] Stage 3: close P2/P3 items and run full workspace mutation baseline again.
+
+## Addendum (2026-02-14)
+
+- [x] Re-ran focused `p2p` mutation baseline after transport/discovery/sync hardening:
+  - Command scope: `--package scam-p2p --file crates/p2p/src/{discovery,gossip,sync,transport,wire}.rs`
+  - Result snapshot: `total=154`, `caught=123`, `missed=0`, `timeout=0`, `unviable=31`.
+- [x] Re-ran focused `stratum` mutation baseline after frame/secure/noise hardening:
+  - Command scope: `--package scam-stratum --file crates/stratum/src/lib.rs`
+  - Result snapshot: `total=310`, `caught=238`, `missed=37`, `timeout=5`, `unviable=30`.
+- [x] `stratum` misses were reduced (`89 -> 37`) and remaining misses are concentrated in:
+  - vardiff threshold edge math (`Sv2Session::record_share_timestamp`),
+  - noise sync/async branch guards and no-op replacements,
+  - algebraically equivalent bitwise compose mutants (`|` vs `^` on non-overlapping shifted bytes),
+  - constant-size arithmetic mutants in key-material array definitions.
+- [ ] Next pass: finish remaining `stratum` misses/timeouts, then run full Stage 2 (`stratum+p2p+node`) again.
