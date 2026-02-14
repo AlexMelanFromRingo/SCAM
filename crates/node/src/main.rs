@@ -7675,6 +7675,13 @@ mod tests {
         PathBuf::from(format!("target/{prefix}-{ts}"))
     }
 
+    fn network_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("network test mutex poisoned")
+    }
+
     fn allocate_local_addr() -> Option<String> {
         match TcpListener::bind("127.0.0.1:0") {
             Ok(listener) => listener.local_addr().ok().map(|addr| addr.to_string()),
@@ -8453,6 +8460,7 @@ mod tests {
 
     #[test]
     fn relay_serve_rejects_network_id_mismatch_after_handshake() {
+        let _net_guard = network_test_guard();
         let work_dir = temp_dir("test-relay-network-mismatch");
         fs::create_dir_all(&work_dir).expect("mkdir");
         let config_path = work_dir.join("devnet.toml");
@@ -8508,6 +8516,7 @@ mod tests {
 
     #[test]
     fn relay_serve_enforces_per_peer_message_limit() {
+        let _net_guard = network_test_guard();
         let work_dir = temp_dir("test-relay-message-limit");
         fs::create_dir_all(&work_dir).expect("mkdir");
         let config_path = work_dir.join("devnet.toml");
@@ -8572,6 +8581,7 @@ mod tests {
 
     #[test]
     fn relay_serve_persists_telemetry_snapshots_when_enabled() {
+        let _net_guard = network_test_guard();
         let work_dir = temp_dir("test-relay-telemetry");
         fs::create_dir_all(&work_dir).expect("mkdir");
         let config_path = work_dir.join("devnet.toml");
@@ -9476,6 +9486,7 @@ mod tests {
 
     #[test]
     fn static_asset_helpers_handle_unknown_suffix_and_traversal() {
+        let _net_guard = network_test_guard();
         assert_eq!(
             super::guess_content_type(std::path::Path::new("index.html")),
             "text/html; charset=utf-8"
@@ -9580,6 +9591,7 @@ mod tests {
 
     #[test]
     fn run_rpc_serve_dispatches_health_and_unknown_routes() {
+        let _net_guard = network_test_guard();
         let Some(addr) = allocate_local_addr() else {
             return;
         };
@@ -9645,6 +9657,7 @@ mod tests {
 
     #[test]
     fn run_rpc_serve_dispatches_core_and_wallet_routes() {
+        let _net_guard = network_test_guard();
         let Some(addr) = allocate_local_addr() else {
             return;
         };
@@ -9726,6 +9739,7 @@ mod tests {
 
     #[test]
     fn run_rpc_serve_route_matching_and_hrp_validation_are_strict() {
+        let _net_guard = network_test_guard();
         let Some(addr) = allocate_local_addr() else {
             return;
         };
@@ -10597,6 +10611,7 @@ mod tests {
 
     #[test]
     fn sv2_conformance_happy_path_reports_expected_sequence() {
+        let _net_guard = network_test_guard();
         let Some(addr) = allocate_local_addr() else {
             return;
         };
@@ -10695,6 +10710,7 @@ mod tests {
 
     #[test]
     fn sv2_conformance_error_path_reports_fail_and_errors() {
+        let _net_guard = network_test_guard();
         let Some(addr) = allocate_local_addr() else {
             return;
         };
@@ -11114,6 +11130,7 @@ mod tests {
 
     #[test]
     fn template_provider_service_roundtrip() {
+        let _net_guard = network_test_guard();
         let Some(addr) = allocate_local_addr() else {
             return;
         };
@@ -11148,6 +11165,7 @@ mod tests {
 
     #[test]
     fn job_declarator_service_roundtrip() {
+        let _net_guard = network_test_guard();
         let Some(addr) = allocate_local_addr() else {
             return;
         };
@@ -11180,6 +11198,7 @@ mod tests {
 
     #[test]
     fn translator_service_roundtrip() {
+        let _net_guard = network_test_guard();
         let Some(addr) = allocate_local_addr() else {
             return;
         };
