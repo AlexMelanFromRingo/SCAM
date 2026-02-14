@@ -52,6 +52,23 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: scam-rust-${{ runner.os }}
+          workspaces: |
+            . -> target
+
+      - name: Cache cargo install tools
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-mutants
+            ~/.cargo/bin/cargo-nextest
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
+          key: scam-cargo-tools-${{ runner.os }}-mutants-26.2.0-nextest
+
       - name: Install cargo-mutants
         run: |
           if ! command -v cargo-mutants >/dev/null 2>&1; then

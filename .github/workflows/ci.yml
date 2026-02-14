@@ -11,6 +11,12 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: scam-rust-${{ runner.os }}
+          workspaces: |
+            . -> target
       - name: Format
         run: cargo fmt --all -- --check
       - name: Check
@@ -27,6 +33,12 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: scam-rust-${{ runner.os }}
+          workspaces: |
+            . -> target
       - name: Run SV2 conformance matrix
         run: scripts/sv2-conformance-matrix.sh
       - name: Upload conformance artifacts
