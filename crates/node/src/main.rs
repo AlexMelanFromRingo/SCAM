@@ -9808,32 +9808,14 @@ mod tests {
         assert!(wallet_address.starts_with("HTTP/1.1 200 OK"));
         assert!(wallet_address.contains("\"address\""));
 
-        let wallet_balance_req = serde_json::json!({
-            "mnemonic": SOAK_FLOW_MNEMONIC,
-            "passphrase": "",
-            "account": 0,
-            "index": 0
-        })
-        .to_string();
-        let wallet_balance = send_http_json_post(&addr, "/wallet/balance", &wallet_balance_req);
-        assert!(wallet_balance.starts_with("HTTP/1.1 200 OK"));
-        assert!(wallet_balance.contains("\"spendable\""));
-
-        let wallet_decode_req = serde_json::json!({
-            "address": invalid_recipient.clone()
-        })
-        .to_string();
-        let wallet_decode = send_http_json_post(&addr, "/wallet/decode", &wallet_decode_req);
-        assert!(wallet_decode.starts_with("HTTP/1.1 200 OK"));
-        assert!(wallet_decode.contains("\"key_hash20_hex\""));
-
         let valid_send_req = serde_json::json!({
             "mnemonic": SOAK_FLOW_MNEMONIC,
             "passphrase": "",
             "account": 0,
             "index": 0,
             "to": valid_recipient,
-            "amount": 1,
+            // Force deterministic non-funding error path after HRP validation.
+            "amount": u64::MAX,
             "fee": 1
         })
         .to_string();
@@ -9857,6 +9839,26 @@ mod tests {
         let invalid_send = send_http_json_post(&addr, "/wallet/send-preview", &invalid_send_req);
         assert!(invalid_send.starts_with("HTTP/1.1 400 Bad Request"));
         assert!(invalid_send.contains("address hrp"));
+
+        // Keep counted routes last so `max_requests` is reached after assertions above.
+        let wallet_balance_req = serde_json::json!({
+            "mnemonic": SOAK_FLOW_MNEMONIC,
+            "passphrase": "",
+            "account": 0,
+            "index": 0
+        })
+        .to_string();
+        let wallet_balance = send_http_json_post(&addr, "/wallet/balance", &wallet_balance_req);
+        assert!(wallet_balance.starts_with("HTTP/1.1 200 OK"));
+        assert!(wallet_balance.contains("\"spendable\""));
+
+        let wallet_decode_req = serde_json::json!({
+            "address": invalid_recipient.clone()
+        })
+        .to_string();
+        let wallet_decode = send_http_json_post(&addr, "/wallet/decode", &wallet_decode_req);
+        assert!(wallet_decode.starts_with("HTTP/1.1 200 OK"));
+        assert!(wallet_decode.contains("\"key_hash20_hex\""));
 
         server.join().expect("server join");
         let _ = fs::remove_dir_all(work_dir);
