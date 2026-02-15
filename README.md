@@ -206,6 +206,35 @@ cargo run -p scam-node -- config-scaffold \
 
 ## 6) Running a Node
 
+### 6.0 Simple Launch Helpers
+
+For default local usage (without long CLI flag lists), use:
+
+```bash
+scripts/scam-easy.sh help
+scripts/scam-easy.sh node
+scripts/scam-easy.sh relay
+scripts/scam-easy.sh rpc
+scripts/scam-easy.sh pool
+scripts/scam-easy.sh miner
+```
+
+For local multi-node verification:
+
+```bash
+scripts/local-multinode.sh up
+scripts/local-multinode.sh status
+scripts/local-multinode.sh down
+```
+
+For a fuller local lab (2+ nodes + miner + demo wallets + UI):
+
+```bash
+scripts/local-test-lab.sh up
+scripts/local-test-lab.sh status
+scripts/local-test-lab.sh down
+```
+
 ### 6.1 Bootstrap node runtime
 
 ```bash

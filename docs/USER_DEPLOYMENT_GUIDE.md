@@ -142,6 +142,33 @@ NODE_COUNT=5 RUN_STRATUM=true BASE_P2P_PORT=20444 BASE_RPC_PORT=20080 \
   scripts/local-multinode.sh up
 ```
 
+### 5.3 End-to-End Local Lab (2+ nodes + miner + wallets + UI)
+
+If you want a fuller local test setup (sync + mining + wallet files + web UI):
+
+```bash
+scripts/local-test-lab.sh up
+```
+
+What it does:
+- starts `NODE_COUNT` relay nodes (default `2`),
+- enables RPC+Web UI on each node,
+- starts one Stratum pool on node-0,
+- starts one miner connected to node-0 pool,
+- generates two demo wallets and saves them under `target/local-test-lab/wallets/`.
+
+Control:
+
+```bash
+scripts/local-test-lab.sh status
+scripts/local-test-lab.sh down
+scripts/local-test-lab.sh clean
+```
+
+You can then open UIs:
+- `http://127.0.0.1:19080/` (node-0 by default)
+- `http://127.0.0.1:19081/` (node-1 by default)
+
 ## 6) Create Wallet (Secure Recommended)
 
 Create encrypted vault:
