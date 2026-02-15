@@ -36,6 +36,29 @@ on:
         options:
           - cargo
           - nextest
+      shard:
+        description: "Optional shard (example: 1/4)"
+        required: false
+        default: ""
+        type: string
+      examine_re:
+        description: "Optional regex for targeted mutants (-F)"
+        required: false
+        default: ""
+        type: string
+      exclude_re:
+        description: "Optional regex for excluded mutants (-E)"
+        required: false
+        default: ""
+        type: string
+      iterate:
+        description: "Skip already-caught mutants from prior artifacts"
+        required: true
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
   schedule:
     - cron: "0 3 * * *"
 
@@ -98,6 +121,10 @@ jobs:
           export MUTATION_TIMEOUT="${{ inputs.timeout_sec }}"
           export MUTATION_MIN_TEST_TIMEOUT="${{ inputs.min_test_timeout_sec }}"
           export MUTATION_TEST_TOOL="${{ inputs.test_tool }}"
+          export MUTATION_SHARD="${{ inputs.shard }}"
+          export MUTATION_EXAMINE_RE="${{ inputs.examine_re }}"
+          export MUTATION_EXCLUDE_RE="${{ inputs.exclude_re }}"
+          export MUTATION_ITERATE="${{ inputs.iterate }}"
           scripts/mutation-staged.sh "${{ inputs.stage }}"
 
       - name: Upload mutation artifacts
