@@ -45,6 +45,7 @@ RUN_SYNC_LOOP="${RUN_SYNC_LOOP:-false}"
 SYNC_LOOP_INTERVAL_SEC="${SYNC_LOOP_INTERVAL_SEC:-5}"
 P2P_READ_TIMEOUT_SEC="${P2P_READ_TIMEOUT_SEC:-5}"
 P2P_WRITE_TIMEOUT_SEC="${P2P_WRITE_TIMEOUT_SEC:-5}"
+STRATUM_READ_TIMEOUT_SEC="${STRATUM_READ_TIMEOUT_SEC:-30}"
 UI_DIR="${UI_DIR:-web}"
 SCAM_NODE_BIN="${SCAM_NODE_BIN:-}"
 
@@ -203,6 +204,7 @@ start_cluster() {
   require_positive_int "SYNC_LOOP_INTERVAL_SEC" "${SYNC_LOOP_INTERVAL_SEC}"
   require_positive_int "P2P_READ_TIMEOUT_SEC" "${P2P_READ_TIMEOUT_SEC}"
   require_positive_int "P2P_WRITE_TIMEOUT_SEC" "${P2P_WRITE_TIMEOUT_SEC}"
+  require_positive_int "STRATUM_READ_TIMEOUT_SEC" "${STRATUM_READ_TIMEOUT_SEC}"
 
   mkdir -p "${CLUSTER_DIR}"
   local bin
@@ -264,6 +266,7 @@ start_cluster() {
         --config "${CONFIG}" \
         --runtime-db "${runtime_db}" \
         --bind "127.0.0.1:${stratum_port}" \
+        --read-timeout-sec "${STRATUM_READ_TIMEOUT_SEC}" \
         > "${logsdir}/stratum.log" 2>&1 &
       write_pid "${nodedir}/stratum.pid" "$!"
       ensure_pid_started "${nodedir}/stratum.pid" "node-${idx} stratum-serve" "${logsdir}/stratum.log"

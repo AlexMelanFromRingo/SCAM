@@ -1112,6 +1112,47 @@ fn persist_runtime_db(runtime: &ChainRuntime, runtime_db_path: &Path) -> Result<
     Ok(())
 }
 
+fn is_runtime_db_lock_conflict(err: &NodeError) -> bool {
+    let msg = err.to_string();
+    msg.contains("Database already open") || msg.contains("Cannot acquire lock")
+}
+
+fn persist_runtime_db_with_retry(
+    runtime: &ChainRuntime,
+    runtime_db_path: &Path,
+    attempts: usize,
+    backoff_ms: u64,
+) -> Result<(), NodeError> {
+    let mut last_err = None;
+    let tries = attempts.max(1);
+    for idx in 0..tries {
+        match persist_runtime_db(runtime, runtime_db_path) {
+            Ok(()) => return Ok(()),
+            Err(err) if is_runtime_db_lock_conflict(&err) => {
+                last_err = Some(err);
+                if idx + 1 < tries {
+                    std::thread::sleep(Duration::from_millis(backoff_ms.max(1)));
+                    continue;
+                }
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        NodeError::Runtime("runtime db persist failed for unknown reason".to_owned())
+    }))
+}
+
+fn next_stratum_job_timestamp(runtime: &ChainRuntime, cfg: &ChainConfig) -> u64 {
+    const CONSENSUS_MAX_FUTURE_BLOCK_TIME_SEC: u64 = 2 * 60 * 60;
+    let tip_ts = runtime.tip_header().timestamp;
+    let min_next = tip_ts.saturating_add(1);
+    let wall_now = current_unix_sec().unwrap_or(min_next);
+    let max_future = wall_now.saturating_add(CONSENSUS_MAX_FUTURE_BLOCK_TIME_SEC);
+    let ideal = tip_ts.saturating_add(cfg.target_block_time_sec);
+    std::cmp::max(min_next, ideal.min(max_future))
+}
+
 fn run_node(
     network: Network,
     config: Option<PathBuf>,
@@ -3606,6 +3647,7 @@ fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
         let state_clone = state.clone();
         let active_clone = active_peers.clone();
         let cfg_clone = cfg.clone();
+        let runtime_db_path_clone = runtime_db_path.clone();
         let read_limit = args.max_messages_per_peer;
         handles.push(thread::spawn(move || -> Result<(), NodeError> {
             let result = (|| -> Result<(), NodeError> {
@@ -3633,9 +3675,21 @@ fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
                 }
 
                 let mut seen = 0u32;
+                let mut runtime_db_seen_mtime = None::<SystemTime>;
                 loop {
                     if should_stop_after_seen_messages(read_limit, seen) {
                         break;
+                    }
+                    {
+                        let mut guard = state_clone.lock().map_err(|_| {
+                            NodeError::Runtime("relay state mutex poisoned".to_owned())
+                        })?;
+                        refresh_runtime_from_db_if_changed(
+                            &cfg_clone,
+                            &mut guard.runtime,
+                            &runtime_db_path_clone,
+                            &mut runtime_db_seen_mtime,
+                        )?;
                     }
                     let Some(inbound) = map_relay_read_result(read_message(&mut stream, &framing))?
                     else {
@@ -4539,10 +4593,7 @@ impl StratumTemplateProvider for RuntimeTemplateProvider {
             version: 1,
             prev_hash: runtime.tip_hash(),
             merkle_root,
-            ntime: runtime
-                .tip_header()
-                .timestamp
-                .saturating_add(cfg.target_block_time_sec),
+            ntime: next_stratum_job_timestamp(runtime, cfg),
             network_target: target,
         };
         Ok(StratumTemplateWork { template, coinbase })
@@ -4664,10 +4715,7 @@ async fn issue_new_stratum_job_async<S: AsyncRead + AsyncWrite + Unpin>(
                 channel_id: session.channel_id(),
                 version: 1,
                 prev_hash_hex: runtime.tip_hash().to_hex(),
-                ntime: runtime
-                    .tip_header()
-                    .timestamp
-                    .saturating_add(ctx.cfg.target_block_time_sec),
+                ntime: next_stratum_job_timestamp(&runtime, &ctx.cfg),
                 network_target_hex: target.to_hex(),
                 block_subsidy: ctx.cfg.block_subsidy,
                 reward_key_hash20_hex: hex::encode(reward_key_hash20),
@@ -4934,7 +4982,21 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
                                 {
                                     let mut runtime = lock_runtime(&ctx.runtime)?;
                                     let _ = runtime.submit_block(block)?;
-                                    persist_runtime_db(&runtime, &ctx.runtime_db_path)?;
+                                    match persist_runtime_db_with_retry(
+                                        &runtime,
+                                        &ctx.runtime_db_path,
+                                        80,
+                                        25,
+                                    ) {
+                                        Ok(()) => {}
+                                        Err(err) if is_runtime_db_lock_conflict(&err) => {
+                                            eprintln!(
+                                                "warning: runtime db lock contention while persisting mined block; keeping in-memory tip {}",
+                                                runtime.tip_hash()
+                                            );
+                                        }
+                                        Err(err) => return Err(err),
+                                    }
                                     last_tip_hash = runtime.tip_hash();
                                 }
 
@@ -5634,6 +5696,9 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
             workers.spawn(async move {
                 let result = run_stratum_client_async(stream, client_ctx, permit).await;
                 active_clients.fetch_sub(1, Ordering::Relaxed);
+                if let Err(err) = &result {
+                    eprintln!("stratum worker error: {err}");
+                }
                 result
             });
 
@@ -6959,7 +7024,28 @@ fn refresh_runtime_from_db_if_changed(
     if current_mtime == *last_seen_mtime {
         return Ok(());
     }
-    let (fresh, _) = load_runtime_from_db_or_genesis(cfg, runtime_db_path)?;
+    let mut fresh = None;
+    for attempt in 0..10 {
+        match load_runtime_from_db_or_genesis(cfg, runtime_db_path) {
+            Ok((loaded, _source)) => {
+                fresh = Some(loaded);
+                break;
+            }
+            Err(err) if is_runtime_db_lock_conflict(&err) => {
+                if attempt < 9 {
+                    std::thread::sleep(Duration::from_millis(25));
+                    continue;
+                }
+                // Another process owns the runtime DB lock at the moment.
+                // Keep serving with the latest in-memory runtime and retry refresh on next request.
+                return Ok(());
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    let Some(fresh) = fresh else {
+        return Ok(());
+    };
     *runtime = fresh;
     *last_seen_mtime = current_mtime;
     Ok(())

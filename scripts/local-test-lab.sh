@@ -32,8 +32,10 @@ MINER_READ_TIMEOUT_SEC="${MINER_READ_TIMEOUT_SEC:-2}"
 MINER_MAX_NONCE_PER_CYCLE="${MINER_MAX_NONCE_PER_CYCLE:-250000}"
 MINER_MAX_SHARES="${MINER_MAX_SHARES:-0}"
 MINER_MAX_RUNTIME_SEC="${MINER_MAX_RUNTIME_SEC:-0}"
+STRATUM_READ_TIMEOUT_SEC="${STRATUM_READ_TIMEOUT_SEC:-30}"
 RUN_SYNC_LOOP="${RUN_SYNC_LOOP:-true}"
 SYNC_LOOP_INTERVAL_SEC="${SYNC_LOOP_INTERVAL_SEC:-5}"
+SYNC_MAX_BATCHES_PER_PEER="${SYNC_MAX_BATCHES_PER_PEER:-8}"
 
 WALLET_WORDS="${WALLET_WORDS:-12}"
 WALLET_HRP="${WALLET_HRP:-sd}"
@@ -42,6 +44,7 @@ ENDPOINTS_FILE="${CLUSTER_DIR}/endpoints.tsv"
 MINER_PID_FILE="${CLUSTER_DIR}/miner.pid"
 MINER_LOG_FILE="${CLUSTER_DIR}/miner.log"
 WALLETS_DIR="${CLUSTER_DIR}/wallets"
+FOLLOW_SYNC_DIR="${CLUSTER_DIR}/follower-sync"
 
 is_true() {
   local raw="${1:-false}"
@@ -130,6 +133,47 @@ generate_demo_wallet() {
   printf "WALLET_%s_ADDRESS=%q\n" "${wallet_idx}" "${address}" >> "${WALLETS_DIR}/wallets.env"
 }
 
+stop_follower_sync_loops() {
+  if [[ ! -d "${FOLLOW_SYNC_DIR}" ]]; then
+    return 0
+  fi
+  for pid_file in "${FOLLOW_SYNC_DIR}"/sync-node-*.pid; do
+    [[ -e "${pid_file}" ]] || continue
+    stop_pid_file "${pid_file}"
+  done
+}
+
+start_follower_sync_loops() {
+  local bin="$1"
+  if ! is_true "${RUN_SYNC_LOOP}"; then
+    return 0
+  fi
+  mkdir -p "${FOLLOW_SYNC_DIR}"
+  for ((idx = 1; idx < NODE_COUNT; idx++)); do
+    local node_tag nodedir runtime_db peers_dir pid_file log_file
+    node_tag="$(printf "%02d" "${idx}")"
+    nodedir="${CLUSTER_DIR}/node-${node_tag}"
+    runtime_db="${nodedir}/runtime.redb"
+    peers_dir="${nodedir}/peers"
+    pid_file="${FOLLOW_SYNC_DIR}/sync-node-${node_tag}.pid"
+    log_file="${nodedir}/logs/sync-follow.log"
+    (
+      while true; do
+        "${bin}" sync-book \
+          --network "${NETWORK}" \
+          --config "${CONFIG}" \
+          --runtime-db "${runtime_db}" \
+          --peers-dir "${peers_dir}" \
+          --max-peers "${NODE_COUNT}" \
+          --max-batches-per-peer "${SYNC_MAX_BATCHES_PER_PEER}" \
+          >> "${log_file}" 2>&1 || true
+        sleep "${SYNC_LOOP_INTERVAL_SEC}"
+      done
+    ) &
+    echo "$!" > "${pid_file}"
+  done
+}
+
 start_lab() {
   require_positive_int "NODE_COUNT" "${NODE_COUNT}"
   if (( NODE_COUNT < 2 )); then
@@ -145,12 +189,14 @@ start_lab() {
   BASE_P2P_PORT="${BASE_P2P_PORT}" \
   BASE_RPC_PORT="${BASE_RPC_PORT}" \
   BASE_STRATUM_PORT="${BASE_STRATUM_PORT}" \
+  STRATUM_READ_TIMEOUT_SEC="${STRATUM_READ_TIMEOUT_SEC}" \
   RUN_RPC=true \
   RUN_STRATUM=true \
   BUILD="${BUILD}" \
   CARGO_PROFILE="${CARGO_PROFILE}" \
   SYNC_BOOK=true \
-  RUN_SYNC_LOOP="${RUN_SYNC_LOOP}" \
+  RUN_SYNC_LOOP=false \
+  SYNC_MAX_BATCHES_PER_PEER="${SYNC_MAX_BATCHES_PER_PEER}" \
   SYNC_LOOP_INTERVAL_SEC="${SYNC_LOOP_INTERVAL_SEC}" \
   scripts/local-multinode.sh up
 
@@ -195,6 +241,8 @@ start_lab() {
     exit 1
   fi
 
+  start_follower_sync_loops "${bin}"
+
   local rpc0 rpc1
   rpc0="$(extract_col "0" "3")"
   rpc1="$(extract_col "1" "3")"
@@ -213,6 +261,7 @@ start_lab() {
 
 down_lab() {
   stop_pid_file "${MINER_PID_FILE}"
+  stop_follower_sync_loops
   CLUSTER_DIR="${CLUSTER_DIR}" scripts/local-multinode.sh down
   echo "[lab] down"
 }
@@ -223,6 +272,18 @@ status_lab() {
     echo "[lab] miner=running pool=127.0.0.1:$(extract_col "0" "4")"
   else
     echo "[lab] miner=stopped"
+  fi
+  if [[ -d "${FOLLOW_SYNC_DIR}" ]]; then
+    for pid_file in "${FOLLOW_SYNC_DIR}"/sync-node-*.pid; do
+      [[ -e "${pid_file}" ]] || continue
+      local node_tag
+      node_tag="$(basename "${pid_file}" .pid | sed -E 's/^sync-node-//')"
+      if pid_is_alive "$(cat "${pid_file}")"; then
+        echo "[lab] follower-sync node-${node_tag}=running"
+      else
+        echo "[lab] follower-sync node-${node_tag}=stopped"
+      fi
+    done
   fi
 }
 
