@@ -173,9 +173,6 @@ pub fn build_template_from_mempool(
             if included_set.insert(txid) {
                 included.push(txid);
             }
-            if included.len() >= params.max_txs {
-                break;
-            }
         }
     }
 
@@ -297,9 +294,13 @@ fn build_cpfp_package(
 
     // Safety bound: each pass must either order at least one txid or terminate.
     for _ in 0..=entries.len() {
-        if remaining.is_empty() || ordered.len() >= package_limit {
+        if remaining.is_empty() {
             break;
         }
+        if ordered.len() == package_limit {
+            break;
+        }
+        debug_assert!(ordered.len() < package_limit);
         let mut progressed = false;
         let ready_ranked = ranked
             .iter()
@@ -322,7 +323,7 @@ fn build_cpfp_package(
             total_fee = total_fee.saturating_add(entry.fee);
             total_size = total_size.saturating_add(entry.size);
             progressed = true;
-            if ordered.len() >= package_limit {
+            if ordered.len() == package_limit {
                 break;
             }
         }
@@ -346,15 +347,17 @@ fn build_cpfp_package(
 }
 
 fn package_beats_current(candidate: &PackageCandidate, current: &PackageCandidate) -> bool {
-    (
+    let candidate_rank = (
         candidate.score_key,
         candidate.total_fee,
         std::cmp::Reverse(candidate.root),
-    ) > (
+    );
+    let current_rank = (
         current.score_key,
         current.total_fee,
         std::cmp::Reverse(current.root),
-    )
+    );
+    candidate_rank.cmp(&current_rank).is_gt()
 }
 
 impl TemplateManager {
@@ -848,6 +851,61 @@ mod tests {
     }
 
     #[test]
+    fn cpfp_package_builder_enforces_strict_package_limit() {
+        let root = scam_core::Hash256([51u8; 32]);
+        let child_a = scam_core::Hash256([52u8; 32]);
+        let child_b = scam_core::Hash256([53u8; 32]);
+        let child_c = scam_core::Hash256([54u8; 32]);
+
+        let ranked = vec![child_c, child_b, child_a, root];
+        let mut entries = HashMap::<scam_core::Hash256, CandidateEntry>::new();
+        entries.insert(
+            root,
+            CandidateEntry {
+                fee: 1,
+                size: 100,
+                parents: vec![],
+            },
+        );
+        entries.insert(
+            child_a,
+            CandidateEntry {
+                fee: 2,
+                size: 100,
+                parents: vec![root],
+            },
+        );
+        entries.insert(
+            child_b,
+            CandidateEntry {
+                fee: 3,
+                size: 100,
+                parents: vec![child_a],
+            },
+        );
+        entries.insert(
+            child_c,
+            CandidateEntry {
+                fee: 4,
+                size: 100,
+                parents: vec![child_b],
+            },
+        );
+
+        let mut children = HashMap::<scam_core::Hash256, Vec<scam_core::Hash256>>::new();
+        children.insert(root, vec![child_a]);
+        children.insert(child_a, vec![child_b]);
+        children.insert(child_b, vec![child_c]);
+        let included = HashSet::new();
+
+        let package = build_cpfp_package(root, &ranked, &entries, &children, &included, 2);
+        assert_eq!(package.ordered_txids, vec![root, child_a]);
+        assert_eq!(package.total_fee, 3);
+        assert_eq!(package.total_size, 200);
+        assert_eq!(package.score_key, 15);
+    }
+
+    #[test]
     fn package_comparator_uses_score_fee_and_root_tiebreak() {
         let base = PackageCandidate {
             root: scam_core::Hash256([10u8; 32]),
@@ -892,6 +950,18 @@ mod tests {
             score_key: 500,
         };
         assert!(!package_beats_current(&same_score_fee_higher_root, &base));
+    }
+
+    #[test]
+    fn package_comparator_rejects_exact_ties() {
+        let base = PackageCandidate {
+            root: scam_core::Hash256([77u8; 32]),
+            ordered_txids: vec![],
+            total_fee: 100,
+            total_size: 200,
+            score_key: 500,
+        };
+        assert!(!package_beats_current(&base, &base));
     }
 
     #[test]
