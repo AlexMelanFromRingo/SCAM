@@ -8042,11 +8042,16 @@ mod tests {
         let io_timeout = std::io::Error::from(std::io::ErrorKind::TimedOut);
         let io_reset = std::io::Error::from(std::io::ErrorKind::ConnectionReset);
         let io_broken_pipe = std::io::Error::from(std::io::ErrorKind::BrokenPipe);
+        let io_denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
         assert!(super::relay_io_error_is_nonfatal(&io_timeout));
         assert!(super::relay_io_error_is_nonfatal(&io_reset));
         assert!(super::relay_io_error_is_nonfatal(&io_broken_pipe));
         assert!(super::sv2_io_error_is_timeout_like(&io_timeout));
         assert!(!super::sv2_io_error_is_timeout_like(&io_reset));
+        assert!(!super::http_io_error_is_timeout_like(&io_broken_pipe));
+        assert!(super::http_io_error_is_closed_like(&io_reset));
+        assert!(super::http_io_error_is_closed_like(&io_broken_pipe));
+        assert!(!super::http_io_error_is_closed_like(&io_denied));
 
         assert!(!super::should_require_noise_static_key(
             false,
@@ -8207,6 +8212,14 @@ mod tests {
             Err(err) => err,
         };
         assert!(fatal.to_string().contains("stratum read failed"));
+
+        let fatal_io = match super::map_sv2_read_result(Err(scam_stratum::StratumError::Io(
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        ))) {
+            Ok(_) => panic!("non-timeout io errors must bubble up"),
+            Err(err) => err,
+        };
+        assert!(fatal_io.to_string().contains("stratum read failed"));
     }
 
     #[test]
@@ -9721,7 +9734,29 @@ mod tests {
                 reason: "oops".to_owned(),
             },
         );
+        super::update_sv2_conformance_state(
+            &mut setup_success,
+            &mut channel_opened,
+            &mut job_messages_seen,
+            &mut set_target_seen,
+            &mut errors,
+            &Sv2Message::OpenStandardMiningChannelError {
+                request_id: 7,
+                code: "not-authorized".to_owned(),
+                reason: "denied".to_owned(),
+            },
+        );
         assert!(!errors.is_empty());
+        assert!(
+            errors.iter().any(|entry| entry.contains("setup error")),
+            "setup errors must be retained in report state"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|entry| entry.contains("open channel error")),
+            "open channel errors must be retained in report state"
+        );
         assert!(!super::sv2_conformance_pass(
             setup_success,
             channel_opened,
@@ -9910,6 +9945,65 @@ mod tests {
     }
 
     #[test]
+    fn read_http_request_connection_closed_without_bytes_is_treated_as_no_request() {
+        struct ClosedReader;
+
+        impl Read for ClosedReader {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset))
+            }
+        }
+
+        let mut reader = ClosedReader;
+        let parsed = super::read_http_request(&mut reader).expect("closed without bytes");
+        assert!(
+            parsed.is_none(),
+            "closed idle socket should produce no request"
+        );
+    }
+
+    #[test]
+    fn read_http_request_connection_closed_after_partial_payload_is_rejected() {
+        #[derive(Default)]
+        struct PartialThenClosed {
+            calls: usize,
+        }
+
+        impl Read for PartialThenClosed {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.calls == 0 {
+                    let part = b"POST /wallet/new HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nab";
+                    let len = part.len().min(buf.len());
+                    buf[..len].copy_from_slice(&part[..len]);
+                    self.calls = 1;
+                    return Ok(len);
+                }
+                Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset))
+            }
+        }
+
+        let mut reader = PartialThenClosed::default();
+        let err = super::read_http_request(&mut reader).expect_err("partial close must fail");
+        assert!(err.to_string().contains("connection closed"));
+    }
+
+    #[test]
+    fn read_http_request_non_timeout_non_close_io_error_is_reported() {
+        struct PermissionDeniedReader;
+
+        impl Read for PermissionDeniedReader {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            }
+        }
+
+        let mut reader = PermissionDeniedReader;
+        let err =
+            super::read_http_request(&mut reader).expect_err("permission denied must bubble up");
+        assert!(err.to_string().contains("http read failed"));
+    }
+
+    #[test]
     fn read_role_request_handles_empty_invalid_and_valid_payloads() {
         let mut empty = std::io::Cursor::new(Vec::<u8>::new());
         let err = super::read_role_request::<serde_json::Value, _>(&mut empty)
@@ -10019,6 +10113,10 @@ mod tests {
         assert_eq!(
             super::guess_content_type(std::path::Path::new("data.json")),
             "application/json; charset=utf-8"
+        );
+        assert_eq!(
+            super::guess_content_type(std::path::Path::new("diagram.svg")),
+            "image/svg+xml"
         );
         assert_eq!(
             super::guess_content_type(std::path::Path::new("bundle.unknown")),
@@ -10508,6 +10606,22 @@ mod tests {
         assert!(
             send_err.to_string().contains("is not valid for network"),
             "unexpected send error: {send_err}"
+        );
+
+        let balance_addr_err = run_wallet(super::WalletCommand::BalanceAddress {
+            network: Network::Devnet,
+            config: Some(work_dir.join("devnet.toml")),
+            address: scam_wallet::to_address("s", key.pubkey_compressed()).expect("address"),
+            mine_blocks: 0,
+            interval_sec: 120,
+            max_nonce: 500_000,
+        })
+        .expect_err("watch-only balance must reject mismatched hrp");
+        assert!(
+            balance_addr_err
+                .to_string()
+                .contains("is not valid for network"),
+            "unexpected balance-by-address error: {balance_addr_err}"
         );
         let _ = fs::remove_dir_all(work_dir);
     }
@@ -11865,5 +11979,17 @@ mod tests {
         let err = super::run_from_args(["scam-node", "--definitely-invalid-flag"])
             .expect_err("invalid args must fail parse");
         assert!(err.to_string().contains("unexpected argument"));
+
+        let missing_cfg = temp_dir("run-from-args-missing-config").join("missing.toml");
+        let err = super::run_from_args([
+            "scam-node",
+            "status",
+            "--network",
+            "devnet",
+            "--config",
+            missing_cfg.to_str().expect("missing cfg path"),
+        ])
+        .expect_err("run_from_args must execute command dispatch");
+        assert!(err.to_string().contains("config"));
     }
 }
