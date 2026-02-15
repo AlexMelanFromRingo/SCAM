@@ -103,6 +103,45 @@ http://127.0.0.1:18080/
 Wallet actions in the web UI call RPC endpoints (`/wallet/*`).
 Mining operations should still use Stratum/SV2 commands.
 
+### 5.2 Automated Local Multi-Node Cluster
+
+For local integration testing you can raise multiple relay/RPC nodes automatically:
+
+```bash
+scripts/local-multinode.sh up
+```
+
+Default cluster settings:
+- `NODE_COUNT=3`
+- P2P ports: `19444, 19445, ...`
+- RPC ports: `19080, 19081, ...`
+- data/logs under `target/local-cluster/`
+
+Check processes:
+
+```bash
+scripts/local-multinode.sh status
+```
+
+Stop cluster:
+
+```bash
+scripts/local-multinode.sh down
+```
+
+Stop + remove all local cluster artifacts:
+
+```bash
+scripts/local-multinode.sh clean
+```
+
+Useful overrides:
+
+```bash
+NODE_COUNT=5 RUN_STRATUM=true BASE_P2P_PORT=20444 BASE_RPC_PORT=20080 \
+  scripts/local-multinode.sh up
+```
+
 ## 6) Create Wallet (Secure Recommended)
 
 Create encrypted vault:
