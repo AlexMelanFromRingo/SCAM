@@ -42,6 +42,7 @@ SYNC_MAX_BATCHES_PER_PEER="${SYNC_MAX_BATCHES_PER_PEER:-8}"
 P2P_READ_TIMEOUT_SEC="${P2P_READ_TIMEOUT_SEC:-5}"
 P2P_WRITE_TIMEOUT_SEC="${P2P_WRITE_TIMEOUT_SEC:-5}"
 UI_DIR="${UI_DIR:-web}"
+SCAM_NODE_BIN="${SCAM_NODE_BIN:-}"
 
 ENDPOINTS_FILE="${CLUSTER_DIR}/endpoints.tsv"
 BIN_PATH="${CLUSTER_DIR}/scam-node.path"
@@ -149,6 +150,16 @@ stop_pid_file() {
 }
 
 resolve_binary() {
+  if [[ -n "${SCAM_NODE_BIN}" ]]; then
+    if [[ ! -x "${SCAM_NODE_BIN}" ]]; then
+      echo "[cluster] SCAM_NODE_BIN is not executable: ${SCAM_NODE_BIN}" >&2
+      exit 2
+    fi
+    echo "${SCAM_NODE_BIN}" > "${BIN_PATH}"
+    echo "${SCAM_NODE_BIN}"
+    return
+  fi
+
   if is_true "${BUILD}"; then
     if [[ "${CARGO_PROFILE}" == "release" ]]; then
       echo "[cluster] building scam-node (release)"

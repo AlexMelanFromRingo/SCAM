@@ -21,6 +21,7 @@ NODE_COUNT="${NODE_COUNT:-2}"
 BUILD="${BUILD:-true}"
 CARGO_PROFILE="${CARGO_PROFILE:-debug}"
 UI_DIR="${UI_DIR:-web}"
+SCAM_NODE_BIN="${SCAM_NODE_BIN:-}"
 
 BASE_P2P_PORT="${BASE_P2P_PORT:-19444}"
 BASE_RPC_PORT="${BASE_RPC_PORT:-19080}"
@@ -77,6 +78,14 @@ stop_pid_file() {
 }
 
 resolve_binary() {
+  if [[ -n "${SCAM_NODE_BIN}" ]]; then
+    if [[ ! -x "${SCAM_NODE_BIN}" ]]; then
+      echo "[lab] SCAM_NODE_BIN is not executable: ${SCAM_NODE_BIN}" >&2
+      exit 2
+    fi
+    echo "${SCAM_NODE_BIN}"
+    return
+  fi
   if [[ -f "${CLUSTER_DIR}/scam-node.path" ]]; then
     local from_file
     from_file="$(cat "${CLUSTER_DIR}/scam-node.path")"
@@ -130,6 +139,7 @@ start_lab() {
   NETWORK="${NETWORK}" \
   CONFIG="${CONFIG}" \
   CLUSTER_DIR="${CLUSTER_DIR}" \
+  SCAM_NODE_BIN="${SCAM_NODE_BIN}" \
   BASE_P2P_PORT="${BASE_P2P_PORT}" \
   BASE_RPC_PORT="${BASE_RPC_PORT}" \
   BASE_STRATUM_PORT="${BASE_STRATUM_PORT}" \

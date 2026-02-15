@@ -142,6 +142,12 @@ NODE_COUNT=5 RUN_STRATUM=true BASE_P2P_PORT=20444 BASE_RPC_PORT=20080 \
   scripts/local-multinode.sh up
 ```
 
+Binary-only mode (outside repo, no cargo):
+
+```bash
+SCAM_NODE_BIN=./scam-node BUILD=false scripts/local-multinode.sh up
+```
+
 ### 5.3 End-to-End Local Lab (2+ nodes + miner + wallets + UI)
 
 If you want a fuller local test setup (sync + mining + wallet files + web UI):
@@ -168,6 +174,12 @@ scripts/local-test-lab.sh clean
 You can then open UIs:
 - `http://127.0.0.1:19080/` (node-0 by default)
 - `http://127.0.0.1:19081/` (node-1 by default)
+
+Binary-only mode:
+
+```bash
+SCAM_NODE_BIN=./scam-node BUILD=false scripts/local-test-lab.sh up
+```
 
 ## 6) Create Wallet (Secure Recommended)
 

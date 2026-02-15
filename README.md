@@ -227,12 +227,24 @@ scripts/local-multinode.sh status
 scripts/local-multinode.sh down
 ```
 
+Binary-only run (outside repo, no cargo build step):
+
+```bash
+SCAM_NODE_BIN=./scam-node BUILD=false scripts/local-multinode.sh up
+```
+
 For a fuller local lab (2+ nodes + miner + demo wallets + UI):
 
 ```bash
 scripts/local-test-lab.sh up
 scripts/local-test-lab.sh status
 scripts/local-test-lab.sh down
+```
+
+Binary-only run:
+
+```bash
+SCAM_NODE_BIN=./scam-node BUILD=false scripts/local-test-lab.sh up
 ```
 
 ### 6.1 Bootstrap node runtime
