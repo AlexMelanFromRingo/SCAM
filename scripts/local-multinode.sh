@@ -166,11 +166,11 @@ resolve_binary() {
 
   if is_true "${BUILD}"; then
     if [[ "${CARGO_PROFILE}" == "release" ]]; then
-      echo "[cluster] building scam-node (release)"
+      echo "[cluster] building scam-node (release)" >&2
       cargo build --release -p scam-node
       echo "target/release/scam-node" > "${BIN_PATH}"
     else
-      echo "[cluster] building scam-node (debug)"
+      echo "[cluster] building scam-node (debug)" >&2
       cargo build -p scam-node
       echo "target/debug/scam-node" > "${BIN_PATH}"
     fi
