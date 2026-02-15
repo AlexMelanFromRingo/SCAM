@@ -161,6 +161,7 @@ What it does:
 - enables RPC+Web UI on each node,
 - starts one Stratum pool on node-0,
 - starts one miner connected to node-0 pool,
+- starts periodic `sync-book` loops by default (`RUN_SYNC_LOOP=true`),
 - generates two demo wallets and saves them under `target/local-test-lab/wallets/`.
 
 Control:
@@ -179,6 +180,12 @@ Binary-only mode:
 
 ```bash
 SCAM_NODE_BIN=./scam-node BUILD=false scripts/local-test-lab.sh up
+```
+
+Disable periodic sync loop:
+
+```bash
+RUN_SYNC_LOOP=false scripts/local-test-lab.sh up
 ```
 
 ## 6) Create Wallet (Secure Recommended)
@@ -228,6 +235,15 @@ scam-node wallet send \
   --fee 1
 ```
 
+Watch-only balance by address:
+
+```bash
+scam-node wallet balance-address \
+  --network devnet \
+  --config config/devnet.toml \
+  --address <address>
+```
+
 Address decode:
 
 ```bash
@@ -255,8 +271,10 @@ scam-node stratum-serve \
 Run worker:
 
 ```bash
-scam-node stratum-mine --pool 127.0.0.1:3347 --user miner01 --max-shares 100
+scam-node stratum-mine --pool 127.0.0.1:3347 --user <payout_address> --max-shares 100
 ```
+
+If `--user` is a valid SCAM address for the selected network, Stratum uses it as the coinbase payout target for that channel.
 
 ## 9) Secure Stratum (`noise_xx`) Setup
 
@@ -286,7 +304,7 @@ Secure worker:
 ```bash
 scam-node stratum-mine \
   --pool 127.0.0.1:3347 \
-  --user miner01 \
+  --user <payout_address> \
   --secure-transport \
   --secure-transport-mode noise-xx \
   --secure-static-secret-key-hex <client_secret_hex32>

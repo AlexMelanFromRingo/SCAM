@@ -23,6 +23,8 @@ set -euo pipefail
 #   CARGO_PROFILE=debug   # debug|release
 #   SYNC_BOOK=true
 #   SYNC_MAX_BATCHES_PER_PEER=8
+#   RUN_SYNC_LOOP=false
+#   SYNC_LOOP_INTERVAL_SEC=5
 
 COMMAND="${1:-up}"
 
@@ -39,6 +41,8 @@ BUILD="${BUILD:-true}"
 CARGO_PROFILE="${CARGO_PROFILE:-debug}"
 SYNC_BOOK="${SYNC_BOOK:-true}"
 SYNC_MAX_BATCHES_PER_PEER="${SYNC_MAX_BATCHES_PER_PEER:-8}"
+RUN_SYNC_LOOP="${RUN_SYNC_LOOP:-false}"
+SYNC_LOOP_INTERVAL_SEC="${SYNC_LOOP_INTERVAL_SEC:-5}"
 P2P_READ_TIMEOUT_SEC="${P2P_READ_TIMEOUT_SEC:-5}"
 P2P_WRITE_TIMEOUT_SEC="${P2P_WRITE_TIMEOUT_SEC:-5}"
 UI_DIR="${UI_DIR:-web}"
@@ -196,6 +200,7 @@ start_cluster() {
   require_positive_int "BASE_RPC_PORT" "${BASE_RPC_PORT}"
   require_positive_int "BASE_STRATUM_PORT" "${BASE_STRATUM_PORT}"
   require_positive_int "SYNC_MAX_BATCHES_PER_PEER" "${SYNC_MAX_BATCHES_PER_PEER}"
+  require_positive_int "SYNC_LOOP_INTERVAL_SEC" "${SYNC_LOOP_INTERVAL_SEC}"
   require_positive_int "P2P_READ_TIMEOUT_SEC" "${P2P_READ_TIMEOUT_SEC}"
   require_positive_int "P2P_WRITE_TIMEOUT_SEC" "${P2P_WRITE_TIMEOUT_SEC}"
 
@@ -306,6 +311,32 @@ start_cluster() {
     done
   fi
 
+  if is_true "${RUN_SYNC_LOOP}"; then
+    echo "[cluster] starting periodic sync-book loops (interval=${SYNC_LOOP_INTERVAL_SEC}s)"
+    for ((idx = 0; idx < NODE_COUNT; idx++)); do
+      local logsdir runtime_db peersdir nodedir
+      logsdir="$(logs_dir_path "${idx}")"
+      runtime_db="$(runtime_db_path "${idx}")"
+      peersdir="$(peers_dir_path "${idx}")"
+      nodedir="$(node_dir "${idx}")"
+      (
+        while true; do
+          "${bin}" sync-book \
+            --network "${NETWORK}" \
+            --config "${CONFIG}" \
+            --runtime-db "${runtime_db}" \
+            --peers-dir "${peersdir}" \
+            --max-peers "${NODE_COUNT}" \
+            --max-batches-per-peer "${SYNC_MAX_BATCHES_PER_PEER}" \
+            >> "${logsdir}/sync-loop.log" 2>&1 || true
+          sleep "${SYNC_LOOP_INTERVAL_SEC}"
+        done
+      ) &
+      write_pid "${nodedir}/sync-loop.pid" "$!"
+      ensure_pid_started "${nodedir}/sync-loop.pid" "node-${idx} sync-loop" "${logsdir}/sync-loop.log"
+    done
+  fi
+
   echo "[cluster] up"
   echo "[cluster] endpoints:"
   cat "${ENDPOINTS_FILE}"
@@ -329,6 +360,10 @@ stop_cluster() {
     [[ -e "${pid_file}" ]] || continue
     stop_pid_file "${pid_file}"
   done
+  for pid_file in "${CLUSTER_DIR}"/node-*/sync-loop.pid; do
+    [[ -e "${pid_file}" ]] || continue
+    stop_pid_file "${pid_file}"
+  done
   echo "[cluster] down"
 }
 
@@ -342,10 +377,11 @@ status_cluster() {
     if [[ "${node}" == "node" ]]; then
       continue
     fi
-    local relay_state rpc_state stratum_state
+    local relay_state rpc_state stratum_state sync_state
     relay_state="stopped"
     rpc_state="n/a"
     stratum_state="n/a"
+    sync_state="stopped"
     if [[ -f "${dir}/relay.pid" ]] && pid_is_alive "$(cat "${dir}/relay.pid")"; then
       relay_state="running"
     fi
@@ -361,7 +397,10 @@ status_cluster() {
         stratum_state="running"
       fi
     fi
-    echo "  node-${node}: relay=${relay_state} p2p=127.0.0.1:${p2p} rpc=${rpc_state} stratum=${stratum_state}"
+    if [[ -f "${dir}/sync-loop.pid" ]] && pid_is_alive "$(cat "${dir}/sync-loop.pid")"; then
+      sync_state="running"
+    fi
+    echo "  node-${node}: relay=${relay_state} p2p=127.0.0.1:${p2p} rpc=${rpc_state} stratum=${stratum_state} sync=${sync_state}"
   done < "${ENDPOINTS_FILE}"
 }
 

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use scam_chain::{BlockSubmissionOutcome, ChainError, ChainRuntime};
@@ -846,6 +846,20 @@ enum WalletCommand {
         account: u32,
         #[arg(long, default_value_t = 0)]
         index: u32,
+        #[arg(long, default_value_t = 0)]
+        mine_blocks: u32,
+        #[arg(long, default_value_t = 120)]
+        interval_sec: u64,
+        #[arg(long, default_value_t = 500_000)]
+        max_nonce: u64,
+    },
+    BalanceAddress {
+        #[arg(long, value_enum, default_value_t = Network::Devnet)]
+        network: Network,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        address: String,
         #[arg(long, default_value_t = 0)]
         mine_blocks: u32,
         #[arg(long, default_value_t = 120)]
@@ -1826,6 +1840,46 @@ fn run_wallet(command: WalletCommand) -> Result<(), NodeError> {
             );
 
             println!("Wallet balance:");
+            println!("Tip height: {}", summary.tip_height);
+            println!("Address: {}", summary.address);
+            println!("Address key hash20: {}", summary.key_hash20_hex);
+            println!("UTXOs: {}", summary.utxo_count);
+            println!("Spendable UTXOs: {}", summary.spendable_utxo_count);
+            println!("Immature UTXOs: {}", summary.immature_utxo_count);
+            println!("Total: {}", summary.total);
+            println!("Spendable: {}", summary.spendable);
+            println!("Immature: {}", summary.immature);
+        }
+        WalletCommand::BalanceAddress {
+            network,
+            config,
+            address,
+            mine_blocks,
+            interval_sec,
+            max_nonce,
+        } => {
+            let (cfg, runtime) = build_runtime_for_query(
+                network,
+                config,
+                None,
+                mine_blocks,
+                interval_sec,
+                max_nonce,
+                "wallet-balance-address",
+            )?;
+            let decoded = parse_address(&address)?;
+            let accepted_hrps = accepted_hrps_for_network(network, &cfg.hrp);
+            if !accepted_hrps.iter().any(|hrp| hrp == &decoded.hrp) {
+                return Err(NodeError::Runtime(format!(
+                    "address hrp '{}' is not valid for network '{}' (accepted: {})",
+                    decoded.hrp,
+                    cfg.network_id,
+                    accepted_hrps.join(", ")
+                )));
+            }
+            let summary =
+                wallet_balance_response(&runtime, &cfg, 0, 0, address, decoded.key_hash20);
+            println!("Wallet balance (watch-only):");
             println!("Tip height: {}", summary.tip_height);
             println!("Address: {}", summary.address);
             println!("Address key hash20: {}", summary.key_hash20_hex);
@@ -4458,6 +4512,8 @@ trait StratumTemplateProvider {
         &self,
         runtime: &ChainRuntime,
         cfg: &ChainConfig,
+        reward_key_hash20: [u8; 20],
+        coinbase_label: &str,
     ) -> Result<StratumTemplateWork, NodeError>;
 }
 
@@ -4469,15 +4525,14 @@ impl StratumTemplateProvider for RuntimeTemplateProvider {
         &self,
         runtime: &ChainRuntime,
         cfg: &ChainConfig,
+        reward_key_hash20: [u8; 20],
+        coinbase_label: &str,
     ) -> Result<StratumTemplateWork, NodeError> {
         let target = runtime.expected_target_for_next_block()?;
         let coinbase = build_coinbase_tx(
-            format!(
-                "stratum-template-h{}",
-                runtime.tip_height().saturating_add(1)
-            ),
+            coinbase_label.to_owned(),
             cfg.block_subsidy,
-            cfg.genesis_reward_key_hash20()?,
+            reward_key_hash20,
         );
         let merkle_root = scam_core::merkle::merkle_root(&[coinbase.txid()]);
         let template = MiningTemplate {
@@ -4597,6 +4652,8 @@ async fn issue_new_stratum_job_async<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     secure: &mut Option<StratumSecureTransport>,
     jobs: &mut HashMap<u32, StratumWork>,
+    reward_key_hash20: [u8; 20],
+    coinbase_label: &str,
 ) -> Result<Hash256, NodeError> {
     let (tip_hash, template_work) = {
         let runtime = lock_runtime(&ctx.runtime)?;
@@ -4613,15 +4670,17 @@ async fn issue_new_stratum_job_async<S: AsyncRead + AsyncWrite + Unpin>(
                     .saturating_add(ctx.cfg.target_block_time_sec),
                 network_target_hex: target.to_hex(),
                 block_subsidy: ctx.cfg.block_subsidy,
-                reward_key_hash20_hex: hex::encode(ctx.cfg.genesis_reward_key_hash20()?),
-                coinbase_label: format!(
-                    "stratum-template-h{}",
-                    runtime.tip_height().saturating_add(1)
-                ),
+                reward_key_hash20_hex: hex::encode(reward_key_hash20),
+                coinbase_label: coinbase_label.to_owned(),
             };
             request_template_from_provider(addr, &request)?
         } else {
-            ctx.template_provider.build_template(&runtime, &ctx.cfg)?
+            ctx.template_provider.build_template(
+                &runtime,
+                &ctx.cfg,
+                reward_key_hash20,
+                coinbase_label,
+            )?
         };
         (tip_hash, template_work)
     };
@@ -4786,6 +4845,8 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
     let mut last_keepalive = Instant::now();
     let mut last_activity = Instant::now();
     let mut last_tip_hash = load_runtime_tip_hash(&ctx)?;
+    let mut payout_key_hash20 = ctx.cfg.genesis_reward_key_hash20()?;
+    let mut payout_label = stratum_coinbase_label(session.channel_id(), "default");
 
     loop {
         match read_sv2_message_async(&mut stream, secure_transport.as_mut(), read_timeout).await? {
@@ -4801,6 +4862,8 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
                             &mut stream,
                             &mut secure_transport,
                             &mut jobs,
+                            payout_key_hash20,
+                            &payout_label,
                         )
                         .await?;
                     }
@@ -4824,13 +4887,23 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
                 for event in response.events {
                     match event {
                         SessionEvent::SetupAccepted => {}
-                        SessionEvent::ChannelOpened { .. } => {
+                        SessionEvent::ChannelOpened { user, .. } => {
+                            if let Some(parsed) = stratum_user_payout_key_hash20(&user) {
+                                payout_key_hash20 = parsed;
+                                payout_label = stratum_coinbase_label(session.channel_id(), &user);
+                            } else {
+                                payout_key_hash20 = ctx.cfg.genesis_reward_key_hash20()?;
+                                payout_label =
+                                    stratum_coinbase_label(session.channel_id(), "default");
+                            }
                             last_tip_hash = issue_new_stratum_job_async(
                                 &mut session,
                                 &ctx,
                                 &mut stream,
                                 &mut secure_transport,
                                 &mut jobs,
+                                payout_key_hash20,
+                                &payout_label,
                             )
                             .await?;
                         }
@@ -4874,6 +4947,8 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
                                         &mut stream,
                                         &mut secure_transport,
                                         &mut jobs,
+                                        payout_key_hash20,
+                                        &payout_label,
                                     )
                                     .await?;
                                 }
@@ -5028,6 +5103,24 @@ fn should_process_share_as_block(is_block: bool) -> bool {
 
 fn should_reissue_job_for_channel(channel_id: u32, active_channel_id: u32) -> bool {
     channel_id == active_channel_id
+}
+
+fn stratum_user_payout_key_hash20(user: &str) -> Option<[u8; 20]> {
+    parse_address(user).ok().map(|decoded| decoded.key_hash20)
+}
+
+fn stratum_coinbase_label(channel_id: u32, user_hint: &str) -> String {
+    let compact = user_hint
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .take(24)
+        .collect::<String>();
+    let suffix = if compact.is_empty() {
+        "default".to_owned()
+    } else {
+        compact
+    };
+    format!("stratum-ch{channel_id}-{suffix}")
 }
 
 fn should_send_open_standard_channel(open_sent: bool) -> bool {
@@ -6433,6 +6526,12 @@ struct WalletBalanceRpcRequest {
     index: u32,
 }
 
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+struct WalletBalanceByAddressRpcRequest {
+    address: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 struct WalletSendPreviewRpcRequest {
@@ -6846,6 +6945,26 @@ fn ui_dir_is_servable(ui_dir: &Path) -> bool {
     ui_dir.exists() && ui_dir.is_dir()
 }
 
+fn runtime_db_mtime(path: &Path) -> Option<SystemTime> {
+    fs::metadata(path).ok()?.modified().ok()
+}
+
+fn refresh_runtime_from_db_if_changed(
+    cfg: &ChainConfig,
+    runtime: &mut ChainRuntime,
+    runtime_db_path: &Path,
+    last_seen_mtime: &mut Option<SystemTime>,
+) -> Result<(), NodeError> {
+    let current_mtime = runtime_db_mtime(runtime_db_path);
+    if current_mtime == *last_seen_mtime {
+        return Ok(());
+    }
+    let (fresh, _) = load_runtime_from_db_or_genesis(cfg, runtime_db_path)?;
+    *runtime = fresh;
+    *last_seen_mtime = current_mtime;
+    Ok(())
+}
+
 fn try_serve_ui_asset<W: Write>(
     stream: &mut W,
     ui_dir: &Path,
@@ -6967,15 +7086,19 @@ fn run_rpc_serve(args: RpcServeArgs) -> Result<(), NodeError> {
         max_nonce,
         max_requests,
     } = args;
-    let (cfg, runtime) = build_runtime_for_query(
+    let runtime_db_path = runtime_db
+        .clone()
+        .unwrap_or_else(|| default_runtime_db_path(network));
+    let (cfg, mut runtime) = build_runtime_for_query(
         network,
         config,
-        runtime_db,
+        Some(runtime_db_path.clone()),
         mine_blocks,
         interval_sec,
         max_nonce,
         "rpc-serve",
     )?;
+    let mut runtime_db_seen_mtime = runtime_db_mtime(&runtime_db_path);
 
     let listener = TcpListener::bind(&bind)
         .map_err(|e| NodeError::Runtime(format!("rpc bind failed on {}: {e}", bind)))?;
@@ -6987,7 +7110,7 @@ fn run_rpc_serve(args: RpcServeArgs) -> Result<(), NodeError> {
         runtime.tip_hash()
     );
     println!(
-        "Endpoints: GET /health, /status, /block/<height>, /tx/<height>/<index>, /mempool; POST /wallet/new, /wallet/address, /wallet/decode, /wallet/balance, /wallet/send-preview, /wallet/qr"
+        "Endpoints: GET /health, /status, /block/<height>, /tx/<height>/<index>, /mempool; POST /wallet/new, /wallet/address, /wallet/decode, /wallet/balance, /wallet/balance-by-address, /wallet/send-preview, /wallet/qr"
     );
     println!("UI assets directory: {}", ui_dir.display());
     if let Some(path) = relay_telemetry.as_ref() {
@@ -7022,6 +7145,12 @@ fn run_rpc_serve(args: RpcServeArgs) -> Result<(), NodeError> {
 
         let method = request.method.as_str();
         let path = request.path.as_str();
+        refresh_runtime_from_db_if_changed(
+            &cfg,
+            &mut runtime,
+            &runtime_db_path,
+            &mut runtime_db_seen_mtime,
+        )?;
         let (status, body) = if rpc_exact_route_matches(method, path, "GET", "/health") {
             ("200 OK", "{\"ok\":true}".to_owned())
         } else if rpc_exact_route_matches(method, path, "GET", "/status") {
@@ -7322,6 +7451,45 @@ fn run_rpc_serve(args: RpcServeArgs) -> Result<(), NodeError> {
                 Err(e) => (
                     "500 Internal Server Error",
                     json_error_body(&format!("wallet balance serialization failed: {e}")),
+                ),
+            }
+        } else if rpc_exact_route_matches(method, path, "POST", "/wallet/balance-by-address") {
+            let req = match parse_json_body::<WalletBalanceByAddressRpcRequest>(&request) {
+                Ok(value) => value,
+                Err(err) => {
+                    let body = json_error_body(&err.to_string());
+                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
+                    continue;
+                }
+            };
+            let decoded = match parse_address(&req.address) {
+                Ok(value) => value,
+                Err(err) => {
+                    let body = json_error_body(&err.to_string());
+                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
+                    continue;
+                }
+            };
+            let accepted_hrps = accepted_hrps_for_network(network, &cfg.hrp);
+            if should_reject_send_preview_hrp(&accepted_hrps, &decoded.hrp) {
+                let body = json_error_body(&format!(
+                    "address hrp '{}' is not valid for network '{}' (accepted: {})",
+                    decoded.hrp,
+                    cfg.network_id,
+                    accepted_hrps.join(", ")
+                ));
+                write_http_json_response(&mut stream, "400 Bad Request", &body)?;
+                continue;
+            }
+            let payload =
+                wallet_balance_response(&runtime, &cfg, 0, 0, req.address, decoded.key_hash20);
+            match to_pretty_json(&payload) {
+                Ok(body) => ("200 OK", body),
+                Err(e) => (
+                    "500 Internal Server Error",
+                    json_error_body(&format!(
+                        "wallet balance-by-address serialization failed: {e}"
+                    )),
                 ),
             }
         } else if rpc_exact_route_matches(method, path, "POST", "/wallet/send-preview") {
@@ -7917,6 +8085,22 @@ mod tests {
         assert!(!super::should_process_share_as_block(false));
         assert!(super::should_reissue_job_for_channel(7, 7));
         assert!(!super::should_reissue_job_for_channel(7, 8));
+        let payout_seed = WalletMnemonic::parse(SOAK_FLOW_MNEMONIC)
+            .expect("mnemonic")
+            .to_seed("");
+        let payout_key = derive_wallet_key(&payout_seed, 0, 0).expect("wallet key");
+        let payout_addr =
+            scam_wallet::to_address("s", payout_key.pubkey_compressed()).expect("address");
+        let payout = super::stratum_user_payout_key_hash20(&payout_addr).expect("payout decode");
+        assert_eq!(
+            payout,
+            scam_core::hash160_blake3(&payout_key.pubkey_compressed())
+        );
+        assert!(super::stratum_user_payout_key_hash20("not-an-address").is_none());
+        assert_eq!(
+            super::stratum_coinbase_label(7, "sd1q-User_01"),
+            "stratum-ch7-sd1qUser01"
+        );
         assert!(super::should_send_open_standard_channel(false));
         assert!(!super::should_send_open_standard_channel(true));
         assert!(!super::should_emit_miner_keepalive(9));
@@ -10088,7 +10272,7 @@ mod tests {
                 max_nonce: 500_000,
                 // Two send-preview requests below intentionally return early 400 responses,
                 // which do not increment internal `served`.
-                max_requests: 8,
+                max_requests: 9,
             })
             .expect("rpc serve");
         });
@@ -10163,6 +10347,18 @@ mod tests {
         let wallet_balance = send_http_json_post(&addr, "/wallet/balance", &wallet_balance_req);
         assert!(wallet_balance.starts_with("HTTP/1.1 200 OK"));
         assert!(wallet_balance.contains("\"spendable\""));
+
+        let wallet_balance_by_address_req = serde_json::json!({
+            "address": valid_recipient
+        })
+        .to_string();
+        let wallet_balance_by_address = send_http_json_post(
+            &addr,
+            "/wallet/balance-by-address",
+            &wallet_balance_by_address_req,
+        );
+        assert!(wallet_balance_by_address.starts_with("HTTP/1.1 200 OK"));
+        assert!(wallet_balance_by_address.contains("\"address\""));
 
         let wallet_decode_req = serde_json::json!({
             "address": invalid_recipient.clone()

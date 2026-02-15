@@ -81,6 +81,7 @@ Commands:
   wallet-new      generate mnemonic + address
   wallet-address  derive address from MNEMONIC env var
   wallet-balance  show balance for MNEMONIC env var
+  wallet-balance-address show balance for ADDRESS env var
   wallet-send     build signed tx preview for MNEMONIC env var
   help            show this message
 
@@ -89,6 +90,7 @@ Important env vars:
   RELAY_BIND, RPC_BIND, RPC_UI_DIR, RPC_RELAY_TELEMETRY
   POOL_BIND, POOL_ADDR, MINER_USER
   MNEMONIC, TO_ADDRESS, AMOUNT, FEE
+  ADDRESS
 EOF
 }
 
@@ -138,6 +140,13 @@ case "${COMMAND}" in
   wallet-balance)
     require_mnemonic
     run_node_cmd wallet balance --network "${NETWORK}" --config "${CONFIG}" --mnemonic "${MNEMONIC}" --passphrase "${PASSPHRASE}" --account "${ACCOUNT}" --index "${INDEX}" "$@"
+    ;;
+  wallet-balance-address)
+    if [[ -z "${ADDRESS:-}" ]]; then
+      echo "[easy] set ADDRESS env var" >&2
+      exit 2
+    fi
+    run_node_cmd wallet balance-address --network "${NETWORK}" --config "${CONFIG}" --address "${ADDRESS}" "$@"
     ;;
   wallet-send)
     require_mnemonic

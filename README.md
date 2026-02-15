@@ -247,6 +247,8 @@ Binary-only run:
 SCAM_NODE_BIN=./scam-node BUILD=false scripts/local-test-lab.sh up
 ```
 
+By default this lab also starts periodic `sync-book` loops (`RUN_SYNC_LOOP=true`) and assigns miner payout to `wallet-01` unless you override `MINER_USER`.
+
 ### 6.1 Bootstrap node runtime
 
 ```bash
@@ -317,7 +319,7 @@ http://127.0.0.1:18080/
 
 RPC endpoints used by the console:
 - GET: `/health`, `/status`, `/block/<height>`, `/tx/<height>/<index>`, `/mempool`
-- POST: `/wallet/new`, `/wallet/address`, `/wallet/decode`, `/wallet/balance`, `/wallet/send-preview`, `/wallet/qr`
+- POST: `/wallet/new`, `/wallet/address`, `/wallet/decode`, `/wallet/balance`, `/wallet/balance-by-address`, `/wallet/send-preview`, `/wallet/qr`
 
 ---
 
@@ -344,6 +346,15 @@ cargo run -p scam-node -- wallet balance \
   --network devnet \
   --config config/devnet.toml \
   --mnemonic "<words>"
+```
+
+Watch-only balance by address:
+
+```bash
+cargo run -p scam-node -- wallet balance-address \
+  --network devnet \
+  --config config/devnet.toml \
+  --address <address>
 ```
 
 Send:
@@ -416,9 +427,11 @@ cargo run -p scam-node -- stratum-serve \
 ```bash
 cargo run -p scam-node -- stratum-mine \
   --pool 127.0.0.1:3347 \
-  --user miner01 \
+  --user <payout_address> \
   --max-shares 100
 ```
+
+If `--user` is a valid SCAM address for the current network, that address is used as coinbase payout target for the channel.
 
 ### 8.3 External role services
 
@@ -479,7 +492,7 @@ cargo run -p scam-node -- stratum-serve \
 ```bash
 cargo run -p scam-node -- stratum-mine \
   --pool 127.0.0.1:3347 \
-  --user miner01 \
+  --user <payout_address> \
   --secure-transport \
   --secure-transport-mode noise-xx \
   --secure-static-secret-key-hex <client_secret_hex32>

@@ -32,6 +32,8 @@ MINER_READ_TIMEOUT_SEC="${MINER_READ_TIMEOUT_SEC:-2}"
 MINER_MAX_NONCE_PER_CYCLE="${MINER_MAX_NONCE_PER_CYCLE:-250000}"
 MINER_MAX_SHARES="${MINER_MAX_SHARES:-0}"
 MINER_MAX_RUNTIME_SEC="${MINER_MAX_RUNTIME_SEC:-0}"
+RUN_SYNC_LOOP="${RUN_SYNC_LOOP:-true}"
+SYNC_LOOP_INTERVAL_SEC="${SYNC_LOOP_INTERVAL_SEC:-5}"
 
 WALLET_WORDS="${WALLET_WORDS:-12}"
 WALLET_HRP="${WALLET_HRP:-sd}"
@@ -148,6 +150,8 @@ start_lab() {
   BUILD="${BUILD}" \
   CARGO_PROFILE="${CARGO_PROFILE}" \
   SYNC_BOOK=true \
+  RUN_SYNC_LOOP="${RUN_SYNC_LOOP}" \
+  SYNC_LOOP_INTERVAL_SEC="${SYNC_LOOP_INTERVAL_SEC}" \
   scripts/local-multinode.sh up
 
   local bin
@@ -157,6 +161,16 @@ start_lab() {
   : > "${WALLETS_DIR}/wallets.env"
   generate_demo_wallet "${bin}" "01"
   generate_demo_wallet "${bin}" "02"
+  local wallet01_addr
+  wallet01_addr="$(sed -n 's/^Address: //p' "${WALLETS_DIR}/wallet-01.txt" | head -n 1)"
+  if [[ -z "${wallet01_addr}" ]]; then
+    echo "[lab] failed to parse wallet-01 address from ${WALLETS_DIR}/wallet-01.txt" >&2
+    exit 1
+  fi
+  local miner_user_effective="${MINER_USER}"
+  if [[ "${miner_user_effective}" == "lab-miner-01" ]]; then
+    miner_user_effective="${wallet01_addr}"
+  fi
 
   local pool_port
   pool_port="$(extract_col "0" "4")"
@@ -167,7 +181,7 @@ start_lab() {
 
   "${bin}" stratum-mine \
     --pool "127.0.0.1:${pool_port}" \
-    --user "${MINER_USER}" \
+    --user "${miner_user_effective}" \
     --read-timeout-sec "${MINER_READ_TIMEOUT_SEC}" \
     --max-nonce-per-cycle "${MINER_MAX_NONCE_PER_CYCLE}" \
     --max-shares "${MINER_MAX_SHARES}" \
@@ -189,6 +203,8 @@ start_lab() {
   echo "[lab] node-0 UI: http://127.0.0.1:${rpc0}/"
   echo "[lab] node-1 UI: http://127.0.0.1:${rpc1}/"
   echo "[lab] miner log: ${MINER_LOG_FILE}"
+  echo "[lab] miner user: ${miner_user_effective}"
+  echo "[lab] miner payout default wallet: ${wallet01_addr}"
   echo "[lab] demo wallets:"
   echo "  ${WALLETS_DIR}/wallet-01.txt"
   echo "  ${WALLETS_DIR}/wallet-02.txt"
