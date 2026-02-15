@@ -308,6 +308,9 @@ fn build_cpfp_package(
             .filter(|txid| remaining.contains(txid))
             .collect::<Vec<_>>();
         for txid in ready_ranked {
+            if ordered.len() == package_limit {
+                break;
+            }
             let Some(entry) = entries.get(&txid) else {
                 continue;
             };
@@ -323,9 +326,6 @@ fn build_cpfp_package(
             total_fee = total_fee.saturating_add(entry.fee);
             total_size = total_size.saturating_add(entry.size);
             progressed = true;
-            if ordered.len() == package_limit {
-                break;
-            }
         }
         if !progressed {
             break;
