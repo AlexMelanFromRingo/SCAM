@@ -267,8 +267,9 @@ function initWalletActions() {
       index: parseNumber(raw.index, 0),
     };
     try {
-      const data = await request("/wallet/send-preview", { method: "POST", body: payload });
+      const data = await request("/wallet/send", { method: "POST", body: payload });
       setResult(walletOut, data);
+      await refreshDashboard();
     } catch (error) {
       setResult(walletOut, error.message, true);
     }
@@ -325,6 +326,11 @@ async function bootstrap() {
   initExplorerActions();
   initWalletActions();
   await refreshDashboard();
+  setInterval(() => {
+    refreshDashboard().catch((error) => {
+      setResult(mempoolOut, `Auto refresh failed: ${error.message}`, true);
+    });
+  }, 5000);
 }
 
 bootstrap();

@@ -3,24 +3,24 @@
 ## Current factual status
 - Consensus/UTXO/PoW validation: works.
 - Stratum mining to local node: works (blocks produced).
-- Node-to-node synchronization: works in polling mode (`sync-book` loop), not full realtime gossip.
-- Wallet UX E2E transfer pipeline: incomplete (only `send-preview`, no live submit+broadcast route).
-- UI: request/refresh based, no realtime push stream.
+- Node-to-node synchronization: realtime INV propagation works for active relay connections; automatic outbound peer dialing is still pending, so bootstrapping still uses `sync-book`/peer orchestration.
+- Wallet UX transfer pipeline: live submit path exists (`wallet/send`, `tx/submit`) with mempool DB admission.
+- UI: request/refresh based (5s auto-refresh), no SSE push stream yet.
 
 ## Why blocks often have `tx_count = 1`
 - Blocks include only coinbase unless mempool has user transactions.
 - Current UX does not expose a production-ready `wallet/send` path that submits a signed tx into relay mempool and propagates it across peers.
 
 ## P0 (must-have for real testnet launch)
-- [ ] Add live RPC submit endpoint (`POST /wallet/send`) that:
-  - [ ] signs tx,
-  - [ ] validates tx context,
-  - [ ] submits to local relay/mempool,
-  - [ ] returns txid + relay acceptance details.
-- [ ] Add raw tx endpoint (`POST /tx/submit`) for external wallets/tools.
-- [ ] Add relay-local admission API/command path usable by RPC without fragile process coupling.
-- [ ] Ensure locally mined blocks are announced to connected peers in realtime (INV/GETDATA/BLOCK path), not only discovered by periodic sync.
-- [ ] Ensure relay workers refresh runtime tip consistently or share a single runtime source of truth.
+- [x] Add live RPC submit endpoint (`POST /wallet/send`) that:
+  - [x] signs tx,
+  - [x] validates tx context,
+  - [x] submits to local relay/mempool (via shared mempool DB),
+  - [x] returns txid + relay acceptance details.
+- [x] Add raw tx endpoint (`POST /tx/submit`) for external wallets/tools (bincode-hex payload).
+- [x] Add relay-local admission path usable by RPC without fragile process coupling (shared `mempool.redb` state).
+- [x] Ensure locally mined blocks are announced to connected peers in near-realtime (timeout-driven INV on long-lived relay sessions).
+- [x] Ensure relay workers refresh runtime tip consistently from runtime DB and persist accepted block updates.
 - [ ] Add mempool-to-block inclusion E2E tests:
   - [ ] tx submit -> appears in mempool,
   - [ ] mined block includes tx,
@@ -31,7 +31,7 @@
 - [ ] Add realtime UI updates:
   - [ ] SSE stream endpoint (`/events`) with status/tip/mempool deltas,
   - [ ] frontend EventSource client with auto-reconnect and stale-state indicator.
-- [ ] Keep polling fallback when SSE unavailable.
+- [x] Keep polling fallback when SSE unavailable (UI now auto-refreshes every 5s).
 - [ ] Add explicit node health telemetry in UI (relay peers, sync lag, mempool size, last block age).
 - [ ] Add RPC endpoint to query balance by address + tx history in one call for wallet UX.
 

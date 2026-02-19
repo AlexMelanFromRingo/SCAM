@@ -16,7 +16,7 @@ use scam_core::{
     TxIn, TxOut, block_meets_pow, render_hash_bitmap_16x16,
 };
 use scam_mempool::{InsertOutcome, Mempool, MempoolError, OrphanPool};
-use scam_miner::{BlockTemplate, mine_block};
+use scam_miner::{BlockTemplate, MempoolTemplateParams, build_template_from_mempool, mine_block};
 use scam_p2p::{
     FramingConfig, GossipEngine, GossipError, InventoryItem, LocalHandshake, PeerCandidate,
     ReplacementRateLimit, TransportError, WireMessage, build_block_locator, client_handshake,
@@ -25,9 +25,10 @@ use scam_p2p::{
 };
 use scam_rpc::{StatusResponse, TxResponse, header_to_block_response, to_pretty_json};
 use scam_storage::{
-    ChainArchive, ChainStateSnapshot, PeerAddressBook, PeerAddressRecord, StorageError,
-    load_chain_archive_db, load_peer_book_db, load_snapshot, load_snapshot_db,
-    save_chain_archive_db, save_peer_book_db, save_snapshot, save_snapshot_db,
+    ChainArchive, ChainStateSnapshot, MempoolSnapshot, MempoolTxRecord, PeerAddressBook,
+    PeerAddressRecord, StorageError, load_chain_archive_db, load_mempool_db, load_peer_book_db,
+    load_snapshot, load_snapshot_db, save_chain_archive_db, save_mempool_db, save_peer_book_db,
+    save_snapshot, save_snapshot_db,
 };
 use scam_stratum::{
     IdentityTranslator, JobDeclarator, MiningJob, MiningTemplate, NoiseSv2Transport,
@@ -1077,6 +1078,10 @@ fn default_runtime_db_path(network: Network) -> PathBuf {
     PathBuf::from(format!("data/{}.runtime.redb", network.as_str()))
 }
 
+fn default_mempool_db_path(runtime_db_path: &Path) -> PathBuf {
+    runtime_db_path.with_file_name("mempool.redb")
+}
+
 fn runtime_to_archive(runtime: &ChainRuntime) -> Result<ChainArchive, NodeError> {
     let blocks_by_height = runtime.main_chain_blocks()?;
     Ok(ChainArchive {
@@ -1112,7 +1117,81 @@ fn persist_runtime_db(runtime: &ChainRuntime, runtime_db_path: &Path) -> Result<
     Ok(())
 }
 
+fn mempool_snapshot_from_pool(cfg: &ChainConfig, mempool: &Mempool) -> MempoolSnapshot {
+    let mut entries = mempool
+        .txids_by_feerate_desc()
+        .into_iter()
+        .filter_map(|txid| {
+            mempool
+                .get_with_fee(&txid)
+                .map(|(tx, fee)| MempoolTxRecord {
+                    txid,
+                    tx: tx.clone(),
+                    fee,
+                })
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|a, b| a.txid.cmp(&b.txid));
+    MempoolSnapshot {
+        network_id: cfg.network_id.clone(),
+        entries,
+    }
+}
+
+fn persist_mempool_db(
+    cfg: &ChainConfig,
+    mempool: &Mempool,
+    mempool_db_path: &Path,
+) -> Result<(), NodeError> {
+    let snapshot = mempool_snapshot_from_pool(cfg, mempool);
+    save_mempool_db(mempool_db_path, &snapshot)?;
+    Ok(())
+}
+
+fn load_mempool_from_db_or_empty(
+    cfg: &ChainConfig,
+    mempool_db_path: &Path,
+) -> Result<Mempool, NodeError> {
+    let mut mempool = Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)?;
+    if !mempool_db_path.exists() {
+        return Ok(mempool);
+    }
+    let snapshot = load_mempool_db(mempool_db_path)?;
+    if snapshot.network_id != cfg.network_id {
+        return Err(NodeError::Runtime(format!(
+            "mempool db network mismatch: db='{}', config='{}'",
+            snapshot.network_id, cfg.network_id
+        )));
+    }
+    for entry in snapshot.entries {
+        let _ = mempool.insert_with_fee(entry.tx, entry.fee);
+    }
+    Ok(mempool)
+}
+
+fn remove_confirmed_txids_from_mempool_db(
+    cfg: &ChainConfig,
+    mempool_db_path: &Path,
+    txids: &[Hash256],
+) -> Result<usize, NodeError> {
+    if txids.is_empty() {
+        return Ok(0);
+    }
+    let mut mempool = load_mempool_from_db_or_empty(cfg, mempool_db_path)?;
+    let removed = mempool.remove_confirmed_txids(txids);
+    if removed.is_empty() && !mempool_db_path.exists() {
+        return Ok(0);
+    }
+    persist_mempool_db_with_retry(cfg, &mempool, mempool_db_path, 80, 25)?;
+    Ok(removed.len())
+}
+
 fn is_runtime_db_lock_conflict(err: &NodeError) -> bool {
+    let msg = err.to_string();
+    msg.contains("Database already open") || msg.contains("Cannot acquire lock")
+}
+
+fn is_mempool_db_lock_conflict(err: &NodeError) -> bool {
     let msg = err.to_string();
     msg.contains("Database already open") || msg.contains("Cannot acquire lock")
 }
@@ -1140,6 +1219,33 @@ fn persist_runtime_db_with_retry(
     }
     Err(last_err.unwrap_or_else(|| {
         NodeError::Runtime("runtime db persist failed for unknown reason".to_owned())
+    }))
+}
+
+fn persist_mempool_db_with_retry(
+    cfg: &ChainConfig,
+    mempool: &Mempool,
+    mempool_db_path: &Path,
+    attempts: usize,
+    backoff_ms: u64,
+) -> Result<(), NodeError> {
+    let mut last_err = None;
+    let tries = attempts.max(1);
+    for idx in 0..tries {
+        match persist_mempool_db(cfg, mempool, mempool_db_path) {
+            Ok(()) => return Ok(()),
+            Err(err) if is_mempool_db_lock_conflict(&err) => {
+                last_err = Some(err);
+                if idx + 1 < tries {
+                    std::thread::sleep(Duration::from_millis(backoff_ms.max(1)));
+                    continue;
+                }
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        NodeError::Runtime("mempool db persist failed for unknown reason".to_owned())
     }))
 }
 
@@ -3548,6 +3654,43 @@ fn process_relay_wire_message(
     }
 }
 
+fn push_inv_batches(out: &mut Vec<WireMessage>, items: Vec<InventoryItem>, max_inv_items: usize) {
+    if items.is_empty() || max_inv_items == 0 {
+        return;
+    }
+    for chunk in items.chunks(max_inv_items) {
+        out.push(WireMessage::Inv {
+            items: chunk.to_vec(),
+        });
+    }
+}
+
+fn relay_proactive_inventory_messages(
+    state: &RelayServerState,
+    last_tip_announced: &mut Option<Hash256>,
+    announced_txids: &mut HashSet<Hash256>,
+    max_inv_items: usize,
+) -> Vec<WireMessage> {
+    let mut out = Vec::<WireMessage>::new();
+    let tip = state.runtime.tip_hash();
+    if *last_tip_announced != Some(tip) {
+        push_inv_batches(&mut out, vec![InventoryItem::Block(tip)], max_inv_items);
+        *last_tip_announced = Some(tip);
+    }
+
+    let current_txids = state.relay.mempool.txids_by_feerate_desc();
+    let current_set = current_txids.iter().copied().collect::<HashSet<_>>();
+    announced_txids.retain(|txid| current_set.contains(txid));
+    let mut new_items = Vec::<InventoryItem>::new();
+    for txid in current_txids {
+        if announced_txids.insert(txid) {
+            new_items.push(InventoryItem::Tx(txid));
+        }
+    }
+    push_inv_batches(&mut out, new_items, max_inv_items);
+    out
+}
+
 fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
     let config_path = args
         .config
@@ -3556,6 +3699,7 @@ fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
     let runtime_db_path = args
         .runtime_db
         .unwrap_or_else(|| default_runtime_db_path(args.network));
+    let mempool_db_path = default_mempool_db_path(&runtime_db_path);
     let (runtime, source) = load_runtime_from_db_or_genesis(&cfg, &runtime_db_path)?;
 
     let max_inv_items = args.max_inv_items.unwrap_or(cfg.p2p_max_inv_items).max(1);
@@ -3575,7 +3719,7 @@ fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
             .max(1),
     };
     let relay = RelayAdmissionState {
-        mempool: Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)?,
+        mempool: load_mempool_from_db_or_empty(&cfg, &mempool_db_path)?,
         orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)?,
         gossip: GossipEngine::with_limits_and_replacement(
             max_inv_items,
@@ -3593,6 +3737,7 @@ fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
         "P2P relay serving on {} network={} source={} (tx mempool admission active)",
         args.bind, cfg.network_id, source
     );
+    println!("Mempool DB: {}", mempool_db_path.display());
     println!(
         "Relay policy: max_inv_items={} ban_threshold={} replacement_window={}s replacement_max_per_peer={} replacement_penalty={}",
         max_inv_items,
@@ -3601,6 +3746,12 @@ fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
         replacement.max_replacements,
         replacement.penalty
     );
+    {
+        let guard = state
+            .lock()
+            .map_err(|_| NodeError::Runtime("relay state mutex poisoned".to_owned()))?;
+        persist_mempool_db_with_retry(&cfg, &guard.relay.mempool, &mempool_db_path, 20, 25)?;
+    }
 
     let stop_flag = Arc::new(AtomicBool::new(false));
     let telemetry_handle = if let Some(path) = args.telemetry_out.clone() {
@@ -3648,6 +3799,8 @@ fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
         let active_clone = active_peers.clone();
         let cfg_clone = cfg.clone();
         let runtime_db_path_clone = runtime_db_path.clone();
+        let mempool_db_path_clone = mempool_db_path.clone();
+        let max_inv_items_clone = max_inv_items;
         let read_limit = args.max_messages_per_peer;
         handles.push(thread::spawn(move || -> Result<(), NodeError> {
             let result = (|| -> Result<(), NodeError> {
@@ -3675,7 +3828,10 @@ fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
                 }
 
                 let mut seen = 0u32;
-                let mut runtime_db_seen_mtime = None::<SystemTime>;
+                let mut runtime_db_seen_mtime = runtime_db_mtime(&runtime_db_path_clone);
+                let mut mempool_db_seen_mtime = mempool_db_mtime(&mempool_db_path_clone);
+                let mut last_tip_announced = None::<Hash256>;
+                let mut announced_txids = HashSet::<Hash256>::new();
                 loop {
                     if should_stop_after_seen_messages(read_limit, seen) {
                         break;
@@ -3690,19 +3846,75 @@ fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
                             &runtime_db_path_clone,
                             &mut runtime_db_seen_mtime,
                         )?;
+                        refresh_mempool_from_db_if_changed(
+                            &cfg_clone,
+                            &mut guard.relay,
+                            &mempool_db_path_clone,
+                            &mut mempool_db_seen_mtime,
+                        )?;
                     }
-                    let Some(inbound) = map_relay_read_result(read_message(&mut stream, &framing))?
-                    else {
-                        break;
+
+                    let inbound = match map_relay_read_result(read_message(&mut stream, &framing))?
+                    {
+                        RelayReadOutcome::Timeout => {
+                            let proactive = {
+                                let guard = state_clone.lock().map_err(|_| {
+                                    NodeError::Runtime("relay state mutex poisoned".to_owned())
+                                })?;
+                                relay_proactive_inventory_messages(
+                                    &guard,
+                                    &mut last_tip_announced,
+                                    &mut announced_txids,
+                                    max_inv_items_clone,
+                                )
+                            };
+                            for msg in proactive {
+                                send_message(&mut stream, &msg, &framing)?;
+                            }
+                            continue;
+                        }
+                        RelayReadOutcome::Closed => break,
+                        RelayReadOutcome::Message(message) => message,
                     };
                     seen = seen.saturating_add(1);
                     let now = current_unix_sec()?;
-                    let outbound = {
+                    let (outbound, runtime_changed, mempool_changed) = {
                         let mut guard = state_clone.lock().map_err(|_| {
                             NodeError::Runtime("relay state mutex poisoned".to_owned())
                         })?;
-                        process_relay_wire_message(&mut guard, peer_id, inbound, now)?
+                        let tip_before = guard.runtime.tip_hash();
+                        let mempool_before = guard.relay.mempool.revision();
+                        let outbound =
+                            process_relay_wire_message(&mut guard, peer_id, inbound, now)?;
+                        let runtime_changed = guard.runtime.tip_hash() != tip_before;
+                        let mempool_changed = guard.relay.mempool.revision() != mempool_before;
+                        (outbound, runtime_changed, mempool_changed)
                     };
+                    if runtime_changed {
+                        let guard = state_clone.lock().map_err(|_| {
+                            NodeError::Runtime("relay state mutex poisoned".to_owned())
+                        })?;
+                        persist_runtime_db_with_retry(
+                            &guard.runtime,
+                            &runtime_db_path_clone,
+                            80,
+                            25,
+                        )?;
+                        runtime_db_seen_mtime = runtime_db_mtime(&runtime_db_path_clone);
+                    }
+                    if mempool_changed {
+                        let guard = state_clone.lock().map_err(|_| {
+                            NodeError::Runtime("relay state mutex poisoned".to_owned())
+                        })?;
+                        persist_mempool_db_with_retry(
+                            &cfg_clone,
+                            &guard.relay.mempool,
+                            &mempool_db_path_clone,
+                            80,
+                            25,
+                        )?;
+                        mempool_db_seen_mtime = mempool_db_mtime(&mempool_db_path_clone);
+                    }
                     for msg in outbound {
                         send_message(&mut stream, &msg, &framing)?;
                     }
@@ -4523,7 +4735,10 @@ fn request_template_from_provider(
         .map_err(|e| NodeError::Runtime(format!("invalid coinbase_tx_hex from provider: {e}")))?;
     let coinbase = bincode::deserialize::<Transaction>(&coinbase_bytes)
         .map_err(|e| NodeError::Runtime(format!("invalid coinbase tx payload: {e}")))?;
-    Ok(StratumTemplateWork { template, coinbase })
+    Ok(StratumTemplateWork {
+        template,
+        block_txs: vec![coinbase],
+    })
 }
 
 fn translate_remote_job_with_service(
@@ -4552,13 +4767,13 @@ fn translate_remote_job_with_service(
 #[derive(Clone)]
 struct StratumTemplateWork {
     template: MiningTemplate,
-    coinbase: Transaction,
+    block_txs: Vec<Transaction>,
 }
 
 #[derive(Clone)]
 struct StratumWork {
     job: MiningJob,
-    coinbase: Transaction,
+    block_txs: Vec<Transaction>,
 }
 
 trait StratumTemplateProvider {
@@ -4566,6 +4781,8 @@ trait StratumTemplateProvider {
         &self,
         runtime: &ChainRuntime,
         cfg: &ChainConfig,
+        mempool_db_path: &Path,
+        max_template_txs: usize,
         reward_key_hash20: [u8; 20],
         coinbase_label: &str,
     ) -> Result<StratumTemplateWork, NodeError>;
@@ -4579,24 +4796,42 @@ impl StratumTemplateProvider for RuntimeTemplateProvider {
         &self,
         runtime: &ChainRuntime,
         cfg: &ChainConfig,
+        mempool_db_path: &Path,
+        max_template_txs: usize,
         reward_key_hash20: [u8; 20],
         coinbase_label: &str,
     ) -> Result<StratumTemplateWork, NodeError> {
         let target = runtime.expected_target_for_next_block()?;
-        let coinbase = build_coinbase_tx(
-            coinbase_label.to_owned(),
-            cfg.block_subsidy,
-            reward_key_hash20,
-        );
-        let merkle_root = scam_core::merkle::merkle_root(&[coinbase.txid()]);
-        let template = MiningTemplate {
+        let mempool = load_mempool_from_db_or_empty(cfg, mempool_db_path)?;
+        let params = MempoolTemplateParams {
             version: 1,
-            prev_hash: runtime.tip_hash(),
-            merkle_root,
-            ntime: next_stratum_job_timestamp(runtime, cfg),
-            network_target: target,
+            prev_block: runtime.tip_hash(),
+            timestamp: next_stratum_job_timestamp(runtime, cfg),
+            target,
+            block_subsidy: cfg.block_subsidy,
+            miner_key_hash20: reward_key_hash20,
+            coinbase_tag: coinbase_label.to_owned(),
+            max_txs: max_template_txs.max(1),
         };
-        Ok(StratumTemplateWork { template, coinbase })
+        let (template_block, _summary) = build_template_from_mempool(&params, &mempool)
+            .map_err(|e| NodeError::Runtime(format!("stratum template build failed: {e}")))?;
+        let txids = template_block
+            .transactions
+            .iter()
+            .map(Transaction::txid)
+            .collect::<Vec<_>>();
+        let merkle_root = scam_core::merkle::merkle_root(&txids);
+        let template = MiningTemplate {
+            version: template_block.version,
+            prev_hash: template_block.prev_block,
+            merkle_root,
+            ntime: template_block.timestamp,
+            network_target: template_block.target,
+        };
+        Ok(StratumTemplateWork {
+            template,
+            block_txs: template_block.transactions,
+        })
     }
 }
 
@@ -4663,6 +4898,8 @@ struct StratumServerContext {
     cfg: ChainConfig,
     runtime: Arc<Mutex<ChainRuntime>>,
     runtime_db_path: PathBuf,
+    mempool_db_path: PathBuf,
+    max_template_txs: usize,
     share_target: Target,
     min_share_target: Target,
     max_share_target: Target,
@@ -4726,6 +4963,8 @@ async fn issue_new_stratum_job_async<S: AsyncRead + AsyncWrite + Unpin>(
             ctx.template_provider.build_template(
                 &runtime,
                 &ctx.cfg,
+                &ctx.mempool_db_path,
+                ctx.max_template_txs,
                 reward_key_hash20,
                 coinbase_label,
             )?
@@ -4759,7 +4998,7 @@ async fn issue_new_stratum_job_async<S: AsyncRead + AsyncWrite + Unpin>(
     };
     let work = StratumWork {
         job,
-        coinbase: template_work.coinbase,
+        block_txs: template_work.block_txs,
     };
 
     let new_job = session.install_job(work.job.clone())?;
@@ -4967,6 +5206,12 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
                                 let Some(work) = jobs.get(&job_id).cloned() else {
                                     continue;
                                 };
+                                let included_txids = work
+                                    .block_txs
+                                    .iter()
+                                    .skip(1)
+                                    .map(Transaction::txid)
+                                    .collect::<Vec<_>>();
                                 let block = scam_core::Block {
                                     header: scam_core::BlockHeader {
                                         version: work.job.version,
@@ -4976,7 +5221,7 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
                                         target: work.job.network_target,
                                         nonce,
                                     },
-                                    transactions: vec![work.coinbase],
+                                    transactions: work.block_txs,
                                 };
 
                                 {
@@ -4998,6 +5243,15 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
                                         Err(err) => return Err(err),
                                     }
                                     last_tip_hash = runtime.tip_hash();
+                                }
+                                if let Err(err) = remove_confirmed_txids_from_mempool_db(
+                                    &ctx.cfg,
+                                    &ctx.mempool_db_path,
+                                    &included_txids,
+                                ) {
+                                    eprintln!(
+                                        "warning: failed to trim confirmed txids from mempool db: {err}"
+                                    );
                                 }
 
                                 jobs.clear();
@@ -5101,13 +5355,26 @@ fn should_stop_after_seen_messages(read_limit: u32, seen: u32) -> bool {
     read_limit != 0 && seen >= read_limit
 }
 
-fn relay_io_error_is_nonfatal(err: &std::io::Error) -> bool {
+#[derive(Debug)]
+enum RelayReadOutcome {
+    Message(WireMessage),
+    Timeout,
+    Closed,
+}
+
+fn relay_io_error_is_timeout_like(err: &std::io::Error) -> bool {
     matches!(
         err.kind(),
         std::io::ErrorKind::TimedOut
             | std::io::ErrorKind::WouldBlock
             | std::io::ErrorKind::Interrupted
-            | std::io::ErrorKind::UnexpectedEof
+    )
+}
+
+fn relay_io_error_is_closed_like(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::UnexpectedEof
             | std::io::ErrorKind::ConnectionReset
             | std::io::ErrorKind::ConnectionAborted
             | std::io::ErrorKind::BrokenPipe
@@ -5131,10 +5398,15 @@ fn ensure_relay_peer_network(
 
 fn map_relay_read_result(
     result: Result<WireMessage, TransportError>,
-) -> Result<Option<WireMessage>, NodeError> {
+) -> Result<RelayReadOutcome, NodeError> {
     match result {
-        Ok(message) => Ok(Some(message)),
-        Err(TransportError::Io(err)) if relay_io_error_is_nonfatal(&err) => Ok(None),
+        Ok(message) => Ok(RelayReadOutcome::Message(message)),
+        Err(TransportError::Io(err)) if relay_io_error_is_timeout_like(&err) => {
+            Ok(RelayReadOutcome::Timeout)
+        }
+        Err(TransportError::Io(err)) if relay_io_error_is_closed_like(&err) => {
+            Ok(RelayReadOutcome::Closed)
+        }
         Err(err) => Err(NodeError::Transport(err)),
     }
 }
@@ -5195,6 +5467,216 @@ fn should_emit_miner_keepalive(elapsed_sec: u64) -> bool {
 
 fn wallet_send_preview_has_invalid_amount(amount: u64) -> bool {
     amount == 0
+}
+
+fn tx_submit_has_invalid_payload(tx_hex: &str) -> bool {
+    tx_hex.trim().is_empty()
+}
+
+fn decode_tx_from_bincode_hex(raw: &str) -> Result<Transaction, NodeError> {
+    let trimmed = raw.trim();
+    let decoded =
+        hex::decode(trimmed).map_err(|e| NodeError::Runtime(format!("invalid tx_hex: {e}")))?;
+    bincode::deserialize::<Transaction>(&decoded)
+        .map_err(|e| NodeError::Runtime(format!("invalid tx payload: {e}")))
+}
+
+#[derive(Clone, Copy)]
+struct ResolvedPrevout {
+    value: u64,
+    key_hash20: [u8; 20],
+    is_coinbase: bool,
+    created_height: u64,
+}
+
+fn resolve_prevout_for_admission(
+    runtime: &ChainRuntime,
+    mempool: &Mempool,
+    outpoint: &OutPoint,
+) -> Option<ResolvedPrevout> {
+    if let Some(entry) = runtime.utxo_set().get(outpoint) {
+        return Some(ResolvedPrevout {
+            value: entry.value,
+            key_hash20: entry.key_hash20,
+            is_coinbase: entry.is_coinbase,
+            created_height: entry.created_height,
+        });
+    }
+    let (parent_tx, _fee) = mempool.get_with_fee(&outpoint.txid)?;
+    let output = parent_tx.outputs.get(outpoint.vout as usize)?;
+    Some(ResolvedPrevout {
+        value: output.value,
+        key_hash20: output.key_hash20,
+        is_coinbase: false,
+        created_height: runtime.tip_height().saturating_add(1),
+    })
+}
+
+fn validate_tx_for_local_admission(
+    cfg: &ChainConfig,
+    runtime: &ChainRuntime,
+    mempool: &Mempool,
+    tx: &Transaction,
+) -> Result<u64, NodeError> {
+    if tx.is_coinbase() {
+        return Err(NodeError::Runtime(
+            "coinbase transaction cannot be submitted to mempool".to_owned(),
+        ));
+    }
+    if tx.inputs.is_empty() {
+        return Err(NodeError::Runtime(
+            "transaction must include at least one input".to_owned(),
+        ));
+    }
+    if tx.outputs.is_empty() {
+        return Err(NodeError::Runtime(
+            "transaction must include at least one output".to_owned(),
+        ));
+    }
+
+    let mut seen = HashSet::<OutPoint>::new();
+    let mut input_sum = 0u128;
+    let mut output_sum = 0u128;
+    let mut missing = Vec::<String>::new();
+    let tip_height = runtime.tip_height();
+    let maturity = cfg.coinbase_maturity as u64;
+
+    for (output_index, output) in tx.outputs.iter().enumerate() {
+        if output.value == 0 {
+            return Err(NodeError::Runtime(format!(
+                "output #{output_index} has zero value"
+            )));
+        }
+        output_sum = output_sum
+            .checked_add(output.value as u128)
+            .ok_or_else(|| NodeError::Runtime("output value overflow".to_owned()))?;
+    }
+
+    for (input_index, input) in tx.inputs.iter().enumerate() {
+        if input.prev_out.is_coinbase() {
+            return Err(NodeError::Runtime(format!(
+                "input #{input_index} references coinbase prevout"
+            )));
+        }
+        if !seen.insert(input.prev_out.clone()) {
+            return Err(NodeError::Runtime(format!(
+                "input #{input_index} double-spends prevout within tx"
+            )));
+        }
+        if input.pubkey_compressed.len() != 33 {
+            return Err(NodeError::Runtime(format!(
+                "input #{input_index} has invalid pubkey length {}",
+                input.pubkey_compressed.len()
+            )));
+        }
+        if !matches!(input.pubkey_compressed[0], 0x02 | 0x03) {
+            return Err(NodeError::Runtime(format!(
+                "input #{input_index} has invalid pubkey prefix {:02x}",
+                input.pubkey_compressed[0]
+            )));
+        }
+        if input.signature.len() != 64 {
+            return Err(NodeError::Runtime(format!(
+                "input #{input_index} has invalid signature length {}",
+                input.signature.len()
+            )));
+        }
+
+        let Some(prevout) = resolve_prevout_for_admission(runtime, mempool, &input.prev_out) else {
+            missing.push(format!("{}:{}", input.prev_out.txid, input.prev_out.vout));
+            continue;
+        };
+
+        if prevout.is_coinbase && tip_height < prevout.created_height.saturating_add(maturity) {
+            return Err(NodeError::Runtime(format!(
+                "input #{input_index} spends immature coinbase (created_height={}, maturity={})",
+                prevout.created_height, maturity
+            )));
+        }
+        let derived_key_hash20 = scam_core::hash160_blake3(&input.pubkey_compressed);
+        if derived_key_hash20 != prevout.key_hash20 {
+            return Err(NodeError::Runtime(format!(
+                "input #{input_index} pubkey hash mismatch with referenced output"
+            )));
+        }
+
+        let mut signature = [0u8; 64];
+        signature.copy_from_slice(&input.signature);
+        let mut pubkey = [0u8; 33];
+        pubkey.copy_from_slice(&input.pubkey_compressed);
+        let digest = tx
+            .signing_digest_with_chain_domain(input_index, cfg.network_id.as_bytes())
+            .map_err(|e| {
+                NodeError::Runtime(format!("input #{input_index} signing digest failed: {e}"))
+            })?;
+        let sig_ok = verify_digest(digest.0, signature, pubkey)?;
+        if !sig_ok {
+            return Err(NodeError::Runtime(format!(
+                "input #{input_index} signature verification failed"
+            )));
+        }
+
+        input_sum = input_sum
+            .checked_add(prevout.value as u128)
+            .ok_or_else(|| NodeError::Runtime("input value overflow".to_owned()))?;
+    }
+
+    if !missing.is_empty() {
+        return Err(NodeError::Runtime(format!(
+            "transaction has unresolved inputs: {}",
+            missing.join(", ")
+        )));
+    }
+    if input_sum < output_sum {
+        return Err(NodeError::Runtime(format!(
+            "transaction overspends: inputs={} outputs={}",
+            input_sum, output_sum
+        )));
+    }
+    let fee = input_sum.saturating_sub(output_sum);
+    u64::try_from(fee).map_err(|_| NodeError::Runtime("transaction fee overflow".to_owned()))
+}
+
+fn mempool_outcome_label(outcome: &InsertOutcome) -> &'static str {
+    match outcome {
+        InsertOutcome::Accepted { .. } => "accepted",
+        InsertOutcome::Replaced { .. } => "replaced",
+        InsertOutcome::AcceptedWithEviction { .. } => "accepted_with_eviction",
+        InsertOutcome::AlreadyPresent { .. } => "already_present",
+        InsertOutcome::RejectedConflictInsufficientFee { .. } => {
+            "rejected_conflict_insufficient_fee"
+        }
+        InsertOutcome::RejectedConflictInsufficientFeerate { .. } => {
+            "rejected_conflict_insufficient_feerate"
+        }
+    }
+}
+
+fn submit_tx_via_mempool_db(
+    cfg: &ChainConfig,
+    runtime_db_path: &Path,
+    mempool_db_path: &Path,
+    tx: Transaction,
+    requested_fee: u64,
+) -> Result<(Hash256, String, u64), NodeError> {
+    let (runtime, _) = load_runtime_from_db_or_genesis(cfg, runtime_db_path)?;
+    let mut mempool = load_mempool_from_db_or_empty(cfg, mempool_db_path)?;
+    let implied_fee = validate_tx_for_local_admission(cfg, &runtime, &mempool, &tx)?;
+    let fee = if requested_fee == 0 {
+        implied_fee
+    } else {
+        requested_fee
+    };
+    if fee < implied_fee {
+        return Err(NodeError::Runtime(format!(
+            "provided fee {} is lower than implied fee {}",
+            fee, implied_fee
+        )));
+    }
+    let txid = tx.txid();
+    let outcome = mempool.insert_with_fee(tx, fee)?;
+    persist_mempool_db_with_retry(cfg, &mempool, mempool_db_path, 80, 25)?;
+    Ok((txid, mempool_outcome_label(&outcome).to_owned(), fee))
 }
 
 fn share_target_in_bounds(
@@ -5472,6 +5954,7 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
     let runtime_db_path = args
         .runtime_db
         .unwrap_or_else(|| default_runtime_db_path(args.network));
+    let mempool_db_path = default_mempool_db_path(&runtime_db_path);
     let (runtime, source) = load_runtime_from_db_or_genesis(&cfg, &runtime_db_path)?;
     let share_target_hex = args
         .share_target_hex
@@ -5582,6 +6065,7 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
         runtime.tip_height(),
         runtime.tip_hash()
     );
+    println!("Mempool DB: {}", mempool_db_path.display());
     println!("Share target: {share_target}");
     println!(
         "VarDiff target shares/min: {}",
@@ -5623,11 +6107,14 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
         println!("Job declarator service: {addr}");
     }
     println!("Max clients before exit: {}", args.max_clients);
+    let max_template_txs = cfg.max_mempool_txs as usize;
 
     let ctx = StratumServerContext {
         cfg,
         runtime: Arc::new(Mutex::new(runtime)),
         runtime_db_path,
+        mempool_db_path,
+        max_template_txs,
         share_target,
         min_share_target,
         max_share_target,
@@ -6623,6 +7110,22 @@ impl Default for WalletSendPreviewRpcRequest {
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+struct TxSubmitRpcRequest {
+    tx_hex: String,
+    fee: u64,
+}
+
+impl Default for TxSubmitRpcRequest {
+    fn default() -> Self {
+        Self {
+            tx_hex: String::new(),
+            fee: 1,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Default)]
 #[serde(default)]
 struct WalletQrRpcRequest {
@@ -6670,12 +7173,34 @@ struct WalletSendPreviewRpcResponse {
     network_id: String,
     txid: String,
     raw_tx_hex: String,
+    tx_bincode_hex: String,
     amount: u64,
     fee: u64,
     input_total: u64,
     change: u64,
     is_self_transfer: bool,
     selected_inputs: Vec<WalletSendPreviewInput>,
+}
+
+#[derive(Debug, Serialize)]
+struct WalletSendRpcResponse {
+    network_id: String,
+    txid: String,
+    fee: u64,
+    amount: u64,
+    input_total: u64,
+    change: u64,
+    is_self_transfer: bool,
+    mempool_outcome: String,
+    selected_inputs: Vec<WalletSendPreviewInput>,
+}
+
+#[derive(Debug, Serialize)]
+struct TxSubmitRpcResponse {
+    network_id: String,
+    txid: String,
+    fee: u64,
+    mempool_outcome: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -6694,6 +7219,8 @@ struct MempoolSummaryRpcResponse {
     available: bool,
     source: String,
     snapshot: Option<RelayServerTelemetrySnapshot>,
+    tx_count: Option<usize>,
+    txids: Vec<String>,
 }
 
 fn wallet_address_response(
@@ -7010,8 +7537,16 @@ fn ui_dir_is_servable(ui_dir: &Path) -> bool {
     ui_dir.exists() && ui_dir.is_dir()
 }
 
-fn runtime_db_mtime(path: &Path) -> Option<SystemTime> {
+fn file_mtime(path: &Path) -> Option<SystemTime> {
     fs::metadata(path).ok()?.modified().ok()
+}
+
+fn runtime_db_mtime(path: &Path) -> Option<SystemTime> {
+    file_mtime(path)
+}
+
+fn mempool_db_mtime(path: &Path) -> Option<SystemTime> {
+    file_mtime(path)
 }
 
 fn refresh_runtime_from_db_if_changed(
@@ -7048,6 +7583,43 @@ fn refresh_runtime_from_db_if_changed(
     };
     *runtime = fresh;
     *last_seen_mtime = current_mtime;
+    Ok(())
+}
+
+fn refresh_mempool_from_db_if_changed(
+    cfg: &ChainConfig,
+    relay: &mut RelayAdmissionState,
+    mempool_db_path: &Path,
+    last_seen_mtime: &mut Option<SystemTime>,
+) -> Result<(), NodeError> {
+    let current_mtime = mempool_db_mtime(mempool_db_path);
+    if current_mtime == *last_seen_mtime {
+        return Ok(());
+    }
+
+    let mut fresh = None;
+    for attempt in 0..10 {
+        match load_mempool_from_db_or_empty(cfg, mempool_db_path) {
+            Ok(mempool) => {
+                fresh = Some(mempool);
+                break;
+            }
+            Err(err) if is_mempool_db_lock_conflict(&err) => {
+                if attempt < 9 {
+                    std::thread::sleep(Duration::from_millis(25));
+                    continue;
+                }
+                // Another process owns the mempool DB lock right now.
+                // Keep serving with the latest in-memory mempool and retry later.
+                return Ok(());
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    if let Some(mempool) = fresh {
+        relay.mempool = mempool;
+        *last_seen_mtime = current_mtime;
+    }
     Ok(())
 }
 
@@ -7175,6 +7747,7 @@ fn run_rpc_serve(args: RpcServeArgs) -> Result<(), NodeError> {
     let runtime_db_path = runtime_db
         .clone()
         .unwrap_or_else(|| default_runtime_db_path(network));
+    let mempool_db_path = default_mempool_db_path(&runtime_db_path);
     let (cfg, mut runtime) = build_runtime_for_query(
         network,
         config,
@@ -7196,9 +7769,10 @@ fn run_rpc_serve(args: RpcServeArgs) -> Result<(), NodeError> {
         runtime.tip_hash()
     );
     println!(
-        "Endpoints: GET /health, /status, /block/<height>, /tx/<height>/<index>, /mempool; POST /wallet/new, /wallet/address, /wallet/decode, /wallet/balance, /wallet/balance-by-address, /wallet/send-preview, /wallet/qr"
+        "Endpoints: GET /health, /status, /block/<height>, /tx/<height>/<index>, /mempool; POST /wallet/new, /wallet/address, /wallet/decode, /wallet/balance, /wallet/balance-by-address, /wallet/send-preview, /wallet/send, /tx/submit, /wallet/qr"
     );
     println!("UI assets directory: {}", ui_dir.display());
+    println!("Mempool DB source: {}", mempool_db_path.display());
     if let Some(path) = relay_telemetry.as_ref() {
         println!("Relay telemetry source: {}", path.display());
     }
@@ -7255,17 +7829,43 @@ fn run_rpc_serve(args: RpcServeArgs) -> Result<(), NodeError> {
                 ),
             }
         } else if rpc_exact_route_matches(method, path, "GET", "/mempool") {
+            let (mempool_tx_count, mempool_txids) = if mempool_db_path.exists() {
+                match load_mempool_db(&mempool_db_path) {
+                    Ok(snapshot) => (
+                        Some(snapshot.entries.len()),
+                        snapshot
+                            .entries
+                            .iter()
+                            .map(|entry| entry.txid.to_hex())
+                            .collect::<Vec<_>>(),
+                    ),
+                    Err(err) => {
+                        let body = json_error_body(&format!(
+                            "mempool db load failed ({}): {err}",
+                            mempool_db_path.display()
+                        ));
+                        write_http_json_response(&mut stream, "500 Internal Server Error", &body)?;
+                        continue;
+                    }
+                }
+            } else {
+                (None, Vec::new())
+            };
             let summary = if let Some(telemetry_path) = relay_telemetry.as_ref() {
                 match load_latest_jsonl_record::<RelayServerTelemetrySnapshot>(telemetry_path) {
                     Ok(Some(snapshot)) => MempoolSummaryRpcResponse {
                         available: true,
                         source: telemetry_path.display().to_string(),
                         snapshot: Some(snapshot),
+                        tx_count: mempool_tx_count,
+                        txids: mempool_txids.clone(),
                     },
                     Ok(None) => MempoolSummaryRpcResponse {
-                        available: false,
+                        available: mempool_tx_count.is_some(),
                         source: telemetry_path.display().to_string(),
                         snapshot: None,
+                        tx_count: mempool_tx_count,
+                        txids: mempool_txids.clone(),
                     },
                     Err(err) => {
                         let body = json_error_body(&err.to_string());
@@ -7275,9 +7875,11 @@ fn run_rpc_serve(args: RpcServeArgs) -> Result<(), NodeError> {
                 }
             } else {
                 MempoolSummaryRpcResponse {
-                    available: false,
-                    source: "relay telemetry not configured".to_owned(),
+                    available: mempool_tx_count.is_some(),
+                    source: format!("mempool db: {}", mempool_db_path.display()),
                     snapshot: None,
+                    tx_count: mempool_tx_count,
+                    txids: mempool_txids,
                 }
             };
             match to_pretty_json(&summary) {
@@ -7647,6 +8249,10 @@ fn run_rpc_serve(args: RpcServeArgs) -> Result<(), NodeError> {
                 network_id: cfg.network_id.clone(),
                 txid: signed.tx.txid().to_hex(),
                 raw_tx_hex: hex::encode(signed.tx.encode_for_hash()),
+                tx_bincode_hex: hex::encode(
+                    bincode::serialize(&signed.tx)
+                        .map_err(|e| NodeError::Runtime(format!("tx encode failed: {e}")))?,
+                ),
                 amount: req.amount,
                 fee: req.fee,
                 input_total: signed.input_total,
@@ -7667,6 +8273,160 @@ fn run_rpc_serve(args: RpcServeArgs) -> Result<(), NodeError> {
                 Err(e) => (
                     "500 Internal Server Error",
                     json_error_body(&format!("wallet send serialization failed: {e}")),
+                ),
+            }
+        } else if rpc_exact_route_matches(method, path, "POST", "/wallet/send") {
+            let req = match parse_json_body::<WalletSendPreviewRpcRequest>(&request) {
+                Ok(value) => value,
+                Err(err) => {
+                    let body = json_error_body(&err.to_string());
+                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
+                    continue;
+                }
+            };
+            if wallet_send_preview_has_invalid_amount(req.amount) {
+                let body = json_error_body("amount must be > 0");
+                write_http_json_response(&mut stream, "400 Bad Request", &body)?;
+                continue;
+            }
+            let recipient = match parse_address(&req.to) {
+                Ok(value) => value,
+                Err(err) => {
+                    let body = json_error_body(&err.to_string());
+                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
+                    continue;
+                }
+            };
+            let accepted_hrps = accepted_hrps_for_network(network, &cfg.hrp);
+            if should_reject_send_preview_hrp(&accepted_hrps, &recipient.hrp) {
+                let body = json_error_body(&format!(
+                    "address hrp '{}' is not valid for network '{}' (accepted: {})",
+                    recipient.hrp,
+                    cfg.network_id,
+                    accepted_hrps.join(", ")
+                ));
+                write_http_json_response(&mut stream, "400 Bad Request", &body)?;
+                continue;
+            }
+            let mnemonic = match WalletMnemonic::parse(&req.mnemonic) {
+                Ok(value) => value,
+                Err(err) => {
+                    let body = json_error_body(&err.to_string());
+                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
+                    continue;
+                }
+            };
+            let seed = mnemonic.to_seed(&req.passphrase);
+            let key = match derive_wallet_key(&seed, req.account, req.index) {
+                Ok(value) => value,
+                Err(err) => {
+                    let body = json_error_body(&err.to_string());
+                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
+                    continue;
+                }
+            };
+            let signed = match build_signed_transfer_tx(
+                &runtime,
+                &cfg.network_id,
+                &key,
+                recipient.key_hash20,
+                req.amount,
+                req.fee,
+            ) {
+                Ok(value) => value,
+                Err(err) => {
+                    let body = json_error_body(&err.to_string());
+                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
+                    continue;
+                }
+            };
+            let (txid, outcome, effective_fee) = match submit_tx_via_mempool_db(
+                &cfg,
+                &runtime_db_path,
+                &mempool_db_path,
+                signed.tx.clone(),
+                req.fee,
+            ) {
+                Ok(value) => value,
+                Err(err) => {
+                    let body = json_error_body(&err.to_string());
+                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
+                    continue;
+                }
+            };
+            let payload = WalletSendRpcResponse {
+                network_id: cfg.network_id.clone(),
+                txid: txid.to_hex(),
+                fee: effective_fee,
+                amount: req.amount,
+                input_total: signed.input_total,
+                change: signed.change_value,
+                is_self_transfer: signed.is_self_transfer,
+                mempool_outcome: outcome,
+                selected_inputs: signed
+                    .selected_inputs
+                    .into_iter()
+                    .map(|item| WalletSendPreviewInput {
+                        txid: item.outpoint.txid.to_hex(),
+                        vout: item.outpoint.vout,
+                        value: item.value,
+                    })
+                    .collect(),
+            };
+            match to_pretty_json(&payload) {
+                Ok(body) => ("200 OK", body),
+                Err(e) => (
+                    "500 Internal Server Error",
+                    json_error_body(&format!("wallet send serialization failed: {e}")),
+                ),
+            }
+        } else if rpc_exact_route_matches(method, path, "POST", "/tx/submit") {
+            let req = match parse_json_body::<TxSubmitRpcRequest>(&request) {
+                Ok(value) => value,
+                Err(err) => {
+                    let body = json_error_body(&err.to_string());
+                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
+                    continue;
+                }
+            };
+            if tx_submit_has_invalid_payload(&req.tx_hex) {
+                let body = json_error_body("tx_hex must not be empty");
+                write_http_json_response(&mut stream, "400 Bad Request", &body)?;
+                continue;
+            }
+            let tx = match decode_tx_from_bincode_hex(&req.tx_hex) {
+                Ok(value) => value,
+                Err(err) => {
+                    let body = json_error_body(&err.to_string());
+                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
+                    continue;
+                }
+            };
+            let (txid, outcome, effective_fee) = match submit_tx_via_mempool_db(
+                &cfg,
+                &runtime_db_path,
+                &mempool_db_path,
+                tx,
+                req.fee,
+            ) {
+                Ok(value) => value,
+                Err(err) => {
+                    let body = json_error_body(&err.to_string());
+                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
+                    continue;
+                }
+            };
+            let payload = TxSubmitRpcResponse {
+                network_id: cfg.network_id.clone(),
+                txid: txid.to_hex(),
+                fee: effective_fee,
+                mempool_outcome: outcome,
+            };
+            match to_pretty_json(&payload) {
+                Ok(body) => ("200 OK", body),
+                Err(e) => (
+                    "500 Internal Server Error",
+                    json_error_body(&format!("tx submit serialization failed: {e}")),
                 ),
             }
         } else if rpc_exact_route_matches(method, path, "POST", "/wallet/qr") {
@@ -8129,9 +8889,13 @@ mod tests {
         let io_reset = std::io::Error::from(std::io::ErrorKind::ConnectionReset);
         let io_broken_pipe = std::io::Error::from(std::io::ErrorKind::BrokenPipe);
         let io_denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
-        assert!(super::relay_io_error_is_nonfatal(&io_timeout));
-        assert!(super::relay_io_error_is_nonfatal(&io_reset));
-        assert!(super::relay_io_error_is_nonfatal(&io_broken_pipe));
+        assert!(super::relay_io_error_is_timeout_like(&io_timeout));
+        assert!(!super::relay_io_error_is_timeout_like(&io_reset));
+        assert!(!super::relay_io_error_is_timeout_like(&io_broken_pipe));
+        assert!(!super::relay_io_error_is_closed_like(&io_timeout));
+        assert!(super::relay_io_error_is_closed_like(&io_reset));
+        assert!(super::relay_io_error_is_closed_like(&io_broken_pipe));
+        assert!(!super::relay_io_error_is_closed_like(&io_denied));
         assert!(super::sv2_io_error_is_timeout_like(&io_timeout));
         assert!(!super::sv2_io_error_is_timeout_like(&io_reset));
         assert!(!super::http_io_error_is_timeout_like(&io_broken_pipe));
@@ -8246,25 +9010,28 @@ mod tests {
     fn map_relay_read_result_handles_io_and_protocol_errors() {
         let ok = super::map_relay_read_result(Ok(WireMessage::Ping { nonce: 7 }))
             .expect("ok relay message");
-        assert!(matches!(ok, Some(WireMessage::Ping { nonce: 7 })));
+        assert!(matches!(
+            ok,
+            super::RelayReadOutcome::Message(WireMessage::Ping { nonce: 7 })
+        ));
 
         let timeout = super::map_relay_read_result(Err(scam_p2p::TransportError::Io(
             std::io::Error::from(std::io::ErrorKind::TimedOut),
         )))
-        .expect("timeout maps to None");
-        assert!(timeout.is_none());
+        .expect("timeout maps to timeout");
+        assert!(matches!(timeout, super::RelayReadOutcome::Timeout));
 
         let reset = super::map_relay_read_result(Err(scam_p2p::TransportError::Io(
             std::io::Error::from(std::io::ErrorKind::ConnectionReset),
         )))
-        .expect("connection reset should be non-fatal");
-        assert!(reset.is_none());
+        .expect("connection reset maps to closed");
+        assert!(matches!(reset, super::RelayReadOutcome::Closed));
 
         let broken = super::map_relay_read_result(Err(scam_p2p::TransportError::Io(
             std::io::Error::from(std::io::ErrorKind::BrokenPipe),
         )))
-        .expect("broken pipe should be non-fatal");
-        assert!(broken.is_none());
+        .expect("broken pipe maps to closed");
+        assert!(matches!(broken, super::RelayReadOutcome::Closed));
 
         let denied = super::map_relay_read_result(Err(scam_p2p::TransportError::Io(
             std::io::Error::from(std::io::ErrorKind::PermissionDenied),
@@ -8430,10 +9197,13 @@ mod tests {
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
         let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
         let runtime_db_path = temp_dir("test-stratum-client-async-logic").join("runtime.redb");
+        let mempool_db_path = runtime_db_path.with_file_name("mempool.redb");
         let ctx = super::StratumServerContext {
             cfg: cfg.clone(),
             runtime: std::sync::Arc::new(std::sync::Mutex::new(runtime)),
             runtime_db_path,
+            mempool_db_path,
+            max_template_txs: cfg.max_mempool_txs as usize,
             share_target: Target::MAX,
             min_share_target: Target::from_hex(&cfg.stratum_min_share_target)
                 .expect("min share target parse"),
@@ -11296,6 +12066,135 @@ mod tests {
         .expect("signed tx with change");
         assert_eq!(with_change.change_value, 1);
         assert_eq!(with_change.tx.outputs.len(), 2);
+    }
+
+    #[test]
+    fn submit_tx_via_mempool_db_accepts_valid_signed_transaction() {
+        let mut cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        cfg.coinbase_maturity = 1;
+        cfg.validate().expect("config validate");
+
+        let work_dir = temp_dir("test-submit-mempool-db");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let runtime_db = work_dir.join("runtime.redb");
+        let mempool_db = work_dir.join("mempool.redb");
+
+        let mnemonic = WalletMnemonic::parse(SOAK_FLOW_MNEMONIC).expect("mnemonic");
+        let seed = mnemonic.to_seed("");
+        let sender_key = derive_wallet_key(&seed, 0, 0).expect("sender key");
+        let recipient_key = derive_wallet_key(&seed, 0, 1).expect("recipient key");
+        let sender_key_hash20 = scam_core::hash160_blake3(&sender_key.pubkey_compressed());
+        let recipient_key_hash20 = scam_core::hash160_blake3(&recipient_key.pubkey_compressed());
+
+        let mut runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let params = super::MiningLoopParams {
+            count: 2,
+            interval_sec: cfg.target_block_time_sec,
+            max_nonce: 500_000,
+            subsidy: cfg.block_subsidy,
+            miner_key_hash: sender_key_hash20,
+            label_prefix: "submit-mempool",
+            print_each: false,
+        };
+        mine_blocks_on_runtime(&mut runtime, &params).expect("mine blocks");
+        persist_runtime_db(&runtime, &runtime_db).expect("persist runtime");
+
+        let signed = build_signed_transfer_tx(
+            &runtime,
+            &cfg.network_id,
+            &sender_key,
+            recipient_key_hash20,
+            1_000_000,
+            500,
+        )
+        .expect("build signed tx");
+        let (txid, outcome, fee) =
+            super::submit_tx_via_mempool_db(&cfg, &runtime_db, &mempool_db, signed.tx, 500)
+                .expect("submit tx");
+
+        assert_eq!(fee, 500);
+        assert_eq!(outcome, "accepted");
+        let snapshot = scam_storage::load_mempool_db(&mempool_db).expect("load mempool db");
+        assert_eq!(snapshot.network_id, cfg.network_id);
+        assert!(snapshot.entries.iter().any(|entry| entry.txid == txid));
+
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
+    fn relay_proactive_inventory_messages_announces_tip_and_new_mempool_txids_once() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+
+        let mut relay = RelayAdmissionState {
+            mempool: Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip: GossipEngine::new(128).expect("gossip"),
+        };
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: OutPoint {
+                    txid: Hash256([7u8; 32]),
+                    vout: 0,
+                },
+                signature: vec![1u8; 64],
+                pubkey_compressed: vec![2u8; 33],
+                sequence: 0,
+            }],
+            outputs: vec![TxOut {
+                value: 10,
+                key_hash20: [9u8; 20],
+            }],
+            lock_time: 0,
+        };
+        relay
+            .mempool
+            .insert_with_fee(tx.clone(), 2_000)
+            .expect("insert tx");
+
+        let state = RelayServerState { runtime, relay };
+        let mut last_tip_announced = None;
+        let mut announced_txids = std::collections::HashSet::<Hash256>::new();
+        let first = super::relay_proactive_inventory_messages(
+            &state,
+            &mut last_tip_announced,
+            &mut announced_txids,
+            128,
+        );
+        assert!(
+            first.iter().any(|msg| match msg {
+                WireMessage::Inv { items } => items.iter().any(|item| {
+                    matches!(item, InventoryItem::Block(hash) if *hash == state.runtime.tip_hash())
+                }),
+                _ => false,
+            }),
+            "first proactive pass must announce tip hash"
+        );
+        assert!(
+            first.iter().any(|msg| match msg {
+                WireMessage::Inv { items } => items
+                    .iter()
+                    .any(|item| matches!(item, InventoryItem::Tx(txid) if *txid == tx.txid())),
+                _ => false,
+            }),
+            "first proactive pass must announce unseen mempool txid"
+        );
+
+        let second = super::relay_proactive_inventory_messages(
+            &state,
+            &mut last_tip_announced,
+            &mut announced_txids,
+            128,
+        );
+        assert!(
+            second.is_empty(),
+            "second proactive pass must not re-announce unchanged inventory"
+        );
     }
 
     #[test]
