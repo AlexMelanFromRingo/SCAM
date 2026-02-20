@@ -8,6 +8,10 @@ const statNetwork = document.getElementById("statNetwork");
 const statHeight = document.getElementById("statHeight");
 const statUtxo = document.getElementById("statUtxo");
 const statWork = document.getElementById("statWork");
+const statRelayPeers = document.getElementById("statRelayPeers");
+const statSyncLag = document.getElementById("statSyncLag");
+const statLastBlockAge = document.getElementById("statLastBlockAge");
+const statRelayMempool = document.getElementById("statRelayMempool");
 const latestRange = document.getElementById("latestRange");
 const latestBlocksBody = document.getElementById("latestBlocksBody");
 
@@ -41,6 +45,14 @@ function shortHash(hex, head = 12, tail = 8) {
   if (typeof hex !== "string") return "-";
   if (hex.length <= head + tail + 3) return hex;
   return `${hex.slice(0, head)}...${hex.slice(-tail)}`;
+}
+
+function formatAgeSeconds(sec) {
+  const n = Number(sec);
+  if (!Number.isFinite(n) || n < 0) return "-";
+  if (n < 60) return `${Math.floor(n)}s`;
+  if (n < 3600) return `${Math.floor(n / 60)}m ${Math.floor(n % 60)}s`;
+  return `${Math.floor(n / 3600)}h ${Math.floor((n % 3600) / 60)}m`;
 }
 
 function formatJson(data) {
@@ -104,6 +116,10 @@ async function loadStatus() {
   statHeight.textContent = `${status.tip_height ?? "-"}`;
   statUtxo.textContent = `${status.utxo_count ?? "-"}`;
   statWork.textContent = status.cumulative_work ?? "-";
+  statRelayPeers.textContent = "-";
+  statSyncLag.textContent = "-";
+  statLastBlockAge.textContent = "-";
+  statRelayMempool.textContent = "-";
   return status;
 }
 
@@ -185,6 +201,19 @@ function applyLiveSnapshot(snapshot) {
   statHeight.textContent = `${snapshot.tip_height ?? "-"}`;
   statUtxo.textContent = `${snapshot.utxo_count ?? "-"}`;
   statWork.textContent = snapshot.cumulative_work ?? "-";
+  statRelayPeers.textContent =
+    snapshot.relay_active_peers === null || snapshot.relay_active_peers === undefined
+      ? "-"
+      : `${snapshot.relay_active_peers}`;
+  statSyncLag.textContent =
+    snapshot.sync_lag_blocks === null || snapshot.sync_lag_blocks === undefined
+      ? "-"
+      : `${snapshot.sync_lag_blocks} blk`;
+  statLastBlockAge.textContent = formatAgeSeconds(snapshot.last_block_age_sec);
+  statRelayMempool.textContent =
+    snapshot.relay_mempool_len === null || snapshot.relay_mempool_len === undefined
+      ? "-"
+      : `${snapshot.relay_mempool_len}`;
 
   const tipHeight = Number(snapshot.tip_height);
   if (Number.isFinite(tipHeight) && tipHeight !== state.lastTipHeight) {

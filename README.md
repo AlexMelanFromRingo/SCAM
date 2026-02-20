@@ -327,7 +327,7 @@ http://127.0.0.1:18080/
 
 RPC endpoints used by the console:
 - GET: `/health`, `/status`, `/block/<height>`, `/tx/<height>/<index>`, `/mempool`, `/events` (SSE snapshots)
-- POST: `/wallet/new`, `/wallet/address`, `/wallet/decode`, `/wallet/balance`, `/wallet/balance-by-address`, `/wallet/send-preview`, `/wallet/send`, `/tx/submit`, `/wallet/qr`
+- POST: `/wallet/new`, `/wallet/address`, `/wallet/decode`, `/wallet/balance`, `/wallet/balance-by-address`, `/wallet/balance-history-by-address`, `/wallet/send-preview`, `/wallet/send`, `/tx/submit`, `/wallet/qr`
 
 ---
 

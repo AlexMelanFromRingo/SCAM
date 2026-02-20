@@ -5,7 +5,7 @@
 - Stratum mining to local node: works (blocks produced).
 - Node-to-node synchronization: realtime INV propagation works for active relay connections; relay has outbound peer auto-dial from peer-book (`--outbound-connect`) and now tolerates out-of-order block arrival via unknown-parent recovery + pending orphan promotion.
 - Wallet UX transfer pipeline: live submit path (`wallet/send`, `tx/submit`) is wired to mempool DB admission and mined confirmation flow.
-- UI: request/refresh based (5s auto-refresh), no SSE push stream yet.
+- UI: SSE push stream (`/events`) with polling fallback (5s) is active; dashboard now shows relay peers, relay mempool, sync lag, and last-block age.
 
 ## Why blocks often have `tx_count = 1`
 - Blocks include only coinbase unless mempool has user transactions.
@@ -28,12 +28,12 @@
   - [x] receiver balance updates.
 
 ## P1 (required for operational usability)
-- [ ] Add realtime UI updates:
+- [x] Add realtime UI updates:
   - [x] SSE stream endpoint (`/events`) with status/tip/mempool deltas.
   - [x] frontend EventSource client with auto-reconnect + polling fallback indicator.
 - [x] Keep polling fallback when SSE unavailable (UI now auto-refreshes every 5s).
-- [ ] Add explicit node health telemetry in UI (relay peers, sync lag, mempool size, last block age).
-- [ ] Add RPC endpoint to query balance by address + tx history in one call for wallet UX.
+- [x] Add explicit node health telemetry in UI (relay peers, sync lag, mempool size, last block age).
+- [x] Add RPC endpoint to query balance by address + tx history in one call for wallet UX (`POST /wallet/balance-history-by-address`).
 
 ## P1 networking hardening
 - [ ] Verify relay thread model under sustained connections (no silent worker exits).
@@ -48,7 +48,7 @@
 - [ ] Operator runbook updates (incident handling, recovery, metrics thresholds).
 
 ## Required test additions (minimum)
-- [ ] `wallet/send` happy path integration test.
+- [x] `wallet/send` happy path integration test.
 - [ ] `wallet/send` rejects invalid hrp/negative amount/insufficient funds/double spend.
 - [ ] Reorg case: pending tx survives/reenters mempool when block disconnected.
 - [ ] Realtime propagation latency test between two relays.
@@ -56,6 +56,6 @@
 
 ## Definition of done for “testnet-ready”
 - [x] No dependence on periodic `sync-book` loop for normal block propagation.
-- [ ] User tx can be created/submitted/propagated/mined/observed from another node.
-- [ ] UI reflects chain/mempool updates automatically (realtime stream) with clear fallback.
+- [x] User tx can be created/submitted/propagated/mined/observed from another node.
+- [x] UI reflects chain/mempool updates automatically (realtime stream) with clear fallback.
 - [ ] Full workspace: `fmt`, `clippy -D warnings`, tests, mutation stages (agreed thresholds).

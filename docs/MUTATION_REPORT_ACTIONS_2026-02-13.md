@@ -100,3 +100,15 @@ Run window: `2026-02-13T16:10:10Z` -> `2026-02-13T17:09:00Z`
 - [x] Re-ran Stage 1 after miner/package comparator and CPFP hardening:
   - Command scope: `scripts/mutation-staged.sh stage1`
   - Result snapshot: `total=529`, `caught=471`, `missed=0`, `timeout=0`, `unviable=58`.
+
+## Addendum (2026-02-21)
+
+- [x] Collected latest CI mutation snapshots by stage after node/relay hardening waves:
+  - Stage 1: `total=534`, `caught=472`, `missed=4`, `timeout=0`, `unviable=58`.
+  - Stage 2: `total=875`, `caught=728`, `missed=11`, `timeout=10`, `unviable=126`.
+  - Stage 3: `total=1497`, `caught=1250`, `missed=33`, `timeout=10`, `unviable=204`.
+- [ ] Stage 2 rerun is still required on the newest realtime relay commit set (`unknown-parent recovery + mempool/rpc lock retry`) before closing Stage 2.
+- [ ] Stage 3 rerun is still required after Stage 2 closes, because Stage 3 includes node/rpc/wallet surfaces touched by subsequent fixes.
+- [ ] Remaining timeout focus:
+  - `crates/node/src/main.rs` (`decode_optional_hex32`, `max_requests_reached`, `run_sv2_conformance`, `read_http_request` guards),
+  - `crates/p2p/src/transport.rs::send_message`.
