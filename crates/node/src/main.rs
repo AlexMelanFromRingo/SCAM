@@ -7564,6 +7564,22 @@ struct WalletBalanceByAddressRpcRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(default)]
+struct WalletBalanceHistoryByAddressRpcRequest {
+    address: String,
+    max_entries: usize,
+}
+
+impl Default for WalletBalanceHistoryByAddressRpcRequest {
+    fn default() -> Self {
+        Self {
+            address: String::new(),
+            max_entries: 50,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default)]
 struct WalletSendPreviewRpcRequest {
     mnemonic: String,
     passphrase: String,
@@ -7640,6 +7656,23 @@ struct WalletBalanceRpcResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct WalletTxHistoryEntry {
+    height: u64,
+    txid: String,
+    coinbase: bool,
+    received: u128,
+    sent: u128,
+    net: u128,
+    direction: String,
+}
+
+#[derive(Debug, Serialize)]
+struct WalletBalanceHistoryRpcResponse {
+    balance: WalletBalanceRpcResponse,
+    tx_history: Vec<WalletTxHistoryEntry>,
+}
+
+#[derive(Debug, Serialize)]
 struct WalletSendPreviewInput {
     txid: String,
     vout: u32,
@@ -7710,6 +7743,12 @@ struct RpcEventSnapshot {
     cumulative_work: String,
     mempool_available: bool,
     mempool_tx_count: usize,
+    relay_active_peers: Option<usize>,
+    relay_tip_height: Option<u64>,
+    relay_mempool_len: Option<usize>,
+    relay_snapshot_age_sec: Option<u64>,
+    sync_lag_blocks: Option<u64>,
+    last_block_age_sec: u64,
     unix_sec: u64,
 }
 
@@ -7784,6 +7823,77 @@ fn wallet_balance_response(
     }
 }
 
+fn wallet_tx_history_for_key_hash(
+    runtime: &ChainRuntime,
+    key_hash20: [u8; 20],
+    max_entries: usize,
+) -> Vec<WalletTxHistoryEntry> {
+    if max_entries == 0 {
+        return Vec::new();
+    }
+    let mut known_outputs = HashMap::<OutPoint, TxOut>::new();
+    let mut history = Vec::<WalletTxHistoryEntry>::new();
+
+    for (height, block_hash) in runtime.block_hashes().iter().copied().enumerate() {
+        let Some(block) = runtime.block_by_hash(&block_hash) else {
+            continue;
+        };
+        for tx in &block.transactions {
+            let txid = tx.txid();
+            let mut sent = 0u128;
+            if !tx.is_coinbase() {
+                for input in &tx.inputs {
+                    if let Some(prev_out) = known_outputs.get(&input.prev_out)
+                        && prev_out.key_hash20 == key_hash20
+                    {
+                        sent = sent.saturating_add(prev_out.value as u128);
+                    }
+                }
+            }
+
+            let mut received = 0u128;
+            for output in &tx.outputs {
+                if output.key_hash20 == key_hash20 {
+                    received = received.saturating_add(output.value as u128);
+                }
+            }
+
+            if sent > 0 || received > 0 {
+                let (direction, net) = if received > sent {
+                    ("in".to_owned(), received.saturating_sub(sent))
+                } else if sent > received {
+                    ("out".to_owned(), sent.saturating_sub(received))
+                } else {
+                    ("self".to_owned(), 0)
+                };
+                history.push(WalletTxHistoryEntry {
+                    height: height as u64,
+                    txid: txid.to_hex(),
+                    coinbase: tx.is_coinbase(),
+                    received,
+                    sent,
+                    net,
+                    direction,
+                });
+            }
+
+            for (vout, output) in tx.outputs.iter().enumerate() {
+                known_outputs.insert(
+                    OutPoint {
+                        txid,
+                        vout: vout as u32,
+                    },
+                    output.clone(),
+                );
+            }
+        }
+    }
+
+    history.reverse();
+    history.truncate(max_entries);
+    history
+}
+
 fn mempool_tx_count_from_db(mempool_db_path: &Path) -> Result<(bool, usize), NodeError> {
     if !mempool_db_path.exists() {
         return Ok((false, 0));
@@ -7796,8 +7906,26 @@ fn build_rpc_event_snapshot(
     cfg: &ChainConfig,
     runtime: &ChainRuntime,
     mempool_db_path: &Path,
+    relay_telemetry_path: Option<&Path>,
 ) -> Result<RpcEventSnapshot, NodeError> {
     let (mempool_available, mempool_tx_count) = mempool_tx_count_from_db(mempool_db_path)?;
+    let now_unix_sec = current_unix_sec()?;
+    let (relay_active_peers, relay_tip_height, relay_mempool_len, relay_snapshot_age_sec) =
+        match relay_telemetry_path {
+            Some(path) => match load_latest_jsonl_record::<RelayServerTelemetrySnapshot>(path)? {
+                Some(snapshot) => (
+                    Some(snapshot.active_peers),
+                    Some(snapshot.tip_height),
+                    Some(snapshot.mempool_len),
+                    Some(now_unix_sec.saturating_sub(snapshot.timestamp_unix_sec)),
+                ),
+                None => (None, None, None, None),
+            },
+            None => (None, None, None, None),
+        };
+    let sync_lag_blocks =
+        relay_tip_height.map(|relay_tip| runtime.tip_height().abs_diff(relay_tip));
+    let last_block_age_sec = now_unix_sec.saturating_sub(runtime.tip_header().timestamp);
     Ok(RpcEventSnapshot {
         network_id: cfg.network_id.clone(),
         tip_height: runtime.tip_height(),
@@ -7806,7 +7934,13 @@ fn build_rpc_event_snapshot(
         cumulative_work: runtime.cumulative_work().to_str_radix(10),
         mempool_available,
         mempool_tx_count,
-        unix_sec: current_unix_sec()?,
+        relay_active_peers,
+        relay_tip_height,
+        relay_mempool_len,
+        relay_snapshot_age_sec,
+        sync_lag_blocks,
+        last_block_age_sec,
+        unix_sec: now_unix_sec,
     })
 }
 
@@ -8313,6 +8447,7 @@ fn run_rpc_events_worker(
     cfg: ChainConfig,
     runtime_db_path: PathBuf,
     mempool_db_path: PathBuf,
+    relay_telemetry_path: Option<PathBuf>,
     stop_flag: Arc<AtomicBool>,
     interval: Duration,
 ) -> Result<(), NodeError> {
@@ -8332,7 +8467,12 @@ fn run_rpc_events_worker(
             &runtime_db_path,
             &mut runtime_db_seen_mtime,
         )?;
-        let snapshot = build_rpc_event_snapshot(&cfg, &runtime, &mempool_db_path)?;
+        let snapshot = build_rpc_event_snapshot(
+            &cfg,
+            &runtime,
+            &mempool_db_path,
+            relay_telemetry_path.as_deref(),
+        )?;
         let payload = serde_json::to_string(&snapshot)
             .map_err(|e| NodeError::Runtime(format!("events serialization failed: {e}")))?;
         if let Err(err) = write_http_sse_event(&mut stream, "snapshot", &payload) {
@@ -8384,7 +8524,7 @@ fn run_rpc_serve(args: RpcServeArgs) -> Result<(), NodeError> {
         runtime.tip_hash()
     );
     println!(
-        "Endpoints: GET /health, /status, /block/<height>, /tx/<height>/<index>, /mempool, /events; POST /wallet/new, /wallet/address, /wallet/decode, /wallet/balance, /wallet/balance-by-address, /wallet/send-preview, /wallet/send, /tx/submit, /wallet/qr"
+        "Endpoints: GET /health, /status, /block/<height>, /tx/<height>/<index>, /mempool, /events; POST /wallet/new, /wallet/address, /wallet/decode, /wallet/balance, /wallet/balance-by-address, /wallet/balance-history-by-address, /wallet/send-preview, /wallet/send, /tx/submit, /wallet/qr"
     );
     println!("UI assets directory: {}", ui_dir.display());
     println!("Mempool DB source: {}", mempool_db_path.display());
@@ -8429,6 +8569,7 @@ fn run_rpc_serve(args: RpcServeArgs) -> Result<(), NodeError> {
             let cfg_clone = cfg.clone();
             let runtime_db_path_clone = runtime_db_path.clone();
             let mempool_db_path_clone = mempool_db_path.clone();
+            let relay_telemetry_clone = relay_telemetry.clone();
             let stop_clone = events_stop_flag.clone();
             events_workers.push(thread::spawn(move || {
                 if let Err(err) = run_rpc_events_worker(
@@ -8436,6 +8577,7 @@ fn run_rpc_serve(args: RpcServeArgs) -> Result<(), NodeError> {
                     cfg_clone,
                     runtime_db_path_clone,
                     mempool_db_path_clone,
+                    relay_telemetry_clone,
                     stop_clone,
                     events_interval,
                 ) {
@@ -8820,6 +8962,56 @@ fn run_rpc_serve(args: RpcServeArgs) -> Result<(), NodeError> {
                     "500 Internal Server Error",
                     json_error_body(&format!(
                         "wallet balance-by-address serialization failed: {e}"
+                    )),
+                ),
+            }
+        } else if rpc_exact_route_matches(
+            method,
+            path,
+            "POST",
+            "/wallet/balance-history-by-address",
+        ) {
+            let req = match parse_json_body::<WalletBalanceHistoryByAddressRpcRequest>(&request) {
+                Ok(value) => value,
+                Err(err) => {
+                    let body = json_error_body(&err.to_string());
+                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
+                    continue;
+                }
+            };
+            let decoded = match parse_address(&req.address) {
+                Ok(value) => value,
+                Err(err) => {
+                    let body = json_error_body(&err.to_string());
+                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
+                    continue;
+                }
+            };
+            let accepted_hrps = accepted_hrps_for_network(network, &cfg.hrp);
+            if should_reject_send_preview_hrp(&accepted_hrps, &decoded.hrp) {
+                let body = json_error_body(&format!(
+                    "address hrp '{}' is not valid for network '{}' (accepted: {})",
+                    decoded.hrp,
+                    cfg.network_id,
+                    accepted_hrps.join(", ")
+                ));
+                write_http_json_response(&mut stream, "400 Bad Request", &body)?;
+                continue;
+            }
+            let balance =
+                wallet_balance_response(&runtime, &cfg, 0, 0, req.address, decoded.key_hash20);
+            let tx_history =
+                wallet_tx_history_for_key_hash(&runtime, decoded.key_hash20, req.max_entries);
+            let payload = WalletBalanceHistoryRpcResponse {
+                balance,
+                tx_history,
+            };
+            match to_pretty_json(&payload) {
+                Ok(body) => ("200 OK", body),
+                Err(e) => (
+                    "500 Internal Server Error",
+                    json_error_body(&format!(
+                        "wallet balance-history-by-address serialization failed: {e}"
                     )),
                 ),
             }
@@ -11871,13 +12063,16 @@ mod tests {
         fs::create_dir_all(&work_dir).expect("mkdir");
 
         let missing_mempool = work_dir.join("missing-mempool.redb");
-        let missing = super::build_rpc_event_snapshot(&cfg, &runtime, &missing_mempool)
+        let missing = super::build_rpc_event_snapshot(&cfg, &runtime, &missing_mempool, None)
             .expect("snapshot without mempool db");
         assert_eq!(missing.network_id, cfg.network_id);
         assert_eq!(missing.tip_height, runtime.tip_height());
         assert_eq!(missing.tip_hash, runtime.tip_hash().to_hex());
         assert!(!missing.mempool_available);
         assert_eq!(missing.mempool_tx_count, 0);
+        assert!(missing.last_block_age_sec <= missing.unix_sec);
+        assert!(missing.relay_active_peers.is_none());
+        assert!(missing.sync_lag_blocks.is_none());
         assert!(missing.unix_sec > 0);
 
         let mempool_db = work_dir.join("mempool.redb");
@@ -11886,7 +12081,7 @@ mod tests {
             entries: Vec::new(),
         };
         save_mempool_db(&mempool_db, &snapshot).expect("persist empty mempool");
-        let present = super::build_rpc_event_snapshot(&cfg, &runtime, &mempool_db)
+        let present = super::build_rpc_event_snapshot(&cfg, &runtime, &mempool_db, None)
             .expect("snapshot with mempool db");
         assert!(present.mempool_available);
         assert_eq!(present.mempool_tx_count, 0);
@@ -12222,7 +12417,7 @@ mod tests {
                 max_nonce: 500_000,
                 // Two send-preview requests below intentionally return early 400 responses,
                 // which do not increment internal `served`.
-                max_requests: 9,
+                max_requests: 10,
             })
             .expect("rpc serve");
         });
@@ -12309,6 +12504,14 @@ mod tests {
         );
         assert!(wallet_balance_by_address.starts_with("HTTP/1.1 200 OK"));
         assert!(wallet_balance_by_address.contains("\"address\""));
+
+        let wallet_balance_history_by_address = send_http_json_post(
+            &addr,
+            "/wallet/balance-history-by-address",
+            &wallet_balance_by_address_req,
+        );
+        assert!(wallet_balance_history_by_address.starts_with("HTTP/1.1 200 OK"));
+        assert!(wallet_balance_history_by_address.contains("\"tx_history\""));
 
         let wallet_decode_req = serde_json::json!({
             "address": invalid_recipient.clone()
@@ -13395,6 +13598,83 @@ mod tests {
         assert_eq!(balance.utxo_count, 1);
 
         let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
+    fn wallet_tx_history_for_key_hash_reports_receive_and_spend_entries() {
+        let mut cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        cfg.coinbase_maturity = 1;
+        cfg.validate().expect("config validate");
+
+        let mnemonic = WalletMnemonic::parse(SOAK_FLOW_MNEMONIC).expect("mnemonic");
+        let seed = mnemonic.to_seed("");
+        let sender_key = derive_wallet_key(&seed, 0, 0).expect("sender");
+        let recipient_key = derive_wallet_key(&seed, 0, 1).expect("recipient");
+        let sender_key_hash20 = scam_core::hash160_blake3(&sender_key.pubkey_compressed());
+        let recipient_key_hash20 = scam_core::hash160_blake3(&recipient_key.pubkey_compressed());
+
+        let mut runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let params = super::MiningLoopParams {
+            count: 2,
+            interval_sec: cfg.target_block_time_sec,
+            max_nonce: 500_000,
+            subsidy: cfg.block_subsidy,
+            miner_key_hash: sender_key_hash20,
+            label_prefix: "wallet-history",
+            print_each: false,
+        };
+        mine_blocks_on_runtime(&mut runtime, &params).expect("mine");
+
+        let signed = build_signed_transfer_tx(
+            &runtime,
+            &cfg.network_id,
+            &sender_key,
+            recipient_key_hash20,
+            500_000,
+            500,
+        )
+        .expect("signed");
+        let tx = signed.tx;
+
+        let mut mempool =
+            Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool");
+        mempool.insert_with_fee(tx.clone(), 500).expect("insert");
+        let template_params = super::MempoolTemplateParams {
+            version: 1,
+            prev_block: runtime.tip_hash(),
+            timestamp: runtime
+                .tip_header()
+                .timestamp
+                .saturating_add(cfg.target_block_time_sec),
+            target: runtime.expected_target_for_next_block().expect("target"),
+            block_subsidy: cfg.block_subsidy,
+            miner_key_hash20: sender_key_hash20,
+            coinbase_tag: "wallet-history-template".to_owned(),
+            max_txs: cfg.max_mempool_txs as usize,
+        };
+        let (template, _summary) =
+            super::build_template_from_mempool(&template_params, &mempool).expect("template");
+        let mined = mine_block(&template, 500_000).expect("mine");
+        runtime.apply_next_block(mined).expect("apply");
+
+        let sender_history = super::wallet_tx_history_for_key_hash(&runtime, sender_key_hash20, 50);
+        let recipient_history =
+            super::wallet_tx_history_for_key_hash(&runtime, recipient_key_hash20, 50);
+
+        assert!(
+            sender_history
+                .iter()
+                .any(|entry| entry.direction == "out" && entry.sent > 0),
+            "sender history should include outgoing transfer"
+        );
+        assert!(
+            recipient_history
+                .iter()
+                .any(|entry| entry.direction == "in" && entry.received > 0),
+            "recipient history should include incoming transfer"
+        );
     }
 
     #[test]
