@@ -9010,9 +9010,9 @@ mod tests {
         send_http_request(addr, &request)
     }
 
-    fn spawn_sync_peer_server(
+    fn spawn_sync_peer_server_from_runtime(
         cfg: &ChainConfig,
-        remote_blocks: u32,
+        remote: &ChainRuntime,
     ) -> Option<(String, thread::JoinHandle<Result<(), String>>)> {
         let listener = match TcpListener::bind("127.0.0.1:0") {
             Ok(listener) => listener,
@@ -9020,18 +9020,6 @@ mod tests {
             Err(err) => panic!("bind sync peer: {err}"),
         };
         let addr = listener.local_addr().expect("addr").to_string();
-
-        let mut remote = ChainRuntime::from_config(cfg.clone()).expect("remote runtime");
-        let params = super::MiningLoopParams {
-            count: remote_blocks,
-            interval_sec: cfg.target_block_time_sec,
-            max_nonce: 500_000,
-            subsidy: cfg.block_subsidy,
-            miner_key_hash: cfg.genesis_reward_key_hash20().expect("key hash"),
-            label_prefix: "sync-peer-test",
-            print_each: false,
-        };
-        mine_blocks_on_runtime(&mut remote, &params).expect("mine remote chain");
 
         let remote_tip = remote.tip_height();
         let remote_chain = remote.block_hashes().to_vec();
@@ -9132,6 +9120,24 @@ mod tests {
         });
 
         Some((addr, handle))
+    }
+
+    fn spawn_sync_peer_server(
+        cfg: &ChainConfig,
+        remote_blocks: u32,
+    ) -> Option<(String, thread::JoinHandle<Result<(), String>>)> {
+        let mut remote = ChainRuntime::from_config(cfg.clone()).expect("remote runtime");
+        let params = super::MiningLoopParams {
+            count: remote_blocks,
+            interval_sec: cfg.target_block_time_sec,
+            max_nonce: 500_000,
+            subsidy: cfg.block_subsidy,
+            miner_key_hash: cfg.genesis_reward_key_hash20().expect("key hash"),
+            label_prefix: "sync-peer-test",
+            print_each: false,
+        };
+        mine_blocks_on_runtime(&mut remote, &params).expect("mine remote chain");
+        spawn_sync_peer_server_from_runtime(cfg, &remote)
     }
 
     #[test]
@@ -12502,6 +12508,153 @@ mod tests {
         let snapshot = scam_storage::load_mempool_db(&mempool_db).expect("load mempool db");
         assert_eq!(snapshot.network_id, cfg.network_id);
         assert!(snapshot.entries.iter().any(|entry| entry.txid == txid));
+
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
+    fn tx_submit_mine_and_sync_updates_receiver_balance() {
+        let _net_guard = network_test_guard();
+        let mut cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        cfg.coinbase_maturity = 1;
+        cfg.validate().expect("config validate");
+
+        let work_dir = temp_dir("test-tx-submit-mine-sync");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let runtime_db = work_dir.join("runtime.redb");
+        let mempool_db = work_dir.join("mempool.redb");
+
+        let mnemonic = WalletMnemonic::parse(SOAK_FLOW_MNEMONIC).expect("mnemonic");
+        let seed = mnemonic.to_seed("");
+        let sender_key = derive_wallet_key(&seed, 0, 0).expect("sender key");
+        let recipient_key = derive_wallet_key(&seed, 0, 1).expect("recipient key");
+        let sender_key_hash20 = scam_core::hash160_blake3(&sender_key.pubkey_compressed());
+        let recipient_key_hash20 = scam_core::hash160_blake3(&recipient_key.pubkey_compressed());
+        let recipient_address =
+            scam_wallet::to_address(&cfg.hrp, recipient_key.pubkey_compressed()).expect("address");
+
+        let mut producer_runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let mining_seed = super::MiningLoopParams {
+            count: 2,
+            interval_sec: cfg.target_block_time_sec,
+            max_nonce: 500_000,
+            subsidy: cfg.block_subsidy,
+            miner_key_hash: sender_key_hash20,
+            label_prefix: "tx-e2e-seed",
+            print_each: false,
+        };
+        mine_blocks_on_runtime(&mut producer_runtime, &mining_seed).expect("seed mining");
+        persist_runtime_db(&producer_runtime, &runtime_db).expect("persist runtime");
+
+        let send_amount = 1_250_000u64;
+        let fee = 500u64;
+        let signed = build_signed_transfer_tx(
+            &producer_runtime,
+            &cfg.network_id,
+            &sender_key,
+            recipient_key_hash20,
+            send_amount,
+            fee,
+        )
+        .expect("build signed tx");
+        let submitted_txid = signed.tx.txid();
+        let (txid, outcome, effective_fee) =
+            super::submit_tx_via_mempool_db(&cfg, &runtime_db, &mempool_db, signed.tx, fee)
+                .expect("submit tx");
+        assert_eq!(txid, submitted_txid);
+        assert_eq!(outcome, "accepted");
+        assert_eq!(effective_fee, fee);
+
+        let mempool = super::load_mempool_from_db_or_empty(&cfg, &mempool_db).expect("mempool");
+        assert!(mempool.contains(&submitted_txid));
+
+        let template_params = super::MempoolTemplateParams {
+            version: 1,
+            prev_block: producer_runtime.tip_hash(),
+            timestamp: producer_runtime
+                .tip_header()
+                .timestamp
+                .saturating_add(cfg.target_block_time_sec),
+            target: producer_runtime
+                .expected_target_for_next_block()
+                .expect("target"),
+            block_subsidy: cfg.block_subsidy,
+            miner_key_hash20: sender_key_hash20,
+            coinbase_tag: "tx-e2e-template".to_owned(),
+            max_txs: cfg.max_mempool_txs as usize,
+        };
+        let (template, summary) =
+            super::build_template_from_mempool(&template_params, &mempool).expect("template");
+        assert!(
+            summary.included_txids.contains(&submitted_txid),
+            "submitted tx must be selected into mined template"
+        );
+
+        let mined = mine_block(&template, 500_000).expect("mine block");
+        assert!(
+            mined
+                .transactions
+                .iter()
+                .any(|tx| tx.txid() == submitted_txid),
+            "submitted tx must appear in mined block"
+        );
+        producer_runtime
+            .apply_next_block(mined.clone())
+            .expect("apply mined block");
+        let confirmed_txids = mined
+            .transactions
+            .iter()
+            .skip(1)
+            .map(Transaction::txid)
+            .collect::<Vec<_>>();
+        super::remove_confirmed_txids_from_mempool_db(&cfg, &mempool_db, &confirmed_txids)
+            .expect("trim mempool");
+        persist_runtime_db(&producer_runtime, &runtime_db).expect("persist runtime");
+
+        let post_mine_snapshot =
+            scam_storage::load_mempool_db(&mempool_db).expect("mempool snapshot");
+        assert!(
+            post_mine_snapshot
+                .entries
+                .iter()
+                .all(|entry| entry.txid != submitted_txid),
+            "confirmed tx must be removed from mempool snapshot"
+        );
+
+        let Some((peer_addr, peer_server)) =
+            spawn_sync_peer_server_from_runtime(&cfg, &producer_runtime)
+        else {
+            let _ = fs::remove_dir_all(work_dir);
+            return;
+        };
+        let mut follower_runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let sync_stats = super::sync_runtime_with_peer(
+            &cfg,
+            &mut follower_runtime,
+            &peer_addr,
+            1,
+            "scam-node/test-tx-e2e",
+        )
+        .expect("sync follower");
+        assert!(sync_stats.blocks_applied >= 1);
+        assert_eq!(follower_runtime.tip_hash(), producer_runtime.tip_hash());
+        peer_server
+            .join()
+            .expect("peer join")
+            .expect("peer server ok");
+
+        let balance = super::wallet_balance_response(
+            &follower_runtime,
+            &cfg,
+            0,
+            0,
+            recipient_address,
+            recipient_key_hash20,
+        );
+        assert_eq!(balance.total, send_amount as u128);
+        assert_eq!(balance.spendable, send_amount as u128);
+        assert_eq!(balance.utxo_count, 1);
 
         let _ = fs::remove_dir_all(work_dir);
     }

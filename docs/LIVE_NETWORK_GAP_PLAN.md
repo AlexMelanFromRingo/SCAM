@@ -22,10 +22,10 @@
 - [x] Ensure locally mined blocks are announced to connected peers in near-realtime (timeout-driven INV on long-lived relay sessions).
 - [x] Ensure relay workers refresh runtime tip consistently from runtime DB and persist accepted block updates.
 - [ ] Add mempool-to-block inclusion E2E tests:
-  - [ ] tx submit -> appears in mempool,
-  - [ ] mined block includes tx,
-  - [ ] peer node receives/applies block,
-  - [ ] receiver balance updates.
+  - [x] tx submit -> appears in mempool,
+  - [x] mined block includes tx,
+  - [x] peer node receives/applies block,
+  - [x] receiver balance updates.
 
 ## P1 (required for operational usability)
 - [ ] Add realtime UI updates:
