@@ -1202,18 +1202,22 @@ fn is_mempool_db_lock_conflict(err: &NodeError) -> bool {
     msg.contains("Database already open") || msg.contains("Cannot acquire lock")
 }
 
-fn persist_runtime_db_with_retry(
-    runtime: &ChainRuntime,
-    runtime_db_path: &Path,
+fn persist_with_retry<F>(
     attempts: usize,
     backoff_ms: u64,
-) -> Result<(), NodeError> {
+    is_lock_conflict: fn(&NodeError) -> bool,
+    unknown_err_message: &'static str,
+    mut persist_op: F,
+) -> Result<(), NodeError>
+where
+    F: FnMut() -> Result<(), NodeError>,
+{
     let mut last_err = None;
     let tries = attempts.max(1);
     for idx in 0..tries {
-        match persist_runtime_db(runtime, runtime_db_path) {
+        match persist_op() {
             Ok(()) => return Ok(()),
-            Err(err) if is_runtime_db_lock_conflict(&err) => {
+            Err(err) if is_lock_conflict(&err) => {
                 last_err = Some(err);
                 if idx + 1 < tries {
                     std::thread::sleep(Duration::from_millis(backoff_ms.max(1)));
@@ -1223,9 +1227,22 @@ fn persist_runtime_db_with_retry(
             Err(err) => return Err(err),
         }
     }
-    Err(last_err.unwrap_or_else(|| {
-        NodeError::Runtime("runtime db persist failed for unknown reason".to_owned())
-    }))
+    Err(last_err.unwrap_or_else(|| NodeError::Runtime(unknown_err_message.to_owned())))
+}
+
+fn persist_runtime_db_with_retry(
+    runtime: &ChainRuntime,
+    runtime_db_path: &Path,
+    attempts: usize,
+    backoff_ms: u64,
+) -> Result<(), NodeError> {
+    persist_with_retry(
+        attempts,
+        backoff_ms,
+        is_runtime_db_lock_conflict,
+        "runtime db persist failed for unknown reason",
+        || persist_runtime_db(runtime, runtime_db_path),
+    )
 }
 
 fn persist_mempool_db_with_retry(
@@ -1235,24 +1252,13 @@ fn persist_mempool_db_with_retry(
     attempts: usize,
     backoff_ms: u64,
 ) -> Result<(), NodeError> {
-    let mut last_err = None;
-    let tries = attempts.max(1);
-    for idx in 0..tries {
-        match persist_mempool_db(cfg, mempool, mempool_db_path) {
-            Ok(()) => return Ok(()),
-            Err(err) if is_mempool_db_lock_conflict(&err) => {
-                last_err = Some(err);
-                if idx + 1 < tries {
-                    std::thread::sleep(Duration::from_millis(backoff_ms.max(1)));
-                    continue;
-                }
-            }
-            Err(err) => return Err(err),
-        }
-    }
-    Err(last_err.unwrap_or_else(|| {
-        NodeError::Runtime("mempool db persist failed for unknown reason".to_owned())
-    }))
+    persist_with_retry(
+        attempts,
+        backoff_ms,
+        is_mempool_db_lock_conflict,
+        "mempool db persist failed for unknown reason",
+        || persist_mempool_db(cfg, mempool, mempool_db_path),
+    )
 }
 
 fn next_stratum_job_timestamp(runtime: &ChainRuntime, cfg: &ChainConfig) -> u64 {
@@ -9030,6 +9036,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::{Shutdown, TcpListener, TcpStream};
     use std::path::PathBuf;
+    use std::sync::mpsc;
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -9232,6 +9239,28 @@ mod tests {
             }
         }
         response
+    }
+
+    fn join_with_timeout<T: Send + 'static>(
+        handle: thread::JoinHandle<T>,
+        timeout: Duration,
+        label: &str,
+    ) -> T {
+        let (tx, rx) = mpsc::sync_channel(1);
+        let label_owned = label.to_owned();
+        thread::spawn(move || {
+            let _ = tx.send(handle.join());
+        });
+        match rx.recv_timeout(timeout) {
+            Ok(joined) => match joined {
+                Ok(value) => value,
+                Err(_) => panic!("{label_owned} thread panicked"),
+            },
+            Err(_) => panic!(
+                "{label_owned} thread did not finish within {} ms",
+                timeout.as_millis()
+            ),
+        }
     }
 
     fn spawn_sync_peer_server_from_runtime(
@@ -9555,6 +9584,171 @@ mod tests {
             super::nonempty_parent_dir(std::path::Path::new("dir/report.json"))
                 .expect("non-empty parent"),
             std::path::Path::new("dir")
+        );
+    }
+
+    #[test]
+    fn decode_optional_hex32_handles_none_valid_and_invalid_values() {
+        let none = super::decode_optional_hex32("field", &None).expect("none decode");
+        assert!(none.is_none());
+
+        let valid_raw = Some("11".repeat(32));
+        let valid = super::decode_optional_hex32("field", &valid_raw).expect("valid decode");
+        assert_eq!(valid, Some([0x11u8; 32]));
+
+        let invalid_len = Some("aa".repeat(31));
+        let err = super::decode_optional_hex32("field", &invalid_len).expect_err("invalid len");
+        match err {
+            super::NodeError::InvalidHexLength {
+                field,
+                expected,
+                got,
+            } => {
+                assert_eq!(field, "field");
+                assert_eq!(expected, 32);
+                assert_eq!(got, 31);
+            }
+            other => panic!("unexpected decode error variant: {other}"),
+        }
+    }
+
+    #[test]
+    fn lock_conflict_detectors_are_exact_and_case_sensitive_for_expected_fragments() {
+        let lock_open = super::NodeError::Runtime("Database already open".to_owned());
+        let lock_acquire = super::NodeError::Runtime("Cannot acquire lock".to_owned());
+        let other = super::NodeError::Runtime("permission denied".to_owned());
+        let lowercase = super::NodeError::Runtime("database already open".to_owned());
+
+        assert!(super::is_runtime_db_lock_conflict(&lock_open));
+        assert!(super::is_runtime_db_lock_conflict(&lock_acquire));
+        assert!(!super::is_runtime_db_lock_conflict(&other));
+        assert!(!super::is_runtime_db_lock_conflict(&lowercase));
+
+        assert!(super::is_mempool_db_lock_conflict(&lock_open));
+        assert!(super::is_mempool_db_lock_conflict(&lock_acquire));
+        assert!(!super::is_mempool_db_lock_conflict(&other));
+        assert!(!super::is_mempool_db_lock_conflict(&lowercase));
+    }
+
+    #[test]
+    fn persist_with_retry_retries_only_for_lock_conflicts() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let tries_ok = Arc::new(AtomicUsize::new(0));
+        let tries_ok_clone = tries_ok.clone();
+        super::persist_with_retry(
+            3,
+            1,
+            super::is_runtime_db_lock_conflict,
+            "unknown",
+            move || {
+                let attempt = tries_ok_clone.fetch_add(1, Ordering::Relaxed);
+                if attempt == 0 {
+                    Err(super::NodeError::Runtime(
+                        "Database already open".to_owned(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .expect("second attempt should succeed");
+        assert_eq!(tries_ok.load(Ordering::Relaxed), 2);
+
+        let tries_err = Arc::new(AtomicUsize::new(0));
+        let tries_err_clone = tries_err.clone();
+        let non_lock_err = super::persist_with_retry(
+            5,
+            20,
+            super::is_runtime_db_lock_conflict,
+            "unknown",
+            move || {
+                tries_err_clone.fetch_add(1, Ordering::Relaxed);
+                Err(super::NodeError::Runtime("permission denied".to_owned()))
+            },
+        )
+        .expect_err("non lock errors should not retry");
+        assert!(non_lock_err.to_string().contains("permission denied"));
+        assert_eq!(tries_err.load(Ordering::Relaxed), 1);
+
+        let tries_zero = Arc::new(AtomicUsize::new(0));
+        let tries_zero_clone = tries_zero.clone();
+        let exhausted = super::persist_with_retry(
+            0,
+            1,
+            super::is_runtime_db_lock_conflict,
+            "unknown runtime persist error",
+            move || {
+                tries_zero_clone.fetch_add(1, Ordering::Relaxed);
+                Err(super::NodeError::Runtime(
+                    "Database already open".to_owned(),
+                ))
+            },
+        )
+        .expect_err("attempts=0 still performs one try");
+        assert!(exhausted.to_string().contains("Database already open"));
+        assert_eq!(tries_zero.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn remove_confirmed_txids_from_mempool_db_handles_missing_and_readonly_db_paths() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let work_dir = temp_dir("test-remove-confirmed-mempool-db");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let missing_db = work_dir.join("missing-mempool.redb");
+        let txid = Hash256([0x55; 32]);
+
+        let removed = super::remove_confirmed_txids_from_mempool_db(&cfg, &missing_db, &[txid])
+            .expect("missing db path should be accepted");
+        assert_eq!(removed, 0);
+        assert!(
+            !missing_db.exists(),
+            "missing mempool DB should stay absent when nothing is removed"
+        );
+
+        let existing_db = work_dir.join("existing-mempool.redb");
+        let snapshot = MempoolSnapshot {
+            network_id: cfg.network_id.clone(),
+            entries: Vec::new(),
+        };
+        save_mempool_db(&existing_db, &snapshot).expect("persist snapshot");
+        let mut perms = fs::metadata(&existing_db).expect("metadata").permissions();
+        perms.set_readonly(true);
+        fs::set_permissions(&existing_db, perms).expect("set readonly");
+
+        let err = super::remove_confirmed_txids_from_mempool_db(&cfg, &existing_db, &[txid])
+            .expect_err("readonly existing db should fail on persist");
+        assert!(
+            err.to_string().contains("Permission denied"),
+            "unexpected readonly error: {err}"
+        );
+
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
+    fn next_stratum_job_timestamp_caps_future_window_and_advances_over_tip() {
+        let mut cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let tip_ts = runtime.tip_header().timestamp;
+        let expected_ideal = tip_ts.saturating_add(cfg.target_block_time_sec);
+        let ts = super::next_stratum_job_timestamp(&runtime, &cfg);
+        assert_eq!(ts, expected_ideal);
+
+        cfg.target_block_time_sec = u64::MAX / 4;
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime huge target");
+        let now = super::current_unix_sec().expect("now");
+        let capped = super::next_stratum_job_timestamp(&runtime, &cfg);
+        assert!(
+            capped >= now.saturating_add(6_000),
+            "expected cap close to 2h in future, got {capped} (now={now})"
+        );
+        assert!(
+            capped <= now.saturating_add(7_200),
+            "expected 2h future cap upper bound, got {capped} (now={now})"
         );
     }
 
@@ -10355,7 +10549,7 @@ mod tests {
         let _ = client_handshake(&mut stream, &framing, &local_hello);
         drop(stream);
 
-        let result = server.join().expect("server join");
+        let result = join_with_timeout(server, Duration::from_secs(5), "relay mismatch server");
         let err = result.expect_err("relay must fail on network mismatch");
         assert!(err.to_string().contains("network mismatch"));
         let _ = fs::remove_dir_all(work_dir);
@@ -10442,9 +10636,7 @@ mod tests {
         }
 
         drop(stream);
-        server
-            .join()
-            .expect("server join")
+        join_with_timeout(server, Duration::from_secs(5), "relay message-limit server")
             .expect("relay serve should exit cleanly");
         let _ = fs::remove_dir_all(work_dir);
     }
@@ -10506,9 +10698,7 @@ mod tests {
         thread::sleep(Duration::from_millis(1_250));
         drop(stream);
 
-        server
-            .join()
-            .expect("server join")
+        join_with_timeout(server, Duration::from_secs(6), "relay telemetry server")
             .expect("relay serve should exit cleanly");
 
         let content = fs::read_to_string(&telemetry_path).expect("read telemetry");
@@ -11701,7 +11891,7 @@ mod tests {
         assert!(unknown_response.starts_with("HTTP/1.1 200 OK"));
         assert!(unknown_response.contains("<html>ui</html>"));
 
-        server.join().expect("server join");
+        join_with_timeout(server, Duration::from_secs(5), "rpc health routes server");
         let _ = fs::remove_dir_all(work_dir);
     }
 
@@ -11759,7 +11949,7 @@ mod tests {
         let wallet_qr = send_http_json_post(&addr, "/wallet/qr", "{\"address\":\"scam\"}");
         assert!(wallet_qr.starts_with("HTTP/1.1 200 OK"));
 
-        server.join().expect("server join");
+        join_with_timeout(server, Duration::from_secs(5), "rpc core routes server");
         let _ = fs::remove_dir_all(work_dir);
     }
 
@@ -11809,7 +11999,7 @@ mod tests {
         let health = send_http_request(&addr, "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n");
         assert!(health.starts_with("HTTP/1.1 200 OK"));
 
-        server.join().expect("server join");
+        join_with_timeout(server, Duration::from_secs(5), "rpc events server");
         let _ = fs::remove_dir_all(work_dir);
     }
 
@@ -11971,7 +12161,7 @@ mod tests {
         assert!(wallet_decode.starts_with("HTTP/1.1 200 OK"));
         assert!(wallet_decode.contains("\"key_hash20_hex\""));
 
-        server.join().expect("server join");
+        join_with_timeout(server, Duration::from_secs(5), "rpc strict routes server");
         let _ = fs::remove_dir_all(work_dir);
     }
 
@@ -12276,6 +12466,74 @@ mod tests {
             "invalid-bind",
             "127.0.0.1:18444"
         ));
+        assert!(!super::relay_target_matches_bind(
+            "127.0.0.1:18444",
+            "invalid-peer"
+        ));
+        assert!(super::relay_target_matches_bind(
+            "[::]:18444",
+            "[::1]:18444"
+        ));
+        assert!(!super::relay_target_matches_bind(
+            "0.0.0.0:18444",
+            "127.0.0.1:18445"
+        ));
+    }
+
+    #[test]
+    fn push_inv_batches_respects_empty_and_chunking_contracts() {
+        let mut out = Vec::<WireMessage>::new();
+        super::push_inv_batches(&mut out, Vec::new(), 8);
+        assert!(out.is_empty());
+
+        super::push_inv_batches(&mut out, vec![InventoryItem::Tx(Hash256([1u8; 32]))], 0);
+        assert!(out.is_empty());
+
+        super::push_inv_batches(
+            &mut out,
+            vec![
+                InventoryItem::Tx(Hash256([1u8; 32])),
+                InventoryItem::Tx(Hash256([2u8; 32])),
+                InventoryItem::Tx(Hash256([3u8; 32])),
+            ],
+            2,
+        );
+        assert_eq!(out.len(), 2);
+        match &out[0] {
+            WireMessage::Inv { items } => assert_eq!(items.len(), 2),
+            other => panic!("unexpected first message: {other:?}"),
+        }
+        match &out[1] {
+            WireMessage::Inv { items } => assert_eq!(items.len(), 1),
+            other => panic!("unexpected second message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn refresh_runtime_from_db_skips_reload_when_mtime_unchanged() {
+        let cfg_devnet: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("devnet config");
+        let cfg_testnet: ChainConfig =
+            toml::from_str(include_str!("../../../config/testnet.toml")).expect("testnet config");
+        let work_dir = temp_dir("test-refresh-runtime-mtime");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let runtime_db_path = work_dir.join("runtime.redb");
+
+        let runtime_testnet = ChainRuntime::from_config(cfg_testnet.clone()).expect("runtime");
+        persist_runtime_db(&runtime_testnet, &runtime_db_path).expect("persist runtime");
+        let mut local_runtime = ChainRuntime::from_config(cfg_devnet.clone()).expect("runtime");
+        let mut last_seen = super::runtime_db_mtime(&runtime_db_path);
+        let before_tip = local_runtime.tip_hash();
+
+        super::refresh_runtime_from_db_if_changed(
+            &cfg_devnet,
+            &mut local_runtime,
+            &runtime_db_path,
+            &mut last_seen,
+        )
+        .expect("mtime unchanged should skip mismatched reload");
+        assert_eq!(local_runtime.tip_hash(), before_tip);
+        let _ = fs::remove_dir_all(work_dir);
     }
 
     #[test]
@@ -13193,7 +13451,11 @@ mod tests {
             stack_name: Some("mock-stack".to_owned()),
         })
         .expect("conformance should pass");
-        server.join().expect("server join");
+        join_with_timeout(
+            server,
+            Duration::from_secs(5),
+            "sv2 conformance pass server",
+        );
 
         let rendered = fs::read_to_string(&report_path).expect("read report");
         let report: serde_json::Value = serde_json::from_str(&rendered).expect("parse report");
@@ -13292,7 +13554,11 @@ mod tests {
         })
         .expect_err("conformance must fail on setup/open errors");
         assert!(err.to_string().contains("conformance check failed"));
-        server.join().expect("server join");
+        join_with_timeout(
+            server,
+            Duration::from_secs(5),
+            "sv2 conformance fail server",
+        );
 
         let rendered = fs::read_to_string(&report_path).expect("read report");
         let report: serde_json::Value = serde_json::from_str(&rendered).expect("parse report");
@@ -13672,7 +13938,7 @@ mod tests {
         assert_eq!(response.template.version, 1);
         assert_eq!(response.template.prev_hash, Hash256::ZERO);
         assert_eq!(response.template.ntime, 1_800_000_000);
-        server.join().expect("template provider").expect("ok");
+        join_with_timeout(server, Duration::from_secs(5), "template provider").expect("ok");
     }
 
     #[test]
@@ -13719,7 +13985,7 @@ mod tests {
         .job_id;
         assert_eq!(first, 42);
         assert_eq!(second, 43);
-        server.join().expect("job declarator").expect("ok");
+        join_with_timeout(server, Duration::from_secs(5), "job declarator").expect("ok");
     }
 
     #[test]
@@ -13756,7 +14022,7 @@ mod tests {
         .expect("job");
         assert_eq!(job.channel_id, 3);
         assert_eq!(job.job_id, 9);
-        server.join().expect("translator").expect("ok");
+        join_with_timeout(server, Duration::from_secs(5), "translator").expect("ok");
     }
 
     #[test]
