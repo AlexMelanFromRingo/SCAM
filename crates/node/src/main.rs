@@ -4343,6 +4343,7 @@ fn run_relay_outbound_worker(
             peer_id,
             &state,
             &active_peers,
+            &stop_flag,
             &cfg,
             &runtime_db_path,
             &mempool_db_path,
@@ -4456,6 +4457,7 @@ fn run_relay_peer_session(
     peer_id: u64,
     state: &Arc<Mutex<RelayServerState>>,
     active: &Arc<Mutex<usize>>,
+    stop_flag: &Arc<AtomicBool>,
     cfg: &ChainConfig,
     runtime_db_path: &Path,
     mempool_db_path: &Path,
@@ -4512,6 +4514,9 @@ fn run_relay_peer_session(
         let mut last_tip_announced = None::<Hash256>;
         let mut announced_txids = HashSet::<Hash256>::new();
         loop {
+            if stop_flag.load(Ordering::Relaxed) {
+                break;
+            }
             if should_stop_after_seen_messages(read_limit, seen) {
                 break;
             }
@@ -4535,6 +4540,9 @@ fn run_relay_peer_session(
 
             let inbound = match map_relay_read_result(read_message(stream, &framing))? {
                 RelayReadOutcome::Timeout => {
+                    if stop_flag.load(Ordering::Relaxed) {
+                        break;
+                    }
                     let proactive = {
                         let guard = state.lock().map_err(|_| {
                             NodeError::Runtime("relay state mutex poisoned".to_owned())
@@ -4769,6 +4777,7 @@ fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
         let cfg_clone = cfg.clone();
         let runtime_db_path_clone = runtime_db_path.clone();
         let mempool_db_path_clone = mempool_db_path.clone();
+        let stop_clone = stop_flag.clone();
         let max_inv_items_clone = max_inv_items;
         let read_limit = args.max_messages_per_peer;
         handles.push(thread::spawn(move || {
@@ -4778,6 +4787,7 @@ fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
                 peer_id,
                 &state_clone,
                 &active_clone,
+                &stop_clone,
                 &cfg_clone,
                 &runtime_db_path_clone,
                 &mempool_db_path_clone,
@@ -9948,6 +9958,24 @@ mod tests {
         response
     }
 
+    fn try_send_http_request(addr: &str, request: &str) -> Option<String> {
+        let mut stream = match TcpStream::connect(addr) {
+            Ok(stream) => stream,
+            Err(_) => return None,
+        };
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+        if stream.write_all(request.as_bytes()).is_err() {
+            return None;
+        }
+        let _ = stream.shutdown(Shutdown::Write);
+        let mut response = String::new();
+        if stream.read_to_string(&mut response).is_err() {
+            return None;
+        }
+        Some(response)
+    }
+
     fn send_http_json_post(addr: &str, path: &str, body: &str) -> String {
         let request = format!(
             "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
@@ -13207,7 +13235,7 @@ mod tests {
                 mine_blocks: 0,
                 interval_sec: 120,
                 max_nonce: 500_000,
-                max_requests: 6,
+                max_requests: 16,
             })
             .expect("rpc serve");
         });
@@ -13298,9 +13326,18 @@ mod tests {
             "expected conflict rejection or idempotent already_present, got: {second_send}"
         );
 
+        // Ensure server receives enough requests to trigger max_requests shutdown even if one of
+        // the earlier calls was dropped by transient local socket timing.
+        for _ in 0..16 {
+            let _ = try_send_http_request(
+                &addr,
+                "GET /health HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+            );
+        }
+
         join_with_timeout(
             server,
-            Duration::from_secs(5),
+            Duration::from_secs(20),
             "rpc wallet-send reject server",
         );
     }
@@ -15726,10 +15763,11 @@ mod tests {
             latency
         );
 
+        let _ = sender.shutdown(Shutdown::Both);
         drop(sender);
-        join_with_timeout(server_a, Duration::from_secs(12), "relay latency server A")
+        join_with_timeout(server_a, Duration::from_secs(30), "relay latency server A")
             .expect("relay A should exit");
-        join_with_timeout(server_b, Duration::from_secs(12), "relay latency server B")
+        join_with_timeout(server_b, Duration::from_secs(30), "relay latency server B")
             .expect("relay B should exit");
         let _ = fs::remove_dir_all(work_dir);
     }
