@@ -36,10 +36,10 @@
 - [x] Add RPC endpoint to query balance by address + tx history in one call for wallet UX (`POST /wallet/balance-history-by-address`).
 
 ## P1 networking hardening
-- [ ] Verify relay thread model under sustained connections (no silent worker exits).
+- [x] Verify relay thread model under sustained connections (no silent worker exits).
 - [x] Add integration test: multi-node realtime propagation without `sync-book` assistance.
 - [ ] Add integration test: node restart + catch-up + mempool rebroadcast.
-- [ ] Add deterministic failure logs for peer disconnect reasons (protocol error, timeout, ban, io reset).
+- [x] Add deterministic failure logs for peer disconnect reasons (protocol error, timeout, ban, io reset).
 
 ## P2 (launch confidence)
 - [ ] Soak test profile for 24h: 2-5 nodes + miner + tx spam profile.
@@ -49,10 +49,10 @@
 
 ## Required test additions (minimum)
 - [x] `wallet/send` happy path integration test.
-- [ ] `wallet/send` rejects invalid hrp/negative amount/insufficient funds/double spend.
+- [x] `wallet/send` rejects invalid hrp/negative amount/insufficient funds/double spend.
 - [ ] Reorg case: pending tx survives/reenters mempool when block disconnected.
 - [ ] Realtime propagation latency test between two relays.
-- [ ] UI events endpoint contract tests (schema + heartbeat).
+- [x] UI events endpoint contract tests (schema + heartbeat).
 
 ## Definition of done for “testnet-ready”
 - [x] No dependence on periodic `sync-book` loop for normal block propagation.

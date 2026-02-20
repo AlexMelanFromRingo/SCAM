@@ -11129,6 +11129,73 @@ mod tests {
     }
 
     #[test]
+    fn relay_serve_handles_multiple_short_lived_handshakes_without_worker_errors() {
+        let _net_guard = network_test_guard();
+        let work_dir = temp_dir("test-relay-sustained-handshakes");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let config_path = work_dir.join("devnet.toml");
+        fs::write(&config_path, include_str!("../../../config/devnet.toml")).expect("write cfg");
+        let runtime_db = work_dir.join("runtime.redb");
+        let peers_dir = work_dir.join("peers");
+        let Some(bind) = allocate_local_addr() else {
+            return;
+        };
+
+        let client_count = 12u32;
+        let server_bind = bind.clone();
+        let server = thread::spawn(move || {
+            super::run_relay_serve(super::RelayServeArgs {
+                network: Network::Devnet,
+                config: Some(config_path),
+                runtime_db: Some(runtime_db),
+                bind: server_bind,
+                max_clients: client_count,
+                max_messages_per_peer: 8,
+                read_timeout_sec: 2,
+                write_timeout_sec: 2,
+                max_inv_items: None,
+                ban_threshold: None,
+                replacement_window_sec: None,
+                replacement_max_per_peer: None,
+                replacement_penalty: None,
+                telemetry_out: None,
+                telemetry_every_sec: 1,
+                peers_dir,
+                outbound_connect: false,
+                outbound_redial_sec: 1,
+            })
+        });
+
+        for idx in 0..client_count {
+            let mut stream = connect_with_retry(&bind);
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("timeout");
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .expect("timeout");
+            let framing = FramingConfig::default();
+            let local_hello = LocalHandshake {
+                protocol_version: 1,
+                network_id: "devnet".to_owned(),
+                user_agent: format!("test-short-client-{idx}"),
+                start_height: 0,
+            };
+            let remote = client_handshake(&mut stream, &framing, &local_hello).expect("handshake");
+            assert_eq!(remote.network_id, "devnet");
+            drop(stream);
+        }
+
+        join_with_timeout(
+            server,
+            Duration::from_secs(8),
+            "relay sustained handshakes server",
+        )
+        .expect("relay serve should survive short-lived sessions");
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
     fn query_runtime_mining_guard_uses_nonzero_semantics() {
         assert!(!super::should_mine_query_blocks(0));
         assert!(super::should_mine_query_blocks(1));
@@ -12419,12 +12486,177 @@ mod tests {
         assert!(events.contains("event: snapshot"));
         assert!(events.contains("data: {\"network_id\":\"devnet\""));
         assert!(events.contains("\"last_block_age_sec\""));
+        let snapshot_line = events
+            .lines()
+            .find(|line| line.starts_with("data: "))
+            .expect("snapshot data line");
+        let payload = snapshot_line.trim_start_matches("data: ").trim();
+        let parsed: serde_json::Value = serde_json::from_str(payload).expect("snapshot json");
+        for required_key in [
+            "network_id",
+            "tip_height",
+            "tip_hash",
+            "utxo_count",
+            "cumulative_work",
+            "mempool_available",
+            "mempool_tx_count",
+            "relay_active_peers",
+            "relay_tip_height",
+            "relay_mempool_len",
+            "relay_snapshot_age_sec",
+            "sync_lag_blocks",
+            "last_block_age_sec",
+            "unix_sec",
+        ] {
+            assert!(
+                parsed.get(required_key).is_some(),
+                "snapshot must include key {required_key}"
+            );
+        }
 
         let health = send_http_request(&addr, "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n");
         assert!(health.starts_with("HTTP/1.1 200 OK"));
 
         join_with_timeout(server, Duration::from_secs(5), "rpc events server");
         let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
+    fn run_rpc_serve_wallet_send_rejects_invalid_and_double_spend_paths() {
+        let _net_guard = network_test_guard();
+        let Some(addr) = allocate_local_addr() else {
+            return;
+        };
+        let work_dir = temp_dir("test-rpc-wallet-send-rejections");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let config_path = work_dir.join("devnet.toml");
+        let runtime_db = work_dir.join("runtime.redb");
+
+        let mut cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        cfg.coinbase_maturity = 1;
+        cfg.validate().expect("config validate");
+        fs::write(&config_path, toml::to_string(&cfg).expect("serialize cfg")).expect("write cfg");
+
+        let seed = WalletMnemonic::parse(SOAK_FLOW_MNEMONIC)
+            .expect("mnemonic")
+            .to_seed("");
+        let sender_key = derive_wallet_key(&seed, 0, 0).expect("sender key");
+        let recipient_key = derive_wallet_key(&seed, 0, 1).expect("recipient key");
+        let sender_key_hash20 = scam_core::hash160_blake3(&sender_key.pubkey_compressed());
+        let valid_recipient =
+            scam_wallet::to_address("sd", recipient_key.pubkey_compressed()).expect("valid addr");
+        let invalid_hrp_recipient =
+            scam_wallet::to_address("s", recipient_key.pubkey_compressed()).expect("other hrp");
+
+        let mut runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let seed_mining = super::MiningLoopParams {
+            count: 2,
+            interval_sec: cfg.target_block_time_sec,
+            max_nonce: 500_000,
+            subsidy: cfg.block_subsidy,
+            miner_key_hash: sender_key_hash20,
+            label_prefix: "rpc-send-reject",
+            print_each: false,
+        };
+        mine_blocks_on_runtime(&mut runtime, &seed_mining).expect("seed mining");
+        persist_runtime_db(&runtime, &runtime_db).expect("persist runtime");
+
+        let server_addr = addr.clone();
+        let server = thread::spawn(move || {
+            run_rpc_serve(RpcServeArgs {
+                network: Network::Devnet,
+                config: Some(config_path),
+                runtime_db: Some(runtime_db),
+                bind: server_addr,
+                ui_dir: work_dir.join("ui"),
+                relay_telemetry: None,
+                mine_blocks: 0,
+                interval_sec: 120,
+                max_nonce: 500_000,
+                max_requests: 6,
+            })
+            .expect("rpc serve");
+        });
+
+        let zero_amount_req = serde_json::json!({
+            "mnemonic": SOAK_FLOW_MNEMONIC,
+            "passphrase": "",
+            "account": 0,
+            "index": 0,
+            "to": valid_recipient,
+            "amount": 0,
+            "fee": 1
+        })
+        .to_string();
+        let zero_amount = send_http_json_post(&addr, "/wallet/send", &zero_amount_req);
+        assert!(zero_amount.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(zero_amount.contains("amount must be > 0"));
+
+        let negative_amount_req = format!(
+            "{{\"mnemonic\":\"{}\",\"passphrase\":\"\",\"account\":0,\"index\":0,\"to\":\"{}\",\"amount\":-1,\"fee\":1}}",
+            SOAK_FLOW_MNEMONIC, valid_recipient
+        );
+        let negative_amount = send_http_json_post(&addr, "/wallet/send", &negative_amount_req);
+        assert!(negative_amount.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(negative_amount.contains("invalid type"));
+
+        let invalid_hrp_req = serde_json::json!({
+            "mnemonic": SOAK_FLOW_MNEMONIC,
+            "passphrase": "",
+            "account": 0,
+            "index": 0,
+            "to": invalid_hrp_recipient,
+            "amount": 1,
+            "fee": 1
+        })
+        .to_string();
+        let invalid_hrp = send_http_json_post(&addr, "/wallet/send", &invalid_hrp_req);
+        assert!(invalid_hrp.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(invalid_hrp.contains("address hrp"));
+
+        let insufficient_req = serde_json::json!({
+            "mnemonic": SOAK_FLOW_MNEMONIC,
+            "passphrase": "",
+            "account": 0,
+            "index": 0,
+            "to": valid_recipient,
+            "amount": u64::MAX,
+            "fee": 1
+        })
+        .to_string();
+        let insufficient = send_http_json_post(&addr, "/wallet/send", &insufficient_req);
+        assert!(insufficient.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(insufficient.contains("insufficient spendable funds"));
+
+        let valid_send_req = serde_json::json!({
+            "mnemonic": SOAK_FLOW_MNEMONIC,
+            "passphrase": "",
+            "account": 0,
+            "index": 0,
+            "to": valid_recipient,
+            "amount": 1_000_000u64,
+            "fee": 500u64
+        })
+        .to_string();
+        let first_send = send_http_json_post(&addr, "/wallet/send", &valid_send_req);
+        assert!(first_send.starts_with("HTTP/1.1 200 OK"));
+        assert!(first_send.contains("\"mempool_outcome\""));
+
+        let second_send = send_http_json_post(&addr, "/wallet/send", &valid_send_req);
+        assert!(second_send.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(
+            second_send.contains("replacement")
+                || second_send.contains("conflict")
+                || second_send.contains("mempool"),
+            "expected double-spend style rejection path, got: {second_send}"
+        );
+
+        join_with_timeout(
+            server,
+            Duration::from_secs(5),
+            "rpc wallet-send reject server",
+        );
     }
 
     #[test]

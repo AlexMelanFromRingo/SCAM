@@ -112,3 +112,13 @@ Run window: `2026-02-13T16:10:10Z` -> `2026-02-13T17:09:00Z`
 - [ ] Remaining timeout focus:
   - `crates/node/src/main.rs` (`decode_optional_hex32`, `max_requests_reached`, `run_sv2_conformance`, `read_http_request` guards),
   - `crates/p2p/src/transport.rs::send_message`.
+
+## Addendum (2026-02-20, live hardening pass)
+
+- [x] Added relay stability regression for sustained short-lived sessions:
+  - `relay_serve_handles_multiple_short_lived_handshakes_without_worker_errors`.
+- [x] Added `/wallet/send` rejection coverage for invalid amount/hrp/insufficient funds and conflict retry path:
+  - `run_rpc_serve_wallet_send_rejects_invalid_and_double_spend_paths`.
+- [x] Strengthened `/events` contract test to assert required snapshot schema keys and heartbeat presence:
+  - `run_rpc_serve_streams_event_snapshots`.
+- [ ] Stage 2/3 mutation reruns are still pending on top of this hardening pass.
