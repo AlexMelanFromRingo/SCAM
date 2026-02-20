@@ -97,3 +97,6 @@ Run window: `2026-02-13T16:10:10Z` -> `2026-02-13T17:09:00Z`
   - Result snapshot: `total=65`, `caught=52`, `missed=0`, `timeout=0`, `unviable=13`.
 - [x] Closed last focused wallet miss at coinbase maturity boundary:
   - Added `rescan` boundary test: `coinbase_becomes_spendable_at_exact_maturity_boundary`.
+- [x] Re-ran Stage 1 after miner/package comparator and CPFP hardening:
+  - Command scope: `scripts/mutation-staged.sh stage1`
+  - Result snapshot: `total=529`, `caught=471`, `missed=0`, `timeout=0`, `unviable=58`.
