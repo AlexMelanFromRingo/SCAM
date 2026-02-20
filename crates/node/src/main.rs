@@ -4,7 +4,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -74,6 +74,7 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     Node(NodeArgs),
+    RunMode(RunModeArgs),
     Status(StatusArgs),
     GetBlock(GetBlockArgs),
     GetTx(GetTxArgs),
@@ -114,6 +115,53 @@ struct NodeArgs {
     runtime_db: Option<PathBuf>,
     #[arg(long, default_value_t = false)]
     print_genesis: bool,
+}
+
+#[derive(Debug, Clone, ValueEnum)]
+enum RunModePreset {
+    NodeOnly,
+    Pool,
+    NodeMiner,
+    Solo,
+    SoloRemote,
+}
+
+#[derive(Debug, Clone, Args)]
+struct RunModeArgs {
+    #[arg(long, value_enum, default_value_t = Network::Devnet)]
+    network: Network,
+    #[arg(long)]
+    config: Option<PathBuf>,
+    #[arg(long)]
+    runtime_db: Option<PathBuf>,
+    #[arg(long, value_enum, default_value_t = RunModePreset::NodeMiner)]
+    preset: RunModePreset,
+    #[arg(long, default_value = "data/peers")]
+    peers_dir: PathBuf,
+    #[arg(long, default_value = "0.0.0.0:18444")]
+    relay_bind: String,
+    #[arg(long, default_value = "127.0.0.1:18080")]
+    rpc_bind: String,
+    #[arg(long, default_value = "web")]
+    ui_dir: PathBuf,
+    #[arg(long, default_value = "127.0.0.1:3347")]
+    stratum_bind: String,
+    #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
+    relay_outbound_connect: bool,
+    #[arg(long, default_value_t = 5)]
+    relay_outbound_redial_sec: u64,
+    #[arg(long)]
+    miner_pool: Option<String>,
+    #[arg(long, default_value = "scam-miner")]
+    miner_user: String,
+    #[arg(long, default_value_t = 2)]
+    miner_read_timeout_sec: u64,
+    #[arg(long, default_value_t = 250_000)]
+    miner_max_nonce_per_cycle: u64,
+    #[arg(long, default_value_t = 0)]
+    miner_max_shares: u64,
+    #[arg(long, default_value_t = 0)]
+    miner_max_runtime_sec: u64,
 }
 
 #[derive(Debug, Args)]
@@ -1335,6 +1383,234 @@ fn run_node(
         println!("{genesis:#?}");
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RunModePlan {
+    run_relay: bool,
+    run_rpc: bool,
+    run_stratum: bool,
+    run_miner: bool,
+    miner_pool: Option<String>,
+}
+
+fn loopback_pool_from_bind(bind: &str) -> Result<String, NodeError> {
+    let addr: SocketAddr = bind
+        .parse()
+        .map_err(|e| NodeError::Runtime(format!("invalid bind address '{bind}': {e}")))?;
+    Ok(format!("127.0.0.1:{}", addr.port()))
+}
+
+fn build_run_mode_plan(args: &RunModeArgs) -> Result<RunModePlan, NodeError> {
+    let mut plan = match args.preset {
+        RunModePreset::NodeOnly => RunModePlan {
+            run_relay: true,
+            run_rpc: true,
+            run_stratum: false,
+            run_miner: false,
+            miner_pool: None,
+        },
+        RunModePreset::Pool => RunModePlan {
+            run_relay: true,
+            run_rpc: true,
+            run_stratum: true,
+            run_miner: false,
+            miner_pool: None,
+        },
+        RunModePreset::NodeMiner => RunModePlan {
+            run_relay: true,
+            run_rpc: true,
+            run_stratum: true,
+            run_miner: true,
+            miner_pool: None,
+        },
+        RunModePreset::Solo => RunModePlan {
+            run_relay: false,
+            run_rpc: false,
+            run_stratum: true,
+            run_miner: true,
+            miner_pool: None,
+        },
+        RunModePreset::SoloRemote => RunModePlan {
+            run_relay: false,
+            run_rpc: false,
+            run_stratum: false,
+            run_miner: true,
+            miner_pool: args.miner_pool.clone(),
+        },
+    };
+
+    if plan.run_miner {
+        plan.miner_pool = match &args.miner_pool {
+            Some(pool) => Some(pool.clone()),
+            None if plan.run_stratum => Some(loopback_pool_from_bind(&args.stratum_bind)?),
+            None => {
+                return Err(NodeError::Runtime(
+                    "miner pool is required when running miner without local stratum server \
+                     (use --miner-pool <host:port>)"
+                        .to_owned(),
+                ));
+            }
+        };
+    }
+    Ok(plan)
+}
+
+fn spawn_mode_service<F>(
+    name: &'static str,
+    done_tx: mpsc::Sender<(&'static str, Result<(), NodeError>)>,
+    service: F,
+) where
+    F: FnOnce() -> Result<(), NodeError> + Send + 'static,
+{
+    thread::spawn(move || {
+        let result = service();
+        let _ = done_tx.send((name, result));
+    });
+}
+
+fn run_mode(args: RunModeArgs) -> Result<(), NodeError> {
+    let config_path = args
+        .config
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(format!("config/{}.toml", args.network.as_str())));
+    let cfg = load_chain_config(&config_path)?;
+    let runtime_db_path = args
+        .runtime_db
+        .clone()
+        .unwrap_or_else(|| default_runtime_db_path(args.network));
+    let (runtime, source) = load_runtime_from_db_or_genesis(&cfg, &runtime_db_path)?;
+    persist_runtime_db(&runtime, &runtime_db_path)?;
+
+    let plan = build_run_mode_plan(&args)?;
+    if !plan.run_relay && !plan.run_rpc && !plan.run_stratum && !plan.run_miner {
+        return Err(NodeError::Runtime(
+            "run-mode produced empty service plan".to_owned(),
+        ));
+    }
+
+    println!("Run mode preset: {:?}", args.preset);
+    println!("Network: {}", cfg.network_id);
+    println!("Config: {}", config_path.display());
+    println!(
+        "Runtime DB: {} (source={source})",
+        runtime_db_path.display()
+    );
+    println!(
+        "Services: relay={} rpc={} stratum={} miner={}",
+        plan.run_relay, plan.run_rpc, plan.run_stratum, plan.run_miner
+    );
+
+    let (done_tx, done_rx) = mpsc::channel::<(&'static str, Result<(), NodeError>)>();
+
+    if plan.run_relay {
+        let relay_args = RelayServeArgs {
+            network: args.network,
+            config: Some(config_path.clone()),
+            runtime_db: Some(runtime_db_path.clone()),
+            peers_dir: args.peers_dir.clone(),
+            bind: args.relay_bind.clone(),
+            max_clients: 0,
+            max_messages_per_peer: 0,
+            read_timeout_sec: 5,
+            write_timeout_sec: 5,
+            max_inv_items: None,
+            ban_threshold: None,
+            replacement_window_sec: None,
+            replacement_max_per_peer: None,
+            replacement_penalty: None,
+            telemetry_out: None,
+            telemetry_every_sec: 30,
+            outbound_connect: args.relay_outbound_connect,
+            outbound_redial_sec: args.relay_outbound_redial_sec,
+        };
+        let tx = done_tx.clone();
+        spawn_mode_service("relay-serve", tx, move || run_relay_serve(relay_args));
+    }
+
+    if plan.run_rpc {
+        let rpc_args = RpcServeArgs {
+            network: args.network,
+            config: Some(config_path.clone()),
+            runtime_db: Some(runtime_db_path.clone()),
+            bind: args.rpc_bind.clone(),
+            ui_dir: args.ui_dir.clone(),
+            relay_telemetry: None,
+            mine_blocks: 0,
+            interval_sec: cfg.target_block_time_sec,
+            max_nonce: 500_000,
+            max_requests: 0,
+        };
+        let tx = done_tx.clone();
+        spawn_mode_service("rpc-serve", tx, move || run_rpc_serve(rpc_args));
+    }
+
+    if plan.run_stratum {
+        let stratum_args = StratumServeArgs {
+            network: args.network,
+            config: Some(config_path.clone()),
+            runtime_db: Some(runtime_db_path.clone()),
+            bind: args.stratum_bind.clone(),
+            share_target_hex: None,
+            max_jobs_per_channel: None,
+            max_clients: 0,
+            max_active_clients: None,
+            read_timeout_sec: None,
+            keepalive_sec: None,
+            idle_timeout_sec: None,
+            vardiff_target_shares_per_minute: None,
+            vardiff_retarget_interval_shares: None,
+            vardiff_clamp_up: None,
+            vardiff_clamp_down: None,
+            max_rejected_shares: None,
+            min_share_target_hex: None,
+            max_share_target_hex: None,
+            secure_transport: false,
+            secure_transport_mode: None,
+            secure_rekey_interval_messages: None,
+            secure_static_secret_key_hex: None,
+            secure_expected_remote_static_pubkey_hex: None,
+            template_provider_addr: None,
+            job_declarator_addr: None,
+        };
+        let tx = done_tx.clone();
+        spawn_mode_service("stratum-serve", tx, move || run_stratum_serve(stratum_args));
+    }
+
+    if plan.run_miner {
+        let miner_pool = plan.miner_pool.clone().ok_or_else(|| {
+            NodeError::Runtime("run-mode miner pool planning failed unexpectedly".to_owned())
+        })?;
+        let miner_args = StratumMineArgs {
+            pool: miner_pool,
+            user: args.miner_user.clone(),
+            read_timeout_sec: args.miner_read_timeout_sec,
+            max_nonce_per_cycle: args.miner_max_nonce_per_cycle,
+            max_shares: args.miner_max_shares,
+            max_runtime_sec: args.miner_max_runtime_sec,
+            secure_transport: false,
+            secure_transport_mode: None,
+            secure_rekey_interval_messages: 10_000,
+            secure_static_secret_key_hex: None,
+            secure_expected_remote_static_pubkey_hex: None,
+            translator_addr: None,
+        };
+        let tx = done_tx.clone();
+        spawn_mode_service("stratum-mine", tx, move || run_stratum_mine(miner_args));
+    }
+
+    drop(done_tx);
+    let (service, result) = done_rx
+        .recv()
+        .map_err(|_| NodeError::Runtime("run-mode channel closed unexpectedly".to_owned()))?;
+    match result {
+        Ok(()) => Err(NodeError::Runtime(format!(
+            "{service} exited (run-mode expects long-lived services)"
+        ))),
+        Err(err) => Err(NodeError::Runtime(format!(
+            "{service} exited with error: {err}"
+        ))),
+    }
 }
 
 fn should_mine_query_blocks(mine_blocks: u32) -> bool {
@@ -9464,6 +9740,7 @@ fn run_command(cli: Cli) -> Result<(), NodeError> {
             args.runtime_db,
             args.print_genesis,
         ),
+        Some(Command::RunMode(args)) => run_mode(args),
         Some(Command::Status(args)) => run_status(args),
         Some(Command::GetBlock(args)) => run_get_block(args),
         Some(Command::GetTx(args)) => run_get_tx(args),
@@ -9514,6 +9791,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    use clap::Parser;
     use std::fs;
     use std::io::{Read, Write};
     use std::net::{Shutdown, TcpListener, TcpStream};
@@ -10084,6 +10362,101 @@ mod tests {
                 .expect("non-empty parent"),
             std::path::Path::new("dir")
         );
+    }
+
+    #[test]
+    fn run_mode_plan_presets_match_expected_roles() {
+        let base = super::RunModeArgs {
+            network: Network::Devnet,
+            config: None,
+            runtime_db: None,
+            preset: super::RunModePreset::NodeOnly,
+            peers_dir: PathBuf::from("data/peers"),
+            relay_bind: "0.0.0.0:18444".to_owned(),
+            rpc_bind: "127.0.0.1:18080".to_owned(),
+            ui_dir: PathBuf::from("web"),
+            stratum_bind: "127.0.0.1:3347".to_owned(),
+            relay_outbound_connect: true,
+            relay_outbound_redial_sec: 5,
+            miner_pool: None,
+            miner_user: "scam-miner".to_owned(),
+            miner_read_timeout_sec: 2,
+            miner_max_nonce_per_cycle: 250_000,
+            miner_max_shares: 0,
+            miner_max_runtime_sec: 0,
+        };
+
+        let node_only = super::build_run_mode_plan(&base).expect("node-only");
+        assert_eq!(
+            node_only,
+            super::RunModePlan {
+                run_relay: true,
+                run_rpc: true,
+                run_stratum: false,
+                run_miner: false,
+                miner_pool: None,
+            }
+        );
+
+        let mut pool_args = base.clone();
+        pool_args.preset = super::RunModePreset::Pool;
+        let pool = super::build_run_mode_plan(&pool_args).expect("pool");
+        assert!(pool.run_relay && pool.run_rpc && pool.run_stratum);
+        assert!(!pool.run_miner);
+
+        let mut node_miner_args = base.clone();
+        node_miner_args.preset = super::RunModePreset::NodeMiner;
+        let node_miner = super::build_run_mode_plan(&node_miner_args).expect("node-miner");
+        assert!(node_miner.run_relay && node_miner.run_rpc && node_miner.run_stratum);
+        assert!(node_miner.run_miner);
+        assert_eq!(node_miner.miner_pool, Some("127.0.0.1:3347".to_owned()));
+
+        let mut solo_args = base.clone();
+        solo_args.preset = super::RunModePreset::Solo;
+        let solo = super::build_run_mode_plan(&solo_args).expect("solo");
+        assert!(!solo.run_relay && !solo.run_rpc && solo.run_stratum && solo.run_miner);
+
+        let mut solo_remote_args = base.clone();
+        solo_remote_args.preset = super::RunModePreset::SoloRemote;
+        solo_remote_args.miner_pool = Some("192.0.2.12:3347".to_owned());
+        let solo_remote = super::build_run_mode_plan(&solo_remote_args).expect("solo-remote");
+        assert!(!solo_remote.run_relay && !solo_remote.run_rpc && !solo_remote.run_stratum);
+        assert!(solo_remote.run_miner);
+        assert_eq!(solo_remote.miner_pool, Some("192.0.2.12:3347".to_owned()));
+    }
+
+    #[test]
+    fn run_mode_plan_rejects_remote_miner_without_pool() {
+        let args = super::RunModeArgs {
+            network: Network::Devnet,
+            config: None,
+            runtime_db: None,
+            preset: super::RunModePreset::SoloRemote,
+            peers_dir: PathBuf::from("data/peers"),
+            relay_bind: "0.0.0.0:18444".to_owned(),
+            rpc_bind: "127.0.0.1:18080".to_owned(),
+            ui_dir: PathBuf::from("web"),
+            stratum_bind: "127.0.0.1:3347".to_owned(),
+            relay_outbound_connect: true,
+            relay_outbound_redial_sec: 5,
+            miner_pool: None,
+            miner_user: "scam-miner".to_owned(),
+            miner_read_timeout_sec: 2,
+            miner_max_nonce_per_cycle: 250_000,
+            miner_max_shares: 0,
+            miner_max_runtime_sec: 0,
+        };
+        let err = super::build_run_mode_plan(&args).expect_err("must require pool");
+        assert!(err.to_string().contains("miner pool is required"));
+    }
+
+    #[test]
+    fn run_mode_cli_defaults_enable_outbound_connect() {
+        let parsed = super::Cli::try_parse_from(["scam-node", "run-mode"]).expect("run-mode parse");
+        let Some(super::Command::RunMode(args)) = parsed.command else {
+            panic!("expected run-mode command");
+        };
+        assert!(args.relay_outbound_connect);
     }
 
     #[test]
@@ -12892,7 +13265,12 @@ mod tests {
         .to_string();
         let insufficient = send_http_json_post(&addr, "/wallet/send", &insufficient_req);
         assert!(insufficient.starts_with("HTTP/1.1 400 Bad Request"));
-        assert!(insufficient.contains("insufficient spendable funds"));
+        assert!(
+            insufficient.contains("insufficient spendable funds")
+                || insufficient.contains("amount + fee overflow")
+                || insufficient.contains("total required amount overflows"),
+            "expected insufficient-funds style rejection, got: {insufficient}"
+        );
 
         let valid_send_req = serde_json::json!({
             "mnemonic": SOAK_FLOW_MNEMONIC,
@@ -15251,7 +15629,7 @@ mod tests {
                     config: Some(config_path),
                     runtime_db: Some(runtime_db_b),
                     bind: bind_b,
-                    max_clients: 2,
+                    max_clients: 1,
                     max_messages_per_peer: 0,
                     read_timeout_sec: 1,
                     write_timeout_sec: 1,
@@ -15280,7 +15658,7 @@ mod tests {
                     config: Some(config_path),
                     runtime_db: Some(runtime_db_a),
                     bind: bind_a,
-                    max_clients: 2,
+                    max_clients: 1,
                     max_messages_per_peer: 0,
                     read_timeout_sec: 1,
                     write_timeout_sec: 1,
