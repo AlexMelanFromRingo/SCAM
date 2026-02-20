@@ -29,8 +29,8 @@
 
 ## P1 (required for operational usability)
 - [ ] Add realtime UI updates:
-  - [ ] SSE stream endpoint (`/events`) with status/tip/mempool deltas,
-  - [ ] frontend EventSource client with auto-reconnect and stale-state indicator.
+  - [x] SSE stream endpoint (`/events`) with status/tip/mempool deltas.
+  - [x] frontend EventSource client with auto-reconnect + polling fallback indicator.
 - [x] Keep polling fallback when SSE unavailable (UI now auto-refreshes every 5s).
 - [ ] Add explicit node health telemetry in UI (relay peers, sync lag, mempool size, last block age).
 - [ ] Add RPC endpoint to query balance by address + tx history in one call for wallet UX.

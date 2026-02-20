@@ -40,7 +40,8 @@ SYNC_LOOP_INTERVAL_SEC="${SYNC_LOOP_INTERVAL_SEC:-5}"
 SYNC_MAX_BATCHES_PER_PEER="${SYNC_MAX_BATCHES_PER_PEER:-8}"
 
 WALLET_WORDS="${WALLET_WORDS:-12}"
-WALLET_HRP="${WALLET_HRP:-sd}"
+WALLET_HRP="${WALLET_HRP:-}"
+RESOLVED_WALLET_HRP=""
 
 ENDPOINTS_FILE="${CLUSTER_DIR}/endpoints.tsv"
 MINER_PID_FILE="${CLUSTER_DIR}/miner.pid"
@@ -123,7 +124,7 @@ generate_demo_wallet() {
   local bin="$1"
   local wallet_idx="$2"
   local out_file="${WALLETS_DIR}/wallet-${wallet_idx}.txt"
-  "${bin}" wallet new --words "${WALLET_WORDS}" --hrp "${WALLET_HRP}" > "${out_file}"
+  "${bin}" wallet new --words "${WALLET_WORDS}" --hrp "${RESOLVED_WALLET_HRP}" > "${out_file}"
   local mnemonic address
   mnemonic="$(sed -n 's/^Mnemonic: //p' "${out_file}" | head -n 1)"
   address="$(sed -n 's/^Address: //p' "${out_file}" | head -n 1)"
@@ -133,6 +134,24 @@ generate_demo_wallet() {
   fi
   printf "WALLET_%s_MNEMONIC=%q\n" "${wallet_idx}" "${mnemonic}" >> "${WALLETS_DIR}/wallets.env"
   printf "WALLET_%s_ADDRESS=%q\n" "${wallet_idx}" "${address}" >> "${WALLETS_DIR}/wallets.env"
+}
+
+resolve_wallet_hrp() {
+  if [[ -n "${WALLET_HRP}" ]]; then
+    echo "${WALLET_HRP}"
+    return
+  fi
+  if [[ -f "${CONFIG}" ]]; then
+    local from_config
+    from_config="$(
+      sed -nE 's/^[[:space:]]*hrp[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' "${CONFIG}" | head -n 1
+    )"
+    if [[ -n "${from_config}" ]]; then
+      echo "${from_config}"
+      return
+    fi
+  fi
+  echo "sd"
 }
 
 stop_follower_sync_loops() {
@@ -199,13 +218,14 @@ start_lab() {
   BUILD="${BUILD}" \
   CARGO_PROFILE="${CARGO_PROFILE}" \
   SYNC_BOOK=true \
-  RUN_SYNC_LOOP=false \
+  RUN_SYNC_LOOP="${RUN_SYNC_LOOP}" \
   SYNC_MAX_BATCHES_PER_PEER="${SYNC_MAX_BATCHES_PER_PEER}" \
   SYNC_LOOP_INTERVAL_SEC="${SYNC_LOOP_INTERVAL_SEC}" \
   scripts/local-multinode.sh up
 
   local bin
   bin="$(resolve_binary)"
+  RESOLVED_WALLET_HRP="$(resolve_wallet_hrp)"
 
   mkdir -p "${WALLETS_DIR}"
   : > "${WALLETS_DIR}/wallets.env"
@@ -257,6 +277,7 @@ start_lab() {
   echo "[lab] miner log: ${MINER_LOG_FILE}"
   echo "[lab] miner user: ${miner_user_effective}"
   echo "[lab] miner payout default wallet: ${wallet01_addr}"
+  echo "[lab] wallet hrp: ${RESOLVED_WALLET_HRP}"
   echo "[lab] demo wallets:"
   echo "  ${WALLETS_DIR}/wallet-01.txt"
   echo "  ${WALLETS_DIR}/wallet-02.txt"
