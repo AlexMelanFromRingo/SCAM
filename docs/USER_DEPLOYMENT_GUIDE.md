@@ -161,7 +161,8 @@ What it does:
 - enables RPC+Web UI on each node,
 - starts one Stratum pool on node-0,
 - starts one miner connected to node-0 pool,
-- starts periodic `sync-book` loops by default (`RUN_SYNC_LOOP=true`),
+- enables live relay outbound auto-connect by default (`RELAY_OUTBOUND_CONNECT=true`),
+- keeps periodic `sync-book` loops disabled by default (`RUN_SYNC_LOOP=false`),
 - generates two demo wallets and saves them under `target/local-test-lab/wallets/`.
 
 Control:
@@ -182,10 +183,10 @@ Binary-only mode:
 SCAM_NODE_BIN=./scam-node BUILD=false scripts/local-test-lab.sh up
 ```
 
-Disable periodic sync loop:
+Enable periodic sync loop fallback:
 
 ```bash
-RUN_SYNC_LOOP=false scripts/local-test-lab.sh up
+RUN_SYNC_LOOP=true scripts/local-test-lab.sh up
 ```
 
 ## 6) Create Wallet (Secure Recommended)

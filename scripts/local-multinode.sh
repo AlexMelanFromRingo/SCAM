@@ -25,6 +25,11 @@ set -euo pipefail
 #   SYNC_MAX_BATCHES_PER_PEER=8
 #   RUN_SYNC_LOOP=false
 #   SYNC_LOOP_INTERVAL_SEC=5
+#   P2P_READ_TIMEOUT_SEC=5
+#   P2P_WRITE_TIMEOUT_SEC=5
+#   RELAY_OUTBOUND_CONNECT=true
+#   RELAY_OUTBOUND_REDIAL_SEC=2
+#   STRATUM_READ_TIMEOUT_SEC=30
 
 COMMAND="${1:-up}"
 
@@ -45,6 +50,8 @@ RUN_SYNC_LOOP="${RUN_SYNC_LOOP:-false}"
 SYNC_LOOP_INTERVAL_SEC="${SYNC_LOOP_INTERVAL_SEC:-5}"
 P2P_READ_TIMEOUT_SEC="${P2P_READ_TIMEOUT_SEC:-5}"
 P2P_WRITE_TIMEOUT_SEC="${P2P_WRITE_TIMEOUT_SEC:-5}"
+RELAY_OUTBOUND_CONNECT="${RELAY_OUTBOUND_CONNECT:-true}"
+RELAY_OUTBOUND_REDIAL_SEC="${RELAY_OUTBOUND_REDIAL_SEC:-2}"
 STRATUM_READ_TIMEOUT_SEC="${STRATUM_READ_TIMEOUT_SEC:-30}"
 UI_DIR="${UI_DIR:-web}"
 SCAM_NODE_BIN="${SCAM_NODE_BIN:-}"
@@ -204,6 +211,7 @@ start_cluster() {
   require_positive_int "SYNC_LOOP_INTERVAL_SEC" "${SYNC_LOOP_INTERVAL_SEC}"
   require_positive_int "P2P_READ_TIMEOUT_SEC" "${P2P_READ_TIMEOUT_SEC}"
   require_positive_int "P2P_WRITE_TIMEOUT_SEC" "${P2P_WRITE_TIMEOUT_SEC}"
+  require_positive_int "RELAY_OUTBOUND_REDIAL_SEC" "${RELAY_OUTBOUND_REDIAL_SEC}"
   require_positive_int "STRATUM_READ_TIMEOUT_SEC" "${STRATUM_READ_TIMEOUT_SEC}"
 
   mkdir -p "${CLUSTER_DIR}"
@@ -224,6 +232,10 @@ start_cluster() {
     stratum_port="$(stratum_port_for "${idx}")"
 
     mkdir -p "${logsdir}" "${peersdir}"
+    local relay_extra_args=()
+    if is_true "${RELAY_OUTBOUND_CONNECT}"; then
+      relay_extra_args+=(--outbound-connect --outbound-redial-sec "${RELAY_OUTBOUND_REDIAL_SEC}")
+    fi
 
     "${bin}" node \
       --network "${NETWORK}" \
@@ -235,9 +247,11 @@ start_cluster() {
       --network "${NETWORK}" \
       --config "${CONFIG}" \
       --runtime-db "${runtime_db}" \
+      --peers-dir "${peersdir}" \
       --bind "127.0.0.1:${p2p_port}" \
       --read-timeout-sec "${P2P_READ_TIMEOUT_SEC}" \
       --write-timeout-sec "${P2P_WRITE_TIMEOUT_SEC}" \
+      "${relay_extra_args[@]}" \
       --telemetry-out "${nodedir}/relay.telemetry.jsonl" \
       --telemetry-every-sec 5 \
       > "${logsdir}/relay.log" 2>&1 &

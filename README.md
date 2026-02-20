@@ -247,7 +247,7 @@ Binary-only run:
 SCAM_NODE_BIN=./scam-node BUILD=false scripts/local-test-lab.sh up
 ```
 
-By default this lab also starts periodic `sync-book` loops (`RUN_SYNC_LOOP=true`) and assigns miner payout to `wallet-01` unless you override `MINER_USER`.
+By default this lab uses live relay outbound auto-connect (`RELAY_OUTBOUND_CONNECT=true`) and does not run periodic `sync-book` loops (`RUN_SYNC_LOOP=false`). Miner payout defaults to `wallet-01` unless you override `MINER_USER`.
 
 ### 6.1 Bootstrap node runtime
 

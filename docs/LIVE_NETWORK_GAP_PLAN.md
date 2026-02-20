@@ -3,13 +3,13 @@
 ## Current factual status
 - Consensus/UTXO/PoW validation: works.
 - Stratum mining to local node: works (blocks produced).
-- Node-to-node synchronization: realtime INV propagation works for active relay connections; automatic outbound peer dialing is still pending, so bootstrapping still uses `sync-book`/peer orchestration.
+- Node-to-node synchronization: realtime INV propagation works for active relay connections; relay now has outbound peer auto-dial from peer-book (`--outbound-connect`), with local scripts defaulting it on.
 - Wallet UX transfer pipeline: live submit path exists (`wallet/send`, `tx/submit`) with mempool DB admission.
 - UI: request/refresh based (5s auto-refresh), no SSE push stream yet.
 
 ## Why blocks often have `tx_count = 1`
 - Blocks include only coinbase unless mempool has user transactions.
-- Current UX does not expose a production-ready `wallet/send` path that submits a signed tx into relay mempool and propagates it across peers.
+- A live `wallet/send` path exists now, but E2E propagation/mining coverage is still incomplete.
 
 ## P0 (must-have for real testnet launch)
 - [x] Add live RPC submit endpoint (`POST /wallet/send`) that:
