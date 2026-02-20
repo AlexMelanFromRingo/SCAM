@@ -1175,6 +1175,37 @@ fn load_mempool_from_db_or_empty(
     Ok(mempool)
 }
 
+fn load_mempool_from_db_or_empty_with_retry(
+    cfg: &ChainConfig,
+    mempool_db_path: &Path,
+    attempts: usize,
+    backoff_ms: u64,
+) -> Result<Mempool, NodeError> {
+    let tries = attempts.max(1);
+    for idx in 0..tries {
+        match load_mempool_from_db_or_empty(cfg, mempool_db_path) {
+            Ok(mempool) => return Ok(mempool),
+            Err(err) if is_mempool_db_lock_conflict(&err) => {
+                if idx + 1 < tries {
+                    std::thread::sleep(Duration::from_millis(backoff_ms.max(1)));
+                    continue;
+                }
+                eprintln!(
+                    "warning: mempool db lock contention while building template; using empty mempool snapshot"
+                );
+                return Mempool::with_policy(
+                    cfg.max_mempool_txs as usize,
+                    cfg.min_relay_fee_per_kb,
+                )
+                .map_err(NodeError::from);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+        .map_err(NodeError::from)
+}
+
 fn remove_confirmed_txids_from_mempool_db(
     cfg: &ChainConfig,
     mempool_db_path: &Path,
@@ -3388,7 +3419,25 @@ fn run_sync_book(args: SyncBookArgs) -> Result<(), NodeError> {
 struct RelayServerState {
     runtime: ChainRuntime,
     relay: RelayAdmissionState,
+    pending_block_orphans: HashMap<Hash256, scam_core::Block>,
+    pending_block_orphan_order: VecDeque<Hash256>,
+    last_parent_sync_request_sec: HashMap<Hash256, u64>,
 }
+
+impl RelayServerState {
+    fn new(runtime: ChainRuntime, relay: RelayAdmissionState) -> Self {
+        Self {
+            runtime,
+            relay,
+            pending_block_orphans: HashMap::new(),
+            pending_block_orphan_order: VecDeque::new(),
+            last_parent_sync_request_sec: HashMap::new(),
+        }
+    }
+}
+
+const RELAY_MAX_PENDING_BLOCK_ORPHANS: usize = 512;
+const RELAY_PARENT_RESYNC_COOLDOWN_SEC: u64 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RelayServerTelemetrySnapshot {
@@ -3414,6 +3463,113 @@ fn relay_fee_hint(tx: &Transaction) -> u64 {
     let mut hint = [0u8; 8];
     hint.copy_from_slice(&txid.0[..8]);
     u64::from_be_bytes(hint).saturating_add(1)
+}
+
+fn relay_forget_pending_orphan_block(state: &mut RelayServerState, hash: Hash256) {
+    state.pending_block_orphans.remove(&hash);
+    state
+        .pending_block_orphan_order
+        .retain(|queued| *queued != hash);
+}
+
+fn relay_store_pending_orphan_block(state: &mut RelayServerState, block: scam_core::Block) {
+    let block_hash = block.header.block_hash();
+    if state.pending_block_orphans.contains_key(&block_hash) {
+        return;
+    }
+    if state.pending_block_orphan_order.len() >= RELAY_MAX_PENDING_BLOCK_ORPHANS
+        && let Some(evicted) = state.pending_block_orphan_order.pop_front()
+    {
+        state.pending_block_orphans.remove(&evicted);
+    }
+    state.pending_block_orphans.insert(block_hash, block);
+    state.pending_block_orphan_order.push_back(block_hash);
+}
+
+fn relay_finalize_applied_block(state: &mut RelayServerState, block: &scam_core::Block) {
+    let txids = block
+        .transactions
+        .iter()
+        .map(|tx| tx.txid())
+        .collect::<Vec<_>>();
+    let _ = state.relay.mempool.remove_confirmed_txids(&txids);
+    let _ = state.relay.gossip.announce_block(block.clone());
+    relay_forget_pending_orphan_block(state, block.header.block_hash());
+}
+
+fn relay_should_request_parent_sync(
+    state: &mut RelayServerState,
+    parent: Hash256,
+    now_unix_sec: u64,
+) -> bool {
+    state
+        .last_parent_sync_request_sec
+        .retain(|_, ts| now_unix_sec.saturating_sub(*ts) <= RELAY_PARENT_RESYNC_COOLDOWN_SEC * 30);
+    match state.last_parent_sync_request_sec.get(&parent).copied() {
+        Some(last) if now_unix_sec.saturating_sub(last) < RELAY_PARENT_RESYNC_COOLDOWN_SEC => false,
+        _ => {
+            state
+                .last_parent_sync_request_sec
+                .insert(parent, now_unix_sec);
+            true
+        }
+    }
+}
+
+fn relay_recovery_messages_for_unknown_parent(
+    state: &mut RelayServerState,
+    parent: Hash256,
+    now_unix_sec: u64,
+) -> Vec<WireMessage> {
+    if !relay_should_request_parent_sync(state, parent, now_unix_sec) {
+        return Vec::new();
+    }
+    let locator = build_block_locator(state.runtime.block_hashes());
+    vec![
+        WireMessage::GetData {
+            items: vec![InventoryItem::Block(parent)],
+        },
+        WireMessage::GetBlocks {
+            locator,
+            stop: None,
+        },
+    ]
+}
+
+fn relay_try_apply_pending_orphans(state: &mut RelayServerState) {
+    loop {
+        let mut progressed = false;
+        let queued = state
+            .pending_block_orphan_order
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        for orphan_hash in queued {
+            let Some(orphan_block) = state.pending_block_orphans.get(&orphan_hash).cloned() else {
+                relay_forget_pending_orphan_block(state, orphan_hash);
+                continue;
+            };
+            let parent = orphan_block.header.prev_block;
+            if state.runtime.block_by_hash(&parent).is_none() {
+                continue;
+            }
+            match state.runtime.submit_block(orphan_block.clone()) {
+                Ok(_) => {
+                    relay_finalize_applied_block(state, &orphan_block);
+                    state.last_parent_sync_request_sec.remove(&parent);
+                    progressed = true;
+                }
+                Err(ChainError::UnknownParent { .. }) => {}
+                Err(_) => {
+                    // Drop invalid orphan candidates to avoid retry loops on malformed blocks.
+                    relay_forget_pending_orphan_block(state, orphan_hash);
+                }
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
 }
 
 fn nonempty_parent_dir(path: &Path) -> Option<&Path> {
@@ -3647,21 +3803,22 @@ fn process_relay_wire_message(
                 Err(err) => Err(err),
             }
         }
-        WireMessage::Block { block } => {
-            let txids = block
-                .transactions
-                .iter()
-                .map(|tx| tx.txid())
-                .collect::<Vec<_>>();
-            match state.runtime.submit_block(block.clone()) {
-                Ok(_) => {
-                    let _ = state.relay.mempool.remove_confirmed_txids(&txids);
-                    let _ = state.relay.gossip.announce_block(block);
-                    Ok(Vec::new())
-                }
-                Err(err) => Err(NodeError::Chain(err)),
+        WireMessage::Block { block } => match state.runtime.submit_block(block.clone()) {
+            Ok(_) => {
+                relay_finalize_applied_block(state, &block);
+                relay_try_apply_pending_orphans(state);
+                Ok(Vec::new())
             }
-        }
+            Err(ChainError::UnknownParent { parent, .. }) => {
+                relay_store_pending_orphan_block(state, block);
+                Ok(relay_recovery_messages_for_unknown_parent(
+                    state,
+                    parent,
+                    now_unix_sec,
+                ))
+            }
+            Err(err) => Err(NodeError::Chain(err)),
+        },
         WireMessage::NotFound { .. } => Ok(Vec::new()),
     }
 }
@@ -4096,7 +4253,7 @@ fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
             replacement,
         )?,
     };
-    let state = Arc::new(Mutex::new(RelayServerState { runtime, relay }));
+    let state = Arc::new(Mutex::new(RelayServerState::new(runtime, relay)));
     let active_peers = Arc::new(Mutex::new(0usize));
     let next_peer_id = Arc::new(AtomicU64::new(0));
 
@@ -5114,7 +5271,7 @@ impl StratumTemplateProvider for RuntimeTemplateProvider {
     ) -> Result<StratumTemplateWork, NodeError> {
         let prev_block = runtime.tip_hash();
         let target = runtime.expected_target_for_next_block()?;
-        let mempool = load_mempool_from_db_or_empty(cfg, mempool_db_path)?;
+        let mempool = load_mempool_from_db_or_empty_with_retry(cfg, mempool_db_path, 10, 25)?;
         let params = MempoolTemplateParams {
             version: 1,
             prev_block,
@@ -8316,13 +8473,13 @@ fn run_rpc_serve(args: RpcServeArgs) -> Result<(), NodeError> {
             }
         } else if rpc_exact_route_matches(method, path, "GET", "/mempool") {
             let (mempool_tx_count, mempool_txids) = if mempool_db_path.exists() {
-                match load_mempool_db(&mempool_db_path) {
-                    Ok(snapshot) => (
-                        Some(snapshot.entries.len()),
-                        snapshot
-                            .entries
-                            .iter()
-                            .map(|entry| entry.txid.to_hex())
+                match load_mempool_from_db_or_empty_with_retry(&cfg, &mempool_db_path, 10, 15) {
+                    Ok(mempool) => (
+                        Some(mempool.len()),
+                        mempool
+                            .txids_by_feerate_desc()
+                            .into_iter()
+                            .map(|txid| txid.to_hex())
                             .collect::<Vec<_>>(),
                     ),
                     Err(err) => {
@@ -13275,7 +13432,7 @@ mod tests {
             .insert_with_fee(tx.clone(), 2_000)
             .expect("insert tx");
 
-        let state = RelayServerState { runtime, relay };
+        let state = RelayServerState::new(runtime, relay);
         let mut last_tip_announced = None;
         let mut announced_txids = std::collections::HashSet::<Hash256>::new();
         let first = super::relay_proactive_inventory_messages(
@@ -13765,7 +13922,7 @@ mod tests {
                 .expect("orphan"),
             gossip,
         };
-        let mut state = RelayServerState { runtime, relay };
+        let mut state = RelayServerState::new(runtime, relay);
 
         let mut txs = [
             relay_tx(base_outpoint.clone(), 1, 11),
@@ -13845,7 +14002,7 @@ mod tests {
             .mempool
             .insert_with_fee(tx.clone(), 1_000)
             .expect("insert tx");
-        let mut state = RelayServerState { runtime, relay };
+        let mut state = RelayServerState::new(runtime, relay);
 
         let out = process_relay_wire_message(
             &mut state,
@@ -13891,7 +14048,7 @@ mod tests {
                 .expect("orphan"),
             gossip,
         };
-        let mut state = RelayServerState { runtime, relay };
+        let mut state = RelayServerState::new(runtime, relay);
 
         let out = process_relay_wire_message(
             &mut state,
@@ -13904,6 +14061,95 @@ mod tests {
         .expect("process inv");
         assert_eq!(out.len(), 1);
         assert!(matches!(out[0], WireMessage::GetData { .. }));
+    }
+
+    #[test]
+    fn relay_block_unknown_parent_requests_recovery_and_promotes_orphan_when_parent_arrives() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        cfg.validate().expect("config validate");
+        let miner_key_hash = cfg.genesis_reward_key_hash20().expect("reward key");
+
+        let mut producer = ChainRuntime::from_config(cfg.clone()).expect("producer runtime");
+        let mine_params = super::MiningLoopParams {
+            count: 2,
+            interval_sec: cfg.target_block_time_sec,
+            max_nonce: 500_000,
+            subsidy: cfg.block_subsidy,
+            miner_key_hash,
+            label_prefix: "relay-orphan-recovery",
+            print_each: false,
+        };
+        mine_blocks_on_runtime(&mut producer, &mine_params).expect("mine producer chain");
+        let chain = producer.block_hashes().to_vec();
+        let parent_hash = chain[1];
+        let child_hash = chain[2];
+        let parent_block = producer
+            .block_by_hash(&parent_hash)
+            .expect("parent block")
+            .clone();
+        let child_block = producer
+            .block_by_hash(&child_hash)
+            .expect("child block")
+            .clone();
+
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("consumer runtime");
+        let mut gossip = GossipEngine::with_limits_and_replacement(
+            64,
+            50,
+            ReplacementRateLimit {
+                window_sec: 60,
+                max_replacements: 5,
+                penalty: 10,
+            },
+        )
+        .expect("gossip");
+        gossip.connect_peer(42);
+        let relay = RelayAdmissionState {
+            mempool: Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip,
+        };
+        let mut state = RelayServerState::new(runtime, relay);
+
+        let recover = process_relay_wire_message(
+            &mut state,
+            42,
+            WireMessage::Block { block: child_block },
+            1_000,
+        )
+        .expect("unknown parent should trigger recovery path");
+        assert!(
+            recover.iter().any(|msg| matches!(
+                msg,
+                WireMessage::GetData { items }
+                    if items.contains(&InventoryItem::Block(parent_hash))
+            )),
+            "recovery path must request missing parent block"
+        );
+        assert!(
+            recover
+                .iter()
+                .any(|msg| matches!(msg, WireMessage::GetBlocks { .. })),
+            "recovery path must request block locator sync"
+        );
+        assert_eq!(state.runtime.tip_height(), 0);
+        assert_eq!(state.pending_block_orphans.len(), 1);
+
+        let post_parent = process_relay_wire_message(
+            &mut state,
+            42,
+            WireMessage::Block {
+                block: parent_block.clone(),
+            },
+            1_001,
+        )
+        .expect("parent apply");
+        assert!(post_parent.is_empty());
+        assert_eq!(state.runtime.tip_hash(), child_hash);
+        assert!(state.pending_block_orphans.is_empty());
     }
 
     #[test]
