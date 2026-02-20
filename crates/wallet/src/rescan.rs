@@ -316,4 +316,35 @@ mod tests {
         assert_eq!(report.immature_total, 50);
         assert_eq!(report.balances[0].immature, 50);
     }
+
+    #[test]
+    fn coinbase_becomes_spendable_at_exact_maturity_boundary() {
+        let seed = [4u8; 64];
+        let watched = derive_watched_keys(&seed, 0, 0, 0).expect("watch");
+        let mine_hash = watched[0].key_hash20;
+        let other_hash = [0x44u8; 20];
+
+        let mut prev_hash = Hash256::ZERO;
+        let mut blocks = Vec::<(u64, Block)>::new();
+        for height in 0..=100u64 {
+            let reward_hash = if height == 0 { mine_hash } else { other_hash };
+            let block = make_block(
+                prev_hash,
+                100u64.saturating_add(height.saturating_mul(120)),
+                vec![coinbase_to(50, reward_hash)],
+            );
+            prev_hash = block.header.block_hash();
+            blocks.push((height, block));
+        }
+
+        let refs = blocks
+            .iter()
+            .map(|(height, block)| (*height, block))
+            .collect::<Vec<_>>();
+        let report = rescan_blocks(&watched, refs, 100);
+        assert_eq!(report.tip_height, 100);
+        assert_eq!(report.unspent_total, 50);
+        assert_eq!(report.spendable_total, 50);
+        assert_eq!(report.immature_total, 0);
+    }
 }

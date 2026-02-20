@@ -89,3 +89,11 @@ Run window: `2026-02-13T16:10:10Z` -> `2026-02-13T17:09:00Z`
   - Command scope: `scripts/mutation-staged.sh stage2`
   - Result snapshot: `total=862`, `caught=690`, `missed=39`, `timeout=0`, `unviable=133`.
   - Remaining misses are concentrated in node runtime-network integration paths (`sync/relay/rpc/stratum`) and a few stream wrapper helpers.
+
+## Addendum (2026-02-20)
+
+- [x] Re-ran focused `rpc+wallet` mutation baseline after new vector/contract tests:
+  - Command scope: `MUTATION_PACKAGES='scam-rpc scam-wallet' scripts/mutation-baseline.sh`
+  - Result snapshot: `total=65`, `caught=52`, `missed=0`, `timeout=0`, `unviable=13`.
+- [x] Closed last focused wallet miss at coinbase maturity boundary:
+  - Added `rescan` boundary test: `coinbase_becomes_spendable_at_exact_maturity_boundary`.
