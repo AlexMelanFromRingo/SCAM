@@ -255,6 +255,8 @@ Automated local E2E transfer/mining/sync check (wallet-01 -> wallet-02 across no
 scripts/local-e2e-flow.sh
 ```
 
+Expected result: `[e2e] success` plus JSON payload with `txid` and non-zero `receiver_spendable`, without enabling periodic `sync-book` loops.
+
 ### 6.1 Bootstrap node runtime
 
 ```bash
