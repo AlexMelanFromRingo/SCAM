@@ -1,6 +1,8 @@
 const apiBaseInput = document.getElementById("apiBase");
 const saveEndpointBtn = document.getElementById("saveEndpoint");
 const refreshAllBtn = document.getElementById("refreshAll");
+const liveStatus = document.getElementById("liveStatus");
+const liveMode = document.getElementById("liveMode");
 
 const statNetwork = document.getElementById("statNetwork");
 const statHeight = document.getElementById("statHeight");
@@ -21,8 +23,13 @@ const txLookupOut = document.getElementById("txLookupOut");
 const mempoolOut = document.getElementById("mempoolOut");
 const walletOut = document.getElementById("walletOut");
 
+const DASHBOARD_POLL_INTERVAL_MS = 5000;
+
 const state = {
   apiBase: localStorage.getItem("scam.console.apiBase") || window.location.origin,
+  events: null,
+  lastTipHeight: null,
+  lastMempoolCount: null,
 };
 
 function parseNumber(value, fallback = 0) {
@@ -48,6 +55,20 @@ function setResult(el, data, isError = false) {
 function endpoint(path) {
   const base = state.apiBase.replace(/\/$/, "");
   return `${base}${path}`;
+}
+
+function setLiveStatusBadge(mode, text) {
+  if (!liveStatus) return;
+  liveStatus.classList.remove("connected", "reconnecting", "disconnected");
+  liveStatus.classList.add(mode);
+  liveStatus.textContent = text;
+}
+
+function closeLiveStream() {
+  if (state.events) {
+    state.events.close();
+    state.events = null;
+  }
 }
 
 async function request(path, { method = "GET", body } = {}) {
@@ -79,10 +100,10 @@ async function request(path, { method = "GET", body } = {}) {
 
 async function loadStatus() {
   const status = await request("/status");
-  statNetwork.textContent = status.network_id || "-";
+  statNetwork.textContent = status.network_id ?? "-";
   statHeight.textContent = `${status.tip_height ?? "-"}`;
   statUtxo.textContent = `${status.utxo_count ?? "-"}`;
-  statWork.textContent = status.cumulative_work || "-";
+  statWork.textContent = status.cumulative_work ?? "-";
   return status;
 }
 
@@ -131,6 +152,13 @@ async function loadLatestBlocks(tipHeight, count = 12) {
 async function loadMempool() {
   try {
     const mempool = await request("/mempool");
+    const countFromField = Number(mempool.tx_count);
+    const countFromTxids = Array.isArray(mempool.txids) ? mempool.txids.length : null;
+    if (Number.isFinite(countFromField)) {
+      state.lastMempoolCount = countFromField;
+    } else if (Number.isFinite(countFromTxids)) {
+      state.lastMempoolCount = countFromTxids;
+    }
     setResult(mempoolOut, mempool);
   } catch (error) {
     setResult(mempoolOut, `Cannot load mempool snapshot: ${error.message}`, true);
@@ -140,12 +168,72 @@ async function loadMempool() {
 async function refreshDashboard() {
   try {
     const status = await loadStatus();
+    state.lastTipHeight = Number.isFinite(Number(status.tip_height))
+      ? Number(status.tip_height)
+      : state.lastTipHeight;
     await Promise.all([loadLatestBlocks(status.tip_height), loadMempool()]);
   } catch (error) {
     setResult(blockLookupOut, `Dashboard refresh failed: ${error.message}`, true);
     setResult(txLookupOut, `Dashboard refresh failed: ${error.message}`, true);
     setResult(mempoolOut, `Dashboard refresh failed: ${error.message}`, true);
   }
+}
+
+function applyLiveSnapshot(snapshot) {
+  if (!snapshot || typeof snapshot !== "object") return;
+  statNetwork.textContent = snapshot.network_id ?? "-";
+  statHeight.textContent = `${snapshot.tip_height ?? "-"}`;
+  statUtxo.textContent = `${snapshot.utxo_count ?? "-"}`;
+  statWork.textContent = snapshot.cumulative_work ?? "-";
+
+  const tipHeight = Number(snapshot.tip_height);
+  if (Number.isFinite(tipHeight) && tipHeight !== state.lastTipHeight) {
+    state.lastTipHeight = tipHeight;
+    loadLatestBlocks(tipHeight).catch((error) => {
+      setResult(blockLookupOut, `Live latest blocks failed: ${error.message}`, true);
+    });
+  }
+
+  const mempoolCount = Number(snapshot.mempool_tx_count);
+  if (Number.isFinite(mempoolCount) && mempoolCount !== state.lastMempoolCount) {
+    state.lastMempoolCount = mempoolCount;
+    loadMempool().catch((error) => {
+      setResult(mempoolOut, `Live mempool refresh failed: ${error.message}`, true);
+    });
+  }
+}
+
+function startLiveStream() {
+  closeLiveStream();
+  if (typeof EventSource === "undefined") {
+    setLiveStatusBadge("disconnected", "Live stream: unsupported");
+    if (liveMode) liveMode.textContent = "Fallback polling: 5s";
+    return;
+  }
+
+  const events = new EventSource(endpoint("/events"));
+  state.events = events;
+  setLiveStatusBadge("reconnecting", "Live stream: connecting");
+  if (liveMode) liveMode.textContent = "SSE push + polling fallback";
+
+  const onSnapshot = (event) => {
+    try {
+      const snapshot = JSON.parse(event.data);
+      applyLiveSnapshot(snapshot);
+    } catch (error) {
+      setResult(mempoolOut, `Live snapshot parse failed: ${error.message}`, true);
+    }
+  };
+
+  events.addEventListener("snapshot", onSnapshot);
+  events.onmessage = onSnapshot;
+  events.onopen = () => {
+    setLiveStatusBadge("connected", "Live stream: connected");
+  };
+  events.onerror = () => {
+    if (state.events !== events) return;
+    setLiveStatusBadge("reconnecting", "Live stream: reconnecting");
+  };
 }
 
 function serializeForm(form) {
@@ -313,6 +401,7 @@ function initEndpointControls() {
     state.apiBase = apiBaseInput.value.trim().replace(/\/$/, "");
     localStorage.setItem("scam.console.apiBase", state.apiBase);
     await refreshDashboard();
+    startLiveStream();
   });
 
   refreshAllBtn.addEventListener("click", async () => {
@@ -326,11 +415,13 @@ async function bootstrap() {
   initExplorerActions();
   initWalletActions();
   await refreshDashboard();
+  startLiveStream();
   setInterval(() => {
     refreshDashboard().catch((error) => {
       setResult(mempoolOut, `Auto refresh failed: ${error.message}`, true);
     });
-  }, 5000);
+  }, DASHBOARD_POLL_INTERVAL_MS);
+  window.addEventListener("beforeunload", () => closeLiveStream());
 }
 
 bootstrap();

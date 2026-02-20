@@ -7538,6 +7538,18 @@ struct MempoolSummaryRpcResponse {
     txids: Vec<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct RpcEventSnapshot {
+    network_id: String,
+    tip_height: u64,
+    tip_hash: String,
+    utxo_count: usize,
+    cumulative_work: String,
+    mempool_available: bool,
+    mempool_tx_count: usize,
+    unix_sec: u64,
+}
+
 fn wallet_address_response(
     cfg: &ChainConfig,
     account: u32,
@@ -7609,6 +7621,32 @@ fn wallet_balance_response(
     }
 }
 
+fn mempool_tx_count_from_db(mempool_db_path: &Path) -> Result<(bool, usize), NodeError> {
+    if !mempool_db_path.exists() {
+        return Ok((false, 0));
+    }
+    let snapshot = load_mempool_db(mempool_db_path)?;
+    Ok((true, snapshot.entries.len()))
+}
+
+fn build_rpc_event_snapshot(
+    cfg: &ChainConfig,
+    runtime: &ChainRuntime,
+    mempool_db_path: &Path,
+) -> Result<RpcEventSnapshot, NodeError> {
+    let (mempool_available, mempool_tx_count) = mempool_tx_count_from_db(mempool_db_path)?;
+    Ok(RpcEventSnapshot {
+        network_id: cfg.network_id.clone(),
+        tip_height: runtime.tip_height(),
+        tip_hash: runtime.tip_hash().to_hex(),
+        utxo_count: runtime.utxo_len(),
+        cumulative_work: runtime.cumulative_work().to_str_radix(10),
+        mempool_available,
+        mempool_tx_count,
+        unix_sec: current_unix_sec()?,
+    })
+}
+
 fn write_http_response<W: Write>(
     stream: &mut W,
     status_line: &str,
@@ -7642,6 +7680,38 @@ fn write_http_json_response<W: Write>(
         "application/json; charset=utf-8",
         body.as_bytes(),
     )
+}
+
+fn write_http_sse_headers<W: Write>(stream: &mut W) -> Result<(), NodeError> {
+    let headers = concat!(
+        "HTTP/1.1 200 OK\r\n",
+        "Content-Type: text/event-stream; charset=utf-8\r\n",
+        "Cache-Control: no-cache\r\n",
+        "Connection: keep-alive\r\n",
+        "\r\n"
+    );
+    stream
+        .write_all(headers.as_bytes())
+        .map_err(|e| NodeError::Runtime(format!("http write failed: {e}")))?;
+    stream
+        .flush()
+        .map_err(|e| NodeError::Runtime(format!("http flush failed: {e}")))?;
+    Ok(())
+}
+
+fn write_http_sse_event<W: Write>(
+    stream: &mut W,
+    event_name: &str,
+    payload_json: &str,
+) -> Result<(), NodeError> {
+    let frame = format!("event: {event_name}\ndata: {payload_json}\n\n");
+    stream
+        .write_all(frame.as_bytes())
+        .map_err(|e| NodeError::Runtime(format!("http write failed: {e}")))?;
+    stream
+        .flush()
+        .map_err(|e| NodeError::Runtime(format!("http flush failed: {e}")))?;
+    Ok(())
 }
 
 fn find_http_header_terminator(buffer: &[u8]) -> Option<usize> {
@@ -8046,6 +8116,73 @@ fn should_reply_bad_http_request(err: &NodeError) -> bool {
     }
 }
 
+fn rpc_sse_write_error_is_closed_like(err: &NodeError) -> bool {
+    match err {
+        NodeError::Runtime(msg) => {
+            let lowered = msg.to_ascii_lowercase();
+            lowered.contains("broken pipe")
+                || lowered.contains("connection reset")
+                || lowered.contains("connection aborted")
+                || lowered.contains("not connected")
+        }
+        _ => false,
+    }
+}
+
+fn rpc_events_worker_should_continue(stop_flag: &AtomicBool) -> bool {
+    !stop_flag.load(Ordering::Relaxed)
+}
+
+fn reap_finished_rpc_event_workers(handles: &mut Vec<thread::JoinHandle<()>>) {
+    let mut idx = 0usize;
+    while idx < handles.len() {
+        if handles[idx].is_finished() {
+            let handle = handles.swap_remove(idx);
+            let _ = handle.join();
+            continue;
+        }
+        idx += 1;
+    }
+}
+
+fn run_rpc_events_worker(
+    mut stream: TcpStream,
+    cfg: ChainConfig,
+    runtime_db_path: PathBuf,
+    mempool_db_path: PathBuf,
+    stop_flag: Arc<AtomicBool>,
+    interval: Duration,
+) -> Result<(), NodeError> {
+    let (mut runtime, _) = load_runtime_from_db_or_genesis(&cfg, &runtime_db_path)?;
+    let mut runtime_db_seen_mtime = runtime_db_mtime(&runtime_db_path);
+    if let Err(err) = write_http_sse_headers(&mut stream) {
+        if rpc_sse_write_error_is_closed_like(&err) {
+            return Ok(());
+        }
+        return Err(err);
+    }
+
+    while rpc_events_worker_should_continue(&stop_flag) {
+        refresh_runtime_from_db_if_changed(
+            &cfg,
+            &mut runtime,
+            &runtime_db_path,
+            &mut runtime_db_seen_mtime,
+        )?;
+        let snapshot = build_rpc_event_snapshot(&cfg, &runtime, &mempool_db_path)?;
+        let payload = serde_json::to_string(&snapshot)
+            .map_err(|e| NodeError::Runtime(format!("events serialization failed: {e}")))?;
+        if let Err(err) = write_http_sse_event(&mut stream, "snapshot", &payload) {
+            if rpc_sse_write_error_is_closed_like(&err) {
+                return Ok(());
+            }
+            return Err(err);
+        }
+        thread::sleep(interval);
+    }
+    Ok(())
+}
+
 fn run_rpc_serve(args: RpcServeArgs) -> Result<(), NodeError> {
     let RpcServeArgs {
         network,
@@ -8084,7 +8221,7 @@ fn run_rpc_serve(args: RpcServeArgs) -> Result<(), NodeError> {
         runtime.tip_hash()
     );
     println!(
-        "Endpoints: GET /health, /status, /block/<height>, /tx/<height>/<index>, /mempool; POST /wallet/new, /wallet/address, /wallet/decode, /wallet/balance, /wallet/balance-by-address, /wallet/send-preview, /wallet/send, /tx/submit, /wallet/qr"
+        "Endpoints: GET /health, /status, /block/<height>, /tx/<height>/<index>, /mempool, /events; POST /wallet/new, /wallet/address, /wallet/decode, /wallet/balance, /wallet/balance-by-address, /wallet/send-preview, /wallet/send, /tx/submit, /wallet/qr"
     );
     println!("UI assets directory: {}", ui_dir.display());
     println!("Mempool DB source: {}", mempool_db_path.display());
@@ -8095,8 +8232,13 @@ fn run_rpc_serve(args: RpcServeArgs) -> Result<(), NodeError> {
         println!("Max requests before exit: {}", max_requests);
     }
 
+    let events_stop_flag = Arc::new(AtomicBool::new(false));
+    let mut events_workers = Vec::<thread::JoinHandle<()>>::new();
+    let events_interval = Duration::from_secs(1);
+
     let mut served = 0u32;
     for incoming in listener.incoming() {
+        reap_finished_rpc_event_workers(&mut events_workers);
         let mut stream =
             incoming.map_err(|e| NodeError::Runtime(format!("rpc accept failed: {e}")))?;
         configure_stream_timeouts_with_ops(
@@ -8120,6 +8262,29 @@ fn run_rpc_serve(args: RpcServeArgs) -> Result<(), NodeError> {
 
         let method = request.method.as_str();
         let path = request.path.as_str();
+        if rpc_exact_route_matches(method, path, "GET", "/events") {
+            let cfg_clone = cfg.clone();
+            let runtime_db_path_clone = runtime_db_path.clone();
+            let mempool_db_path_clone = mempool_db_path.clone();
+            let stop_clone = events_stop_flag.clone();
+            events_workers.push(thread::spawn(move || {
+                if let Err(err) = run_rpc_events_worker(
+                    stream,
+                    cfg_clone,
+                    runtime_db_path_clone,
+                    mempool_db_path_clone,
+                    stop_clone,
+                    events_interval,
+                ) {
+                    eprintln!("warning: rpc events stream failed: {err}");
+                }
+            }));
+            served = served.saturating_add(1);
+            if max_requests_reached(max_requests, served) {
+                break;
+            }
+            continue;
+        }
         refresh_runtime_from_db_if_changed(
             &cfg,
             &mut runtime,
@@ -8796,6 +8961,10 @@ fn run_rpc_serve(args: RpcServeArgs) -> Result<(), NodeError> {
             break;
         }
     }
+    events_stop_flag.store(true, Ordering::Relaxed);
+    for handle in events_workers {
+        let _ = handle.join();
+    }
     Ok(())
 }
 
@@ -8862,8 +9031,7 @@ mod tests {
     use std::net::{Shutdown, TcpListener, TcpStream};
     use std::path::PathBuf;
     use std::thread;
-    use std::time::Duration;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use scam_chain::ChainRuntime;
     use scam_core::{ChainConfig, Hash256, OutPoint, Target, Transaction, TxIn, TxOut};
@@ -8874,7 +9042,8 @@ mod tests {
         WireMessage, client_handshake, read_message, send_message, server_handshake,
     };
     use scam_storage::{
-        PeerAddressBook, PeerAddressRecord, load_chain_archive_db, load_peer_book_db,
+        MempoolSnapshot, PeerAddressBook, PeerAddressRecord, load_chain_archive_db,
+        load_peer_book_db, save_mempool_db,
     };
     use scam_stratum::{IdentityTranslator, Sv2Message, Translator, read_frame, write_frame};
     use scam_wallet::{WalletMnemonic, derive_wallet_key};
@@ -9018,6 +9187,51 @@ mod tests {
             body.len()
         );
         send_http_request(addr, &request)
+    }
+
+    fn send_http_request_until(
+        addr: &str,
+        request: &str,
+        expected_fragment: &str,
+        timeout: Duration,
+    ) -> String {
+        let mut stream = connect_with_retry(addr);
+        stream
+            .set_read_timeout(Some(Duration::from_millis(250)))
+            .expect("set read timeout");
+        stream
+            .set_write_timeout(Some(Duration::from_secs(10)))
+            .expect("set write timeout");
+        stream
+            .write_all(request.as_bytes())
+            .expect("write request bytes");
+        stream
+            .shutdown(Shutdown::Write)
+            .expect("shutdown write half");
+        let start = Instant::now();
+        let mut response = String::new();
+        let mut buffer = [0u8; 1024];
+        while start.elapsed() < timeout {
+            match stream.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => {
+                    response.push_str(&String::from_utf8_lossy(&buffer[..read]));
+                    if response.contains(expected_fragment) {
+                        break;
+                    }
+                }
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    continue;
+                }
+                Err(err) => panic!("read response: {err}"),
+            }
+        }
+        response
     }
 
     fn spawn_sync_peer_server_from_runtime(
@@ -9301,6 +9515,19 @@ mod tests {
         assert!(super::should_reply_bad_http_request(
             &super::NodeError::Runtime("malformed http request".to_owned())
         ));
+        assert!(super::rpc_sse_write_error_is_closed_like(
+            &super::NodeError::Runtime("http write failed: Broken pipe".to_owned())
+        ));
+        assert!(super::rpc_sse_write_error_is_closed_like(
+            &super::NodeError::Runtime("http flush failed: Connection reset by peer".to_owned())
+        ));
+        assert!(!super::rpc_sse_write_error_is_closed_like(
+            &super::NodeError::Runtime("http write failed: permission denied".to_owned())
+        ));
+        let events_stop = std::sync::atomic::AtomicBool::new(false);
+        assert!(super::rpc_events_worker_should_continue(&events_stop));
+        events_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(!super::rpc_events_worker_should_continue(&events_stop));
 
         assert!(super::share_target_in_bounds(
             Target::MAX,
@@ -11289,6 +11516,38 @@ mod tests {
     }
 
     #[test]
+    fn rpc_event_snapshot_reports_runtime_and_mempool_state() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let work_dir = temp_dir("test-rpc-event-snapshot");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+
+        let missing_mempool = work_dir.join("missing-mempool.redb");
+        let missing = super::build_rpc_event_snapshot(&cfg, &runtime, &missing_mempool)
+            .expect("snapshot without mempool db");
+        assert_eq!(missing.network_id, cfg.network_id);
+        assert_eq!(missing.tip_height, runtime.tip_height());
+        assert_eq!(missing.tip_hash, runtime.tip_hash().to_hex());
+        assert!(!missing.mempool_available);
+        assert_eq!(missing.mempool_tx_count, 0);
+        assert!(missing.unix_sec > 0);
+
+        let mempool_db = work_dir.join("mempool.redb");
+        let snapshot = MempoolSnapshot {
+            network_id: cfg.network_id.clone(),
+            entries: Vec::new(),
+        };
+        save_mempool_db(&mempool_db, &snapshot).expect("persist empty mempool");
+        let present = super::build_rpc_event_snapshot(&cfg, &runtime, &mempool_db)
+            .expect("snapshot with mempool db");
+        assert!(present.mempool_available);
+        assert_eq!(present.mempool_tx_count, 0);
+
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
     fn static_asset_helpers_handle_unknown_suffix_and_traversal() {
         assert_eq!(
             super::guess_content_type(std::path::Path::new("index.html")),
@@ -11499,6 +11758,56 @@ mod tests {
         assert!(wallet_send.starts_with("HTTP/1.1 400 Bad Request"));
         let wallet_qr = send_http_json_post(&addr, "/wallet/qr", "{\"address\":\"scam\"}");
         assert!(wallet_qr.starts_with("HTTP/1.1 200 OK"));
+
+        server.join().expect("server join");
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
+    fn run_rpc_serve_streams_event_snapshots() {
+        let _net_guard = network_test_guard();
+        let Some(addr) = allocate_local_addr() else {
+            return;
+        };
+        let work_dir = temp_dir("test-rpc-serve-events");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let config_path = work_dir.join("devnet.toml");
+        fs::write(&config_path, include_str!("../../../config/devnet.toml")).expect("write cfg");
+        let runtime_db = work_dir.join("runtime.redb");
+        let ui_dir = work_dir.join("ui");
+        fs::create_dir_all(&ui_dir).expect("mkdir ui");
+        fs::write(ui_dir.join("index.html"), "<html>ui</html>").expect("write ui");
+
+        let server_addr = addr.clone();
+        let server = thread::spawn(move || {
+            run_rpc_serve(RpcServeArgs {
+                network: Network::Devnet,
+                config: Some(config_path),
+                runtime_db: Some(runtime_db),
+                bind: server_addr,
+                ui_dir,
+                relay_telemetry: None,
+                mine_blocks: 0,
+                interval_sec: 120,
+                max_nonce: 500_000,
+                max_requests: 2,
+            })
+            .expect("rpc serve");
+        });
+
+        let events = send_http_request_until(
+            &addr,
+            "GET /events HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "event: snapshot",
+            Duration::from_secs(5),
+        );
+        assert!(events.starts_with("HTTP/1.1 200 OK"));
+        assert!(events.contains("text/event-stream"));
+        assert!(events.contains("event: snapshot"));
+        assert!(events.contains("data: {\"network_id\":\"devnet\""));
+
+        let health = send_http_request(&addr, "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        assert!(health.starts_with("HTTP/1.1 200 OK"));
 
         server.join().expect("server join");
         let _ = fs::remove_dir_all(work_dir);

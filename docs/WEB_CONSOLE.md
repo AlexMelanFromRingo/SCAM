@@ -5,6 +5,7 @@ SCAM includes a browser UI served directly by `scam-node rpc-serve`.
 The UI is in `web/` and provides:
 - explorer view (status, latest blocks, block lookup, tx lookup),
 - mempool telemetry snapshot view (from relay telemetry JSONL),
+- live updates via SSE (`GET /events`) with polling fallback,
 - wallet flows over RPC (`new`, `address`, `balance`, `send-preview`, `send`, `decode`, `qr`).
 
 ## 1) Start Node Runtime
@@ -55,6 +56,7 @@ GET:
 - `/block/<height>`
 - `/tx/<height>/<index>`
 - `/mempool`
+- `/events` (SSE stream: periodic `snapshot` events)
 
 POST:
 - `/wallet/new`

@@ -30,6 +30,10 @@
           <button id="saveEndpoint" type="button">Apply</button>
           <button id="refreshAll" type="button">Refresh</button>
         </div>
+        <div class="endpoint-meta">
+          <span id="liveStatus" class="tag live disconnected">Live stream: disconnected</span>
+          <span id="liveMode" class="hint-inline">Fallback polling: 5s</span>
+        </div>
         <p class="hint">
           Tip: run <code>scam-node rpc-serve --network devnet --runtime-db data/devnet.runtime.redb</code>
           and open this page on the same host.

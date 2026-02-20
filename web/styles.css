@@ -104,10 +104,41 @@ body {
   font-size: 0.78rem;
 }
 
+.tag.live.connected {
+  color: #065f46;
+  border-color: rgba(6, 95, 70, 0.28);
+  background: rgba(167, 243, 208, 0.5);
+}
+
+.tag.live.reconnecting {
+  color: #92400e;
+  border-color: rgba(146, 64, 14, 0.24);
+  background: rgba(253, 230, 138, 0.45);
+}
+
+.tag.live.disconnected {
+  color: #991b1b;
+  border-color: rgba(153, 27, 27, 0.2);
+  background: rgba(254, 202, 202, 0.44);
+}
+
 .endpoint-row {
   margin-top: 0.65rem;
   display: flex;
   gap: 0.5rem;
+}
+
+.endpoint-meta {
+  margin-top: 0.55rem;
+  display: flex;
+  gap: 0.55rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.hint-inline {
+  color: var(--muted);
+  font-size: 0.82rem;
 }
 
 input,
