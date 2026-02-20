@@ -5106,16 +5106,17 @@ impl StratumTemplateProvider for RuntimeTemplateProvider {
         reward_key_hash20: [u8; 20],
         coinbase_label: &str,
     ) -> Result<StratumTemplateWork, NodeError> {
+        let prev_block = runtime.tip_hash();
         let target = runtime.expected_target_for_next_block()?;
         let mempool = load_mempool_from_db_or_empty(cfg, mempool_db_path)?;
         let params = MempoolTemplateParams {
             version: 1,
-            prev_block: runtime.tip_hash(),
+            prev_block,
             timestamp: next_stratum_job_timestamp(runtime, cfg),
             target,
             block_subsidy: cfg.block_subsidy,
             miner_key_hash20: reward_key_hash20,
-            coinbase_tag: coinbase_label.to_owned(),
+            coinbase_tag: stratum_coinbase_tag(coinbase_label, prev_block),
             max_txs: max_template_txs.max(1),
         };
         let (template_block, _summary) = build_template_from_mempool(&params, &mempool)
@@ -5762,6 +5763,11 @@ fn stratum_coinbase_label(channel_id: u32, user_hint: &str) -> String {
     format!("stratum-ch{channel_id}-{suffix}")
 }
 
+fn stratum_coinbase_tag(base_label: &str, prev_hash: Hash256) -> String {
+    let prev = prev_hash.to_hex();
+    format!("{base_label}-{}", &prev[..16])
+}
+
 fn should_send_open_standard_channel(open_sent: bool) -> bool {
     !open_sent
 }
@@ -6067,8 +6073,12 @@ fn run_sv2_template_provider(args: Sv2TemplateProviderArgs) -> Result<(), NodeEr
             let request: TemplateProviderRequest = read_role_request(&mut stream)?;
             let reward_key_hash20 =
                 decode_fixed_hex::<20>("reward_key_hash20_hex", &request.reward_key_hash20_hex)?;
+            let prev_hash = Hash256(decode_fixed_hex::<32>(
+                "prev_hash_hex",
+                &request.prev_hash_hex,
+            )?);
             let coinbase = build_coinbase_tx(
-                request.coinbase_label.clone(),
+                stratum_coinbase_tag(&request.coinbase_label, prev_hash),
                 request.block_subsidy,
                 reward_key_hash20,
             );
@@ -9267,6 +9277,10 @@ mod tests {
             super::stratum_coinbase_label(7, "sd1q-User_01"),
             "stratum-ch7-sd1qUser01"
         );
+        let tag_a = super::stratum_coinbase_tag("stratum-ch7-sd1qUser01", Hash256([0x11; 32]));
+        let tag_b = super::stratum_coinbase_tag("stratum-ch7-sd1qUser01", Hash256([0x22; 32]));
+        assert_ne!(tag_a, tag_b);
+        assert!(tag_a.starts_with("stratum-ch7-sd1qUser01-"));
         assert!(super::should_send_open_standard_channel(false));
         assert!(!super::should_send_open_standard_channel(true));
         assert!(!super::should_emit_miner_keepalive(9));

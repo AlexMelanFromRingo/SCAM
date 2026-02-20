@@ -189,6 +189,12 @@ Enable periodic sync loop fallback:
 RUN_SYNC_LOOP=true scripts/local-test-lab.sh up
 ```
 
+Run a full automated E2E flow (mature funds -> `/wallet/send` -> mempool -> mined block -> receiver balance on peer node):
+
+```bash
+scripts/local-e2e-flow.sh
+```
+
 ## 6) Create Wallet (Secure Recommended)
 
 Create encrypted vault:

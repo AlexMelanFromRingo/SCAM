@@ -249,6 +249,12 @@ SCAM_NODE_BIN=./scam-node BUILD=false scripts/local-test-lab.sh up
 
 By default this lab uses live relay outbound auto-connect (`RELAY_OUTBOUND_CONNECT=true`) and does not run periodic `sync-book` loops (`RUN_SYNC_LOOP=false`). Miner payout defaults to `wallet-01` unless you override `MINER_USER`.
 
+Automated local E2E transfer/mining/sync check (wallet-01 -> wallet-02 across node-0/node-1):
+
+```bash
+scripts/local-e2e-flow.sh
+```
+
 ### 6.1 Bootstrap node runtime
 
 ```bash
