@@ -123,4 +123,8 @@ Run window: `2026-02-13T16:10:10Z` -> `2026-02-13T17:09:00Z`
   - `run_rpc_serve_streams_event_snapshots`.
 - [x] Added relay restart/rebroadcast regression:
   - `relay_restart_reloads_tip_and_rebroadcasts_unconfirmed_mempool_tx`.
+- [x] Added relay reorg reinsertion regression:
+  - `relay_reorg_reinserts_disconnected_block_transactions_into_mempool`.
+- [x] Added relay-to-relay realtime propagation latency regression:
+  - `relay_realtime_tx_propagation_latency_between_relays_is_bounded`.
 - [ ] Stage 2/3 mutation reruns are still pending on top of this hardening pass.

@@ -50,8 +50,8 @@
 ## Required test additions (minimum)
 - [x] `wallet/send` happy path integration test.
 - [x] `wallet/send` rejects invalid hrp/negative amount/insufficient funds/double spend.
-- [ ] Reorg case: pending tx survives/reenters mempool when block disconnected.
-- [ ] Realtime propagation latency test between two relays.
+- [x] Reorg case: pending tx survives/reenters mempool when block disconnected.
+- [x] Realtime propagation latency test between two relays.
 - [x] UI events endpoint contract tests (schema + heartbeat).
 
 ## Definition of done for “testnet-ready”

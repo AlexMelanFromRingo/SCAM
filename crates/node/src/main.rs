@@ -3486,15 +3486,77 @@ fn relay_store_pending_orphan_block(state: &mut RelayServerState, block: scam_co
     state.pending_block_orphan_order.push_back(block_hash);
 }
 
-fn relay_finalize_applied_block(state: &mut RelayServerState, block: &scam_core::Block) {
-    let txids = block
-        .transactions
+fn relay_apply_main_chain_transition(
+    state: &mut RelayServerState,
+    chain_before: &[Hash256],
+    chain_after: &[Hash256],
+    now_unix_sec: u64,
+) {
+    let before_set = chain_before.iter().copied().collect::<HashSet<_>>();
+    let after_set = chain_after.iter().copied().collect::<HashSet<_>>();
+
+    let connected_hashes = chain_after
         .iter()
-        .map(|tx| tx.txid())
+        .copied()
+        .filter(|hash| !before_set.contains(hash))
         .collect::<Vec<_>>();
-    let _ = state.relay.mempool.remove_confirmed_txids(&txids);
-    let _ = state.relay.gossip.announce_block(block.clone());
-    relay_forget_pending_orphan_block(state, block.header.block_hash());
+    let disconnected_hashes = chain_before
+        .iter()
+        .copied()
+        .filter(|hash| !after_set.contains(hash))
+        .collect::<Vec<_>>();
+
+    let mut connected_txids = HashSet::<Hash256>::new();
+    let mut connected_blocks = Vec::<scam_core::Block>::new();
+    for hash in &connected_hashes {
+        if let Some(block) = state.runtime.block_by_hash(hash).cloned() {
+            for tx in block.transactions.iter().skip(1) {
+                connected_txids.insert(tx.txid());
+            }
+            connected_blocks.push(block);
+        }
+    }
+
+    if !connected_txids.is_empty() {
+        let confirmed = connected_txids.iter().copied().collect::<Vec<_>>();
+        let _ = state.relay.mempool.remove_confirmed_txids(&confirmed);
+    }
+
+    for block in connected_blocks {
+        let _ = state.relay.gossip.announce_block(block.clone());
+        relay_forget_pending_orphan_block(state, block.header.block_hash());
+    }
+
+    let mut resurrect_candidates = Vec::<Transaction>::new();
+    for hash in disconnected_hashes {
+        let Some(block) = state.runtime.block_by_hash(&hash) else {
+            continue;
+        };
+        for tx in block.transactions.iter().skip(1) {
+            if !connected_txids.contains(&tx.txid()) {
+                resurrect_candidates.push(tx.clone());
+            }
+        }
+    }
+
+    for tx in resurrect_candidates {
+        let txid = tx.txid();
+        if state.relay.mempool.contains(&txid) {
+            continue;
+        }
+        let fee_hint = relay_fee_hint(&tx);
+
+        let missing = detect_missing_outpoints(&state.runtime, &state.relay.mempool, &tx);
+        if missing.is_empty() {
+            let _ = state.relay.mempool.insert_with_fee(tx, fee_hint);
+            continue;
+        }
+
+        let _ = state
+            .relay
+            .orphan_pool
+            .insert(tx, fee_hint, missing, now_unix_sec);
+    }
 }
 
 fn relay_should_request_parent_sync(
@@ -3536,7 +3598,7 @@ fn relay_recovery_messages_for_unknown_parent(
     ]
 }
 
-fn relay_try_apply_pending_orphans(state: &mut RelayServerState) {
+fn relay_try_apply_pending_orphans(state: &mut RelayServerState, now_unix_sec: u64) {
     loop {
         let mut progressed = false;
         let queued = state
@@ -3553,9 +3615,17 @@ fn relay_try_apply_pending_orphans(state: &mut RelayServerState) {
             if state.runtime.block_by_hash(&parent).is_none() {
                 continue;
             }
+            let chain_before = state.runtime.block_hashes().to_vec();
             match state.runtime.submit_block(orphan_block.clone()) {
                 Ok(_) => {
-                    relay_finalize_applied_block(state, &orphan_block);
+                    let chain_after = state.runtime.block_hashes().to_vec();
+                    relay_apply_main_chain_transition(
+                        state,
+                        &chain_before,
+                        &chain_after,
+                        now_unix_sec,
+                    );
+                    relay_forget_pending_orphan_block(state, orphan_hash);
                     state.last_parent_sync_request_sec.remove(&parent);
                     progressed = true;
                 }
@@ -3803,22 +3873,32 @@ fn process_relay_wire_message(
                 Err(err) => Err(err),
             }
         }
-        WireMessage::Block { block } => match state.runtime.submit_block(block.clone()) {
-            Ok(_) => {
-                relay_finalize_applied_block(state, &block);
-                relay_try_apply_pending_orphans(state);
-                Ok(Vec::new())
+        WireMessage::Block { block } => {
+            let chain_before = state.runtime.block_hashes().to_vec();
+            match state.runtime.submit_block(block.clone()) {
+                Ok(_) => {
+                    let chain_after = state.runtime.block_hashes().to_vec();
+                    relay_apply_main_chain_transition(
+                        state,
+                        &chain_before,
+                        &chain_after,
+                        now_unix_sec,
+                    );
+                    relay_forget_pending_orphan_block(state, block.header.block_hash());
+                    relay_try_apply_pending_orphans(state, now_unix_sec);
+                    Ok(Vec::new())
+                }
+                Err(ChainError::UnknownParent { parent, .. }) => {
+                    relay_store_pending_orphan_block(state, block);
+                    Ok(relay_recovery_messages_for_unknown_parent(
+                        state,
+                        parent,
+                        now_unix_sec,
+                    ))
+                }
+                Err(err) => Err(NodeError::Chain(err)),
             }
-            Err(ChainError::UnknownParent { parent, .. }) => {
-                relay_store_pending_orphan_block(state, block);
-                Ok(relay_recovery_messages_for_unknown_parent(
-                    state,
-                    parent,
-                    now_unix_sec,
-                ))
-            }
-            Err(err) => Err(NodeError::Chain(err)),
-        },
+        }
         WireMessage::NotFound { .. } => Ok(Vec::new()),
     }
 }
@@ -14914,6 +14994,353 @@ mod tests {
         assert!(post_parent.is_empty());
         assert_eq!(state.runtime.tip_hash(), child_hash);
         assert!(state.pending_block_orphans.is_empty());
+    }
+
+    #[test]
+    fn relay_reorg_reinserts_disconnected_block_transactions_into_mempool() {
+        let mut cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        cfg.coinbase_maturity = 1;
+        cfg.validate().expect("config validate");
+
+        let mnemonic = WalletMnemonic::parse(SOAK_FLOW_MNEMONIC).expect("mnemonic");
+        let seed = mnemonic.to_seed("");
+        let sender_key = derive_wallet_key(&seed, 0, 0).expect("sender key");
+        let recipient_key = derive_wallet_key(&seed, 0, 1).expect("recipient key");
+        let sender_key_hash20 = scam_core::hash160_blake3(&sender_key.pubkey_compressed());
+        let recipient_key_hash20 = scam_core::hash160_blake3(&recipient_key.pubkey_compressed());
+
+        let mut main_runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        mine_blocks_on_runtime(
+            &mut main_runtime,
+            &super::MiningLoopParams {
+                count: 2,
+                interval_sec: cfg.target_block_time_sec,
+                max_nonce: 500_000,
+                subsidy: cfg.block_subsidy,
+                miner_key_hash: sender_key_hash20,
+                label_prefix: "relay-reorg-main",
+                print_each: false,
+            },
+        )
+        .expect("seed main chain");
+
+        let fee = 500u64;
+        let signed = build_signed_transfer_tx(
+            &main_runtime,
+            &cfg.network_id,
+            &sender_key,
+            recipient_key_hash20,
+            1_000_000,
+            fee,
+        )
+        .expect("build transfer tx");
+        let confirmed_txid = signed.tx.txid();
+
+        let mut tx_block_mempool =
+            Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool");
+        tx_block_mempool
+            .insert_with_fee(signed.tx, fee)
+            .expect("insert tx");
+        let template_params = super::MempoolTemplateParams {
+            version: 1,
+            prev_block: main_runtime.tip_hash(),
+            timestamp: main_runtime
+                .tip_header()
+                .timestamp
+                .saturating_add(cfg.target_block_time_sec),
+            target: main_runtime
+                .expected_target_for_next_block()
+                .expect("target"),
+            block_subsidy: cfg.block_subsidy,
+            miner_key_hash20: sender_key_hash20,
+            coinbase_tag: "relay-reorg-confirm".to_owned(),
+            max_txs: cfg.max_mempool_txs as usize,
+        };
+        let (template, summary) =
+            super::build_template_from_mempool(&template_params, &tx_block_mempool)
+                .expect("build template");
+        assert!(summary.included_txids.contains(&confirmed_txid));
+        let confirmed_block = mine_block(&template, 500_000).expect("mine tx block");
+        main_runtime
+            .apply_next_block(confirmed_block)
+            .expect("apply tx block");
+
+        let fork_from_height = 2u64;
+        let fork_from_hash = main_runtime
+            .block_hash_at_height(fork_from_height)
+            .expect("fork point");
+        let fork_header = main_runtime
+            .header_by_hash(&fork_from_hash)
+            .expect("fork header")
+            .clone();
+        let fork_target = fork_header.target;
+        let mut fork_prev = fork_from_hash;
+        let mut fork_timestamp = fork_header
+            .timestamp
+            .saturating_add(cfg.target_block_time_sec);
+        let mut fork_blocks = Vec::<scam_core::Block>::new();
+        for idx in 0..2u32 {
+            let template = BlockTemplate {
+                version: 1,
+                prev_block: fork_prev,
+                timestamp: fork_timestamp,
+                target: fork_target,
+                transactions: vec![build_coinbase_tx(
+                    format!("relay-reorg-fork-{idx}"),
+                    cfg.block_subsidy,
+                    sender_key_hash20,
+                )],
+            };
+            let block = mine_block(&template, 500_000).expect("mine fork block");
+            fork_prev = block.header.block_hash();
+            fork_timestamp = fork_timestamp.saturating_add(cfg.target_block_time_sec);
+            fork_blocks.push(block);
+        }
+
+        let runtime = ChainRuntime::from_ordered_blocks(
+            cfg.clone(),
+            main_runtime.main_chain_blocks().expect("main blocks"),
+        )
+        .expect("relay runtime");
+        let mut gossip = GossipEngine::with_limits_and_replacement(
+            64,
+            50,
+            ReplacementRateLimit {
+                window_sec: 60,
+                max_replacements: 5,
+                penalty: 10,
+            },
+        )
+        .expect("gossip");
+        gossip.connect_peer(77);
+        let relay = RelayAdmissionState {
+            mempool: Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip,
+        };
+        let mut state = RelayServerState::new(runtime, relay);
+
+        process_relay_wire_message(
+            &mut state,
+            77,
+            WireMessage::Block {
+                block: fork_blocks[0].clone(),
+            },
+            1_000,
+        )
+        .expect("store side branch");
+        assert!(
+            !state.relay.mempool.contains(&confirmed_txid),
+            "tx must remain confirmed on old tip until reorg happens"
+        );
+
+        process_relay_wire_message(
+            &mut state,
+            77,
+            WireMessage::Block {
+                block: fork_blocks[1].clone(),
+            },
+            1_001,
+        )
+        .expect("trigger reorg");
+
+        assert_eq!(
+            state.runtime.tip_hash(),
+            fork_blocks[1].header.block_hash(),
+            "fork tip must become active after heavier branch arrives"
+        );
+        assert!(
+            state.relay.mempool.contains(&confirmed_txid),
+            "tx from disconnected block must return to mempool after reorg"
+        );
+    }
+
+    #[test]
+    fn relay_realtime_tx_propagation_latency_between_relays_is_bounded() {
+        let _net_guard = network_test_guard();
+        let work_dir = temp_dir("test-relay-latency-between-nodes");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let config_path = work_dir.join("devnet.toml");
+        fs::write(&config_path, include_str!("../../../config/devnet.toml")).expect("write cfg");
+
+        let mut cfg = load_chain_config(&config_path).expect("load cfg");
+        cfg.coinbase_maturity = 1;
+        cfg.validate().expect("validate cfg");
+        fs::write(&config_path, toml::to_string(&cfg).expect("serialize cfg")).expect("write cfg");
+
+        let runtime_db_a = work_dir.join("runtime-a.redb");
+        let runtime_db_b = work_dir.join("runtime-b.redb");
+        let mempool_db_b = runtime_db_b.with_file_name("mempool.redb");
+
+        let mnemonic = WalletMnemonic::parse(SOAK_FLOW_MNEMONIC).expect("mnemonic");
+        let seed = mnemonic.to_seed("");
+        let sender_key = derive_wallet_key(&seed, 0, 0).expect("sender key");
+        let recipient_key = derive_wallet_key(&seed, 0, 1).expect("recipient key");
+        let sender_key_hash20 = scam_core::hash160_blake3(&sender_key.pubkey_compressed());
+        let recipient_key_hash20 = scam_core::hash160_blake3(&recipient_key.pubkey_compressed());
+
+        let mut runtime_a = ChainRuntime::from_config(cfg.clone()).expect("runtime A");
+        mine_blocks_on_runtime(
+            &mut runtime_a,
+            &super::MiningLoopParams {
+                count: 2,
+                interval_sec: cfg.target_block_time_sec,
+                max_nonce: 500_000,
+                subsidy: cfg.block_subsidy,
+                miner_key_hash: sender_key_hash20,
+                label_prefix: "relay-latency-a",
+                print_each: false,
+            },
+        )
+        .expect("seed runtime A");
+        persist_runtime_db(&runtime_a, &runtime_db_a).expect("persist A");
+
+        let runtime_b = ChainRuntime::from_ordered_blocks(
+            cfg.clone(),
+            runtime_a.main_chain_blocks().expect("runtime A blocks"),
+        )
+        .expect("runtime B");
+        persist_runtime_db(&runtime_b, &runtime_db_b).expect("persist B");
+
+        let peers_dir_a = work_dir.join("peers-a");
+        let peers_dir_b = work_dir.join("peers-b");
+        fs::create_dir_all(&peers_dir_a).expect("mkdir peers a");
+        fs::create_dir_all(&peers_dir_b).expect("mkdir peers b");
+
+        let Some(bind_a) = allocate_local_addr() else {
+            let _ = fs::remove_dir_all(work_dir);
+            return;
+        };
+        let Some(bind_b) = allocate_local_addr() else {
+            let _ = fs::remove_dir_all(work_dir);
+            return;
+        };
+
+        run_add_peer(AddPeerArgs {
+            network: Network::Devnet,
+            peer: bind_b.clone(),
+            peers_dir: peers_dir_a.clone(),
+        })
+        .expect("add outbound peer");
+
+        let server_b = thread::spawn({
+            let config_path = config_path.clone();
+            let runtime_db_b = runtime_db_b.clone();
+            let peers_dir_b = peers_dir_b.clone();
+            let bind_b = bind_b.clone();
+            move || {
+                super::run_relay_serve(super::RelayServeArgs {
+                    network: Network::Devnet,
+                    config: Some(config_path),
+                    runtime_db: Some(runtime_db_b),
+                    bind: bind_b,
+                    max_clients: 1,
+                    max_messages_per_peer: 0,
+                    read_timeout_sec: 1,
+                    write_timeout_sec: 1,
+                    max_inv_items: None,
+                    ban_threshold: None,
+                    replacement_window_sec: None,
+                    replacement_max_per_peer: None,
+                    replacement_penalty: None,
+                    telemetry_out: None,
+                    telemetry_every_sec: 1,
+                    peers_dir: peers_dir_b,
+                    outbound_connect: false,
+                    outbound_redial_sec: 1,
+                })
+            }
+        });
+
+        let server_a = thread::spawn({
+            let config_path = config_path.clone();
+            let runtime_db_a = runtime_db_a.clone();
+            let peers_dir_a = peers_dir_a.clone();
+            let bind_a = bind_a.clone();
+            move || {
+                super::run_relay_serve(super::RelayServeArgs {
+                    network: Network::Devnet,
+                    config: Some(config_path),
+                    runtime_db: Some(runtime_db_a),
+                    bind: bind_a,
+                    max_clients: 1,
+                    max_messages_per_peer: 0,
+                    read_timeout_sec: 1,
+                    write_timeout_sec: 1,
+                    max_inv_items: None,
+                    ban_threshold: None,
+                    replacement_window_sec: None,
+                    replacement_max_per_peer: None,
+                    replacement_penalty: None,
+                    telemetry_out: None,
+                    telemetry_every_sec: 1,
+                    peers_dir: peers_dir_a,
+                    outbound_connect: true,
+                    outbound_redial_sec: 1,
+                })
+            }
+        });
+
+        thread::sleep(Duration::from_millis(350));
+        let mut sender = connect_with_retry(&bind_a);
+        sender
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("sender read timeout");
+        sender
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .expect("sender write timeout");
+        let framing = FramingConfig::default();
+        let local_hello = LocalHandshake {
+            protocol_version: 1,
+            network_id: "devnet".to_owned(),
+            user_agent: "relay-latency-sender".to_owned(),
+            start_height: 0,
+        };
+        let _remote = client_handshake(&mut sender, &framing, &local_hello).expect("handshake");
+
+        let signed = build_signed_transfer_tx(
+            &runtime_a,
+            &cfg.network_id,
+            &sender_key,
+            recipient_key_hash20,
+            1_000_000,
+            500,
+        )
+        .expect("build tx");
+        let txid = signed.tx.txid();
+
+        let sent_at = Instant::now();
+        send_message(&mut sender, &WireMessage::Tx { tx: signed.tx }, &framing).expect("send tx");
+
+        let mut observed = None::<Duration>;
+        let deadline = Instant::now() + Duration::from_secs(12);
+        while Instant::now() < deadline {
+            if let Ok(snapshot) = scam_storage::load_mempool_db(&mempool_db_b)
+                && snapshot.entries.iter().any(|entry| entry.txid == txid)
+            {
+                observed = Some(sent_at.elapsed());
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+
+        let latency = observed.expect("relay B must observe tx in mempool within deadline");
+        assert!(
+            latency <= Duration::from_secs(8),
+            "expected relay tx propagation <= 8s, got {:?}",
+            latency
+        );
+
+        drop(sender);
+        join_with_timeout(server_a, Duration::from_secs(12), "relay latency server A")
+            .expect("relay A should exit");
+        join_with_timeout(server_b, Duration::from_secs(12), "relay latency server B")
+            .expect("relay B should exit");
+        let _ = fs::remove_dir_all(work_dir);
     }
 
     #[test]
