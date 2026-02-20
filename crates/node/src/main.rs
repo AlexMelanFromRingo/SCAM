@@ -11196,6 +11196,186 @@ mod tests {
     }
 
     #[test]
+    fn relay_restart_reloads_tip_and_rebroadcasts_unconfirmed_mempool_tx() {
+        let _net_guard = network_test_guard();
+        let work_dir = temp_dir("test-relay-restart-rebroadcast");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let config_path = work_dir.join("devnet.toml");
+        let runtime_db = work_dir.join("runtime.redb");
+        fs::write(&config_path, include_str!("../../../config/devnet.toml")).expect("write cfg");
+        let mut cfg: ChainConfig = load_chain_config(&config_path).expect("load cfg");
+        cfg.coinbase_maturity = 1;
+        cfg.validate().expect("cfg validate");
+        fs::write(&config_path, toml::to_string(&cfg).expect("cfg serialize")).expect("cfg write");
+
+        let seed = WalletMnemonic::parse(SOAK_FLOW_MNEMONIC)
+            .expect("mnemonic")
+            .to_seed("");
+        let sender_key = derive_wallet_key(&seed, 0, 0).expect("sender key");
+        let recipient_key = derive_wallet_key(&seed, 0, 1).expect("recipient key");
+        let sender_key_hash20 = scam_core::hash160_blake3(&sender_key.pubkey_compressed());
+        let recipient_key_hash20 = scam_core::hash160_blake3(&recipient_key.pubkey_compressed());
+
+        let mut runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        mine_blocks_on_runtime(
+            &mut runtime,
+            &super::MiningLoopParams {
+                count: 2,
+                interval_sec: cfg.target_block_time_sec,
+                max_nonce: 500_000,
+                subsidy: cfg.block_subsidy,
+                miner_key_hash: sender_key_hash20,
+                label_prefix: "relay-restart",
+                print_each: false,
+            },
+        )
+        .expect("seed chain");
+        persist_runtime_db(&runtime, &runtime_db).expect("persist runtime");
+
+        let signed = build_signed_transfer_tx(
+            &runtime,
+            &cfg.network_id,
+            &sender_key,
+            recipient_key_hash20,
+            1_000_000,
+            500,
+        )
+        .expect("build signed tx");
+        let txid = signed.tx.txid();
+        let (_submitted_txid, outcome, _fee) = super::submit_tx_via_mempool_db(
+            &cfg,
+            &runtime_db,
+            &super::default_mempool_db_path(&runtime_db),
+            signed.tx,
+            500,
+        )
+        .expect("submit tx to mempool db");
+        assert_eq!(outcome, "accepted");
+
+        let tip_before_restart = runtime.tip_hash();
+        let Some(bind) = allocate_local_addr() else {
+            let _ = fs::remove_dir_all(work_dir);
+            return;
+        };
+
+        let start_server = |bind: String, peers_dir: PathBuf, max_clients: u32| {
+            let config_path = config_path.clone();
+            let runtime_db = runtime_db.clone();
+            thread::spawn(move || {
+                super::run_relay_serve(super::RelayServeArgs {
+                    network: Network::Devnet,
+                    config: Some(config_path),
+                    runtime_db: Some(runtime_db),
+                    bind,
+                    max_clients,
+                    max_messages_per_peer: 0,
+                    read_timeout_sec: 1,
+                    write_timeout_sec: 1,
+                    max_inv_items: None,
+                    ban_threshold: None,
+                    replacement_window_sec: None,
+                    replacement_max_per_peer: None,
+                    replacement_penalty: None,
+                    telemetry_out: None,
+                    telemetry_every_sec: 1,
+                    peers_dir,
+                    outbound_connect: false,
+                    outbound_redial_sec: 1,
+                })
+            })
+        };
+
+        let verify_inv_contains_tip_and_tx =
+            |stream: &mut TcpStream, expected_tip: Hash256, expected_txid: Hash256| {
+                let framing = FramingConfig::default();
+                let local_hello = LocalHandshake {
+                    protocol_version: 1,
+                    network_id: "devnet".to_owned(),
+                    user_agent: "test-restart-client".to_owned(),
+                    start_height: 0,
+                };
+                let remote = client_handshake(stream, &framing, &local_hello).expect("handshake");
+                assert_eq!(remote.network_id, "devnet");
+
+                let deadline = Instant::now() + Duration::from_secs(6);
+                let mut saw_tip = false;
+                let mut saw_tx = false;
+                while Instant::now() < deadline && !(saw_tip && saw_tx) {
+                    match read_message(stream, &framing) {
+                        Ok(WireMessage::Inv { items }) => {
+                            for item in items {
+                                match item {
+                                    InventoryItem::Block(hash) if hash == expected_tip => {
+                                        saw_tip = true;
+                                    }
+                                    InventoryItem::Tx(hash) if hash == expected_txid => {
+                                        saw_tx = true;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(scam_p2p::TransportError::Io(err))
+                            if super::relay_io_error_is_timeout_like(&err) =>
+                        {
+                            continue;
+                        }
+                        Err(err) => panic!("read relay inventory failed: {err}"),
+                    }
+                }
+                assert!(saw_tip, "expected tip inventory {expected_tip}");
+                assert!(saw_tx, "expected tx inventory {expected_txid}");
+            };
+
+        let peers_a = work_dir.join("peers-a");
+        let server_a = start_server(bind.clone(), peers_a, 1);
+        let mut stream_a = connect_with_retry(&bind);
+        stream_a
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set read timeout");
+        stream_a
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .expect("set write timeout");
+        verify_inv_contains_tip_and_tx(&mut stream_a, tip_before_restart, txid);
+        drop(stream_a);
+        join_with_timeout(server_a, Duration::from_secs(8), "relay restart phase A")
+            .expect("relay phase A");
+
+        mine_blocks_on_runtime(
+            &mut runtime,
+            &super::MiningLoopParams {
+                count: 1,
+                interval_sec: cfg.target_block_time_sec,
+                max_nonce: 500_000,
+                subsidy: cfg.block_subsidy,
+                miner_key_hash: sender_key_hash20,
+                label_prefix: "relay-restart-after",
+                print_each: false,
+            },
+        )
+        .expect("mine post-restart block");
+        persist_runtime_db(&runtime, &runtime_db).expect("persist updated runtime");
+        let tip_after_restart = runtime.tip_hash();
+        assert_ne!(tip_after_restart, tip_before_restart);
+
+        let peers_b = work_dir.join("peers-b");
+        let server_b = start_server(bind.clone(), peers_b, 1);
+        let mut stream_b = connect_with_retry(&bind);
+        stream_b
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set read timeout");
+        stream_b
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .expect("set write timeout");
+        verify_inv_contains_tip_and_tx(&mut stream_b, tip_after_restart, txid);
+        drop(stream_b);
+        join_with_timeout(server_b, Duration::from_secs(8), "relay restart phase B")
+            .expect("relay phase B");
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
     fn query_runtime_mining_guard_uses_nonzero_semantics() {
         assert!(!super::should_mine_query_blocks(0));
         assert!(super::should_mine_query_blocks(1));

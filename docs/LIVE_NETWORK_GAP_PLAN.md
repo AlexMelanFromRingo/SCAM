@@ -38,7 +38,7 @@
 ## P1 networking hardening
 - [x] Verify relay thread model under sustained connections (no silent worker exits).
 - [x] Add integration test: multi-node realtime propagation without `sync-book` assistance.
-- [ ] Add integration test: node restart + catch-up + mempool rebroadcast.
+- [x] Add integration test: node restart + catch-up + mempool rebroadcast.
 - [x] Add deterministic failure logs for peer disconnect reasons (protocol error, timeout, ban, io reset).
 
 ## P2 (launch confidence)
