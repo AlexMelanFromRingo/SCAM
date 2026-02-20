@@ -72,3 +72,26 @@ pub fn header_to_block_response(
         tx_count,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use serde::Serialize;
+
+    use crate::to_pretty_json;
+
+    #[derive(Serialize)]
+    struct Sample<'a> {
+        id: u32,
+        label: &'a str,
+    }
+
+    #[test]
+    fn to_pretty_json_renders_expected_fields() {
+        let rendered = to_pretty_json(&Sample { id: 7, label: "ok" }).expect("json");
+        assert!(rendered.contains('\n'));
+        assert!(rendered.contains("\"id\": 7"));
+        assert!(rendered.contains("\"label\": \"ok\""));
+        assert!(rendered.starts_with('{'));
+        assert!(rendered.ends_with('}'));
+    }
+}

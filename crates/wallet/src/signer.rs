@@ -149,4 +149,19 @@ mod tests {
         let key_b = derive_wallet_key(&seed, 0, 1).expect("key b");
         assert_ne!(key_a.pubkey_compressed(), key_b.pubkey_compressed());
     }
+
+    #[test]
+    fn secret_key_bytes_are_nonzero_and_vary_by_index() {
+        let seed = [44u8; 64];
+        let key_a = derive_wallet_key(&seed, 0, 0).expect("key a");
+        let key_b = derive_wallet_key(&seed, 0, 1).expect("key b");
+
+        let sk_a = key_a.secret_key_bytes();
+        let sk_b = key_b.secret_key_bytes();
+        assert_ne!(sk_a, [0u8; 32]);
+        assert_ne!(sk_a, [1u8; 32]);
+        assert_ne!(sk_b, [0u8; 32]);
+        assert_ne!(sk_b, [1u8; 32]);
+        assert_ne!(sk_a, sk_b);
+    }
 }

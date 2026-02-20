@@ -73,4 +73,16 @@ mod tests {
         let seed_b = mnemonic.to_seed("passphrase");
         assert_eq!(seed_a, seed_b);
     }
+
+    #[test]
+    fn seed_matches_known_bip39_vector() {
+        let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let mnemonic = WalletMnemonic::parse(phrase).expect("known mnemonic should parse");
+        let seed = mnemonic.to_seed("TREZOR");
+        let expected_hex = concat!(
+            "c55257c360c07c72029aebc1b53c05ed0362ada38ead3e3e9efa3708e5349553",
+            "1f09a6987599d18264c1e1c92f2cf141630c7a3c4ab7c81b2f001698e7463b04"
+        );
+        assert_eq!(hex::encode(seed), expected_hex);
+    }
 }

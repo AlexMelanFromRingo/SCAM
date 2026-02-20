@@ -74,7 +74,9 @@ pub enum AddressError {
 
 #[cfg(test)]
 mod tests {
-    use crate::address::{parse_address, to_address};
+    use scam_core::hash160_blake3;
+
+    use crate::address::{key_hash20_from_compressed_pubkey, parse_address, to_address};
     use crate::signer::derive_wallet_key;
 
     #[test]
@@ -84,6 +86,7 @@ mod tests {
         let address = to_address("sd", key.pubkey_compressed()).expect("address encode");
         let decoded = parse_address(&address).expect("address decode");
         assert_eq!(decoded.hrp, "sd");
+        assert_eq!(decoded.key_hash20, hash160_blake3(&key.pubkey_compressed()));
     }
 
     #[test]
@@ -95,5 +98,15 @@ mod tests {
             err,
             crate::address::AddressError::InvalidHrpPrefix { .. }
         ));
+    }
+
+    #[test]
+    fn key_hash20_matches_hash160_blake3_for_compressed_pubkey() {
+        let seed = [9u8; 64];
+        let key = derive_wallet_key(&seed, 0, 0).expect("derivation");
+        let expected = hash160_blake3(&key.pubkey_compressed());
+        let actual =
+            key_hash20_from_compressed_pubkey(key.pubkey_compressed()).expect("key hash20");
+        assert_eq!(actual, expected);
     }
 }

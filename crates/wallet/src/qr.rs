@@ -71,10 +71,27 @@ mod tests {
     }
 
     #[test]
+    fn qr_for_text_matches_renderer_output() {
+        let payload = "scam";
+        let qr = QrCode::encode_text(payload, QrCodeEcc::Medium).expect("qr");
+        let expected = render_ascii_qr(&qr, 1);
+        let actual = qr_for_text(payload).expect("must generate");
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn payment_uri_qr_generation_works() {
         let ascii =
             qr_for_payment_uri("sc1deadbeef", Some(100), Some("Alice")).expect("must generate");
         assert!(!ascii.is_empty());
+    }
+
+    #[test]
+    fn payment_uri_qr_matches_direct_uri_rendering() {
+        let direct = qr_for_text("coin:sc1deadbeef?amount=100&label=Alice%20Smith").expect("qr");
+        let via_uri = qr_for_payment_uri("sc1deadbeef", Some(100), Some("Alice Smith"))
+            .expect("payment uri qr");
+        assert_eq!(via_uri, direct);
     }
 
     #[test]
@@ -96,5 +113,17 @@ mod tests {
         let rendered = render_ascii_qr(&qr, 1);
         assert!(rendered.contains("##"));
         assert!(rendered.contains("  "));
+    }
+
+    #[test]
+    fn render_ascii_qr_obeys_expected_dimensions_with_border() {
+        let qr = QrCode::encode_text("dim-check", QrCodeEcc::Low).expect("qr");
+        let border = 2;
+        let rendered = render_ascii_qr(&qr, border);
+        let lines = rendered.lines().collect::<Vec<_>>();
+        let expected_modules = qr.size() + (2 * border);
+        assert_eq!(lines.len() as i32, expected_modules);
+        let expected_width = (expected_modules as usize) * 2;
+        assert!(lines.iter().all(|line| line.len() == expected_width));
     }
 }

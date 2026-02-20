@@ -264,6 +264,15 @@ mod tests {
     }
 
     #[test]
+    fn vault_uses_frozen_kdf_defaults() {
+        let vault = new_encrypted_wallet_vault(MNEMONIC, "", "encrypt-pass").expect("vault");
+        assert_eq!(vault.kdf.algorithm, "argon2id");
+        assert_eq!(vault.kdf.memory_kib, 32 * 1024);
+        assert_eq!(vault.kdf.iterations, 2);
+        assert_eq!(vault.kdf.lanes, 1);
+    }
+
+    #[test]
     fn wrong_password_fails_decrypt() {
         let vault = new_encrypted_wallet_vault(MNEMONIC, "", "good-pass").expect("vault");
         let err = decrypt_wallet_vault(&vault, "bad-pass").expect_err("must fail");
