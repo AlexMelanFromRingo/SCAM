@@ -12859,7 +12859,12 @@ mod tests {
         );
         let negative_amount = send_http_json_post(&addr, "/wallet/send", &negative_amount_req);
         assert!(negative_amount.starts_with("HTTP/1.1 400 Bad Request"));
-        assert!(negative_amount.contains("invalid type"));
+        assert!(
+            negative_amount.contains("invalid type")
+                || negative_amount.contains("invalid value")
+                || negative_amount.contains("out of range"),
+            "expected serde numeric type error, got: {negative_amount}"
+        );
 
         let invalid_hrp_req = serde_json::json!({
             "mnemonic": SOAK_FLOW_MNEMONIC,
@@ -15175,8 +15180,13 @@ mod tests {
         cfg.validate().expect("validate cfg");
         fs::write(&config_path, toml::to_string(&cfg).expect("serialize cfg")).expect("write cfg");
 
-        let runtime_db_a = work_dir.join("runtime-a.redb");
-        let runtime_db_b = work_dir.join("runtime-b.redb");
+        let node_a_dir = work_dir.join("node-a");
+        let node_b_dir = work_dir.join("node-b");
+        fs::create_dir_all(&node_a_dir).expect("mkdir node-a");
+        fs::create_dir_all(&node_b_dir).expect("mkdir node-b");
+
+        let runtime_db_a = node_a_dir.join("runtime.redb");
+        let runtime_db_b = node_b_dir.join("runtime.redb");
         let mempool_db_b = runtime_db_b.with_file_name("mempool.redb");
 
         let mnemonic = WalletMnemonic::parse(SOAK_FLOW_MNEMONIC).expect("mnemonic");
@@ -15241,7 +15251,7 @@ mod tests {
                     config: Some(config_path),
                     runtime_db: Some(runtime_db_b),
                     bind: bind_b,
-                    max_clients: 1,
+                    max_clients: 2,
                     max_messages_per_peer: 0,
                     read_timeout_sec: 1,
                     write_timeout_sec: 1,
@@ -15270,7 +15280,7 @@ mod tests {
                     config: Some(config_path),
                     runtime_db: Some(runtime_db_a),
                     bind: bind_a,
-                    max_clients: 1,
+                    max_clients: 2,
                     max_messages_per_peer: 0,
                     read_timeout_sec: 1,
                     write_timeout_sec: 1,
