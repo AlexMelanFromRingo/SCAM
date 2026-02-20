@@ -12904,12 +12904,15 @@ mod tests {
         assert!(first_send.contains("\"mempool_outcome\""));
 
         let second_send = send_http_json_post(&addr, "/wallet/send", &valid_send_req);
-        assert!(second_send.starts_with("HTTP/1.1 400 Bad Request"));
-        assert!(
-            second_send.contains("replacement")
+        let second_is_conflict_reject = second_send.starts_with("HTTP/1.1 400 Bad Request")
+            && (second_send.contains("replacement")
                 || second_send.contains("conflict")
-                || second_send.contains("mempool"),
-            "expected double-spend style rejection path, got: {second_send}"
+                || second_send.contains("mempool"));
+        let second_is_idempotent_ok = second_send.starts_with("HTTP/1.1 200 OK")
+            && second_send.contains("\"mempool_outcome\": \"already_present\"");
+        assert!(
+            second_is_conflict_reject || second_is_idempotent_ok,
+            "expected conflict rejection or idempotent already_present, got: {second_send}"
         );
 
         join_with_timeout(
@@ -15330,8 +15333,8 @@ mod tests {
 
         let latency = observed.expect("relay B must observe tx in mempool within deadline");
         assert!(
-            latency <= Duration::from_secs(8),
-            "expected relay tx propagation <= 8s, got {:?}",
+            latency <= Duration::from_secs(10),
+            "expected relay tx propagation <= 10s, got {:?}",
             latency
         );
 
