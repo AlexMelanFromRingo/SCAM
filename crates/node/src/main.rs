@@ -3901,6 +3901,39 @@ fn relay_target_matches_bind(bind_addr: &str, target: &str) -> bool {
     bind.ip().is_unspecified() && peer.ip().is_loopback()
 }
 
+fn relay_disconnect_reason(err: &NodeError) -> &'static str {
+    match err {
+        NodeError::Chain(ChainError::UnknownParent { .. }) => "unknown-parent",
+        NodeError::Transport(TransportError::InvalidMagic { .. }) => "invalid-magic",
+        NodeError::Transport(TransportError::MessageTooLarge { .. }) => "message-too-large",
+        NodeError::Transport(TransportError::UnexpectedMessage { .. }) => "unexpected-message",
+        NodeError::Transport(TransportError::UnexpectedInventoryItem { .. }) => {
+            "unexpected-inventory"
+        }
+        NodeError::Transport(TransportError::Wire(_)) => "wire-error",
+        NodeError::Transport(TransportError::Io(io_err))
+            if matches!(io_err.kind(), std::io::ErrorKind::TimedOut) =>
+        {
+            "io-timeout"
+        }
+        NodeError::Transport(TransportError::Io(io_err))
+            if matches!(
+                io_err.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::NotConnected
+            ) =>
+        {
+            "io-closed"
+        }
+        NodeError::Transport(TransportError::Io(_)) => "io-error",
+        NodeError::Runtime(msg) if msg.contains("network mismatch") => "network-mismatch",
+        NodeError::Runtime(msg) if msg.contains("relay state mutex poisoned") => "state-poisoned",
+        _ => "internal-error",
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_relay_outbound_worker(
     target: String,
@@ -3961,7 +3994,10 @@ fn run_relay_outbound_worker(
             read_limit,
         ) && !stop_flag.load(Ordering::Relaxed)
         {
-            eprintln!("warning: outbound relay session with {target} ended: {err}");
+            eprintln!(
+                "warning: outbound relay session with {target} ended: reason={} detail={err}",
+                relay_disconnect_reason(&err)
+            );
         }
         thread::sleep(redial_delay);
     }
@@ -8011,6 +8047,17 @@ fn write_http_sse_event<W: Write>(
     Ok(())
 }
 
+fn write_http_sse_comment<W: Write>(stream: &mut W, comment: &str) -> Result<(), NodeError> {
+    let frame = format!(": {comment}\n\n");
+    stream
+        .write_all(frame.as_bytes())
+        .map_err(|e| NodeError::Runtime(format!("http write failed: {e}")))?;
+    stream
+        .flush()
+        .map_err(|e| NodeError::Runtime(format!("http flush failed: {e}")))?;
+    Ok(())
+}
+
 fn find_http_header_terminator(buffer: &[u8]) -> Option<usize> {
     buffer.windows(4).position(|window| window == b"\r\n\r\n")
 }
@@ -8467,6 +8514,12 @@ fn run_rpc_events_worker(
             &runtime_db_path,
             &mut runtime_db_seen_mtime,
         )?;
+        if let Err(err) = write_http_sse_comment(&mut stream, "heartbeat") {
+            if rpc_sse_write_error_is_closed_like(&err) {
+                return Ok(());
+            }
+            return Err(err);
+        }
         let snapshot = build_rpc_event_snapshot(
             &cfg,
             &runtime,
@@ -9923,6 +9976,23 @@ mod tests {
         let network_err =
             super::ensure_relay_peer_network("devnet", "testnet").expect_err("network mismatch");
         assert!(network_err.to_string().contains("network mismatch"));
+
+        let timeout_err = super::NodeError::Transport(super::TransportError::Io(
+            std::io::Error::from(std::io::ErrorKind::TimedOut),
+        ));
+        let closed_err = super::NodeError::Transport(super::TransportError::Io(
+            std::io::Error::from(std::io::ErrorKind::BrokenPipe),
+        ));
+        let unknown_parent_err = super::NodeError::Chain(super::ChainError::UnknownParent {
+            block_hash: Hash256([3u8; 32]),
+            parent: Hash256([4u8; 32]),
+        });
+        assert_eq!(super::relay_disconnect_reason(&timeout_err), "io-timeout");
+        assert_eq!(super::relay_disconnect_reason(&closed_err), "io-closed");
+        assert_eq!(
+            super::relay_disconnect_reason(&unknown_parent_err),
+            "unknown-parent"
+        );
 
         assert_eq!(super::reorg_min_difficulty_window(49), 50);
         assert_eq!(super::reorg_min_difficulty_window(50), 50);
@@ -12345,8 +12415,10 @@ mod tests {
         );
         assert!(events.starts_with("HTTP/1.1 200 OK"));
         assert!(events.contains("text/event-stream"));
+        assert!(events.contains(": heartbeat"));
         assert!(events.contains("event: snapshot"));
         assert!(events.contains("data: {\"network_id\":\"devnet\""));
+        assert!(events.contains("\"last_block_age_sec\""));
 
         let health = send_http_request(&addr, "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n");
         assert!(health.starts_with("HTTP/1.1 200 OK"));
