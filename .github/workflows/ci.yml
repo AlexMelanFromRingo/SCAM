@@ -22,7 +22,9 @@ jobs:
       - name: Check
         run: cargo check --workspace
       - name: Test
-        run: cargo test --workspace
+        run: |
+          cargo test --workspace --exclude scam-node
+          cargo test -p scam-node --bin scam-node -- --test-threads=1
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
