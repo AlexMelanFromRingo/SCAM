@@ -9210,7 +9210,10 @@ fn run_rpc_events_worker(
     Ok(())
 }
 
-fn run_rpc_serve(args: RpcServeArgs) -> Result<(), NodeError> {
+fn run_rpc_serve_inner(
+    args: RpcServeArgs,
+    shutdown_flag: Option<Arc<AtomicBool>>,
+) -> Result<(), NodeError> {
     let RpcServeArgs {
         network,
         config,
@@ -9240,6 +9243,11 @@ fn run_rpc_serve(args: RpcServeArgs) -> Result<(), NodeError> {
 
     let listener = TcpListener::bind(&bind)
         .map_err(|e| NodeError::Runtime(format!("rpc bind failed on {}: {e}", bind)))?;
+    if shutdown_flag.is_some() {
+        listener
+            .set_nonblocking(true)
+            .map_err(|e| NodeError::Runtime(format!("rpc set_nonblocking failed: {e}")))?;
+    }
     println!(
         "RPC listening on {} (network={} tip_h={} tip_hash={})",
         bind,
@@ -9264,10 +9272,27 @@ fn run_rpc_serve(args: RpcServeArgs) -> Result<(), NodeError> {
     let events_interval = Duration::from_secs(1);
 
     let mut served = 0u32;
-    for incoming in listener.incoming() {
+    loop {
+        if let Some(flag) = shutdown_flag.as_ref()
+            && flag.load(Ordering::Relaxed)
+        {
+            break;
+        }
         reap_finished_rpc_event_workers(&mut events_workers);
-        let mut stream =
-            incoming.map_err(|e| NodeError::Runtime(format!("rpc accept failed: {e}")))?;
+        let (mut stream, _) = match listener.accept() {
+            Ok(accepted) => accepted,
+            Err(err)
+                if shutdown_flag.is_some()
+                    && matches!(
+                        err.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    ) =>
+            {
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            Err(err) => return Err(NodeError::Runtime(format!("rpc accept failed: {err}"))),
+        };
         configure_stream_timeouts_with_ops(
             |duration| stream.set_read_timeout(duration),
             |duration| stream.set_write_timeout(duration),
@@ -10092,6 +10117,18 @@ fn run_rpc_serve(args: RpcServeArgs) -> Result<(), NodeError> {
     Ok(())
 }
 
+fn run_rpc_serve(args: RpcServeArgs) -> Result<(), NodeError> {
+    run_rpc_serve_inner(args, None)
+}
+
+#[cfg(test)]
+fn run_rpc_serve_with_shutdown(
+    args: RpcServeArgs,
+    shutdown_flag: Arc<AtomicBool>,
+) -> Result<(), NodeError> {
+    run_rpc_serve_inner(args, Some(shutdown_flag))
+}
+
 fn run_command(cli: Cli) -> Result<(), NodeError> {
     match cli.command {
         Some(Command::Node(args)) => run_node(
@@ -10333,24 +10370,6 @@ mod tests {
         );
     }
 
-    fn try_send_http_request(addr: &str, request: &str) -> Option<String> {
-        let mut stream = match TcpStream::connect(addr) {
-            Ok(stream) => stream,
-            Err(_) => return None,
-        };
-        let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
-        let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
-        if stream.write_all(request.as_bytes()).is_err() {
-            return None;
-        }
-        let _ = stream.shutdown(Shutdown::Write);
-        let mut response = String::new();
-        if stream.read_to_string(&mut response).is_err() {
-            return None;
-        }
-        Some(response)
-    }
-
     fn send_http_json_post(addr: &str, path: &str, body: &str) -> String {
         let request = format!(
             "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
@@ -10359,13 +10378,27 @@ mod tests {
         send_http_request(addr, &request)
     }
 
-    fn drain_rpc_server_until_max_requests(addr: &str, attempts: u32) {
-        for _ in 0..attempts {
-            let _ = try_send_http_request(
-                addr,
-                "GET /health HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
-            );
-        }
+    fn spawn_rpc_server_for_test(
+        args: RpcServeArgs,
+    ) -> (
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        thread::JoinHandle<()>,
+    ) {
+        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shutdown_thread = std::sync::Arc::clone(&shutdown);
+        let handle = thread::spawn(move || {
+            super::run_rpc_serve_with_shutdown(args, shutdown_thread).expect("rpc serve");
+        });
+        (shutdown, handle)
+    }
+
+    fn stop_rpc_server_for_test(
+        shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        handle: thread::JoinHandle<()>,
+        label: &str,
+    ) {
+        shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+        join_with_timeout(handle, Duration::from_secs(10), label);
     }
 
     fn send_http_request_until(
@@ -13997,21 +14030,17 @@ mod tests {
         fs::create_dir_all(&ui_dir).expect("mkdir ui");
         fs::write(ui_dir.join("index.html"), "<html>ui</html>").expect("write ui");
 
-        let server_addr = addr.clone();
-        let server = thread::spawn(move || {
-            run_rpc_serve(RpcServeArgs {
-                network: Network::Devnet,
-                config: Some(config_path),
-                runtime_db: Some(runtime_db),
-                bind: server_addr,
-                ui_dir,
-                relay_telemetry: None,
-                mine_blocks: 0,
-                interval_sec: 120,
-                max_nonce: 500_000,
-                max_requests: 6,
-            })
-            .expect("rpc serve");
+        let (server_shutdown, server) = spawn_rpc_server_for_test(RpcServeArgs {
+            network: Network::Devnet,
+            config: Some(config_path),
+            runtime_db: Some(runtime_db),
+            bind: addr.clone(),
+            ui_dir,
+            relay_telemetry: None,
+            mine_blocks: 0,
+            interval_sec: 120,
+            max_nonce: 500_000,
+            max_requests: 0,
         });
 
         let health_response =
@@ -14026,8 +14055,7 @@ mod tests {
         assert!(unknown_response.starts_with("HTTP/1.1 200 OK"));
         assert!(unknown_response.contains("<html>ui</html>"));
 
-        drain_rpc_server_until_max_requests(&addr, 10);
-        join_with_timeout(server, Duration::from_secs(10), "rpc health routes server");
+        stop_rpc_server_for_test(server_shutdown, server, "rpc health routes server");
         let _ = fs::remove_dir_all(work_dir);
     }
 
@@ -14054,23 +14082,17 @@ mod tests {
         fs::create_dir_all(&ui_dir).expect("mkdir ui");
         fs::write(ui_dir.join("index.html"), "<html>ui</html>").expect("write ui");
 
-        let server_addr = addr.clone();
-        let server = thread::spawn(move || {
-            run_rpc_serve(RpcServeArgs {
-                network: Network::Devnet,
-                config: Some(config_path),
-                runtime_db: Some(runtime_db),
-                bind: server_addr,
-                ui_dir,
-                relay_telemetry: None,
-                mine_blocks: 0,
-                interval_sec: 120,
-                max_nonce: 500_000,
-                // Keep this above the deterministic assertion request set, then drain with
-                // explicit health probes before joining.
-                max_requests: 20,
-            })
-            .expect("rpc serve");
+        let (server_shutdown, server) = spawn_rpc_server_for_test(RpcServeArgs {
+            network: Network::Devnet,
+            config: Some(config_path),
+            runtime_db: Some(runtime_db),
+            bind: addr.clone(),
+            ui_dir,
+            relay_telemetry: None,
+            mine_blocks: 0,
+            interval_sec: 120,
+            max_nonce: 500_000,
+            max_requests: 0,
         });
 
         let status = send_http_request(&addr, "GET /status HTTP/1.1\r\nHost: localhost\r\n\r\n");
@@ -14098,8 +14120,7 @@ mod tests {
         let wallet_qr = send_http_json_post(&addr, "/wallet/qr", "{\"address\":\"scam\"}");
         assert!(wallet_qr.starts_with("HTTP/1.1 200 OK"));
 
-        drain_rpc_server_until_max_requests(&addr, 24);
-        join_with_timeout(server, Duration::from_secs(10), "rpc core routes server");
+        stop_rpc_server_for_test(server_shutdown, server, "rpc core routes server");
         let _ = fs::remove_dir_all(work_dir);
     }
 
@@ -14118,21 +14139,17 @@ mod tests {
         fs::create_dir_all(&ui_dir).expect("mkdir ui");
         fs::write(ui_dir.join("index.html"), "<html>ui</html>").expect("write ui");
 
-        let server_addr = addr.clone();
-        let server = thread::spawn(move || {
-            run_rpc_serve(RpcServeArgs {
-                network: Network::Devnet,
-                config: Some(config_path),
-                runtime_db: Some(runtime_db),
-                bind: server_addr,
-                ui_dir,
-                relay_telemetry: None,
-                mine_blocks: 0,
-                interval_sec: 120,
-                max_nonce: 500_000,
-                max_requests: 6,
-            })
-            .expect("rpc serve");
+        let (server_shutdown, server) = spawn_rpc_server_for_test(RpcServeArgs {
+            network: Network::Devnet,
+            config: Some(config_path),
+            runtime_db: Some(runtime_db),
+            bind: addr.clone(),
+            ui_dir,
+            relay_telemetry: None,
+            mine_blocks: 0,
+            interval_sec: 120,
+            max_nonce: 500_000,
+            max_requests: 0,
         });
 
         let events = send_http_request_until(
@@ -14178,8 +14195,7 @@ mod tests {
         let health = send_http_request(&addr, "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n");
         assert!(health.starts_with("HTTP/1.1 200 OK"));
 
-        drain_rpc_server_until_max_requests(&addr, 10);
-        join_with_timeout(server, Duration::from_secs(10), "rpc events server");
+        stop_rpc_server_for_test(server_shutdown, server, "rpc events server");
         let _ = fs::remove_dir_all(work_dir);
     }
 
@@ -14225,21 +14241,17 @@ mod tests {
         mine_blocks_on_runtime(&mut runtime, &seed_mining).expect("seed mining");
         persist_runtime_db(&runtime, &runtime_db).expect("persist runtime");
 
-        let server_addr = addr.clone();
-        let server = thread::spawn(move || {
-            run_rpc_serve(RpcServeArgs {
-                network: Network::Devnet,
-                config: Some(config_path),
-                runtime_db: Some(runtime_db),
-                bind: server_addr,
-                ui_dir: work_dir.join("ui"),
-                relay_telemetry: None,
-                mine_blocks: 0,
-                interval_sec: 120,
-                max_nonce: 500_000,
-                max_requests: 16,
-            })
-            .expect("rpc serve");
+        let (server_shutdown, server) = spawn_rpc_server_for_test(RpcServeArgs {
+            network: Network::Devnet,
+            config: Some(config_path),
+            runtime_db: Some(runtime_db),
+            bind: addr.clone(),
+            ui_dir: work_dir.join("ui"),
+            relay_telemetry: None,
+            mine_blocks: 0,
+            interval_sec: 120,
+            max_nonce: 500_000,
+            max_requests: 0,
         });
 
         let zero_amount_req = serde_json::json!({
@@ -14328,20 +14340,7 @@ mod tests {
             "expected conflict rejection or idempotent already_present, got: {second_send}"
         );
 
-        // Ensure server receives enough requests to trigger max_requests shutdown even if one of
-        // the earlier calls was dropped by transient local socket timing.
-        for _ in 0..16 {
-            let _ = try_send_http_request(
-                &addr,
-                "GET /health HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
-            );
-        }
-
-        join_with_timeout(
-            server,
-            Duration::from_secs(20),
-            "rpc wallet-send reject server",
-        );
+        stop_rpc_server_for_test(server_shutdown, server, "rpc wallet-send reject server");
     }
 
     #[test]
@@ -14400,22 +14399,17 @@ mod tests {
         let invalid_recipient = scam_wallet::to_address("s", recipient_key.pubkey_compressed())
             .expect("invalid hrp addr");
 
-        let server_addr = addr.clone();
-        let server = thread::spawn(move || {
-            run_rpc_serve(RpcServeArgs {
-                network: Network::Devnet,
-                config: Some(config_path),
-                runtime_db: Some(runtime_db),
-                bind: server_addr,
-                ui_dir,
-                relay_telemetry: None,
-                mine_blocks: 0,
-                interval_sec: 120,
-                max_nonce: 500_000,
-                // Keep this above assertion requests and drain deterministically at the end.
-                max_requests: 32,
-            })
-            .expect("rpc serve");
+        let (server_shutdown, server) = spawn_rpc_server_for_test(RpcServeArgs {
+            network: Network::Devnet,
+            config: Some(config_path),
+            runtime_db: Some(runtime_db),
+            bind: addr.clone(),
+            ui_dir,
+            relay_telemetry: None,
+            mine_blocks: 0,
+            interval_sec: 120,
+            max_nonce: 500_000,
+            max_requests: 0,
         });
 
         let health = send_http_request(&addr, "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n");
@@ -14527,8 +14521,7 @@ mod tests {
         assert!(wallet_decode.starts_with("HTTP/1.1 200 OK"));
         assert!(wallet_decode.contains("\"key_hash20_hex\""));
 
-        drain_rpc_server_until_max_requests(&addr, 48);
-        join_with_timeout(server, Duration::from_secs(10), "rpc strict routes server");
+        stop_rpc_server_for_test(server_shutdown, server, "rpc strict routes server");
         let _ = fs::remove_dir_all(work_dir);
     }
 
