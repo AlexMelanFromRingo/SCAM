@@ -165,34 +165,9 @@ stop_follower_sync_loops() {
 }
 
 start_follower_sync_loops() {
-  local bin="$1"
-  if ! is_true "${RUN_SYNC_LOOP}"; then
-    return 0
-  fi
-  mkdir -p "${FOLLOW_SYNC_DIR}"
-  for ((idx = 1; idx < NODE_COUNT; idx++)); do
-    local node_tag nodedir runtime_db peers_dir pid_file log_file
-    node_tag="$(printf "%02d" "${idx}")"
-    nodedir="${CLUSTER_DIR}/node-${node_tag}"
-    runtime_db="${nodedir}/runtime.redb"
-    peers_dir="${nodedir}/peers"
-    pid_file="${FOLLOW_SYNC_DIR}/sync-node-${node_tag}.pid"
-    log_file="${nodedir}/logs/sync-follow.log"
-    (
-      while true; do
-        "${bin}" sync-book \
-          --network "${NETWORK}" \
-          --config "${CONFIG}" \
-          --runtime-db "${runtime_db}" \
-          --peers-dir "${peers_dir}" \
-          --max-peers "${NODE_COUNT}" \
-          --max-batches-per-peer "${SYNC_MAX_BATCHES_PER_PEER}" \
-          >> "${log_file}" 2>&1 || true
-        sleep "${SYNC_LOOP_INTERVAL_SEC}"
-      done
-    ) &
-    echo "$!" > "${pid_file}"
-  done
+  # Kept for backward compatibility with old lab folders.
+  # Real-time sync is handled by local-multinode's RUN_SYNC_LOOP path.
+  return 0
 }
 
 start_lab() {
