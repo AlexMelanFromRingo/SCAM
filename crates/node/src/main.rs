@@ -162,6 +162,10 @@ struct RunModeArgs {
     miner_max_shares: u64,
     #[arg(long, default_value_t = 0)]
     miner_max_runtime_sec: u64,
+    #[arg(long, default_value_t = 2)]
+    miner_reconnect_delay_sec: u64,
+    #[arg(long, default_value_t = 0)]
+    miner_max_reconnect_attempts: u32,
 }
 
 #[derive(Debug, Args)]
@@ -644,6 +648,10 @@ struct StratumMineArgs {
     max_shares: u64,
     #[arg(long, default_value_t = 0)]
     max_runtime_sec: u64,
+    #[arg(long, default_value_t = 2)]
+    reconnect_delay_sec: u64,
+    #[arg(long, default_value_t = 0)]
+    max_reconnect_attempts: u32,
     #[arg(long, default_value_t = false)]
     secure_transport: bool,
     #[arg(long, value_enum)]
@@ -1636,6 +1644,8 @@ fn run_mode(args: RunModeArgs) -> Result<(), NodeError> {
             max_nonce_per_cycle: args.miner_max_nonce_per_cycle,
             max_shares: args.miner_max_shares,
             max_runtime_sec: args.miner_max_runtime_sec,
+            reconnect_delay_sec: args.miner_reconnect_delay_sec,
+            max_reconnect_attempts: args.miner_max_reconnect_attempts,
             secure_transport: false,
             secure_transport_mode: None,
             secure_rekey_interval_messages: 10_000,
@@ -5798,6 +5808,17 @@ fn sv2_io_error_is_timeout_like(err: &std::io::Error) -> bool {
     )
 }
 
+fn sv2_io_error_is_closed_like(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::NotConnected
+    )
+}
+
 fn read_sv2_message(
     stream: &mut TcpStream,
     secure: Option<&mut StratumSecureTransport>,
@@ -6282,6 +6303,9 @@ fn map_sv2_read_result(
         Err(scam_stratum::StratumError::Io(err)) if sv2_io_error_is_timeout_like(&err) => {
             Ok(StratumReadOutcome::Timeout)
         }
+        Err(scam_stratum::StratumError::Io(err)) if sv2_io_error_is_closed_like(&err) => {
+            Ok(StratumReadOutcome::Closed)
+        }
         Err(err) => Err(NodeError::Runtime(format!("stratum read failed: {err}"))),
     }
 }
@@ -6663,6 +6687,10 @@ fn share_target_in_bounds(
 
 fn nonzero_limit_reached(limit: u64, observed: u64) -> bool {
     limit > 0 && observed >= limit
+}
+
+fn reconnect_attempts_exhausted(max_reconnect_attempts: u32, attempts: u32) -> bool {
+    max_reconnect_attempts > 0 && attempts >= max_reconnect_attempts
 }
 
 fn should_emit_periodic_round(round: u32, every_rounds: u32) -> bool {
@@ -7222,15 +7250,20 @@ fn try_find_share_for_job(
 }
 
 fn run_stratum_mine(args: StratumMineArgs) -> Result<(), NodeError> {
-    let mut stream = TcpStream::connect(&args.pool)
-        .map_err(|e| NodeError::Runtime(format!("stratum connect failed to {}: {e}", args.pool)))?;
+    let pool_addr = args
+        .pool
+        .to_socket_addrs()
+        .map_err(|e| NodeError::Runtime(format!("stratum connect failed to {}: {e}", args.pool)))?
+        .next()
+        .ok_or_else(|| {
+            NodeError::Runtime(format!(
+                "stratum connect failed to {}: no resolved socket addresses",
+                args.pool
+            ))
+        })?;
     let timeout = Duration::from_secs(args.read_timeout_sec.max(1));
-    configure_stream_timeouts_with_ops(
-        |duration| stream.set_read_timeout(duration),
-        |duration| stream.set_write_timeout(duration),
-        timeout,
-        timeout,
-    )?;
+    let reconnect_delay_sec = args.reconnect_delay_sec.max(1);
+    let reconnect_delay = Duration::from_secs(reconnect_delay_sec);
     let secure_transport_mode = args
         .secure_transport_mode
         .map(SecureTransportMode::from)
@@ -7254,66 +7287,12 @@ fn run_stratum_mine(args: StratumMineArgs) -> Result<(), NodeError> {
                 .to_owned(),
         ));
     }
-    let mut secure_transport = if args.secure_transport {
-        let transport = match secure_transport_mode {
-            SecureTransportMode::Legacy => {
-                let mut legacy =
-                    SecureSv2Transport::handshake_client(&mut stream).map_err(|e| {
-                        NodeError::Runtime(format!("stratum secure(legacy) handshake failed: {e}"))
-                    })?;
-                legacy
-                    .set_rekey_interval_messages(args.secure_rekey_interval_messages.max(1))
-                    .map_err(|e| {
-                        NodeError::Runtime(format!(
-                            "stratum secure(legacy) transport config failed: {e}"
-                        ))
-                    })?;
-                StratumSecureTransport::Legacy(legacy)
-            }
-            SecureTransportMode::NoiseXx => {
-                let mut noise = NoiseSv2Transport::handshake_client(
-                    &mut stream,
-                    secure_static_private_key,
-                    secure_expected_remote_static_public_key,
-                )
-                .map_err(|e| {
-                    NodeError::Runtime(format!("stratum secure(noise_xx) handshake failed: {e}"))
-                })?;
-                noise
-                    .set_rekey_interval_messages(args.secure_rekey_interval_messages.max(1))
-                    .map_err(|e| {
-                        NodeError::Runtime(format!(
-                            "stratum secure(noise_xx) transport config failed: {e}"
-                        ))
-                    })?;
-                StratumSecureTransport::Noise(noise)
-            }
-        };
-        Some(transport)
-    } else {
-        None
-    };
-    macro_rules! send_sv2_sync {
-        ($message:expr) => {{
-            match secure_transport.as_mut() {
-                Some(StratumSecureTransport::Legacy(transport)) => transport
-                    .write_message(&mut stream, $message)
-                    .map_err(|e| {
-                        NodeError::Runtime(format!("stratum secure(legacy) write failed: {e}"))
-                    })?,
-                Some(StratumSecureTransport::Noise(transport)) => transport
-                    .write_message(&mut stream, $message)
-                    .map_err(|e| {
-                        NodeError::Runtime(format!("stratum secure(noise_xx) write failed: {e}"))
-                    })?,
-                None => write_sv2_frame(&mut stream, $message)
-                    .map_err(|e| NodeError::Runtime(format!("stratum write failed: {e}")))?,
-            }
-        }};
-    }
-
-    println!("Stratum miner connecting to {}", args.pool);
+    println!("Stratum miner target pool: {} ({pool_addr})", args.pool);
     println!("Secure transport: {}", args.secure_transport);
+    println!(
+        "Reconnect policy: delay={}s max_attempts={}",
+        reconnect_delay_sec, args.max_reconnect_attempts
+    );
     if args.secure_transport {
         println!("Secure transport mode: {}", secure_transport_mode.as_str());
         println!(
@@ -7332,29 +7311,17 @@ fn run_stratum_mine(args: StratumMineArgs) -> Result<(), NodeError> {
     if let Some(addr) = &args.translator_addr {
         println!("Translator service: {addr}");
     }
-    send_sv2_sync!(&Sv2Message::SetupConnection {
-        protocol: 2,
-        min_version: SUPPORTED_SV2_VERSION,
-        max_version: SUPPORTED_SV2_VERSION,
-        flags: 0,
-        user_agent: "scam-node/stratum-mine".to_owned(),
-    });
 
     let started_at = Instant::now();
-    let mut last_io = Instant::now();
-    let mut open_sent = false;
-    let mut share_target = Target::MAX;
-    let mut channel_id = None::<u32>;
-    let mut active_job_id = None::<u32>;
-    let mut jobs = HashMap::<u32, MiningJob>::new();
-    let mut nonce_cursor = HashMap::<u32, u64>::new();
     let translator_addr = args.translator_addr.clone();
     let translator = IdentityTranslator;
     let mut submitted_shares = 0u64;
     let mut accepted_shares = 0u64;
     let mut found_blocks = 0u64;
+    let mut ever_connected = false;
+    let mut reconnect_attempts = 0u32;
 
-    loop {
+    'reconnect: loop {
         if nonzero_limit_reached(args.max_runtime_sec, started_at.elapsed().as_secs()) {
             println!(
                 "stratum miner stopped by max_runtime_sec={} (submitted={}, accepted={}, blocks={})",
@@ -7370,159 +7337,312 @@ fn run_stratum_mine(args: StratumMineArgs) -> Result<(), NodeError> {
             break;
         }
 
-        match read_sv2_message(&mut stream, secure_transport.as_mut())? {
-            StratumReadOutcome::Closed => {
-                println!("stratum pool closed connection");
+        let mut stream = match TcpStream::connect(pool_addr) {
+            Ok(stream) => stream,
+            Err(err) => {
+                if !ever_connected {
+                    return Err(NodeError::Runtime(format!(
+                        "stratum connect failed to {}: {err}",
+                        args.pool
+                    )));
+                }
+                reconnect_attempts = reconnect_attempts.saturating_add(1);
+                if reconnect_attempts_exhausted(args.max_reconnect_attempts, reconnect_attempts) {
+                    return Err(NodeError::Runtime(format!(
+                        "stratum reconnect exhausted after {} attempts: connect to {} failed: {err}",
+                        reconnect_attempts, args.pool
+                    )));
+                }
+                println!(
+                    "stratum reconnect connect-failed: {err}; retrying in {}s (attempt={})",
+                    reconnect_delay_sec, reconnect_attempts
+                );
+                thread::sleep(reconnect_delay);
+                continue;
+            }
+        };
+        configure_stream_timeouts_with_ops(
+            |duration| stream.set_read_timeout(duration),
+            |duration| stream.set_write_timeout(duration),
+            timeout,
+            timeout,
+        )?;
+        ever_connected = true;
+        reconnect_attempts = 0;
+        println!("stratum miner connected to {}", args.pool);
+
+        let mut secure_transport = if args.secure_transport {
+            let transport = match secure_transport_mode {
+                SecureTransportMode::Legacy => {
+                    let mut legacy =
+                        SecureSv2Transport::handshake_client(&mut stream).map_err(|e| {
+                            NodeError::Runtime(format!(
+                                "stratum secure(legacy) handshake failed: {e}"
+                            ))
+                        })?;
+                    legacy
+                        .set_rekey_interval_messages(args.secure_rekey_interval_messages.max(1))
+                        .map_err(|e| {
+                            NodeError::Runtime(format!(
+                                "stratum secure(legacy) transport config failed: {e}"
+                            ))
+                        })?;
+                    StratumSecureTransport::Legacy(legacy)
+                }
+                SecureTransportMode::NoiseXx => {
+                    let mut noise = NoiseSv2Transport::handshake_client(
+                        &mut stream,
+                        secure_static_private_key,
+                        secure_expected_remote_static_public_key,
+                    )
+                    .map_err(|e| {
+                        NodeError::Runtime(format!(
+                            "stratum secure(noise_xx) handshake failed: {e}"
+                        ))
+                    })?;
+                    noise
+                        .set_rekey_interval_messages(args.secure_rekey_interval_messages.max(1))
+                        .map_err(|e| {
+                            NodeError::Runtime(format!(
+                                "stratum secure(noise_xx) transport config failed: {e}"
+                            ))
+                        })?;
+                    StratumSecureTransport::Noise(noise)
+                }
+            };
+            Some(transport)
+        } else {
+            None
+        };
+        macro_rules! send_sv2_sync {
+            ($message:expr) => {{
+                match secure_transport.as_mut() {
+                    Some(StratumSecureTransport::Legacy(transport)) => transport
+                        .write_message(&mut stream, $message)
+                        .map_err(|e| {
+                            NodeError::Runtime(format!("stratum secure(legacy) write failed: {e}"))
+                        })?,
+                    Some(StratumSecureTransport::Noise(transport)) => transport
+                        .write_message(&mut stream, $message)
+                        .map_err(|e| {
+                            NodeError::Runtime(format!(
+                                "stratum secure(noise_xx) write failed: {e}"
+                            ))
+                        })?,
+                    None => write_sv2_frame(&mut stream, $message)
+                        .map_err(|e| NodeError::Runtime(format!("stratum write failed: {e}")))?,
+                }
+            }};
+        }
+
+        send_sv2_sync!(&Sv2Message::SetupConnection {
+            protocol: 2,
+            min_version: SUPPORTED_SV2_VERSION,
+            max_version: SUPPORTED_SV2_VERSION,
+            flags: 0,
+            user_agent: "scam-node/stratum-mine".to_owned(),
+        });
+
+        let mut last_io = Instant::now();
+        let mut open_sent = false;
+        let mut share_target = Target::MAX;
+        let mut channel_id = None::<u32>;
+        let mut active_job_id = None::<u32>;
+        let mut jobs = HashMap::<u32, MiningJob>::new();
+        let mut nonce_cursor = HashMap::<u32, u64>::new();
+
+        let mut reconnect_requested = false;
+        loop {
+            if nonzero_limit_reached(args.max_runtime_sec, started_at.elapsed().as_secs()) {
+                println!(
+                    "stratum miner stopped by max_runtime_sec={} (submitted={}, accepted={}, blocks={})",
+                    args.max_runtime_sec, submitted_shares, accepted_shares, found_blocks
+                );
                 break;
             }
-            StratumReadOutcome::Timeout => {
-                if let Some(job_id) = active_job_id {
-                    if let Some(job) = jobs.get(&job_id) {
-                        let cursor = *nonce_cursor.get(&job_id).unwrap_or(&0);
-                        if let Some((nonce, hash, is_block, next_cursor)) = try_find_share_for_job(
-                            job,
-                            share_target,
-                            cursor,
-                            args.max_nonce_per_cycle,
-                        ) {
-                            nonce_cursor.insert(job_id, next_cursor);
-                            send_sv2_sync!(&Sv2Message::SubmitSharesStandard {
-                                channel_id: job.channel_id,
-                                job_id,
-                                nonce,
-                                ntime: job.ntime,
-                            });
-                            submitted_shares = submitted_shares.saturating_add(1);
-                            println!(
-                                "submitted share: channel={} job={} nonce={} hash={} is_block={}",
-                                job.channel_id, job_id, nonce, hash, is_block
-                            );
-                            last_io = Instant::now();
-                        } else {
-                            nonce_cursor.insert(
-                                job_id,
-                                cursor.wrapping_add(args.max_nonce_per_cycle.saturating_add(1)),
-                            );
-                        }
-                    }
-                } else if should_emit_miner_keepalive(last_io.elapsed().as_secs()) {
-                    send_sv2_sync!(&Sv2Message::KeepAlive);
-                    last_io = Instant::now();
-                }
+            if nonzero_limit_reached(args.max_shares, accepted_shares) {
+                println!(
+                    "stratum miner reached max_shares={} (submitted={}, blocks={})",
+                    args.max_shares, submitted_shares, found_blocks
+                );
+                break;
             }
-            StratumReadOutcome::Message(message) => match message {
-                Sv2Message::SetupConnectionSuccess { .. } => {
-                    if should_send_open_standard_channel(open_sent) {
-                        send_sv2_sync!(&Sv2Message::OpenStandardMiningChannel {
-                            request_id: 1,
-                            user: args.user.clone(),
-                        });
-                        open_sent = true;
+
+            match read_sv2_message(&mut stream, secure_transport.as_mut())? {
+                StratumReadOutcome::Closed => {
+                    println!("stratum pool closed connection");
+                    reconnect_requested = true;
+                    break;
+                }
+                StratumReadOutcome::Timeout => {
+                    if let Some(job_id) = active_job_id {
+                        if let Some(job) = jobs.get(&job_id) {
+                            let cursor = *nonce_cursor.get(&job_id).unwrap_or(&0);
+                            if let Some((nonce, hash, is_block, next_cursor)) =
+                                try_find_share_for_job(
+                                    job,
+                                    share_target,
+                                    cursor,
+                                    args.max_nonce_per_cycle,
+                                )
+                            {
+                                nonce_cursor.insert(job_id, next_cursor);
+                                send_sv2_sync!(&Sv2Message::SubmitSharesStandard {
+                                    channel_id: job.channel_id,
+                                    job_id,
+                                    nonce,
+                                    ntime: job.ntime,
+                                });
+                                submitted_shares = submitted_shares.saturating_add(1);
+                                println!(
+                                    "submitted share: channel={} job={} nonce={} hash={} is_block={}",
+                                    job.channel_id, job_id, nonce, hash, is_block
+                                );
+                                last_io = Instant::now();
+                            } else {
+                                nonce_cursor.insert(
+                                    job_id,
+                                    cursor.wrapping_add(args.max_nonce_per_cycle.saturating_add(1)),
+                                );
+                            }
+                        }
+                    } else if should_emit_miner_keepalive(last_io.elapsed().as_secs()) {
+                        send_sv2_sync!(&Sv2Message::KeepAlive);
                         last_io = Instant::now();
                     }
                 }
-                Sv2Message::SetupConnectionError { code, reason } => {
-                    return Err(NodeError::Runtime(format!(
-                        "stratum setup rejected: code={code} reason={reason}"
-                    )));
-                }
-                Sv2Message::OpenStandardMiningChannelSuccess {
-                    channel_id: opened_channel,
-                    target_hex,
-                    ..
-                } => {
-                    channel_id = Some(opened_channel);
-                    share_target = Target::from_hex(&target_hex).map_err(|e| {
-                        NodeError::Runtime(format!("invalid share target from pool: {e}"))
-                    })?;
-                    println!(
-                        "channel opened: id={} initial_share_target={}",
-                        opened_channel, share_target
-                    );
-                }
-                Sv2Message::OpenStandardMiningChannelError { code, reason, .. } => {
-                    return Err(NodeError::Runtime(format!(
-                        "stratum open channel rejected: code={code} reason={reason}"
-                    )));
-                }
-                Sv2Message::SetTarget {
-                    channel_id: msg_channel,
-                    maximum_target_hex,
-                } => {
-                    if should_apply_set_target(channel_id, msg_channel) {
-                        share_target = Target::from_hex(&maximum_target_hex).map_err(|e| {
-                            NodeError::Runtime(format!("invalid set_target from pool: {e}"))
+                StratumReadOutcome::Message(message) => match message {
+                    Sv2Message::SetupConnectionSuccess { .. } => {
+                        if should_send_open_standard_channel(open_sent) {
+                            send_sv2_sync!(&Sv2Message::OpenStandardMiningChannel {
+                                request_id: 1,
+                                user: args.user.clone(),
+                            });
+                            open_sent = true;
+                            last_io = Instant::now();
+                        }
+                    }
+                    Sv2Message::SetupConnectionError { code, reason } => {
+                        return Err(NodeError::Runtime(format!(
+                            "stratum setup rejected: code={code} reason={reason}"
+                        )));
+                    }
+                    Sv2Message::OpenStandardMiningChannelSuccess {
+                        channel_id: opened_channel,
+                        target_hex,
+                        ..
+                    } => {
+                        channel_id = Some(opened_channel);
+                        share_target = Target::from_hex(&target_hex).map_err(|e| {
+                            NodeError::Runtime(format!("invalid share target from pool: {e}"))
                         })?;
                         println!(
-                            "share target updated: channel={} target={}",
-                            msg_channel, share_target
+                            "channel opened: id={} initial_share_target={}",
+                            opened_channel, share_target
                         );
                     }
-                }
-                Sv2Message::SetNewPrevHash {
-                    channel_id: msg_channel,
-                    job_id,
-                    prev_hash_hex,
-                    ntime,
-                    network_target_hex,
-                } => {
-                    if should_apply_set_new_prev_hash(channel_id, msg_channel)
-                        && let Some(job) = jobs.get_mut(&job_id)
-                    {
-                        job.prev_hash = Hash256::from_hex(&prev_hash_hex).map_err(|e| {
-                            NodeError::Runtime(format!(
-                                "invalid prev_hash in set_new_prev_hash: {e}"
-                            ))
-                        })?;
-                        job.ntime = ntime;
-                        job.network_target =
-                            Target::from_hex(&network_target_hex).map_err(|e| {
+                    Sv2Message::OpenStandardMiningChannelError { code, reason, .. } => {
+                        return Err(NodeError::Runtime(format!(
+                            "stratum open channel rejected: code={code} reason={reason}"
+                        )));
+                    }
+                    Sv2Message::SetTarget {
+                        channel_id: msg_channel,
+                        maximum_target_hex,
+                    } => {
+                        if should_apply_set_target(channel_id, msg_channel) {
+                            share_target = Target::from_hex(&maximum_target_hex).map_err(|e| {
+                                NodeError::Runtime(format!("invalid set_target from pool: {e}"))
+                            })?;
+                            println!(
+                                "share target updated: channel={} target={}",
+                                msg_channel, share_target
+                            );
+                        }
+                    }
+                    Sv2Message::SetNewPrevHash {
+                        channel_id: msg_channel,
+                        job_id,
+                        prev_hash_hex,
+                        ntime,
+                        network_target_hex,
+                    } => {
+                        if should_apply_set_new_prev_hash(channel_id, msg_channel)
+                            && let Some(job) = jobs.get_mut(&job_id)
+                        {
+                            job.prev_hash = Hash256::from_hex(&prev_hash_hex).map_err(|e| {
                                 NodeError::Runtime(format!(
-                                    "invalid network_target in set_new_prev_hash: {e}"
+                                    "invalid prev_hash in set_new_prev_hash: {e}"
                                 ))
                             })?;
-                        active_job_id = Some(job_id);
+                            job.ntime = ntime;
+                            job.network_target =
+                                Target::from_hex(&network_target_hex).map_err(|e| {
+                                    NodeError::Runtime(format!(
+                                        "invalid network_target in set_new_prev_hash: {e}"
+                                    ))
+                                })?;
+                            active_job_id = Some(job_id);
+                        }
                     }
-                }
-                Sv2Message::SubmitSharesSuccess {
-                    accepted, is_block, ..
-                } => {
-                    accepted_shares = accepted_shares.saturating_add(accepted as u64);
-                    if is_block {
-                        found_blocks = found_blocks.saturating_add(1);
-                    }
-                    println!(
-                        "share accepted: accepted={} total_accepted={} blocks={}",
-                        accepted, accepted_shares, found_blocks
-                    );
-                }
-                Sv2Message::SubmitSharesError { code, reason, .. } => {
-                    println!("share rejected: code={} reason={}", code, reason);
-                }
-                Sv2Message::KeepAlive => {
-                    send_sv2_sync!(&Sv2Message::KeepAlive);
-                    last_io = Instant::now();
-                }
-                other => {
-                    let translated = if let Some(addr) = translator_addr.as_deref() {
-                        translate_remote_job_with_service(addr, other)?
-                    } else {
-                        translator.parse_remote_job_message(other).map_err(|e| {
-                            NodeError::Runtime(format!("stratum translate failed: {e}"))
-                        })?
-                    };
-                    if let Some(job) = translated {
-                        active_job_id = Some(job.job_id);
-                        nonce_cursor.insert(job.job_id, 0);
+                    Sv2Message::SubmitSharesSuccess {
+                        accepted, is_block, ..
+                    } => {
+                        accepted_shares = accepted_shares.saturating_add(accepted as u64);
+                        if is_block {
+                            found_blocks = found_blocks.saturating_add(1);
+                        }
                         println!(
-                            "new mining job: channel={} job={} ntime={} target={}",
-                            job.channel_id, job.job_id, job.ntime, job.network_target
+                            "share accepted: accepted={} total_accepted={} blocks={}",
+                            accepted, accepted_shares, found_blocks
                         );
-                        jobs.insert(job.job_id, job);
                     }
-                }
-            },
+                    Sv2Message::SubmitSharesError { code, reason, .. } => {
+                        println!("share rejected: code={} reason={}", code, reason);
+                    }
+                    Sv2Message::KeepAlive => {
+                        send_sv2_sync!(&Sv2Message::KeepAlive);
+                        last_io = Instant::now();
+                    }
+                    other => {
+                        let translated = if let Some(addr) = translator_addr.as_deref() {
+                            translate_remote_job_with_service(addr, other)?
+                        } else {
+                            translator.parse_remote_job_message(other).map_err(|e| {
+                                NodeError::Runtime(format!("stratum translate failed: {e}"))
+                            })?
+                        };
+                        if let Some(job) = translated {
+                            active_job_id = Some(job.job_id);
+                            nonce_cursor.insert(job.job_id, 0);
+                            println!(
+                                "new mining job: channel={} job={} ntime={} target={}",
+                                job.channel_id, job.job_id, job.ntime, job.network_target
+                            );
+                            jobs.insert(job.job_id, job);
+                        }
+                    }
+                },
+            }
         }
+
+        if !reconnect_requested {
+            break 'reconnect;
+        }
+
+        reconnect_attempts = reconnect_attempts.saturating_add(1);
+        if reconnect_attempts_exhausted(args.max_reconnect_attempts, reconnect_attempts) {
+            return Err(NodeError::Runtime(format!(
+                "stratum reconnect attempts exhausted (max={})",
+                args.max_reconnect_attempts
+            )));
+        }
+
+        println!(
+            "stratum miner reconnecting in {}s (attempt={})",
+            reconnect_delay_sec, reconnect_attempts
+        );
+        thread::sleep(reconnect_delay);
     }
 
     println!(
@@ -10733,6 +10853,8 @@ mod tests {
             miner_max_nonce_per_cycle: 250_000,
             miner_max_shares: 0,
             miner_max_runtime_sec: 0,
+            miner_reconnect_delay_sec: 2,
+            miner_max_reconnect_attempts: 0,
         };
 
         let node_only = super::build_run_mode_plan(&base).expect("node-only");
@@ -10794,6 +10916,8 @@ mod tests {
             miner_max_nonce_per_cycle: 250_000,
             miner_max_shares: 0,
             miner_max_runtime_sec: 0,
+            miner_reconnect_delay_sec: 2,
+            miner_max_reconnect_attempts: 0,
         };
         let err = super::build_run_mode_plan(&args).expect_err("must require pool");
         assert!(err.to_string().contains("miner pool is required"));
@@ -10826,6 +10950,8 @@ mod tests {
             miner_max_nonce_per_cycle: 1000,
             miner_max_shares: 1,
             miner_max_runtime_sec: 1,
+            miner_reconnect_delay_sec: 2,
+            miner_max_reconnect_attempts: 0,
         })
         .expect_err("run-mode should surface service failure");
         let msg = err.to_string();
@@ -11367,6 +11493,12 @@ mod tests {
         .expect("timeout maps to read timeout");
         assert!(matches!(timeout, super::StratumReadOutcome::Timeout));
 
+        let closed = super::map_sv2_read_result(Err(scam_stratum::StratumError::Io(
+            std::io::Error::from(std::io::ErrorKind::ConnectionReset),
+        )))
+        .expect("closed-like io maps to closed");
+        assert!(matches!(closed, super::StratumReadOutcome::Closed));
+
         let keepalive = super::map_sv2_read_result(Ok(Some(Sv2Message::KeepAlive)))
             .expect("message pass-through");
         assert!(matches!(
@@ -11374,8 +11506,8 @@ mod tests {
             super::StratumReadOutcome::Message(Sv2Message::KeepAlive)
         ));
 
-        let closed = super::map_sv2_read_result(Ok(None)).expect("closed pass-through");
-        assert!(matches!(closed, super::StratumReadOutcome::Closed));
+        let clean_close = super::map_sv2_read_result(Ok(None)).expect("closed pass-through");
+        assert!(matches!(clean_close, super::StratumReadOutcome::Closed));
 
         let fatal = match super::map_sv2_read_result(Err(
             scam_stratum::StratumError::InvalidFrameLength(17),
@@ -11392,6 +11524,14 @@ mod tests {
             Err(err) => err,
         };
         assert!(fatal_io.to_string().contains("stratum read failed"));
+    }
+
+    #[test]
+    fn reconnect_attempts_exhausted_enforces_only_nonzero_limit() {
+        assert!(!super::reconnect_attempts_exhausted(0, 10));
+        assert!(!super::reconnect_attempts_exhausted(3, 2));
+        assert!(super::reconnect_attempts_exhausted(3, 3));
+        assert!(super::reconnect_attempts_exhausted(3, 7));
     }
 
     #[test]
@@ -14418,6 +14558,8 @@ mod tests {
             max_nonce_per_cycle: 100,
             max_shares: 0,
             max_runtime_sec: 0,
+            reconnect_delay_sec: 2,
+            max_reconnect_attempts: 0,
             secure_transport: true,
             secure_transport_mode: Some(super::SecureTransportModeArg::NoiseXx),
             secure_rekey_interval_messages: 1_000,
@@ -14445,6 +14587,8 @@ mod tests {
             max_nonce_per_cycle: 1_000,
             max_shares: 0,
             max_runtime_sec: 0,
+            reconnect_delay_sec: 2,
+            max_reconnect_attempts: 0,
             secure_transport: false,
             secure_transport_mode: None,
             secure_rekey_interval_messages: 10_000,
