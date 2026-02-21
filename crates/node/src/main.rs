@@ -1229,9 +1229,23 @@ fn load_mempool_from_db_or_empty_with_retry(
     attempts: usize,
     backoff_ms: u64,
 ) -> Result<Mempool, NodeError> {
+    load_mempool_with_retry_inner(cfg, attempts, backoff_ms, || {
+        load_mempool_from_db_or_empty(cfg, mempool_db_path)
+    })
+}
+
+fn load_mempool_with_retry_inner<F>(
+    cfg: &ChainConfig,
+    attempts: usize,
+    backoff_ms: u64,
+    mut load_op: F,
+) -> Result<Mempool, NodeError>
+where
+    F: FnMut() -> Result<Mempool, NodeError>,
+{
     let tries = attempts.max(1);
     for idx in 0..tries {
-        match load_mempool_from_db_or_empty(cfg, mempool_db_path) {
+        match load_op() {
             Ok(mempool) => return Ok(mempool),
             Err(err) if is_mempool_db_lock_conflict(&err) => {
                 if idx + 1 < tries {
@@ -1307,6 +1321,32 @@ where
         }
     }
     Err(last_err.unwrap_or_else(|| NodeError::Runtime(unknown_err_message.to_owned())))
+}
+
+fn load_with_retry<T, F>(
+    attempts: usize,
+    backoff_ms: u64,
+    is_lock_conflict: fn(&NodeError) -> bool,
+    mut load_op: F,
+) -> Result<Option<T>, NodeError>
+where
+    F: FnMut() -> Result<T, NodeError>,
+{
+    let tries = attempts.max(1);
+    for idx in 0..tries {
+        match load_op() {
+            Ok(value) => return Ok(Some(value)),
+            Err(err) if is_lock_conflict(&err) => {
+                if idx + 1 < tries {
+                    std::thread::sleep(Duration::from_millis(backoff_ms.max(1)));
+                    continue;
+                }
+                return Ok(None);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(None)
 }
 
 fn persist_runtime_db_with_retry(
@@ -1483,7 +1523,15 @@ fn run_mode(args: RunModeArgs) -> Result<(), NodeError> {
     persist_runtime_db(&runtime, &runtime_db_path)?;
 
     let plan = build_run_mode_plan(&args)?;
-    if !plan.run_relay && !plan.run_rpc && !plan.run_stratum && !plan.run_miner {
+    if matches!(
+        (
+            plan.run_relay,
+            plan.run_rpc,
+            plan.run_stratum,
+            plan.run_miner
+        ),
+        (false, false, false, false)
+    ) {
         return Err(NodeError::Runtime(
             "run-mode produced empty service plan".to_owned(),
         ));
@@ -3793,10 +3841,8 @@ fn relay_apply_main_chain_transition(
         }
     }
 
-    if !connected_txids.is_empty() {
-        let confirmed = connected_txids.iter().copied().collect::<Vec<_>>();
-        let _ = state.relay.mempool.remove_confirmed_txids(&confirmed);
-    }
+    let confirmed = connected_txids.iter().copied().collect::<Vec<_>>();
+    let _ = state.relay.mempool.remove_confirmed_txids(&confirmed);
 
     for block in connected_blocks {
         let _ = state.relay.gossip.announce_block(block.clone());
@@ -3875,7 +3921,8 @@ fn relay_recovery_messages_for_unknown_parent(
 }
 
 fn relay_try_apply_pending_orphans(state: &mut RelayServerState, now_unix_sec: u64) {
-    loop {
+    let max_passes = state.pending_block_orphan_order.len().saturating_add(1);
+    for _pass in 0..max_passes {
         let mut progressed = false;
         let queued = state
             .pending_block_orphan_order
@@ -4307,17 +4354,21 @@ fn run_relay_outbound_worker(
     write_timeout_sec: u64,
     redial_sec: u64,
 ) {
-    if target.trim().is_empty() || relay_target_matches_bind(&bind_addr, &target) {
+    if target.trim().is_empty() {
+        return;
+    }
+    if relay_target_matches_bind(&bind_addr, &target) {
         return;
     }
     let redial_delay = Duration::from_secs(redial_sec.max(1));
-    while !stop_flag.load(Ordering::Relaxed) {
+    loop {
+        if stop_flag.load(Ordering::Relaxed) {
+            break;
+        }
         let mut stream = match TcpStream::connect(&target) {
             Ok(stream) => stream,
             Err(err) => {
-                if !stop_flag.load(Ordering::Relaxed) {
-                    eprintln!("warning: outbound relay connect to {target} failed: {err}");
-                }
+                eprintln!("warning: outbound relay connect to {target} failed: {err}");
                 thread::sleep(redial_delay);
                 continue;
             }
@@ -4328,9 +4379,7 @@ fn run_relay_outbound_worker(
             Duration::from_secs(read_timeout_sec.max(1)),
             Duration::from_secs(write_timeout_sec.max(1)),
         ) {
-            if !stop_flag.load(Ordering::Relaxed) {
-                eprintln!("warning: outbound relay timeout config for {target} failed: {err}");
-            }
+            eprintln!("warning: outbound relay timeout config for {target} failed: {err}");
             thread::sleep(redial_delay);
             continue;
         }
@@ -4349,8 +4398,10 @@ fn run_relay_outbound_worker(
             &mempool_db_path,
             max_inv_items,
             read_limit,
-        ) && !stop_flag.load(Ordering::Relaxed)
-        {
+        ) {
+            if stop_flag.load(Ordering::Relaxed) {
+                break;
+            }
             eprintln!(
                 "warning: outbound relay session with {target} ended: reason={} detail={err}",
                 relay_disconnect_reason(&err)
@@ -4380,7 +4431,10 @@ fn run_relay_outbound_supervisor(
     let redial_delay = Duration::from_secs(redial_sec.max(1));
     let mut workers = HashMap::<String, thread::JoinHandle<()>>::new();
 
-    while !stop_flag.load(Ordering::Relaxed) {
+    loop {
+        if stop_flag.load(Ordering::Relaxed) {
+            break;
+        }
         let mut finished = Vec::<String>::new();
         for (target, handle) in &workers {
             if handle.is_finished() {
@@ -4398,9 +4452,10 @@ fn run_relay_outbound_supervisor(
         match load_relay_outbound_targets(&peers_dir, &cfg.network_id) {
             Ok(targets) => {
                 for target in targets {
-                    if workers.contains_key(&target)
-                        || relay_target_matches_bind(&bind_addr, &target)
-                    {
+                    if workers.contains_key(&target) {
+                        continue;
+                    }
+                    if relay_target_matches_bind(&bind_addr, &target) {
                         continue;
                     }
                     let stop_clone = stop_flag.clone();
@@ -4450,9 +4505,18 @@ fn run_relay_outbound_supervisor(
     }
 }
 
+fn relay_runtime_or_mempool_changed(
+    tip_before: Hash256,
+    tip_after: Hash256,
+    mempool_before: u64,
+    mempool_after: u64,
+) -> (bool, bool) {
+    (tip_after != tip_before, mempool_after != mempool_before)
+}
+
 #[allow(clippy::too_many_arguments)]
-fn run_relay_peer_session(
-    stream: &mut TcpStream,
+fn run_relay_peer_session<IO: Read + Write>(
+    stream: &mut IO,
     mode: RelayPeerSessionMode,
     peer_id: u64,
     state: &Arc<Mutex<RelayServerState>>,
@@ -4572,8 +4636,14 @@ fn run_relay_peer_session(
                 let tip_before = guard.runtime.tip_hash();
                 let mempool_before = guard.relay.mempool.revision();
                 let outbound = process_relay_wire_message(&mut guard, peer_id, inbound, now)?;
-                let runtime_changed = guard.runtime.tip_hash() != tip_before;
-                let mempool_changed = guard.relay.mempool.revision() != mempool_before;
+                let tip_after = guard.runtime.tip_hash();
+                let mempool_after = guard.relay.mempool.revision();
+                let (runtime_changed, mempool_changed) = relay_runtime_or_mempool_changed(
+                    tip_before,
+                    tip_after,
+                    mempool_before,
+                    mempool_after,
+                );
                 (outbound, runtime_changed, mempool_changed)
             };
             if runtime_changed {
@@ -6180,8 +6250,8 @@ fn read_role_request<T: DeserializeOwned, R: Read>(stream: &mut R) -> Result<T, 
         .map_err(|e| NodeError::Runtime(format!("role request decode failed: {e}")))
 }
 
-fn write_role_response<T: Serialize>(
-    stream: &mut TcpStream,
+fn write_role_response<T: Serialize, W: Write>(
+    stream: &mut W,
     response: &T,
 ) -> Result<(), NodeError> {
     let body = serde_json::to_string(response)
@@ -8654,30 +8724,13 @@ fn refresh_runtime_from_db_if_changed(
     if current_mtime == *last_seen_mtime {
         return Ok(());
     }
-    let mut fresh = None;
-    for attempt in 0..10 {
-        match load_runtime_from_db_or_genesis(cfg, runtime_db_path) {
-            Ok((loaded, _source)) => {
-                fresh = Some(loaded);
-                break;
-            }
-            Err(err) if is_runtime_db_lock_conflict(&err) => {
-                if attempt < 9 {
-                    std::thread::sleep(Duration::from_millis(25));
-                    continue;
-                }
-                // Another process owns the runtime DB lock at the moment.
-                // Keep serving with the latest in-memory runtime and retry refresh on next request.
-                return Ok(());
-            }
-            Err(err) => return Err(err),
-        }
+    let fresh = load_with_retry(10, 25, is_runtime_db_lock_conflict, || {
+        load_runtime_from_db_or_genesis(cfg, runtime_db_path).map(|(loaded, _)| loaded)
+    })?;
+    if let Some(fresh) = fresh {
+        *runtime = fresh;
+        *last_seen_mtime = current_mtime;
     }
-    let Some(fresh) = fresh else {
-        return Ok(());
-    };
-    *runtime = fresh;
-    *last_seen_mtime = current_mtime;
     Ok(())
 }
 
@@ -8691,26 +8744,9 @@ fn refresh_mempool_from_db_if_changed(
     if current_mtime == *last_seen_mtime {
         return Ok(());
     }
-
-    let mut fresh = None;
-    for attempt in 0..10 {
-        match load_mempool_from_db_or_empty(cfg, mempool_db_path) {
-            Ok(mempool) => {
-                fresh = Some(mempool);
-                break;
-            }
-            Err(err) if is_mempool_db_lock_conflict(&err) => {
-                if attempt < 9 {
-                    std::thread::sleep(Duration::from_millis(25));
-                    continue;
-                }
-                // Another process owns the mempool DB lock right now.
-                // Keep serving with the latest in-memory mempool and retry later.
-                return Ok(());
-            }
-            Err(err) => return Err(err),
-        }
-    }
+    let fresh = load_with_retry(10, 25, is_mempool_db_lock_conflict, || {
+        load_mempool_from_db_or_empty(cfg, mempool_db_path)
+    })?;
     if let Some(mempool) = fresh {
         relay.mempool = mempool;
         *last_seen_mtime = current_mtime;
@@ -8856,7 +8892,7 @@ fn reap_finished_rpc_event_workers(handles: &mut Vec<thread::JoinHandle<()>>) {
 }
 
 fn run_rpc_events_worker(
-    mut stream: TcpStream,
+    stream: &mut impl Write,
     cfg: ChainConfig,
     runtime_db_path: PathBuf,
     mempool_db_path: PathBuf,
@@ -8866,7 +8902,7 @@ fn run_rpc_events_worker(
 ) -> Result<(), NodeError> {
     let (mut runtime, _) = load_runtime_from_db_or_genesis(&cfg, &runtime_db_path)?;
     let mut runtime_db_seen_mtime = runtime_db_mtime(&runtime_db_path);
-    if let Err(err) = write_http_sse_headers(&mut stream) {
+    if let Err(err) = write_http_sse_headers(stream) {
         if rpc_sse_write_error_is_closed_like(&err) {
             return Ok(());
         }
@@ -8880,7 +8916,7 @@ fn run_rpc_events_worker(
             &runtime_db_path,
             &mut runtime_db_seen_mtime,
         )?;
-        if let Err(err) = write_http_sse_comment(&mut stream, "heartbeat") {
+        if let Err(err) = write_http_sse_comment(stream, "heartbeat") {
             if rpc_sse_write_error_is_closed_like(&err) {
                 return Ok(());
             }
@@ -8894,7 +8930,7 @@ fn run_rpc_events_worker(
         )?;
         let payload = serde_json::to_string(&snapshot)
             .map_err(|e| NodeError::Runtime(format!("events serialization failed: {e}")))?;
-        if let Err(err) = write_http_sse_event(&mut stream, "snapshot", &payload) {
+        if let Err(err) = write_http_sse_event(stream, "snapshot", &payload) {
             if rpc_sse_write_error_is_closed_like(&err) {
                 return Ok(());
             }
@@ -8991,8 +9027,9 @@ fn run_rpc_serve(args: RpcServeArgs) -> Result<(), NodeError> {
             let relay_telemetry_clone = relay_telemetry.clone();
             let stop_clone = events_stop_flag.clone();
             events_workers.push(thread::spawn(move || {
+                let mut stream = stream;
                 if let Err(err) = run_rpc_events_worker(
-                    stream,
+                    &mut stream,
                     cfg_clone,
                     runtime_db_path_clone,
                     mempool_db_path_clone,
@@ -9806,6 +9843,8 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::{Shutdown, TcpListener, TcpStream};
     use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
     use std::sync::mpsc;
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -10319,6 +10358,8 @@ mod tests {
         assert!(super::should_emit_miner_keepalive(11));
         assert!(super::wallet_send_preview_has_invalid_amount(0));
         assert!(!super::wallet_send_preview_has_invalid_amount(1));
+        assert!(super::tx_submit_has_invalid_payload("   \n\t"));
+        assert!(!super::tx_submit_has_invalid_payload("00"));
         assert!(!super::should_reply_bad_http_request(
             &super::NodeError::Runtime(
                 "http read timeout while waiting for full request: timed out".to_owned()
@@ -10337,6 +10378,12 @@ mod tests {
         ));
         assert!(super::rpc_sse_write_error_is_closed_like(
             &super::NodeError::Runtime("http flush failed: Connection reset by peer".to_owned())
+        ));
+        assert!(super::rpc_sse_write_error_is_closed_like(
+            &super::NodeError::Runtime("http flush failed: connection aborted".to_owned())
+        ));
+        assert!(super::rpc_sse_write_error_is_closed_like(
+            &super::NodeError::Runtime("http flush failed: not connected".to_owned())
         ));
         assert!(!super::rpc_sse_write_error_is_closed_like(
             &super::NodeError::Runtime("http write failed: permission denied".to_owned())
@@ -10373,11 +10420,70 @@ mod tests {
             block_hash: Hash256([3u8; 32]),
             parent: Hash256([4u8; 32]),
         });
+        let invalid_magic_err = super::NodeError::Transport(super::TransportError::InvalidMagic {
+            expected: 1,
+            got: 2,
+        });
+        let too_large_err = super::NodeError::Transport(super::TransportError::MessageTooLarge {
+            limit: 1,
+            got: 2,
+        });
+        let unexpected_msg_err =
+            super::NodeError::Transport(super::TransportError::UnexpectedMessage {
+                expected: "inv",
+                got: "tx".to_owned(),
+            });
+        let unexpected_inv_err =
+            super::NodeError::Transport(super::TransportError::UnexpectedInventoryItem {
+                expected: "block",
+                got: "tx".to_owned(),
+            });
+        let wire_err = super::NodeError::Transport(super::TransportError::Wire(
+            scam_p2p::WireError::MessageTooLarge { limit: 1, got: 2 },
+        ));
+        let io_other_err = super::NodeError::Transport(super::TransportError::Io(
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        ));
+        let runtime_mismatch =
+            super::NodeError::Runtime("fatal: network mismatch after handshake".to_owned());
+        let runtime_poison =
+            super::NodeError::Runtime("relay state mutex poisoned while handling peer".to_owned());
+        let runtime_internal = super::NodeError::Runtime("unexpected runtime error".to_owned());
         assert_eq!(super::relay_disconnect_reason(&timeout_err), "io-timeout");
         assert_eq!(super::relay_disconnect_reason(&closed_err), "io-closed");
         assert_eq!(
             super::relay_disconnect_reason(&unknown_parent_err),
             "unknown-parent"
+        );
+        assert_eq!(
+            super::relay_disconnect_reason(&invalid_magic_err),
+            "invalid-magic"
+        );
+        assert_eq!(
+            super::relay_disconnect_reason(&too_large_err),
+            "message-too-large"
+        );
+        assert_eq!(
+            super::relay_disconnect_reason(&unexpected_msg_err),
+            "unexpected-message"
+        );
+        assert_eq!(
+            super::relay_disconnect_reason(&unexpected_inv_err),
+            "unexpected-inventory"
+        );
+        assert_eq!(super::relay_disconnect_reason(&wire_err), "wire-error");
+        assert_eq!(super::relay_disconnect_reason(&io_other_err), "io-error");
+        assert_eq!(
+            super::relay_disconnect_reason(&runtime_mismatch),
+            "network-mismatch"
+        );
+        assert_eq!(
+            super::relay_disconnect_reason(&runtime_poison),
+            "state-poisoned"
+        );
+        assert_eq!(
+            super::relay_disconnect_reason(&runtime_internal),
+            "internal-error"
         );
 
         assert_eq!(super::reorg_min_difficulty_window(49), 50);
@@ -10389,6 +10495,28 @@ mod tests {
             super::nonempty_parent_dir(std::path::Path::new("dir/report.json"))
                 .expect("non-empty parent"),
             std::path::Path::new("dir")
+        );
+    }
+
+    #[test]
+    fn relay_runtime_or_mempool_changed_detects_exact_transitions() {
+        let tip_a = Hash256([0x11; 32]);
+        let tip_b = Hash256([0x22; 32]);
+        assert_eq!(
+            super::relay_runtime_or_mempool_changed(tip_a, tip_a, 7, 7),
+            (false, false)
+        );
+        assert_eq!(
+            super::relay_runtime_or_mempool_changed(tip_a, tip_b, 7, 7),
+            (true, false)
+        );
+        assert_eq!(
+            super::relay_runtime_or_mempool_changed(tip_a, tip_a, 7, 9),
+            (false, true)
+        );
+        assert_eq!(
+            super::relay_runtime_or_mempool_changed(tip_a, tip_b, 7, 9),
+            (true, true)
         );
     }
 
@@ -10476,6 +10604,48 @@ mod tests {
         };
         let err = super::build_run_mode_plan(&args).expect_err("must require pool");
         assert!(err.to_string().contains("miner pool is required"));
+    }
+
+    #[test]
+    fn run_mode_reports_spawned_service_failure_and_not_empty_plan_error() {
+        let _net_guard = network_test_guard();
+        let work_dir = temp_dir("test-run-mode-spawn");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let config_path = work_dir.join("devnet.toml");
+        fs::write(&config_path, include_str!("../../../config/devnet.toml")).expect("write cfg");
+        let runtime_db = work_dir.join("runtime.redb");
+
+        let err = super::run_mode(super::RunModeArgs {
+            network: Network::Devnet,
+            config: Some(config_path),
+            runtime_db: Some(runtime_db),
+            preset: super::RunModePreset::SoloRemote,
+            peers_dir: work_dir.join("peers"),
+            relay_bind: "127.0.0.1:18444".to_owned(),
+            rpc_bind: "127.0.0.1:18080".to_owned(),
+            ui_dir: work_dir.join("ui"),
+            stratum_bind: "127.0.0.1:3347".to_owned(),
+            relay_outbound_connect: true,
+            relay_outbound_redial_sec: 1,
+            miner_pool: Some("127.0.0.1:0".to_owned()),
+            miner_user: "test-miner".to_owned(),
+            miner_read_timeout_sec: 1,
+            miner_max_nonce_per_cycle: 1000,
+            miner_max_shares: 1,
+            miner_max_runtime_sec: 1,
+        })
+        .expect_err("run-mode should surface service failure");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("stratum-mine exited with error"),
+            "unexpected run-mode error: {msg}"
+        );
+        assert!(
+            !msg.contains("run-mode produced empty service plan"),
+            "run-mode must not report empty plan for solo-remote preset"
+        );
+
+        let _ = fs::remove_dir_all(work_dir);
     }
 
     #[test]
@@ -10589,6 +10759,163 @@ mod tests {
         .expect_err("attempts=0 still performs one try");
         assert!(exhausted.to_string().contains("Database already open"));
         assert_eq!(tries_zero.load(Ordering::Relaxed), 1);
+
+        let start = Instant::now();
+        let timed = super::persist_with_retry(
+            2,
+            200,
+            super::is_runtime_db_lock_conflict,
+            "unknown runtime persist error",
+            || {
+                Err(super::NodeError::Runtime(
+                    "Database already open".to_owned(),
+                ))
+            },
+        )
+        .expect_err("lock-conflict path must fail after bounded retries");
+        assert!(timed.to_string().contains("Database already open"));
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(160),
+            "expected one 200ms backoff sleep, elapsed={elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(350),
+            "unexpected extra backoff sleeps, elapsed={elapsed:?}"
+        );
+
+        let start = Instant::now();
+        let timed_three = super::persist_with_retry(
+            3,
+            150,
+            super::is_runtime_db_lock_conflict,
+            "unknown runtime persist error",
+            || {
+                Err(super::NodeError::Runtime(
+                    "Database already open".to_owned(),
+                ))
+            },
+        )
+        .expect_err("attempts=3 should perform two backoff sleeps");
+        assert!(timed_three.to_string().contains("Database already open"));
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(260),
+            "expected two backoff sleeps for attempts=3, elapsed={elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "unexpected extra backoffs for attempts=3, elapsed={elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn load_mempool_with_retry_inner_retries_lock_conflicts_and_stops_on_other_errors() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+
+        let calls_fallback = Arc::new(AtomicUsize::new(0));
+        let calls_fallback_clone = calls_fallback.clone();
+        let start = Instant::now();
+        let mempool = super::load_mempool_with_retry_inner(&cfg, 2, 200, move || {
+            calls_fallback_clone.fetch_add(1, Ordering::Relaxed);
+            Err(super::NodeError::Runtime(
+                "Database already open".to_owned(),
+            ))
+        })
+        .expect("fallback to empty mempool");
+        assert_eq!(mempool.len(), 0);
+        assert_eq!(calls_fallback.load(Ordering::Relaxed), 2);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(160),
+            "expected one 200ms backoff sleep on lock conflict, elapsed={elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(350),
+            "unexpected extra backoff sleeps on lock conflict, elapsed={elapsed:?}"
+        );
+
+        let max_txs = cfg.max_mempool_txs as usize;
+        let min_fee = cfg.min_relay_fee_per_kb;
+        let calls_success = Arc::new(AtomicUsize::new(0));
+        let calls_success_clone = calls_success.clone();
+        let mempool = super::load_mempool_with_retry_inner(&cfg, 4, 1, move || {
+            let attempt = calls_success_clone.fetch_add(1, Ordering::Relaxed);
+            if attempt == 0 {
+                return Err(super::NodeError::Runtime("Cannot acquire lock".to_owned()));
+            }
+            Mempool::with_policy(max_txs, min_fee).map_err(super::NodeError::from)
+        })
+        .expect("second attempt should succeed");
+        assert_eq!(mempool.len(), 0);
+        assert_eq!(calls_success.load(Ordering::Relaxed), 2);
+
+        let calls_err = Arc::new(AtomicUsize::new(0));
+        let calls_err_clone = calls_err.clone();
+        let err = super::load_mempool_with_retry_inner(&cfg, 5, 25, move || {
+            calls_err_clone.fetch_add(1, Ordering::Relaxed);
+            Err(super::NodeError::Runtime("permission denied".to_owned()))
+        })
+        .expect_err("non-lock errors must fail immediately");
+        assert!(err.to_string().contains("permission denied"));
+        assert_eq!(calls_err.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn load_with_retry_retries_lock_conflicts_and_bubbles_non_lock_errors() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls_none = Arc::new(AtomicUsize::new(0));
+        let calls_none_clone = calls_none.clone();
+        let start = Instant::now();
+        let none: Option<u64> =
+            super::load_with_retry(2, 200, super::is_runtime_db_lock_conflict, move || {
+                calls_none_clone.fetch_add(1, Ordering::Relaxed);
+                Err(super::NodeError::Runtime(
+                    "Database already open".to_owned(),
+                ))
+            })
+            .expect("lock conflicts should degrade to None");
+        assert!(none.is_none());
+        assert_eq!(calls_none.load(Ordering::Relaxed), 2);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(160),
+            "expected one 200ms backoff sleep, elapsed={elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(350),
+            "unexpected extra backoff sleeps, elapsed={elapsed:?}"
+        );
+
+        let calls_some = Arc::new(AtomicUsize::new(0));
+        let calls_some_clone = calls_some.clone();
+        let some = super::load_with_retry(3, 1, super::is_runtime_db_lock_conflict, move || {
+            let attempt = calls_some_clone.fetch_add(1, Ordering::Relaxed);
+            if attempt == 0 {
+                Err(super::NodeError::Runtime("Cannot acquire lock".to_owned()))
+            } else {
+                Ok(7u64)
+            }
+        })
+        .expect("second attempt should succeed");
+        assert_eq!(some, Some(7));
+        assert_eq!(calls_some.load(Ordering::Relaxed), 2);
+
+        let calls_err = Arc::new(AtomicUsize::new(0));
+        let calls_err_clone = calls_err.clone();
+        let err = super::load_with_retry(5, 1, super::is_runtime_db_lock_conflict, move || {
+            calls_err_clone.fetch_add(1, Ordering::Relaxed);
+            Err::<u64, super::NodeError>(super::NodeError::Runtime("permission denied".to_owned()))
+        })
+        .expect_err("non-lock errors should not retry");
+        assert!(err.to_string().contains("permission denied"));
+        assert_eq!(calls_err.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -10625,6 +10952,77 @@ mod tests {
             "unexpected readonly error: {err}"
         );
 
+        let writable_db = work_dir.join("writable-empty-mempool.redb");
+        save_mempool_db(
+            &writable_db,
+            &MempoolSnapshot {
+                network_id: cfg.network_id.clone(),
+                entries: Vec::new(),
+            },
+        )
+        .expect("save writable snapshot");
+        let before = fs::metadata(&writable_db)
+            .expect("metadata before")
+            .modified()
+            .expect("mtime before");
+        let before_bytes = fs::read(&writable_db).expect("read before");
+        thread::sleep(Duration::from_secs(1));
+        let removed = super::remove_confirmed_txids_from_mempool_db(&cfg, &writable_db, &[txid])
+            .expect("existing writable db should still persist even when nothing is removed");
+        assert_eq!(removed, 0);
+        let after = fs::metadata(&writable_db)
+            .expect("metadata after")
+            .modified()
+            .expect("mtime after");
+        let after_bytes = fs::read(&writable_db).expect("read after");
+        assert!(
+            after > before || after_bytes != before_bytes,
+            "mempool db should be rewritten for existing db path even when removed set is empty: before={before:?} after={after:?}"
+        );
+
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_confirmed_txids_existing_db_still_persists_when_removed_set_is_empty() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let work_dir = temp_dir("test-remove-confirmed-persist-empty");
+        let readonly_dir = work_dir.join("readonly");
+        fs::create_dir_all(&readonly_dir).expect("mkdir");
+        let mempool_db = readonly_dir.join("mempool.redb");
+        save_mempool_db(
+            &mempool_db,
+            &MempoolSnapshot {
+                network_id: cfg.network_id.clone(),
+                entries: Vec::new(),
+            },
+        )
+        .expect("save snapshot");
+
+        let mut dir_perms = fs::metadata(&readonly_dir).expect("metadata").permissions();
+        dir_perms.set_mode(0o555);
+        fs::set_permissions(&readonly_dir, dir_perms).expect("set readonly dir");
+
+        let err =
+            super::remove_confirmed_txids_from_mempool_db(&cfg, &mempool_db, &[Hash256([7; 32])])
+                .expect_err(
+                    "existing db path should attempt persist and fail in readonly parent dir",
+                );
+        assert!(
+            err.to_string().contains("Permission denied")
+                || err.to_string().contains("Read-only file system"),
+            "unexpected error for readonly persist path: {err}"
+        );
+
+        let mut cleanup_perms = fs::metadata(&readonly_dir)
+            .expect("cleanup metadata")
+            .permissions();
+        cleanup_perms.set_mode(0o755);
+        let _ = fs::set_permissions(&readonly_dir, cleanup_perms);
         let _ = fs::remove_dir_all(work_dir);
     }
 
@@ -11396,6 +11794,30 @@ mod tests {
     }
 
     #[test]
+    fn persist_runtime_db_with_retry_surfaces_storage_failures() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let runtime = ChainRuntime::from_config(cfg).expect("runtime");
+        let work_dir = temp_dir("test-persist-runtime-retry-error");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let parent_file = work_dir.join("not-a-dir");
+        fs::write(&parent_file, b"file blocks directory creation").expect("write parent file");
+        let invalid_path = parent_file.join("runtime.redb");
+
+        let err = super::persist_runtime_db_with_retry(&runtime, &invalid_path, 2, 1)
+            .expect_err("persist with file-as-parent should fail");
+        assert!(
+            err.to_string().contains("not a directory")
+                || err.to_string().contains("Not a directory")
+                || err.to_string().contains("CreateDir")
+                || err.to_string().contains("File exists"),
+            "unexpected persist error: {err}"
+        );
+
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
     fn relay_serve_rejects_network_id_mismatch_after_handshake() {
         let _net_guard = network_test_guard();
         let work_dir = temp_dir("test-relay-network-mismatch");
@@ -11995,6 +12417,95 @@ mod tests {
         let err = super::write_http_json_response(&mut writer, "200 OK", "{\"ok\":true}")
             .expect_err("writer error must propagate");
         assert!(err.to_string().contains("http write failed"));
+    }
+
+    #[test]
+    fn write_http_sse_helpers_emit_expected_frames_and_propagate_flush_errors() {
+        let mut buf = Vec::<u8>::new();
+        super::write_http_sse_headers(&mut buf).expect("write headers");
+        super::write_http_sse_comment(&mut buf, "heartbeat").expect("write comment");
+        super::write_http_sse_event(&mut buf, "snapshot", "{\"ok\":true}").expect("write event");
+        let text = String::from_utf8(buf).expect("utf8");
+        assert!(text.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(text.contains("text/event-stream"));
+        assert!(text.contains(": heartbeat\n\n"));
+        assert!(text.contains("event: snapshot\ndata: {\"ok\":true}\n\n"));
+
+        struct FlushFailWriter;
+        impl Write for FlushFailWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            }
+        }
+
+        let mut fail = FlushFailWriter;
+        let err = super::write_http_sse_headers(&mut fail).expect_err("headers flush must fail");
+        assert!(err.to_string().contains("http flush failed"));
+
+        let mut fail = FlushFailWriter;
+        let err =
+            super::write_http_sse_comment(&mut fail, "hb").expect_err("comment flush must fail");
+        assert!(err.to_string().contains("http flush failed"));
+
+        let mut fail = FlushFailWriter;
+        let err =
+            super::write_http_sse_event(&mut fail, "evt", "{}").expect_err("event flush must fail");
+        assert!(err.to_string().contains("http flush failed"));
+    }
+
+    #[test]
+    fn run_rpc_events_worker_writes_headers_before_main_loop() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let work_dir = temp_dir("test-rpc-events-worker");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let runtime_db = work_dir.join("runtime.redb");
+        let mempool_db = work_dir.join("mempool.redb");
+
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        persist_runtime_db(&runtime, &runtime_db).expect("persist runtime");
+
+        let stop = Arc::new(AtomicBool::new(true));
+        let mut stream = Vec::<u8>::new();
+        super::run_rpc_events_worker(
+            &mut stream,
+            cfg,
+            runtime_db,
+            mempool_db,
+            None,
+            stop,
+            Duration::from_millis(1),
+        )
+        .expect("rpc events worker should complete cleanly");
+        let text = String::from_utf8(stream).expect("utf8");
+        assert!(text.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(text.contains("text/event-stream"));
+
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
+    fn reap_finished_rpc_event_workers_removes_only_completed_threads() {
+        let (tx, rx) = mpsc::channel::<()>();
+        let finished = thread::spawn(|| {});
+        let blocked = thread::spawn(move || {
+            let _ = rx.recv();
+        });
+        let mut handles = vec![finished, blocked];
+        thread::sleep(Duration::from_millis(20));
+        super::reap_finished_rpc_event_workers(&mut handles);
+        assert_eq!(handles.len(), 1, "finished worker should be reaped");
+
+        let _ = tx.send(());
+        thread::sleep(Duration::from_millis(20));
+        super::reap_finished_rpc_event_workers(&mut handles);
+        assert!(
+            handles.is_empty(),
+            "remaining worker should be reaped after completion"
+        );
     }
 
     #[test]
@@ -12782,6 +13293,29 @@ mod tests {
     }
 
     #[test]
+    fn write_role_response_writes_json_line() {
+        let mut out = Vec::<u8>::new();
+        super::write_role_response(&mut out, &serde_json::json!({"ok": true}))
+            .expect("write response");
+        assert_eq!(out, b"{\"ok\":true}\n");
+
+        struct FailWriter;
+        impl Write for FailWriter {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut fail = FailWriter;
+        let err = super::write_role_response(&mut fail, &serde_json::json!({"ok": true}))
+            .expect_err("write failure should surface");
+        assert!(err.to_string().contains("role response write failed"));
+    }
+
+    #[test]
     fn wallet_balance_response_handles_empty_and_immature_outputs() {
         let cfg: ChainConfig =
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
@@ -13196,6 +13730,7 @@ mod tests {
         let mut cfg: ChainConfig =
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
         cfg.coinbase_maturity = 1;
+        cfg.min_relay_fee_per_kb = 0;
         cfg.validate().expect("config validate");
         fs::write(&config_path, toml::to_string(&cfg).expect("serialize cfg")).expect("write cfg");
 
@@ -13823,6 +14358,10 @@ mod tests {
         ));
         assert!(!super::relay_target_matches_bind(
             "0.0.0.0:18444",
+            "10.0.0.7:18444"
+        ));
+        assert!(!super::relay_target_matches_bind(
+            "0.0.0.0:18444",
             "127.0.0.1:18445"
         ));
     }
@@ -13884,6 +14423,103 @@ mod tests {
     }
 
     #[test]
+    fn refresh_runtime_from_db_if_changed_reloads_tip_when_mtime_changes() {
+        let mut cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("devnet config");
+        cfg.coinbase_maturity = 1;
+        cfg.validate().expect("config validate");
+
+        let work_dir = temp_dir("test-refresh-runtime-reload");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let runtime_db_path = work_dir.join("runtime.redb");
+
+        let mut producer = ChainRuntime::from_config(cfg.clone()).expect("producer runtime");
+        let reward_key_hash = cfg.genesis_reward_key_hash20().expect("reward key");
+        mine_blocks_on_runtime(
+            &mut producer,
+            &super::MiningLoopParams {
+                count: 1,
+                interval_sec: cfg.target_block_time_sec,
+                max_nonce: 500_000,
+                subsidy: cfg.block_subsidy,
+                miner_key_hash: reward_key_hash,
+                label_prefix: "refresh-runtime",
+                print_each: false,
+            },
+        )
+        .expect("mine producer");
+        persist_runtime_db(&producer, &runtime_db_path).expect("persist runtime");
+
+        let mut local_runtime = ChainRuntime::from_config(cfg.clone()).expect("local runtime");
+        let mut seen = None;
+        super::refresh_runtime_from_db_if_changed(
+            &cfg,
+            &mut local_runtime,
+            &runtime_db_path,
+            &mut seen,
+        )
+        .expect("refresh runtime");
+        assert_eq!(local_runtime.tip_hash(), producer.tip_hash());
+        assert_eq!(local_runtime.tip_height(), producer.tip_height());
+        assert!(super::runtime_db_mtime(&runtime_db_path).is_some());
+        assert!(super::file_mtime(&runtime_db_path).is_some());
+
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
+    fn refresh_mempool_from_db_if_changed_reloads_snapshot_when_mtime_changes() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let work_dir = temp_dir("test-refresh-mempool-reload");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let mempool_db_path = work_dir.join("mempool.redb");
+
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: OutPoint {
+                    txid: Hash256([0x11; 32]),
+                    vout: 0,
+                },
+                signature: vec![0x44; 64],
+                pubkey_compressed: vec![0x02; 33],
+                sequence: 0,
+            }],
+            outputs: vec![TxOut {
+                value: 1_000,
+                key_hash20: [0x22; 20],
+            }],
+            lock_time: 0,
+        };
+
+        let mut disk_mempool =
+            Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("disk mempool");
+        disk_mempool
+            .insert_with_fee(tx.clone(), 2_000)
+            .expect("insert tx");
+        let snapshot = super::mempool_snapshot_from_pool(&cfg, &disk_mempool);
+        save_mempool_db(&mempool_db_path, &snapshot).expect("save mempool");
+
+        let mut relay = RelayAdmissionState {
+            mempool: Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("relay mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip: GossipEngine::new(32).expect("gossip"),
+        };
+        let mut seen = None;
+        assert!(!relay.mempool.contains(&tx.txid()));
+        super::refresh_mempool_from_db_if_changed(&cfg, &mut relay, &mempool_db_path, &mut seen)
+            .expect("refresh mempool");
+        assert!(relay.mempool.contains(&tx.txid()));
+        assert!(super::mempool_db_mtime(&mempool_db_path).is_some());
+
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
     fn load_relay_outbound_targets_returns_sorted_and_deduped_peer_addresses() {
         let peers_dir = temp_dir("test-relay-outbound-targets");
         fs::create_dir_all(&peers_dir).expect("mkdir");
@@ -13921,6 +14557,607 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(peers_dir);
+    }
+
+    #[test]
+    fn run_relay_outbound_worker_skips_self_target_immediately() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let relay = RelayAdmissionState {
+            mempool: Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip: GossipEngine::new(16).expect("gossip"),
+        };
+        let state =
+            std::sync::Arc::new(std::sync::Mutex::new(RelayServerState::new(runtime, relay)));
+        let active = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let next_peer = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        let worker = thread::spawn({
+            let stop = stop.clone();
+            move || {
+                super::run_relay_outbound_worker(
+                    "127.0.0.1:18444".to_owned(),
+                    "127.0.0.1:18444".to_owned(),
+                    stop,
+                    next_peer,
+                    state,
+                    active,
+                    cfg,
+                    temp_dir("test-outbound-self-runtime").join("runtime.redb"),
+                    temp_dir("test-outbound-self-mempool").join("mempool.redb"),
+                    128,
+                    1,
+                    1,
+                    1,
+                    1,
+                );
+            }
+        });
+
+        thread::sleep(Duration::from_millis(100));
+        assert!(
+            worker.is_finished(),
+            "self-target worker must return immediately"
+        );
+        join_with_timeout(worker, Duration::from_secs(2), "relay outbound self-target");
+    }
+
+    #[test]
+    fn run_relay_outbound_worker_runs_until_stop_on_unreachable_target() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let relay = RelayAdmissionState {
+            mempool: Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip: GossipEngine::new(16).expect("gossip"),
+        };
+        let state =
+            std::sync::Arc::new(std::sync::Mutex::new(RelayServerState::new(runtime, relay)));
+        let active = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let next_peer = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        let worker = thread::spawn({
+            let stop = stop.clone();
+            move || {
+                super::run_relay_outbound_worker(
+                    "127.0.0.1:1".to_owned(),
+                    "127.0.0.1:18444".to_owned(),
+                    stop,
+                    next_peer,
+                    state,
+                    active,
+                    cfg,
+                    temp_dir("test-outbound-loop-runtime").join("runtime.redb"),
+                    temp_dir("test-outbound-loop-mempool").join("mempool.redb"),
+                    128,
+                    1,
+                    1,
+                    1,
+                    1,
+                );
+            }
+        });
+
+        thread::sleep(Duration::from_millis(100));
+        assert!(
+            !worker.is_finished(),
+            "worker should still be looping on unreachable target until stop flag is raised"
+        );
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        join_with_timeout(
+            worker,
+            Duration::from_secs(3),
+            "relay outbound unreachable target",
+        );
+    }
+
+    #[test]
+    fn run_relay_outbound_supervisor_runs_until_stop_with_self_target_peer() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let relay = RelayAdmissionState {
+            mempool: Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip: GossipEngine::new(16).expect("gossip"),
+        };
+        let state =
+            std::sync::Arc::new(std::sync::Mutex::new(RelayServerState::new(runtime, relay)));
+        let active = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let next_peer = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        let peers_dir = temp_dir("test-outbound-supervisor-self-peer");
+        fs::create_dir_all(&peers_dir).expect("mkdir peers");
+        super::save_peer_book_db(
+            &peers_dir.join("devnet.redb"),
+            &PeerAddressBook {
+                network_id: "devnet".to_owned(),
+                peers: vec![PeerAddressRecord {
+                    address: "127.0.0.1:18444".to_owned(),
+                    last_seen_unix_sec: 0,
+                    ban_score: 0,
+                }],
+            },
+        )
+        .expect("save peers");
+
+        let supervisor = thread::spawn({
+            let stop = stop.clone();
+            let peers_dir = peers_dir.clone();
+            move || {
+                super::run_relay_outbound_supervisor(
+                    stop,
+                    peers_dir,
+                    "127.0.0.1:18444".to_owned(),
+                    next_peer,
+                    state,
+                    active,
+                    cfg,
+                    temp_dir("test-outbound-supervisor-runtime").join("runtime.redb"),
+                    temp_dir("test-outbound-supervisor-mempool").join("mempool.redb"),
+                    128,
+                    1,
+                    1,
+                    1,
+                    1,
+                );
+            }
+        });
+
+        thread::sleep(Duration::from_millis(100));
+        assert!(
+            !supervisor.is_finished(),
+            "supervisor should keep running until stop flag is set"
+        );
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        join_with_timeout(
+            supervisor,
+            Duration::from_secs(3),
+            "relay outbound supervisor self-peer",
+        );
+        let _ = fs::remove_dir_all(peers_dir);
+    }
+
+    #[test]
+    fn run_relay_outbound_worker_connects_and_performs_handshake() {
+        let _net_guard = network_test_guard();
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let relay = RelayAdmissionState {
+            mempool: Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip: GossipEngine::new(64).expect("gossip"),
+        };
+        let state =
+            std::sync::Arc::new(std::sync::Mutex::new(RelayServerState::new(runtime, relay)));
+        let active = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let next_peer = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        let Some(target) = allocate_local_addr() else {
+            return;
+        };
+        let listener = TcpListener::bind(&target).expect("bind outbound test listener");
+        let (tx, rx) = mpsc::channel::<()>();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+            let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+            let framing = FramingConfig::default();
+            let local_hello = LocalHandshake {
+                protocol_version: 1,
+                network_id: "devnet".to_owned(),
+                user_agent: "test-outbound-peer".to_owned(),
+                start_height: 0,
+            };
+            let remote = server_handshake(&mut stream, &framing, &local_hello).expect("handshake");
+            assert_eq!(remote.network_id, "devnet");
+            let _ = tx.send(());
+        });
+
+        let worker = thread::spawn({
+            let stop = stop.clone();
+            let next_peer = next_peer.clone();
+            let state = state.clone();
+            let active = active.clone();
+            let cfg = cfg.clone();
+            move || {
+                super::run_relay_outbound_worker(
+                    target,
+                    "127.0.0.1:18444".to_owned(),
+                    stop,
+                    next_peer,
+                    state,
+                    active,
+                    cfg,
+                    temp_dir("test-outbound-worker-runtime").join("runtime.redb"),
+                    temp_dir("test-outbound-worker-mempool").join("mempool.redb"),
+                    128,
+                    1,
+                    1,
+                    1,
+                    1,
+                );
+            }
+        });
+
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("outbound worker should connect and handshake");
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        join_with_timeout(worker, Duration::from_secs(6), "relay outbound worker");
+        join_with_timeout(server, Duration::from_secs(5), "relay outbound peer");
+    }
+
+    #[test]
+    fn run_relay_outbound_supervisor_spawns_worker_from_peer_book() {
+        let _net_guard = network_test_guard();
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let relay = RelayAdmissionState {
+            mempool: Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip: GossipEngine::new(64).expect("gossip"),
+        };
+        let state =
+            std::sync::Arc::new(std::sync::Mutex::new(RelayServerState::new(runtime, relay)));
+        let active = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let next_peer = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        let Some(target) = allocate_local_addr() else {
+            return;
+        };
+        let listener = TcpListener::bind(&target).expect("bind outbound supervisor listener");
+        let peers_dir = temp_dir("test-outbound-supervisor-peers");
+        fs::create_dir_all(&peers_dir).expect("mkdir peers");
+        super::save_peer_book_db(
+            &peers_dir.join("devnet.redb"),
+            &PeerAddressBook {
+                network_id: "devnet".to_owned(),
+                peers: vec![PeerAddressRecord {
+                    address: target.clone(),
+                    last_seen_unix_sec: 0,
+                    ban_score: 0,
+                }],
+            },
+        )
+        .expect("save peers");
+
+        let (tx, rx) = mpsc::channel::<()>();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+            let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+            let framing = FramingConfig::default();
+            let local_hello = LocalHandshake {
+                protocol_version: 1,
+                network_id: "devnet".to_owned(),
+                user_agent: "test-outbound-supervisor-peer".to_owned(),
+                start_height: 0,
+            };
+            let remote = server_handshake(&mut stream, &framing, &local_hello).expect("handshake");
+            assert_eq!(remote.network_id, "devnet");
+            let _ = tx.send(());
+        });
+
+        let supervisor = thread::spawn({
+            let stop = stop.clone();
+            let next_peer = next_peer.clone();
+            let state = state.clone();
+            let active = active.clone();
+            let cfg = cfg.clone();
+            let peers_dir = peers_dir.clone();
+            move || {
+                super::run_relay_outbound_supervisor(
+                    stop,
+                    peers_dir,
+                    "127.0.0.1:18444".to_owned(),
+                    next_peer,
+                    state,
+                    active,
+                    cfg,
+                    temp_dir("test-outbound-supervisor-runtime").join("runtime.redb"),
+                    temp_dir("test-outbound-supervisor-mempool").join("mempool.redb"),
+                    128,
+                    1,
+                    1,
+                    1,
+                    1,
+                );
+            }
+        });
+
+        rx.recv_timeout(Duration::from_secs(6))
+            .expect("supervisor should spawn worker and connect");
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        join_with_timeout(
+            supervisor,
+            Duration::from_secs(8),
+            "relay outbound supervisor",
+        );
+        join_with_timeout(
+            server,
+            Duration::from_secs(5),
+            "relay outbound supervisor peer",
+        );
+        let _ = fs::remove_dir_all(peers_dir);
+    }
+
+    #[test]
+    fn run_relay_peer_session_persists_mempool_delta_to_db() {
+        let _net_guard = network_test_guard();
+        let mut cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        cfg.coinbase_maturity = 1;
+        cfg.validate().expect("config validate");
+
+        let mnemonic = WalletMnemonic::parse(SOAK_FLOW_MNEMONIC).expect("mnemonic");
+        let seed = mnemonic.to_seed("");
+        let sender_key = derive_wallet_key(&seed, 0, 0).expect("sender key");
+        let recipient_key = derive_wallet_key(&seed, 0, 1).expect("recipient key");
+        let sender_key_hash20 = scam_core::hash160_blake3(&sender_key.pubkey_compressed());
+        let recipient_key_hash20 = scam_core::hash160_blake3(&recipient_key.pubkey_compressed());
+
+        let mut runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        mine_blocks_on_runtime(
+            &mut runtime,
+            &super::MiningLoopParams {
+                count: 2,
+                interval_sec: cfg.target_block_time_sec,
+                max_nonce: 500_000,
+                subsidy: cfg.block_subsidy,
+                miner_key_hash: sender_key_hash20,
+                label_prefix: "relay-session-persist",
+                print_each: false,
+            },
+        )
+        .expect("mine sender funds");
+
+        let fee = 500u64;
+        let tx = build_signed_transfer_tx(
+            &runtime,
+            &cfg.network_id,
+            &sender_key,
+            recipient_key_hash20,
+            1_000_000,
+            fee,
+        )
+        .expect("build signed tx")
+        .tx;
+        let txid = tx.txid();
+
+        let relay = RelayAdmissionState {
+            mempool: Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip: GossipEngine::new(64).expect("gossip"),
+        };
+        let state =
+            std::sync::Arc::new(std::sync::Mutex::new(RelayServerState::new(runtime, relay)));
+        let active = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let work_dir = temp_dir("test-relay-peer-session-persist");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let runtime_db = work_dir.join("runtime.redb");
+        let mempool_db = work_dir.join("mempool.redb");
+        {
+            let guard = state.lock().expect("state lock");
+            persist_runtime_db(&guard.runtime, &runtime_db).expect("persist runtime");
+        }
+
+        let Some(bind) = allocate_local_addr() else {
+            let _ = fs::remove_dir_all(work_dir);
+            return;
+        };
+        let listener = TcpListener::bind(&bind).expect("bind relay session listener");
+        let server = thread::spawn({
+            let state = state.clone();
+            let active = active.clone();
+            let stop = stop.clone();
+            let cfg = cfg.clone();
+            let runtime_db = runtime_db.clone();
+            let mempool_db = mempool_db.clone();
+            move || -> Result<(), super::NodeError> {
+                let (mut stream, _) = listener.accept().expect("accept");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .expect("read timeout");
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(2)))
+                    .expect("write timeout");
+                super::run_relay_peer_session(
+                    &mut stream,
+                    super::RelayPeerSessionMode::Inbound,
+                    77,
+                    &state,
+                    &active,
+                    &stop,
+                    &cfg,
+                    &runtime_db,
+                    &mempool_db,
+                    128,
+                    1,
+                )
+            }
+        });
+
+        let mut client = connect_with_retry(&bind);
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("client read timeout");
+        client
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .expect("client write timeout");
+        let framing = FramingConfig::default();
+        let local_hello = LocalHandshake {
+            protocol_version: 1,
+            network_id: "devnet".to_owned(),
+            user_agent: "test-relay-client".to_owned(),
+            start_height: 0,
+        };
+        let _remote = client_handshake(&mut client, &framing, &local_hello).expect("handshake");
+        send_message(&mut client, &WireMessage::Tx { tx }, &framing).expect("send tx");
+        drop(client);
+
+        join_with_timeout(server, Duration::from_secs(8), "relay peer session persist")
+            .expect("session result");
+        let persisted = super::load_mempool_from_db_or_empty(&cfg, &mempool_db)
+            .expect("load persisted mempool");
+        assert!(persisted.contains(&txid));
+
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
+    fn run_relay_peer_session_rejects_empty_stream_without_handshake() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let relay = RelayAdmissionState {
+            mempool: Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip: GossipEngine::new(16).expect("gossip"),
+        };
+        let state =
+            std::sync::Arc::new(std::sync::Mutex::new(RelayServerState::new(runtime, relay)));
+        let active = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let work_dir = temp_dir("test-relay-peer-session-empty-stream");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let runtime_db = work_dir.join("runtime.redb");
+        let mempool_db = work_dir.join("mempool.redb");
+        {
+            let guard = state.lock().expect("state");
+            persist_runtime_db(&guard.runtime, &runtime_db).expect("persist runtime");
+        }
+
+        let mut stream = std::io::Cursor::new(Vec::<u8>::new());
+        let err = super::run_relay_peer_session(
+            &mut stream,
+            super::RelayPeerSessionMode::Inbound,
+            91,
+            &state,
+            &active,
+            &stop,
+            &cfg,
+            &runtime_db,
+            &mempool_db,
+            32,
+            1,
+        )
+        .expect_err("empty stream must fail before handshake");
+        assert!(
+            err.to_string().contains("closed")
+                || err.to_string().contains("handshake")
+                || err.to_string().contains("io"),
+            "unexpected empty-stream error: {err}"
+        );
+
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_relay_peer_session_performs_handshake_on_unix_socket_pair() {
+        use std::os::unix::net::UnixStream;
+
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let relay = RelayAdmissionState {
+            mempool: Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip: GossipEngine::new(16).expect("gossip"),
+        };
+        let state =
+            std::sync::Arc::new(std::sync::Mutex::new(RelayServerState::new(runtime, relay)));
+        let active = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let work_dir = temp_dir("test-relay-peer-session-unix");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let runtime_db = work_dir.join("runtime.redb");
+        let mempool_db = work_dir.join("mempool.redb");
+        {
+            let guard = state.lock().expect("state");
+            persist_runtime_db(&guard.runtime, &runtime_db).expect("persist runtime");
+        }
+
+        let (mut server_stream, mut client_stream) = UnixStream::pair().expect("unix pair");
+
+        let server = thread::spawn({
+            let state = state.clone();
+            let active = active.clone();
+            let stop = stop.clone();
+            let cfg = cfg.clone();
+            move || {
+                super::run_relay_peer_session(
+                    &mut server_stream,
+                    super::RelayPeerSessionMode::Inbound,
+                    55,
+                    &state,
+                    &active,
+                    &stop,
+                    &cfg,
+                    &runtime_db,
+                    &mempool_db,
+                    32,
+                    1,
+                )
+            }
+        });
+
+        let framing = FramingConfig::default();
+        let local_hello = LocalHandshake {
+            protocol_version: 1,
+            network_id: "devnet".to_owned(),
+            user_agent: "test-relay-unix-client".to_owned(),
+            start_height: 0,
+        };
+        let remote = match client_handshake(&mut client_stream, &framing, &local_hello) {
+            Ok(remote) => remote,
+            Err(scam_p2p::TransportError::Io(err))
+                if err.kind() == std::io::ErrorKind::PermissionDenied =>
+            {
+                drop(client_stream);
+                let _ =
+                    join_with_timeout(server, Duration::from_secs(5), "relay peer session unix");
+                let _ = fs::remove_dir_all(work_dir);
+                return;
+            }
+            Err(err) => panic!("client handshake: {err}"),
+        };
+        assert_eq!(remote.network_id, "devnet");
+        drop(client_stream);
+
+        join_with_timeout(server, Duration::from_secs(5), "relay peer session unix")
+            .expect("session result");
+        let _ = fs::remove_dir_all(work_dir);
     }
 
     #[test]
@@ -14387,6 +15624,82 @@ mod tests {
     }
 
     #[test]
+    fn validate_tx_for_local_admission_enforces_missing_overspend_and_fee_paths() {
+        let mut cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        cfg.coinbase_maturity = 1;
+        cfg.validate().expect("config validate");
+
+        let mnemonic = WalletMnemonic::parse(SOAK_FLOW_MNEMONIC).expect("mnemonic");
+        let seed = mnemonic.to_seed("");
+        let sender_key = derive_wallet_key(&seed, 0, 0).expect("sender key");
+        let recipient_key = derive_wallet_key(&seed, 0, 1).expect("recipient key");
+        let sender_key_hash20 = scam_core::hash160_blake3(&sender_key.pubkey_compressed());
+        let recipient_key_hash20 = scam_core::hash160_blake3(&recipient_key.pubkey_compressed());
+
+        let mut runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        mine_blocks_on_runtime(
+            &mut runtime,
+            &super::MiningLoopParams {
+                count: 2,
+                interval_sec: cfg.target_block_time_sec,
+                max_nonce: 500_000,
+                subsidy: cfg.block_subsidy,
+                miner_key_hash: sender_key_hash20,
+                label_prefix: "validate-local-admission",
+                print_each: false,
+            },
+        )
+        .expect("mine blocks");
+
+        let mempool = Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+            .expect("mempool");
+        let valid_fee = 500u64;
+        let signed = build_signed_transfer_tx(
+            &runtime,
+            &cfg.network_id,
+            &sender_key,
+            recipient_key_hash20,
+            1_000_000,
+            valid_fee,
+        )
+        .expect("signed tx");
+        let implied_fee =
+            super::validate_tx_for_local_admission(&cfg, &runtime, &mempool, &signed.tx)
+                .expect("valid tx");
+        assert_eq!(implied_fee, valid_fee);
+
+        let mut overspend_tx = signed.tx.clone();
+        overspend_tx.outputs[0].value = overspend_tx.outputs[0].value.saturating_add(10_000_000);
+        for input_index in 0..overspend_tx.inputs.len() {
+            let digest = overspend_tx
+                .signing_digest_with_chain_domain(input_index, cfg.network_id.as_bytes())
+                .expect("overspend digest");
+            let signature =
+                scam_wallet::sign_digest(&sender_key, digest.0).expect("overspend resign");
+            overspend_tx.inputs[input_index].signature = signature.to_vec();
+        }
+        let overspend_err =
+            super::validate_tx_for_local_admission(&cfg, &runtime, &mempool, &overspend_tx)
+                .expect_err("overspend must fail");
+        assert!(overspend_err.to_string().contains("overspends"));
+
+        let mut missing_input_tx = signed.tx.clone();
+        missing_input_tx.inputs[0].prev_out.txid = Hash256([0xEE; 32]);
+        let missing_err =
+            super::validate_tx_for_local_admission(&cfg, &runtime, &mempool, &missing_input_tx)
+                .expect_err("missing prevout must fail");
+        assert!(missing_err.to_string().contains("unresolved inputs"));
+
+        let mut bad_pubkey_tx = signed.tx.clone();
+        bad_pubkey_tx.inputs[0].pubkey_compressed = vec![0x02; 32];
+        let bad_pubkey_err =
+            super::validate_tx_for_local_admission(&cfg, &runtime, &mempool, &bad_pubkey_tx)
+                .expect_err("bad pubkey length must fail");
+        assert!(bad_pubkey_err.to_string().contains("invalid pubkey length"));
+    }
+
+    #[test]
     fn submit_tx_via_mempool_db_accepts_valid_signed_transaction() {
         let mut cfg: ChainConfig =
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
@@ -14436,6 +15749,71 @@ mod tests {
         let snapshot = scam_storage::load_mempool_db(&mempool_db).expect("load mempool db");
         assert_eq!(snapshot.network_id, cfg.network_id);
         assert!(snapshot.entries.iter().any(|entry| entry.txid == txid));
+
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
+    fn submit_tx_via_mempool_db_respects_implied_fee_floor_and_zero_fee_alias() {
+        let mut cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        cfg.coinbase_maturity = 1;
+        cfg.validate().expect("config validate");
+
+        let work_dir = temp_dir("test-submit-mempool-fee-floor");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let runtime_db = work_dir.join("runtime.redb");
+        let mempool_db = work_dir.join("mempool.redb");
+
+        let mnemonic = WalletMnemonic::parse(SOAK_FLOW_MNEMONIC).expect("mnemonic");
+        let seed = mnemonic.to_seed("");
+        let sender_key = derive_wallet_key(&seed, 0, 0).expect("sender key");
+        let recipient_key = derive_wallet_key(&seed, 0, 1).expect("recipient key");
+        let sender_key_hash20 = scam_core::hash160_blake3(&sender_key.pubkey_compressed());
+        let recipient_key_hash20 = scam_core::hash160_blake3(&recipient_key.pubkey_compressed());
+
+        let mut runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        mine_blocks_on_runtime(
+            &mut runtime,
+            &super::MiningLoopParams {
+                count: 2,
+                interval_sec: cfg.target_block_time_sec,
+                max_nonce: 500_000,
+                subsidy: cfg.block_subsidy,
+                miner_key_hash: sender_key_hash20,
+                label_prefix: "submit-fee-floor",
+                print_each: false,
+            },
+        )
+        .expect("mine blocks");
+        persist_runtime_db(&runtime, &runtime_db).expect("persist runtime");
+
+        let implied_fee = 700u64;
+        let signed = build_signed_transfer_tx(
+            &runtime,
+            &cfg.network_id,
+            &sender_key,
+            recipient_key_hash20,
+            1_200_000,
+            implied_fee,
+        )
+        .expect("build signed tx");
+
+        let err = super::submit_tx_via_mempool_db(
+            &cfg,
+            &runtime_db,
+            &mempool_db,
+            signed.tx.clone(),
+            implied_fee.saturating_sub(1),
+        )
+        .expect_err("requested fee below implied fee must fail");
+        assert!(err.to_string().contains("lower than implied fee"));
+
+        let (_txid, outcome, effective_fee) =
+            super::submit_tx_via_mempool_db(&cfg, &runtime_db, &mempool_db, signed.tx, 0)
+                .expect("zero requested fee should map to implied fee");
+        assert_eq!(outcome, "accepted");
+        assert_eq!(effective_fee, implied_fee);
 
         let _ = fs::remove_dir_all(work_dir);
     }
@@ -14661,6 +16039,191 @@ mod tests {
                 .iter()
                 .any(|entry| entry.direction == "in" && entry.received > 0),
             "recipient history should include incoming transfer"
+        );
+    }
+
+    #[test]
+    fn wallet_tx_history_marks_equal_sent_and_received_as_self() {
+        let mut cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        cfg.coinbase_maturity = 1;
+        cfg.min_relay_fee_per_kb = 0;
+        cfg.validate().expect("config validate");
+
+        let mnemonic = WalletMnemonic::parse(SOAK_FLOW_MNEMONIC).expect("mnemonic");
+        let seed = mnemonic.to_seed("");
+        let key = derive_wallet_key(&seed, 0, 0).expect("wallet key");
+        let key_hash20 = scam_core::hash160_blake3(&key.pubkey_compressed());
+
+        let mut runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        mine_blocks_on_runtime(
+            &mut runtime,
+            &super::MiningLoopParams {
+                count: 2,
+                interval_sec: cfg.target_block_time_sec,
+                max_nonce: 500_000,
+                subsidy: cfg.block_subsidy,
+                miner_key_hash: key_hash20,
+                label_prefix: "wallet-self-history",
+                print_each: false,
+            },
+        )
+        .expect("mine");
+
+        let self_signed = build_signed_transfer_tx(
+            &runtime,
+            &cfg.network_id,
+            &key,
+            key_hash20,
+            cfg.block_subsidy,
+            0,
+        )
+        .expect("self transfer");
+        let self_txid = self_signed.tx.txid();
+
+        let mut mempool =
+            Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool");
+        mempool
+            .insert_with_fee(self_signed.tx, 0)
+            .expect("insert self tx");
+        let template_params = super::MempoolTemplateParams {
+            version: 1,
+            prev_block: runtime.tip_hash(),
+            timestamp: runtime
+                .tip_header()
+                .timestamp
+                .saturating_add(cfg.target_block_time_sec),
+            target: runtime.expected_target_for_next_block().expect("target"),
+            block_subsidy: cfg.block_subsidy,
+            miner_key_hash20: key_hash20,
+            coinbase_tag: "wallet-self-template".to_owned(),
+            max_txs: cfg.max_mempool_txs as usize,
+        };
+        let (template, _summary) =
+            super::build_template_from_mempool(&template_params, &mempool).expect("template");
+        let mined = mine_block(&template, 500_000).expect("mine");
+        runtime.apply_next_block(mined).expect("apply");
+
+        let history = super::wallet_tx_history_for_key_hash(&runtime, key_hash20, 50);
+        let entry = history
+            .iter()
+            .find(|item| item.txid == self_txid.to_hex())
+            .expect("self transfer history entry");
+        assert_eq!(entry.direction, "self");
+        assert_eq!(entry.net, 0);
+        assert_eq!(entry.sent, entry.received);
+        assert!(entry.sent > 0);
+    }
+
+    #[test]
+    fn wallet_tx_history_keeps_outgoing_only_entries() {
+        let mut cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        cfg.coinbase_maturity = 1;
+        cfg.validate().expect("config validate");
+
+        let mnemonic = WalletMnemonic::parse(SOAK_FLOW_MNEMONIC).expect("mnemonic");
+        let seed = mnemonic.to_seed("");
+        let sender_key = derive_wallet_key(&seed, 0, 0).expect("sender");
+        let recipient_key = derive_wallet_key(&seed, 0, 1).expect("recipient");
+        let sender_key_hash20 = scam_core::hash160_blake3(&sender_key.pubkey_compressed());
+        let recipient_key_hash20 = scam_core::hash160_blake3(&recipient_key.pubkey_compressed());
+
+        let mut runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        mine_blocks_on_runtime(
+            &mut runtime,
+            &super::MiningLoopParams {
+                count: 2,
+                interval_sec: cfg.target_block_time_sec,
+                max_nonce: 500_000,
+                subsidy: cfg.block_subsidy,
+                miner_key_hash: sender_key_hash20,
+                label_prefix: "wallet-outgoing-only",
+                print_each: false,
+            },
+        )
+        .expect("mine");
+
+        let fee = 500u64;
+        let outgoing_only = build_signed_transfer_tx(
+            &runtime,
+            &cfg.network_id,
+            &sender_key,
+            recipient_key_hash20,
+            cfg.block_subsidy.saturating_sub(fee),
+            fee,
+        )
+        .expect("outgoing-only tx");
+        let outgoing_txid = outgoing_only.tx.txid();
+
+        let mut mempool =
+            Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool");
+        mempool
+            .insert_with_fee(outgoing_only.tx, fee)
+            .expect("insert outgoing-only tx");
+        let template_params = super::MempoolTemplateParams {
+            version: 1,
+            prev_block: runtime.tip_hash(),
+            timestamp: runtime
+                .tip_header()
+                .timestamp
+                .saturating_add(cfg.target_block_time_sec),
+            target: runtime.expected_target_for_next_block().expect("target"),
+            block_subsidy: cfg.block_subsidy,
+            miner_key_hash20: sender_key_hash20,
+            coinbase_tag: "wallet-outgoing-only-template".to_owned(),
+            max_txs: cfg.max_mempool_txs as usize,
+        };
+        let (template, _summary) =
+            super::build_template_from_mempool(&template_params, &mempool).expect("template");
+        let mined = mine_block(&template, 500_000).expect("mine");
+        runtime.apply_next_block(mined).expect("apply");
+
+        let history = super::wallet_tx_history_for_key_hash(&runtime, sender_key_hash20, 50);
+        let outgoing = history
+            .iter()
+            .find(|entry| entry.txid == outgoing_txid.to_hex())
+            .expect("outgoing-only entry must be present");
+        assert_eq!(outgoing.direction, "out");
+        assert!(outgoing.sent > 0);
+        assert_eq!(outgoing.received, 0);
+    }
+
+    #[test]
+    fn wallet_tx_history_ignores_unrelated_transactions() {
+        let mut cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        cfg.coinbase_maturity = 1;
+        cfg.validate().expect("config validate");
+
+        let mnemonic = WalletMnemonic::parse(SOAK_FLOW_MNEMONIC).expect("mnemonic");
+        let seed = mnemonic.to_seed("");
+        let owner_key = derive_wallet_key(&seed, 0, 0).expect("owner");
+        let miner_key = derive_wallet_key(&seed, 0, 1).expect("miner");
+        let owner_key_hash20 = scam_core::hash160_blake3(&owner_key.pubkey_compressed());
+        let miner_key_hash20 = scam_core::hash160_blake3(&miner_key.pubkey_compressed());
+
+        let mut runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        mine_blocks_on_runtime(
+            &mut runtime,
+            &super::MiningLoopParams {
+                count: 2,
+                interval_sec: cfg.target_block_time_sec,
+                max_nonce: 500_000,
+                subsidy: cfg.block_subsidy,
+                miner_key_hash: miner_key_hash20,
+                label_prefix: "wallet-history-unrelated",
+                print_each: false,
+            },
+        )
+        .expect("mine");
+
+        let history = super::wallet_tx_history_for_key_hash(&runtime, owner_key_hash20, 50);
+        assert!(
+            history.is_empty(),
+            "owner should not see history entries for unrelated miner-only chain activity"
         );
     }
 
@@ -15420,6 +16983,119 @@ mod tests {
     }
 
     #[test]
+    fn relay_should_request_parent_sync_enforces_cooldown_and_prunes_stale_entries() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let relay = RelayAdmissionState {
+            mempool: Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip: GossipEngine::new(32).expect("gossip"),
+        };
+        let mut state = RelayServerState::new(runtime, relay);
+        let parent = Hash256([0xAA; 32]);
+        let stale_parent = Hash256([0x55; 32]);
+        state.last_parent_sync_request_sec.insert(stale_parent, 1);
+
+        assert!(
+            super::relay_should_request_parent_sync(&mut state, parent, 100),
+            "first request should be allowed"
+        );
+        assert!(
+            !super::relay_should_request_parent_sync(&mut state, parent, 101),
+            "cooldown should block immediate retry"
+        );
+        assert!(
+            super::relay_should_request_parent_sync(&mut state, parent, 102),
+            "cooldown boundary should permit retry"
+        );
+        let mid_parent = Hash256([0x77; 32]);
+        state.last_parent_sync_request_sec.insert(mid_parent, 50);
+        assert!(
+            super::relay_should_request_parent_sync(&mut state, Hash256([0x78; 32]), 100),
+            "unrelated parent request should still be allowed"
+        );
+        assert!(
+            state.last_parent_sync_request_sec.contains_key(&mid_parent),
+            "entries newer than 30*cooldown must be retained"
+        );
+        assert!(
+            !state
+                .last_parent_sync_request_sec
+                .contains_key(&stale_parent),
+            "stale parent sync records should be pruned"
+        );
+    }
+
+    #[test]
+    fn relay_try_apply_pending_orphans_applies_multi_level_orphan_chain() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        cfg.validate().expect("config validate");
+        let miner_key_hash = cfg.genesis_reward_key_hash20().expect("reward key");
+
+        let mut producer = ChainRuntime::from_config(cfg.clone()).expect("producer runtime");
+        mine_blocks_on_runtime(
+            &mut producer,
+            &super::MiningLoopParams {
+                count: 3,
+                interval_sec: cfg.target_block_time_sec,
+                max_nonce: 500_000,
+                subsidy: cfg.block_subsidy,
+                miner_key_hash,
+                label_prefix: "relay-orphan-multi-level",
+                print_each: false,
+            },
+        )
+        .expect("mine producer chain");
+
+        let chain = producer.block_hashes().to_vec();
+        let parent_hash = chain[1];
+        let child_one_hash = chain[2];
+        let child_two_hash = chain[3];
+        let parent_block = producer
+            .block_by_hash(&parent_hash)
+            .expect("parent block")
+            .clone();
+        let child_one = producer
+            .block_by_hash(&child_one_hash)
+            .expect("child one")
+            .clone();
+        let child_two = producer
+            .block_by_hash(&child_two_hash)
+            .expect("child two")
+            .clone();
+
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("consumer runtime");
+        let mut relay = RelayAdmissionState {
+            mempool: Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip: GossipEngine::new(128).expect("gossip"),
+        };
+        relay.gossip.connect_peer(7);
+        let mut state = RelayServerState::new(runtime, relay);
+
+        super::relay_store_pending_orphan_block(&mut state, child_two);
+        super::relay_store_pending_orphan_block(&mut state, child_one);
+        assert_eq!(state.pending_block_orphans.len(), 2);
+        assert_eq!(state.pending_block_orphan_order.len(), 2);
+
+        state
+            .runtime
+            .submit_block(parent_block)
+            .expect("apply parent first");
+        super::relay_try_apply_pending_orphans(&mut state, 1_000);
+
+        assert_eq!(state.runtime.tip_hash(), child_two_hash);
+        assert!(state.pending_block_orphans.is_empty());
+        assert!(state.pending_block_orphan_order.is_empty());
+    }
+
+    #[test]
     fn relay_reorg_reinserts_disconnected_block_transactions_into_mempool() {
         let mut cfg: ChainConfig =
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
@@ -15579,6 +17255,95 @@ mod tests {
         assert!(
             state.relay.mempool.contains(&confirmed_txid),
             "tx from disconnected block must return to mempool after reorg"
+        );
+    }
+
+    #[test]
+    fn relay_apply_main_chain_transition_unchanged_chain_keeps_mempool_entries() {
+        let mut cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        cfg.coinbase_maturity = 1;
+        cfg.validate().expect("config validate");
+
+        let mnemonic = WalletMnemonic::parse(SOAK_FLOW_MNEMONIC).expect("mnemonic");
+        let seed = mnemonic.to_seed("");
+        let sender_key = derive_wallet_key(&seed, 0, 0).expect("sender");
+        let recipient_key = derive_wallet_key(&seed, 0, 1).expect("recipient");
+        let sender_key_hash20 = scam_core::hash160_blake3(&sender_key.pubkey_compressed());
+        let recipient_key_hash20 = scam_core::hash160_blake3(&recipient_key.pubkey_compressed());
+
+        let mut runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        mine_blocks_on_runtime(
+            &mut runtime,
+            &super::MiningLoopParams {
+                count: 2,
+                interval_sec: cfg.target_block_time_sec,
+                max_nonce: 500_000,
+                subsidy: cfg.block_subsidy,
+                miner_key_hash: sender_key_hash20,
+                label_prefix: "relay-transition-unchanged",
+                print_each: false,
+            },
+        )
+        .expect("mine");
+
+        let fee = 500u64;
+        let tx = build_signed_transfer_tx(
+            &runtime,
+            &cfg.network_id,
+            &sender_key,
+            recipient_key_hash20,
+            1_000_000,
+            fee,
+        )
+        .expect("signed")
+        .tx;
+        let txid = tx.txid();
+
+        let mut mined_mempool =
+            Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool");
+        mined_mempool
+            .insert_with_fee(tx.clone(), fee)
+            .expect("insert tx");
+        let template_params = super::MempoolTemplateParams {
+            version: 1,
+            prev_block: runtime.tip_hash(),
+            timestamp: runtime
+                .tip_header()
+                .timestamp
+                .saturating_add(cfg.target_block_time_sec),
+            target: runtime.expected_target_for_next_block().expect("target"),
+            block_subsidy: cfg.block_subsidy,
+            miner_key_hash20: sender_key_hash20,
+            coinbase_tag: "relay-transition-unchanged-template".to_owned(),
+            max_txs: cfg.max_mempool_txs as usize,
+        };
+        let (template, _summary) =
+            super::build_template_from_mempool(&template_params, &mined_mempool).expect("template");
+        let mined = mine_block(&template, 500_000).expect("mine");
+        runtime.apply_next_block(mined).expect("apply");
+
+        let relay = RelayAdmissionState {
+            mempool: Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("relay mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip: GossipEngine::new(32).expect("gossip"),
+        };
+        let mut state = RelayServerState::new(runtime, relay);
+        state
+            .relay
+            .mempool
+            .insert_with_fee(tx, fee)
+            .expect("seed mempool");
+        assert!(state.relay.mempool.contains(&txid));
+
+        let chain = state.runtime.block_hashes().to_vec();
+        super::relay_apply_main_chain_transition(&mut state, &chain, &chain, 10_000);
+        assert!(
+            state.relay.mempool.contains(&txid),
+            "unchanged chain transition must not drop existing mempool entries"
         );
     }
 
