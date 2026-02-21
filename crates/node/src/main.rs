@@ -1380,14 +1380,14 @@ fn persist_mempool_db_with_retry(
     )
 }
 
-fn next_stratum_job_timestamp(runtime: &ChainRuntime, cfg: &ChainConfig) -> u64 {
+fn next_stratum_job_timestamp(runtime: &ChainRuntime, _cfg: &ChainConfig) -> u64 {
     const CONSENSUS_MAX_FUTURE_BLOCK_TIME_SEC: u64 = 2 * 60 * 60;
     let tip_ts = runtime.tip_header().timestamp;
     let min_next = tip_ts.saturating_add(1);
     let wall_now = current_unix_sec().unwrap_or(min_next);
     let max_future = wall_now.saturating_add(CONSENSUS_MAX_FUTURE_BLOCK_TIME_SEC);
-    let ideal = tip_ts.saturating_add(cfg.target_block_time_sec);
-    std::cmp::max(min_next, ideal.min(max_future))
+    let candidate = wall_now;
+    std::cmp::max(min_next, candidate.min(max_future))
 }
 
 fn run_node(
@@ -8235,6 +8235,54 @@ struct MempoolSummaryRpcResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct BlockTxInputRpcResponse {
+    prev_txid: String,
+    prev_vout: u32,
+    sequence: u32,
+    pubkey_compressed_hex: String,
+    signature_hex: String,
+    is_coinbase_input: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct BlockTxOutputRpcResponse {
+    value: u64,
+    key_hash20_hex: String,
+}
+
+#[derive(Debug, Serialize)]
+struct TxLookupRpcResponse {
+    block_height: u64,
+    tx_index: usize,
+    txid: String,
+    version: u32,
+    lock_time: u32,
+    coinbase: bool,
+    input_count: usize,
+    output_count: usize,
+    inputs: Vec<BlockTxInputRpcResponse>,
+    outputs: Vec<BlockTxOutputRpcResponse>,
+}
+
+#[derive(Debug, Serialize)]
+struct BlockLookupRpcResponse {
+    height: u64,
+    hash: String,
+    prev_hash: String,
+    merkle_root: String,
+    computed_merkle_root: String,
+    merkle_valid: bool,
+    timestamp: u64,
+    target: String,
+    nonce: u64,
+    version: u32,
+    pow_hash: String,
+    meets_pow: bool,
+    tx_count: usize,
+    transactions: Vec<TxLookupRpcResponse>,
+}
+
+#[derive(Debug, Serialize)]
 struct RpcEventSnapshot {
     network_id: String,
     tip_height: u64,
@@ -8250,6 +8298,63 @@ struct RpcEventSnapshot {
     sync_lag_blocks: Option<u64>,
     last_block_age_sec: u64,
     unix_sec: u64,
+}
+
+fn tx_lookup_response(block_height: u64, tx_index: usize, tx: &Transaction) -> TxLookupRpcResponse {
+    TxLookupRpcResponse {
+        block_height,
+        tx_index,
+        txid: tx.txid().to_hex(),
+        version: tx.version,
+        lock_time: tx.lock_time,
+        coinbase: tx.is_coinbase(),
+        input_count: tx.inputs.len(),
+        output_count: tx.outputs.len(),
+        inputs: tx
+            .inputs
+            .iter()
+            .map(|input| BlockTxInputRpcResponse {
+                prev_txid: input.prev_out.txid.to_hex(),
+                prev_vout: input.prev_out.vout,
+                sequence: input.sequence,
+                pubkey_compressed_hex: hex::encode(&input.pubkey_compressed),
+                signature_hex: hex::encode(&input.signature),
+                is_coinbase_input: input.prev_out.is_coinbase(),
+            })
+            .collect(),
+        outputs: tx
+            .outputs
+            .iter()
+            .map(|output| BlockTxOutputRpcResponse {
+                value: output.value,
+                key_hash20_hex: hex::encode(output.key_hash20),
+            })
+            .collect(),
+    }
+}
+
+fn block_lookup_response(height: u64, block: &scam_core::Block) -> BlockLookupRpcResponse {
+    BlockLookupRpcResponse {
+        height,
+        hash: block.header.block_hash().to_hex(),
+        prev_hash: block.header.prev_block.to_hex(),
+        merkle_root: block.header.merkle_root.to_hex(),
+        computed_merkle_root: block.computed_merkle_root().to_hex(),
+        merkle_valid: block.has_valid_merkle_root(),
+        timestamp: block.header.timestamp,
+        target: block.header.target.to_hex(),
+        nonce: block.header.nonce,
+        version: block.header.version,
+        pow_hash: scam_core::pow::header_pow_hash(&block.header).to_hex(),
+        meets_pow: block_meets_pow(block),
+        tx_count: block.transactions.len(),
+        transactions: block
+            .transactions
+            .iter()
+            .enumerate()
+            .map(|(index, tx)| tx_lookup_response(height, index, tx))
+            .collect(),
+    }
 }
 
 fn wallet_address_response(
@@ -8853,6 +8958,14 @@ fn rpc_tx_path_parts<'a>(method: &str, path: &'a str) -> Option<(&'a str, &'a st
     Some((height_raw, index_raw, has_extra))
 }
 
+fn rpc_txid_path<'a>(method: &str, path: &'a str) -> Option<&'a str> {
+    if is_get_method(method) {
+        path.strip_prefix("/txid/")
+    } else {
+        None
+    }
+}
+
 fn rpc_tx_path_is_invalid(height_raw: &str, index_raw: &str, has_extra: bool) -> bool {
     height_raw.is_empty() || index_raw.is_empty() || has_extra
 }
@@ -9015,7 +9128,7 @@ fn run_rpc_serve(args: RpcServeArgs) -> Result<(), NodeError> {
         runtime.tip_hash()
     );
     println!(
-        "Endpoints: GET /health, /status, /block/<height>, /tx/<height>/<index>, /mempool, /events; POST /wallet/new, /wallet/address, /wallet/decode, /wallet/balance, /wallet/balance-by-address, /wallet/balance-history-by-address, /wallet/send-preview, /wallet/send, /tx/submit, /wallet/qr"
+        "Endpoints: GET /health, /status, /block/<height>, /tx/<height>/<index>, /txid/<txid>, /mempool, /events; POST /wallet/new, /wallet/address, /wallet/decode, /wallet/balance, /wallet/balance-by-address, /wallet/balance-history-by-address, /wallet/send-preview, /wallet/send, /tx/submit, /wallet/qr"
     );
     println!("UI assets directory: {}", ui_dir.display());
     println!("Mempool DB source: {}", mempool_db_path.display());
@@ -9171,11 +9284,7 @@ fn run_rpc_serve(args: RpcServeArgs) -> Result<(), NodeError> {
                 Ok(height) => match runtime.block_hash_at_height(height) {
                     Some(hash) => match runtime.block_by_hash(&hash) {
                         Some(block) => {
-                            let payload = header_to_block_response(
-                                height,
-                                &block.header,
-                                block.transactions.len(),
-                            );
+                            let payload = block_lookup_response(height, block);
                             match to_pretty_json(&payload) {
                                 Ok(body) => ("200 OK", body),
                                 Err(e) => (
@@ -9211,7 +9320,7 @@ fn run_rpc_serve(args: RpcServeArgs) -> Result<(), NodeError> {
                         Some(hash) => match runtime.block_by_hash(&hash) {
                             Some(block) => match block.transactions.get(index) {
                                 Some(tx) => {
-                                    let payload = TxResponse::from_tx(height, index, tx);
+                                    let payload = tx_lookup_response(height, index, tx);
                                     match to_pretty_json(&payload) {
                                         Ok(body) => ("200 OK", body),
                                         Err(e) => (
@@ -9242,6 +9351,54 @@ fn run_rpc_serve(args: RpcServeArgs) -> Result<(), NodeError> {
                     None => (
                         "400 Bad Request",
                         json_error_body("invalid tx path numbers, expected /tx/<height>/<index>"),
+                    ),
+                }
+            }
+        } else if let Some(txid_raw) = rpc_txid_path(method, path) {
+            if txid_raw.is_empty() || txid_raw.contains('/') {
+                (
+                    "400 Bad Request",
+                    json_error_body("txid path must be /txid/<hex-txid>"),
+                )
+            } else {
+                match Hash256::from_hex(txid_raw) {
+                    Ok(needle_txid) => {
+                        let mut located = None;
+                        for height in (0..=runtime.tip_height()).rev() {
+                            let Some(block_hash) = runtime.block_hash_at_height(height) else {
+                                continue;
+                            };
+                            let Some(block) = runtime.block_by_hash(&block_hash) else {
+                                continue;
+                            };
+                            if let Some((index, tx)) = block
+                                .transactions
+                                .iter()
+                                .enumerate()
+                                .find(|(_, tx)| tx.txid() == needle_txid)
+                            {
+                                located =
+                                    Some((height, index, tx_lookup_response(height, index, tx)));
+                                break;
+                            }
+                        }
+                        match located {
+                            Some((_height, _index, payload)) => match to_pretty_json(&payload) {
+                                Ok(body) => ("200 OK", body),
+                                Err(e) => (
+                                    "500 Internal Server Error",
+                                    json_error_body(&format!("tx serialization failed: {e}")),
+                                ),
+                            },
+                            None => (
+                                "404 Not Found",
+                                json_error_body(&format!("txid {txid_raw} not found")),
+                            ),
+                        }
+                    }
+                    Err(_) => (
+                        "400 Bad Request",
+                        json_error_body("invalid txid hex, expected 32-byte hash"),
                     ),
                 }
             }
@@ -11068,21 +11225,28 @@ mod tests {
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
         let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
         let tip_ts = runtime.tip_header().timestamp;
-        let expected_ideal = tip_ts.saturating_add(cfg.target_block_time_sec);
+        let now = super::current_unix_sec().expect("now");
         let ts = super::next_stratum_job_timestamp(&runtime, &cfg);
-        assert_eq!(ts, expected_ideal);
+        assert!(
+            ts >= now.saturating_sub(2),
+            "expected stratum timestamp near wall-clock, got {ts} (now={now})"
+        );
+        assert!(
+            ts <= now.saturating_add(2),
+            "expected stratum timestamp near wall-clock, got {ts} (now={now})"
+        );
+        assert!(
+            ts > tip_ts,
+            "stratum timestamp must still advance over tip (tip={tip_ts}, got={ts})"
+        );
 
         cfg.target_block_time_sec = u64::MAX / 4;
         let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime huge target");
         let now = super::current_unix_sec().expect("now");
         let capped = super::next_stratum_job_timestamp(&runtime, &cfg);
         assert!(
-            capped >= now.saturating_add(6_000),
-            "expected cap close to 2h in future, got {capped} (now={now})"
-        );
-        assert!(
-            capped <= now.saturating_add(7_200),
-            "expected 2h future cap upper bound, got {capped} (now={now})"
+            capped >= now.saturating_sub(2) && capped <= now.saturating_add(2),
+            "expected wall-clock candidate under huge spacing too, got {capped} (now={now})"
         );
     }
 
@@ -11322,6 +11486,9 @@ mod tests {
             Some(("10", "", false))
         );
         assert_eq!(super::rpc_tx_path_parts("POST", "/tx/10/2"), None);
+        assert_eq!(super::rpc_txid_path("GET", "/txid/abcd"), Some("abcd"));
+        assert_eq!(super::rpc_txid_path("POST", "/txid/abcd"), None);
+        assert_eq!(super::rpc_txid_path("GET", "/tx/10/2"), None);
 
         assert!(super::rpc_tx_path_is_invalid("10", "2", true));
         assert!(super::rpc_tx_path_is_invalid("", "2", false));
@@ -13700,6 +13867,14 @@ mod tests {
         fs::create_dir_all(&work_dir).expect("mkdir");
         let config_path = work_dir.join("devnet.toml");
         fs::write(&config_path, include_str!("../../../config/devnet.toml")).expect("write cfg");
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let genesis_txid = cfg
+            .build_genesis_block()
+            .expect("genesis block")
+            .transactions[0]
+            .txid()
+            .to_hex();
         let runtime_db = work_dir.join("runtime.redb");
         let ui_dir = work_dir.join("ui");
         fs::create_dir_all(&ui_dir).expect("mkdir ui");
@@ -13719,7 +13894,7 @@ mod tests {
                 max_nonce: 500_000,
                 // run_rpc_serve counts only fully handled request paths in `served`;
                 // several requests below intentionally hit early 400 error paths.
-                max_requests: 5,
+                max_requests: 6,
             })
             .expect("rpc serve");
         });
@@ -13730,6 +13905,11 @@ mod tests {
         assert!(block.starts_with("HTTP/1.1 200 OK"));
         let tx = send_http_request(&addr, "GET /tx/0/0 HTTP/1.1\r\nHost: localhost\r\n\r\n");
         assert!(tx.starts_with("HTTP/1.1 200 OK"));
+        let txid = send_http_request(
+            &addr,
+            &format!("GET /txid/{genesis_txid} HTTP/1.1\r\nHost: localhost\r\n\r\n"),
+        );
+        assert!(txid.starts_with("HTTP/1.1 200 OK"));
 
         let wallet_new = send_http_json_post(&addr, "/wallet/new", "{}");
         assert!(wallet_new.starts_with("HTTP/1.1 200 OK"));
@@ -14024,6 +14204,14 @@ mod tests {
         fs::create_dir_all(&work_dir).expect("mkdir");
         let config_path = work_dir.join("devnet.toml");
         fs::write(&config_path, include_str!("../../../config/devnet.toml")).expect("write cfg");
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let genesis_txid = cfg
+            .build_genesis_block()
+            .expect("genesis block")
+            .transactions[0]
+            .txid()
+            .to_hex();
         let runtime_db = work_dir.join("runtime.redb");
         let ui_dir = work_dir.join("no-ui-assets");
 
@@ -14050,7 +14238,7 @@ mod tests {
                 max_nonce: 500_000,
                 // Two send-preview requests below intentionally return early 400 responses,
                 // which do not increment internal `served`.
-                max_requests: 10,
+                max_requests: 14,
             })
             .expect("rpc serve");
         });
@@ -14068,6 +14256,16 @@ mod tests {
 
         let tx = send_http_request(&addr, "GET /tx/0/0 HTTP/1.1\r\nHost: localhost\r\n\r\n");
         assert!(tx.starts_with("HTTP/1.1 200 OK"));
+        let txid = send_http_request(
+            &addr,
+            &format!("GET /txid/{genesis_txid} HTTP/1.1\r\nHost: localhost\r\n\r\n"),
+        );
+        assert!(txid.starts_with("HTTP/1.1 200 OK"));
+        let bad_txid = send_http_request(
+            &addr,
+            "GET /txid/not-hex HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(bad_txid.starts_with("HTTP/1.1 400 Bad Request"));
         let block = send_http_request(&addr, "GET /block/0 HTTP/1.1\r\nHost: localhost\r\n\r\n");
         assert!(block.starts_with("HTTP/1.1 200 OK"));
 

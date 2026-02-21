@@ -22,6 +22,8 @@ const blockLookupOut = document.getElementById("blockLookupOut");
 const txLookupForm = document.getElementById("txLookupForm");
 const txHeightInput = document.getElementById("txHeightInput");
 const txIndexInput = document.getElementById("txIndexInput");
+const txidLookupForm = document.getElementById("txidLookupForm");
+const txidInput = document.getElementById("txidInput");
 const txLookupOut = document.getElementById("txLookupOut");
 
 const mempoolOut = document.getElementById("mempoolOut");
@@ -99,6 +101,14 @@ async function request(path, { method = "GET", body } = {}) {
     payload = text ? JSON.parse(text) : {};
   } catch {
     // keep raw text
+  }
+  if (response.ok && typeof payload === "string") {
+    const trimmed = payload.trimStart().toLowerCase();
+    if (trimmed.startsWith("<!doctype html") || trimmed.startsWith("<html")) {
+      throw new Error(
+        "API returned HTML instead of JSON. Проверь apiBase и перезапусти ноду с новым rpc-serve",
+      );
+    }
   }
   if (!response.ok) {
     const errorMessage =
@@ -311,6 +321,21 @@ function initExplorerActions() {
       setResult(txLookupOut, error.message, true);
     }
   });
+
+  txidLookupForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const txid = (txidInput.value || "").trim().toLowerCase();
+    if (!txid) {
+      setResult(txLookupOut, "txid is required", true);
+      return;
+    }
+    try {
+      const tx = await request(`/txid/${encodeURIComponent(txid)}`);
+      setResult(txLookupOut, tx);
+    } catch (error) {
+      setResult(txLookupOut, error.message, true);
+    }
+  });
 }
 
 function initWalletActions() {
@@ -365,6 +390,22 @@ function initWalletActions() {
       };
       try {
         const data = await request("/wallet/balance", { method: "POST", body: payload });
+        setResult(walletOut, data);
+      } catch (error) {
+        setResult(walletOut, error.message, true);
+      }
+    });
+
+  document
+    .getElementById("walletBalanceAddressForm")
+    .addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const raw = serializeForm(event.currentTarget);
+      const payload = {
+        address: raw.address,
+      };
+      try {
+        const data = await request("/wallet/balance-by-address", { method: "POST", body: payload });
         setResult(walletOut, data);
       } catch (error) {
         setResult(walletOut, error.message, true);

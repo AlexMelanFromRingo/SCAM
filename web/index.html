@@ -113,6 +113,10 @@
             <input id="txIndexInput" type="number" min="0" placeholder="Tx index" required />
             <button type="submit">Load TX</button>
           </form>
+          <form id="txidLookupForm" class="stack" style="margin-top: 12px">
+            <input id="txidInput" type="text" placeholder="TxID (hex)" required />
+            <button type="submit">Load By TxID</button>
+          </form>
           <pre id="txLookupOut" class="result"></pre>
         </article>
       </section>
@@ -128,6 +132,7 @@
           <button data-tab="new" class="tab active" type="button">New</button>
           <button data-tab="address" class="tab" type="button">Address</button>
           <button data-tab="balance" class="tab" type="button">Balance</button>
+          <button data-tab="balance-address" class="tab" type="button">Balance by Address</button>
           <button data-tab="send" class="tab" type="button">Send</button>
           <button data-tab="decode" class="tab" type="button">Decode</button>
           <button data-tab="qr" class="tab" type="button">QR</button>
@@ -211,6 +216,16 @@
                 <input name="index" type="number" min="0" value="0" />
               </label>
               <button type="submit">Get Balance</button>
+            </form>
+          </section>
+
+          <section data-panel="balance-address" class="tab-panel">
+            <form id="walletBalanceAddressForm" class="stack">
+              <label>
+                Address
+                <input name="address" type="text" required />
+              </label>
+              <button type="submit">Get Balance By Address</button>
             </form>
           </section>
 
