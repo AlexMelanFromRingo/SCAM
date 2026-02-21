@@ -4619,7 +4619,9 @@ fn run_relay_peer_session<IO: Read + Write>(
                         )
                     };
                     for msg in proactive {
-                        send_message(stream, &msg, &framing)?;
+                        if !relay_send_message_or_closed(stream, &msg, &framing)? {
+                            break;
+                        }
                     }
                     continue;
                 }
@@ -4661,7 +4663,9 @@ fn run_relay_peer_session<IO: Read + Write>(
                 mempool_db_seen_mtime = mempool_db_mtime(mempool_db_path);
             }
             for msg in outbound {
-                send_message(stream, &msg, &framing)?;
+                if !relay_send_message_or_closed(stream, &msg, &framing)? {
+                    break;
+                }
             }
             let banned = {
                 let guard = state
@@ -6348,6 +6352,18 @@ fn map_relay_read_result(
         Err(TransportError::Io(err)) if relay_io_error_is_closed_like(&err) => {
             Ok(RelayReadOutcome::Closed)
         }
+        Err(err) => Err(NodeError::Transport(err)),
+    }
+}
+
+fn relay_send_message_or_closed<IO: Write>(
+    stream: &mut IO,
+    message: &WireMessage,
+    framing: &FramingConfig,
+) -> Result<bool, NodeError> {
+    match send_message(stream, message, framing) {
+        Ok(()) => Ok(true),
+        Err(TransportError::Io(err)) if relay_io_error_is_closed_like(&err) => Ok(false),
         Err(err) => Err(NodeError::Transport(err)),
     }
 }
@@ -8880,15 +8896,16 @@ fn rpc_events_worker_should_continue(stop_flag: &AtomicBool) -> bool {
 }
 
 fn reap_finished_rpc_event_workers(handles: &mut Vec<thread::JoinHandle<()>>) {
-    let mut idx = 0usize;
-    while idx < handles.len() {
-        if handles[idx].is_finished() {
-            let handle = handles.swap_remove(idx);
+    let mut pending = Vec::<thread::JoinHandle<()>>::with_capacity(handles.len());
+    while let Some(handle) = handles.pop() {
+        if handle.is_finished() {
             let _ = handle.join();
-            continue;
+        } else {
+            pending.push(handle);
         }
-        idx += 1;
     }
+    pending.reverse();
+    *handles = pending;
 }
 
 fn run_rpc_events_worker(
@@ -8909,7 +8926,14 @@ fn run_rpc_events_worker(
         return Err(err);
     }
 
+    if stop_flag.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+
     while rpc_events_worker_should_continue(&stop_flag) {
+        if stop_flag.load(Ordering::Relaxed) {
+            break;
+        }
         refresh_runtime_from_db_if_changed(
             &cfg,
             &mut runtime,
@@ -11082,6 +11106,47 @@ mod tests {
         )))
         .expect_err("unexpected io errors must bubble up");
         assert!(denied.to_string().contains("io error"));
+    }
+
+    #[test]
+    fn relay_send_message_or_closed_maps_closed_io_to_disconnect() {
+        let framing = FramingConfig::default();
+        let ping = WireMessage::Ping { nonce: 7 };
+
+        let mut ok = Vec::<u8>::new();
+        let sent = super::relay_send_message_or_closed(&mut ok, &ping, &framing).expect("send ok");
+        assert!(sent);
+        assert!(!ok.is_empty());
+
+        struct ClosedWriter;
+        impl Write for ClosedWriter {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut closed = ClosedWriter;
+        let sent = super::relay_send_message_or_closed(&mut closed, &ping, &framing)
+            .expect("closed-like errors should map to graceful disconnect");
+        assert!(!sent);
+
+        struct DeniedWriter;
+        impl Write for DeniedWriter {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut denied = DeniedWriter;
+        let err = super::relay_send_message_or_closed(&mut denied, &ping, &framing)
+            .expect_err("non-closed write errors must bubble up");
+        assert!(err.to_string().contains("io error"));
     }
 
     #[test]
