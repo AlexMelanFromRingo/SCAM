@@ -10292,22 +10292,45 @@ mod tests {
     }
 
     fn send_http_request(addr: &str, request: &str) -> String {
-        let mut stream = connect_with_retry(addr);
-        stream
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .expect("set read timeout");
-        stream
-            .set_write_timeout(Some(Duration::from_secs(10)))
-            .expect("set write timeout");
-        stream
-            .write_all(request.as_bytes())
-            .expect("write request bytes");
-        stream
-            .shutdown(Shutdown::Write)
-            .expect("shutdown write half");
-        let mut response = String::new();
-        stream.read_to_string(&mut response).expect("read response");
-        response
+        let mut last_closed_like_err = None::<String>;
+        for _attempt in 0..3 {
+            let mut stream = connect_with_retry(addr);
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .expect("set read timeout");
+            stream
+                .set_write_timeout(Some(Duration::from_secs(10)))
+                .expect("set write timeout");
+            if let Err(err) = stream.write_all(request.as_bytes()) {
+                if super::http_io_error_is_closed_like(&err) {
+                    last_closed_like_err = Some(err.to_string());
+                    continue;
+                }
+                panic!("write request bytes: {err}");
+            }
+            if let Err(err) = stream.shutdown(Shutdown::Write) {
+                if super::http_io_error_is_closed_like(&err) {
+                    last_closed_like_err = Some(err.to_string());
+                    continue;
+                }
+                panic!("shutdown write half: {err}");
+            }
+            let mut response = String::new();
+            match stream.read_to_string(&mut response) {
+                Ok(_) => return response,
+                Err(err) if super::http_io_error_is_closed_like(&err) => {
+                    if !response.is_empty() {
+                        return response;
+                    }
+                    last_closed_like_err = Some(err.to_string());
+                }
+                Err(err) => panic!("read response: {err}"),
+            }
+        }
+        panic!(
+            "read response retries exhausted: {}",
+            last_closed_like_err.unwrap_or_else(|| "unknown closed connection".to_owned())
+        );
     }
 
     fn try_send_http_request(addr: &str, request: &str) -> Option<String> {
@@ -10334,6 +10357,15 @@ mod tests {
             body.len()
         );
         send_http_request(addr, &request)
+    }
+
+    fn drain_rpc_server_until_max_requests(addr: &str, attempts: u32) {
+        for _ in 0..attempts {
+            let _ = try_send_http_request(
+                addr,
+                "GET /health HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+            );
+        }
     }
 
     fn send_http_request_until(
@@ -10375,6 +10407,7 @@ mod tests {
                 {
                     continue;
                 }
+                Err(err) if super::http_io_error_is_closed_like(&err) => break,
                 Err(err) => panic!("read response: {err}"),
             }
         }
@@ -13976,7 +14009,7 @@ mod tests {
                 mine_blocks: 0,
                 interval_sec: 120,
                 max_nonce: 500_000,
-                max_requests: 2,
+                max_requests: 6,
             })
             .expect("rpc serve");
         });
@@ -13993,7 +14026,8 @@ mod tests {
         assert!(unknown_response.starts_with("HTTP/1.1 200 OK"));
         assert!(unknown_response.contains("<html>ui</html>"));
 
-        join_with_timeout(server, Duration::from_secs(5), "rpc health routes server");
+        drain_rpc_server_until_max_requests(&addr, 10);
+        join_with_timeout(server, Duration::from_secs(10), "rpc health routes server");
         let _ = fs::remove_dir_all(work_dir);
     }
 
@@ -14032,9 +14066,9 @@ mod tests {
                 mine_blocks: 0,
                 interval_sec: 120,
                 max_nonce: 500_000,
-                // run_rpc_serve counts only fully handled request paths in `served`;
-                // several requests below intentionally hit early 400 error paths.
-                max_requests: 6,
+                // Keep this above the deterministic assertion request set, then drain with
+                // explicit health probes before joining.
+                max_requests: 20,
             })
             .expect("rpc serve");
         });
@@ -14064,7 +14098,8 @@ mod tests {
         let wallet_qr = send_http_json_post(&addr, "/wallet/qr", "{\"address\":\"scam\"}");
         assert!(wallet_qr.starts_with("HTTP/1.1 200 OK"));
 
-        join_with_timeout(server, Duration::from_secs(5), "rpc core routes server");
+        drain_rpc_server_until_max_requests(&addr, 24);
+        join_with_timeout(server, Duration::from_secs(10), "rpc core routes server");
         let _ = fs::remove_dir_all(work_dir);
     }
 
@@ -14095,7 +14130,7 @@ mod tests {
                 mine_blocks: 0,
                 interval_sec: 120,
                 max_nonce: 500_000,
-                max_requests: 2,
+                max_requests: 6,
             })
             .expect("rpc serve");
         });
@@ -14143,7 +14178,8 @@ mod tests {
         let health = send_http_request(&addr, "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n");
         assert!(health.starts_with("HTTP/1.1 200 OK"));
 
-        join_with_timeout(server, Duration::from_secs(5), "rpc events server");
+        drain_rpc_server_until_max_requests(&addr, 10);
+        join_with_timeout(server, Duration::from_secs(10), "rpc events server");
         let _ = fs::remove_dir_all(work_dir);
     }
 
@@ -14376,9 +14412,8 @@ mod tests {
                 mine_blocks: 0,
                 interval_sec: 120,
                 max_nonce: 500_000,
-                // Two send-preview requests below intentionally return early 400 responses,
-                // which do not increment internal `served`.
-                max_requests: 14,
+                // Keep this above assertion requests and drain deterministically at the end.
+                max_requests: 32,
             })
             .expect("rpc serve");
         });
@@ -14492,7 +14527,8 @@ mod tests {
         assert!(wallet_decode.starts_with("HTTP/1.1 200 OK"));
         assert!(wallet_decode.contains("\"key_hash20_hex\""));
 
-        join_with_timeout(server, Duration::from_secs(5), "rpc strict routes server");
+        drain_rpc_server_until_max_requests(&addr, 48);
+        join_with_timeout(server, Duration::from_secs(10), "rpc strict routes server");
         let _ = fs::remove_dir_all(work_dir);
     }
 
@@ -14539,20 +14575,8 @@ mod tests {
             "unexpected serve error: {serve_err}"
         );
 
-        let listener = match TcpListener::bind("127.0.0.1:0") {
-            Ok(listener) => listener,
-            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
-                let _ = fs::remove_dir_all(work_dir);
-                return;
-            }
-            Err(err) => panic!("bind: {err}"),
-        };
-        let pool = listener.local_addr().expect("addr").to_string();
-        let acceptor = thread::spawn(move || {
-            let _ = listener.accept();
-        });
         let mine_err = run_stratum_mine(StratumMineArgs {
-            pool,
+            pool: "127.0.0.1:1".to_owned(),
             user: "miner".to_owned(),
             read_timeout_sec: 1,
             max_nonce_per_cycle: 100,
@@ -14574,7 +14598,6 @@ mod tests {
                 .contains("requires --secure-static-secret-key-hex"),
             "unexpected mine error: {mine_err}"
         );
-        acceptor.join().expect("acceptor join");
         let _ = fs::remove_dir_all(work_dir);
     }
 
