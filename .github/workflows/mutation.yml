@@ -59,8 +59,6 @@ on:
         options:
           - "false"
           - "true"
-  schedule:
-    - cron: "0 3 * * *"
 
 permissions:
   contents: read
@@ -104,15 +102,6 @@ jobs:
           if ! command -v cargo-nextest >/dev/null 2>&1; then
             cargo install cargo-nextest
           fi
-
-      - name: Run scheduled mutation stage1
-        if: github.event_name == 'schedule'
-        run: |
-          export MUTATION_JOBS=4
-          export MUTATION_TIMEOUT=120
-          export MUTATION_MIN_TEST_TIMEOUT=20
-          export MUTATION_TEST_TOOL=cargo
-          scripts/mutation-staged.sh stage1
 
       - name: Run manual mutation stage
         if: github.event_name == 'workflow_dispatch'
