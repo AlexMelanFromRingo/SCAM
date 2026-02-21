@@ -310,7 +310,7 @@ start_cluster() {
 
   if is_true "${SYNC_BOOK}"; then
     echo "[cluster] running initial sync-book pass"
-    for ((idx = 0; idx < NODE_COUNT; idx++)); do
+    for ((idx = 1; idx < NODE_COUNT; idx++)); do
       local logsdir runtime_db peersdir
       logsdir="$(logs_dir_path "${idx}")"
       runtime_db="$(runtime_db_path "${idx}")"
@@ -330,7 +330,7 @@ start_cluster() {
 
   if is_true "${RUN_SYNC_LOOP}"; then
     echo "[cluster] starting periodic sync-book loops (interval=${SYNC_LOOP_INTERVAL_SEC}s)"
-    for ((idx = 0; idx < NODE_COUNT; idx++)); do
+    for ((idx = 1; idx < NODE_COUNT; idx++)); do
       local logsdir runtime_db peersdir nodedir
       logsdir="$(logs_dir_path "${idx}")"
       runtime_db="$(runtime_db_path "${idx}")"
