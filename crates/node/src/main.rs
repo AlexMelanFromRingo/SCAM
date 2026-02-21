@@ -4618,10 +4618,9 @@ fn run_relay_peer_session<IO: Read + Write>(
                             max_inv_items,
                         )
                     };
-                    for msg in proactive {
-                        if !relay_send_message_or_closed(stream, &msg, &framing)? {
-                            break;
-                        }
+                    match relay_send_messages_until_closed(stream, &proactive, &framing)? {
+                        true => {}
+                        false => break,
                     }
                     continue;
                 }
@@ -4662,10 +4661,9 @@ fn run_relay_peer_session<IO: Read + Write>(
                 persist_mempool_db_with_retry(cfg, &guard.relay.mempool, mempool_db_path, 80, 25)?;
                 mempool_db_seen_mtime = mempool_db_mtime(mempool_db_path);
             }
-            for msg in outbound {
-                if !relay_send_message_or_closed(stream, &msg, &framing)? {
-                    break;
-                }
+            match relay_send_messages_until_closed(stream, &outbound, &framing)? {
+                true => {}
+                false => break,
             }
             let banned = {
                 let guard = state
@@ -6366,6 +6364,20 @@ fn relay_send_message_or_closed<IO: Write>(
         Err(TransportError::Io(err)) if relay_io_error_is_closed_like(&err) => Ok(false),
         Err(err) => Err(NodeError::Transport(err)),
     }
+}
+
+fn relay_send_messages_until_closed<IO: Write>(
+    stream: &mut IO,
+    messages: &[WireMessage],
+    framing: &FramingConfig,
+) -> Result<bool, NodeError> {
+    for message in messages {
+        match relay_send_message_or_closed(stream, message, framing)? {
+            true => {}
+            false => return Ok(false),
+        }
+    }
+    Ok(true)
 }
 
 fn should_require_noise_static_key(
@@ -11147,6 +11159,40 @@ mod tests {
         let err = super::relay_send_message_or_closed(&mut denied, &ping, &framing)
             .expect_err("non-closed write errors must bubble up");
         assert!(err.to_string().contains("io error"));
+    }
+
+    #[test]
+    fn relay_send_messages_until_closed_sends_all_messages_or_stops_cleanly() {
+        let framing = FramingConfig::default();
+        let messages = vec![
+            WireMessage::Ping { nonce: 7 },
+            WireMessage::Ping { nonce: 8 },
+        ];
+
+        let mut out = Vec::<u8>::new();
+        let sent_all =
+            super::relay_send_messages_until_closed(&mut out, &messages, &framing).expect("send");
+        assert!(sent_all);
+        let mut reader = std::io::Cursor::new(out);
+        let first = read_message(&mut reader, &framing).expect("first");
+        let second = read_message(&mut reader, &framing).expect("second");
+        assert!(matches!(first, WireMessage::Ping { nonce: 7 }));
+        assert!(matches!(second, WireMessage::Ping { nonce: 8 }));
+
+        struct ClosedWriter;
+        impl Write for ClosedWriter {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut closed = ClosedWriter;
+        let sent_all = super::relay_send_messages_until_closed(&mut closed, &messages, &framing)
+            .expect("closed path");
+        assert!(!sent_all);
     }
 
     #[test]
