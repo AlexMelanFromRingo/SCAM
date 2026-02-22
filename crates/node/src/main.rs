@@ -6051,6 +6051,13 @@ fn relay_disconnect_reason(err: &NodeError) -> &'static str {
     }
 }
 
+fn relay_session_error_is_fatal(err: &NodeError) -> bool {
+    matches!(
+        relay_disconnect_reason(err),
+        "internal-error" | "state-poisoned"
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(not(test), allow(dead_code))]
 fn run_relay_outbound_worker(
@@ -7175,8 +7182,15 @@ fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
             match join_result {
                 Ok(Ok(())) => {}
                 Ok(Err(err)) => {
-                    if first_error.is_none() {
-                        first_error = Some(err);
+                    if relay_session_error_is_fatal(&err) {
+                        if first_error.is_none() {
+                            first_error = Some(err);
+                        }
+                    } else {
+                        eprintln!(
+                            "warning: relay worker session ended: reason={} detail={err}",
+                            relay_disconnect_reason(&err)
+                        );
                     }
                 }
                 Err(err) => {
@@ -14179,6 +14193,11 @@ mod tests {
             super::relay_disconnect_reason(&runtime_internal),
             "internal-error"
         );
+        assert!(!super::relay_session_error_is_fatal(&timeout_err));
+        assert!(!super::relay_session_error_is_fatal(&closed_err));
+        assert!(!super::relay_session_error_is_fatal(&runtime_mismatch));
+        assert!(super::relay_session_error_is_fatal(&runtime_poison));
+        assert!(super::relay_session_error_is_fatal(&runtime_internal));
 
         assert_eq!(super::reorg_min_difficulty_window(49), 50);
         assert_eq!(super::reorg_min_difficulty_window(50), 50);
