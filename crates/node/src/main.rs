@@ -23141,7 +23141,7 @@ mod tests {
                     config: Some(config_path),
                     runtime_db: Some(runtime_db_b),
                     bind: bind_b,
-                    max_clients: 1,
+                    max_clients: 4,
                     max_messages_per_peer: 0,
                     read_timeout_sec: 1,
                     write_timeout_sec: 1,
@@ -23170,7 +23170,7 @@ mod tests {
                     config: Some(config_path),
                     runtime_db: Some(runtime_db_a),
                     bind: bind_a,
-                    max_clients: 1,
+                    max_clients: 4,
                     max_messages_per_peer: 0,
                     read_timeout_sec: 1,
                     write_timeout_sec: 1,
@@ -23188,7 +23188,7 @@ mod tests {
             }
         });
 
-        thread::sleep(Duration::from_millis(350));
+        thread::sleep(Duration::from_millis(800));
         let mut sender = connect_with_retry(&bind_a);
         sender
             .set_read_timeout(Some(Duration::from_secs(2)))
