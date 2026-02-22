@@ -39,6 +39,7 @@ Fuzz harness package lives in `fuzz/` with targets:
 - `wire_decode`
 - `block_decode`
 - `tx_decode`
+- `relay_tx_submit` (relay wire decode + `/tx/submit` JSON/tx payload parser path)
 
 Run examples:
 
@@ -46,6 +47,7 @@ Run examples:
 cargo fuzz run wire_decode --manifest-path fuzz/Cargo.toml
 cargo fuzz run block_decode --manifest-path fuzz/Cargo.toml
 cargo fuzz run tx_decode --manifest-path fuzz/Cargo.toml
+cargo fuzz run relay_tx_submit --manifest-path fuzz/Cargo.toml
 ```
 
 ## Mutation Testing Baseline

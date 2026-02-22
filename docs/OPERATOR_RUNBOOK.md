@@ -143,3 +143,62 @@ scripts/testnet-dress-rehearsal.sh
 - rollout policy: `docs/SV2_ROLLOUT_POLICY.md`
 - role incident runbook: `docs/SV2_ROLE_INCIDENT_RUNBOOK.md`
 - role interface contract: `docs/SV2_ROLE_INTERFACES.md`
+
+## 9) Incident Thresholds (Default Ops Guardrails)
+
+Baseline thresholds for `devnet/testnet` operations:
+
+- `sync_lag_blocks > 6` for longer than `5m` -> investigate relay connectivity and peer health.
+- `last_block_age > 3 * target_block_time_sec` for longer than `10m` -> investigate miner/pool liveliness.
+- `relay_peer_count == 0` while node is expected online -> investigate bind/firewall/peer-book bootstrap.
+- `orphan_pool_len > 500` or steady growth for `10m` -> investigate inbound malformed tx storm or missing-parent churn.
+- `replacement_rate_limited_total` increasing continuously (`> 20/min`) -> investigate replacement spam source peers.
+- `banned_peer_count` jump (`> 10` within `5m`) -> investigate coordinated bad-peer traffic.
+- `stratum_rejected_share_ratio > 5%` over rolling `10m` -> investigate share target mismatch, stale jobs, clock skew.
+
+## 10) Incident Playbook (Fast Triage)
+
+1. Confirm node liveness and tip movement.
+
+```bash
+curl -s http://127.0.0.1:19080/status | jq .
+curl -s http://127.0.0.1:19080/mempool | jq .
+```
+
+2. Check relay telemetry trend for churn/spam signatures.
+
+```bash
+tail -n 200 data/relay.telemetry.jsonl
+scripts/telemetry-alert-check.py --input data/soak.telemetry.jsonl
+```
+
+3. Verify peer bootstrap and outbound dial path.
+
+```bash
+cargo run -p scam-node -- sync-book --network devnet --config config/devnet.toml --runtime-db data/devnet.runtime.redb
+```
+
+4. If sync divergence persists, isolate and rehydrate runtime from archive.
+
+```bash
+cargo run -p scam-node -- reindex-runtime --network devnet --config config/devnet.toml --runtime-db data/devnet.runtime.redb
+```
+
+5. For SV2 instability, replay corpus against active endpoint and inspect matrix artifacts.
+
+```bash
+POOL=127.0.0.1:3347 scripts/sv2-corpus-replay.sh
+scripts/sv2-conformance-matrix.sh
+```
+
+## 11) Alert Escalation Policy
+
+1. `sev-3` (minor degradation): single threshold breach under `10m`, auto-recovering.
+2. `sev-2` (service risk): repeated threshold breaches for `> 10m` or user-visible sync lag.
+3. `sev-1` (critical): chain split, persistent invalid block acceptance, or sustained no-progress state.
+
+Escalate to `sev-1` immediately when:
+
+- two healthy relays disagree on best tip for `> 5m`,
+- mempool admission rejects valid signed tx across multiple peers,
+- Stratum workers cannot submit accepted shares after transport/channel setup.

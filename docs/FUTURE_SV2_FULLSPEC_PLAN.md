@@ -47,6 +47,8 @@ Clarification: consensus is already functionally implemented; future items touch
 - Run automated compatibility scenarios against each target stack.
 - Maintain golden corpus of cross-stack captures and expected outcomes.
 - Track compatibility quirks by stack/version with explicit workarounds.
+- Baseline harness support is in place for structured target manifests (`SV2_EXTERNAL_TARGETS_FILE`)
+  with per-target expected outcome + vendor/version metadata artifacts.
 
 ### D. Scale and Reliability
 

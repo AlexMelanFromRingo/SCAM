@@ -44,8 +44,8 @@
 ## P2 (launch confidence)
 - [ ] Soak test profile for 24h: 2-5 nodes + miner + tx spam profile.
 - [ ] Mutation stage2/3 rerun after live submit/realtime changes.
-- [ ] Fuzz target for relay wire parsing and tx submit route.
-- [ ] Operator runbook updates (incident handling, recovery, metrics thresholds).
+- [x] Fuzz target for relay wire parsing and tx submit route.
+- [x] Operator runbook updates (incident handling, recovery, metrics thresholds).
 
 ## Required test additions (minimum)
 - [x] `wallet/send` happy path integration test.
