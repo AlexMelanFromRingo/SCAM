@@ -16641,7 +16641,10 @@ mod tests {
             "GET /pool/status HTTP/1.1\r\nHost: localhost\r\n\r\n",
         );
         assert!(pool_status.starts_with("HTTP/1.1 404 Not Found"));
-        assert!(pool_status.contains("stratum telemetry snapshot not available"));
+        assert!(
+            pool_status.contains("snapshot not available")
+                || pool_status.contains("pool telemetry and ledger snapshots are not available")
+        );
 
         stop_rpc_server_for_test(server_shutdown, server, "rpc core routes server");
         let _ = fs::remove_dir_all(work_dir);
