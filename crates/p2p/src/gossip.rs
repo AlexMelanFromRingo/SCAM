@@ -53,6 +53,10 @@ pub struct GossipEngine {
     local_inventory: HashSet<InventoryItem>,
     tx_store: HashMap<Hash256, Transaction>,
     block_store: HashMap<Hash256, Block>,
+    tx_store_order: VecDeque<Hash256>,
+    block_store_order: VecDeque<Hash256>,
+    max_tx_store_items: usize,
+    max_block_store_items: usize,
     replacement_rate_limit: ReplacementRateLimit,
     telemetry: GossipTelemetry,
 }
@@ -108,6 +112,10 @@ impl GossipEngine {
             local_inventory: HashSet::new(),
             tx_store: HashMap::new(),
             block_store: HashMap::new(),
+            tx_store_order: VecDeque::new(),
+            block_store_order: VecDeque::new(),
+            max_tx_store_items: max_inv_items.saturating_mul(8).max(max_inv_items),
+            max_block_store_items: max_inv_items.saturating_mul(8).max(max_inv_items),
             replacement_rate_limit,
             telemetry: GossipTelemetry::default(),
         })
@@ -145,16 +153,14 @@ impl GossipEngine {
     }
 
     pub fn announce_tx(&mut self, tx: Transaction) -> Vec<OutboundMessage> {
-        let txid = tx.txid();
-        self.tx_store.insert(txid, tx);
+        let txid = self.store_tx(tx);
         let item = InventoryItem::Tx(txid);
         self.insert_local_inventory(item.clone());
         self.fanout_inv(None, item)
     }
 
     pub fn announce_block(&mut self, block: Block) -> Vec<OutboundMessage> {
-        let block_hash = block.header.block_hash();
-        self.block_store.insert(block_hash, block);
+        let block_hash = self.store_block(block);
         let item = InventoryItem::Block(block_hash);
         self.insert_local_inventory(item.clone());
         self.fanout_inv(None, item)
@@ -344,8 +350,7 @@ impl GossipEngine {
         from_peer: PeerId,
         tx: Transaction,
     ) -> Result<Vec<OutboundMessage>, GossipError> {
-        let txid = tx.txid();
-        self.tx_store.insert(txid, tx);
+        let txid = self.store_tx(tx);
         let item = InventoryItem::Tx(txid);
         let was_new = self.insert_local_inventory(item.clone());
 
@@ -363,8 +368,7 @@ impl GossipEngine {
         from_peer: PeerId,
         block: Block,
     ) -> Result<Vec<OutboundMessage>, GossipError> {
-        let block_hash = block.header.block_hash();
-        self.block_store.insert(block_hash, block);
+        let block_hash = self.store_block(block);
         let item = InventoryItem::Block(block_hash);
         let was_new = self.insert_local_inventory(item.clone());
 
@@ -405,10 +409,64 @@ impl GossipEngine {
 
     fn forget_tx(&mut self, txid: Hash256) {
         self.tx_store.remove(&txid);
+        self.tx_store_order.retain(|hash| *hash != txid);
         let item = InventoryItem::Tx(txid);
-        self.local_inventory.remove(&item);
+        self.forget_inventory_item(&item);
+    }
+
+    fn forget_block(&mut self, block_hash: Hash256) {
+        self.block_store.remove(&block_hash);
+        self.block_store_order.retain(|hash| *hash != block_hash);
+        let item = InventoryItem::Block(block_hash);
+        self.forget_inventory_item(&item);
+    }
+
+    fn forget_inventory_item(&mut self, item: &InventoryItem) {
+        self.local_inventory.remove(item);
         for peer in self.peers.values_mut() {
-            peer.known_inventory.remove(&item);
+            peer.known_inventory.remove(item);
+        }
+    }
+
+    fn store_tx(&mut self, tx: Transaction) -> Hash256 {
+        let txid = tx.txid();
+        let is_new = self.tx_store.insert(txid, tx).is_none();
+        if is_new {
+            self.tx_store_order.push_back(txid);
+        }
+        self.prune_tx_store();
+        txid
+    }
+
+    fn store_block(&mut self, block: Block) -> Hash256 {
+        let block_hash = block.header.block_hash();
+        let is_new = self.block_store.insert(block_hash, block).is_none();
+        if is_new {
+            self.block_store_order.push_back(block_hash);
+        }
+        self.prune_block_store();
+        block_hash
+    }
+
+    fn prune_tx_store(&mut self) {
+        while self.tx_store.len() > self.max_tx_store_items {
+            let Some(oldest) = self.tx_store_order.pop_front() else {
+                break;
+            };
+            if self.tx_store.contains_key(&oldest) {
+                self.forget_tx(oldest);
+            }
+        }
+    }
+
+    fn prune_block_store(&mut self) {
+        while self.block_store.len() > self.max_block_store_items {
+            let Some(oldest) = self.block_store_order.pop_front() else {
+                break;
+            };
+            if self.block_store.contains_key(&oldest) {
+                self.forget_block(oldest);
+            }
         }
     }
 
@@ -486,7 +544,7 @@ pub enum GossipError {
 mod tests {
     use super::{GossipEngine, OutboundMessage, ReplacementRateLimit};
     use crate::wire::{InventoryItem, WireMessage};
-    use scam_core::{OutPoint, Transaction, TxIn, TxOut};
+    use scam_core::{Hash256, OutPoint, Transaction, TxIn, TxOut};
 
     fn sample_tx(seed: u8) -> Transaction {
         Transaction {
@@ -610,6 +668,57 @@ mod tests {
         let out = engine.announce_block(block);
         assert_eq!(out.len(), 2);
         assert!(engine.has_inventory(&InventoryItem::Block(block_hash)));
+    }
+
+    #[test]
+    fn block_store_prunes_old_entries_and_inventory_when_capacity_is_exceeded() {
+        let mut engine = GossipEngine::new(2).expect("engine");
+        engine.connect_peer(1);
+
+        let limit = engine.max_block_store_items;
+        let mut hashes = Vec::<Hash256>::new();
+        for idx in 0..(limit + 4) {
+            let block = scam_core::Block {
+                header: scam_core::BlockHeader {
+                    version: 1,
+                    prev_block: scam_core::Hash256::ZERO,
+                    merkle_root: scam_core::hash::hash256(format!("merkle-{idx}").as_bytes()),
+                    timestamp: 1_770_763_200 + idx as u64,
+                    target: scam_core::Target::MAX,
+                    nonce: idx as u64,
+                },
+                transactions: Vec::new(),
+            };
+            hashes.push(block.header.block_hash());
+            let _ = engine.announce_block(block);
+        }
+
+        assert_eq!(engine.block_store.len(), limit);
+        let oldest = hashes[0];
+        let newest = *hashes.last().expect("newest hash");
+        assert!(!engine.has_inventory(&InventoryItem::Block(oldest)));
+        assert!(engine.has_inventory(&InventoryItem::Block(newest)));
+    }
+
+    #[test]
+    fn tx_store_prunes_old_entries_and_inventory_when_capacity_is_exceeded() {
+        let mut engine = GossipEngine::new(2).expect("engine");
+        engine.connect_peer(1);
+
+        let limit = engine.max_tx_store_items;
+        let mut txids = Vec::<Hash256>::new();
+        for idx in 0..(limit + 4) {
+            let tx = sample_tx(idx as u8);
+            let txid = tx.txid();
+            txids.push(txid);
+            let _ = engine.announce_tx(tx);
+        }
+
+        assert_eq!(engine.tx_store.len(), limit);
+        let oldest = txids[0];
+        let newest = *txids.last().expect("newest txid");
+        assert!(!engine.has_inventory(&InventoryItem::Tx(oldest)));
+        assert!(engine.has_inventory(&InventoryItem::Tx(newest)));
     }
 
     #[test]

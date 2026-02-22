@@ -3,8 +3,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use num_bigint::BigUint;
 use scam_consensus::{
-    BlockApplySummary, BlockValidationError, UtxoSet, asert_next, chainwork_for_target, lwma_next,
-    retarget_next, validate_and_apply_block, validate_block_basic,
+    BlockApplySummary, BlockValidationError, UtxoEntry, UtxoSet, asert_next, chainwork_for_target,
+    lwma_next, retarget_next, validate_and_apply_block, validate_block_basic,
 };
 use scam_core::{Block, BlockHeader, ChainConfig, DifficultyAlgorithm, Hash256, Target};
 use thiserror::Error;
@@ -38,6 +38,13 @@ pub struct ChainRuntime {
     headers: HashMap<Hash256, BlockHeader>,
     cumulative_work: HashMap<Hash256, BigUint>,
     main_chain: Vec<Hash256>,
+    undo_data: HashMap<Hash256, BlockUndo>,
+}
+
+#[derive(Clone, Debug)]
+struct BlockUndo {
+    spent_entries: Vec<(scam_core::OutPoint, UtxoEntry)>,
+    created_outpoints: Vec<scam_core::OutPoint>,
 }
 
 impl ChainRuntime {
@@ -101,6 +108,7 @@ impl ChainRuntime {
             headers,
             cumulative_work,
             main_chain: vec![genesis_hash],
+            undo_data: HashMap::new(),
         })
     }
 
@@ -325,6 +333,7 @@ impl ChainRuntime {
         }
 
         let height = self.tip_height() + 1;
+        let undo = self.collect_block_undo(&block)?;
         let summary = validate_and_apply_block(
             &block,
             height,
@@ -345,6 +354,7 @@ impl ChainRuntime {
             .clone();
         let work = prev_work + chainwork_for_target(block.header.target);
         self.cumulative_work.insert(block_hash, work);
+        self.undo_data.insert(block_hash, undo);
         Ok(summary)
     }
 
@@ -382,22 +392,25 @@ impl ChainRuntime {
             .expect("tip work must exist")
             .clone();
         if candidate_work <= current_work {
+            // Side-branch blocks are not part of the active chain yet.
+            self.undo_data.remove(&block_hash);
             return Ok(BlockSubmissionOutcome::StoredSideBranch { block_hash });
         }
 
-        let candidate_chain = self.collect_chain_to_genesis(block_hash)?;
-        let replayed = match self.replay_chain(&candidate_chain) {
-            Ok(runtime) => runtime,
-            Err(err) => {
-                self.headers.remove(&block_hash);
-                self.blocks.remove(&block_hash);
-                self.cumulative_work.remove(&block_hash);
-                return Err(err);
-            }
-        };
+        let utxo_backup = self.utxos.clone();
+        let main_chain_backup = self.main_chain.clone();
+        let undo_backup = self.undo_data.clone();
 
-        self.main_chain = candidate_chain;
-        self.utxos = replayed.utxos;
+        let candidate_chain = self.collect_chain_to_genesis(block_hash)?;
+        if let Err(err) = self.reorganize_to_chain(&candidate_chain) {
+            self.utxos = utxo_backup;
+            self.main_chain = main_chain_backup;
+            self.undo_data = undo_backup;
+            self.headers.remove(&block_hash);
+            self.blocks.remove(&block_hash);
+            self.cumulative_work.remove(&block_hash);
+            return Err(err);
+        }
 
         let new_tip = self.tip_hash();
         if self
@@ -448,31 +461,135 @@ impl ChainRuntime {
         Ok(reversed)
     }
 
-    fn replay_chain(&self, chain_hashes: &[Hash256]) -> Result<Self, ChainError> {
-        let Some(genesis_hash) = chain_hashes.first().copied() else {
+    fn reorganize_to_chain(&mut self, chain_hashes: &[Hash256]) -> Result<(), ChainError> {
+        let Some(_) = chain_hashes.first() else {
             return Err(ChainError::InvalidRuntime(
                 "candidate chain cannot be empty".to_owned(),
             ));
         };
 
-        let genesis = self
-            .blocks
-            .get(&genesis_hash)
-            .ok_or(ChainError::MissingBlock {
-                block_hash: genesis_hash,
-            })?
-            .clone();
-        let mut replay = ChainRuntime::new(self.config.clone(), genesis)?;
-
-        for hash in chain_hashes.iter().copied().skip(1) {
-            let block = self
-                .blocks
-                .get(&hash)
-                .ok_or(ChainError::MissingBlock { block_hash: hash })?
-                .clone();
-            replay.apply_next_block(block)?;
+        let fork_height = self.find_fork_height(chain_hashes)?;
+        while self.main_chain.len().saturating_sub(1) > fork_height {
+            self.disconnect_tip_block()?;
         }
-        Ok(replay)
+        for hash in chain_hashes.iter().copied().skip(fork_height + 1) {
+            self.connect_known_block(hash)?;
+        }
+        Ok(())
+    }
+
+    fn find_fork_height(&self, chain_hashes: &[Hash256]) -> Result<usize, ChainError> {
+        let mut fork = None;
+        for (height, candidate_hash) in chain_hashes.iter().enumerate() {
+            match self.main_chain.get(height) {
+                Some(local_hash) if local_hash == candidate_hash => {
+                    fork = Some(height);
+                }
+                _ => break,
+            }
+        }
+        fork.ok_or_else(|| {
+            ChainError::InvalidRuntime("candidate chain does not share local genesis".to_owned())
+        })
+    }
+
+    fn connect_known_block(&mut self, block_hash: Hash256) -> Result<(), ChainError> {
+        let block = self
+            .blocks
+            .get(&block_hash)
+            .ok_or(ChainError::MissingBlock { block_hash })?
+            .clone();
+
+        if block.header.prev_block != self.tip_hash() {
+            return Err(ChainError::PrevBlockMustBeTip {
+                expected_tip: self.tip_hash(),
+                got_prev: block.header.prev_block,
+            });
+        }
+        self.validate_contextual_timestamps(&block)?;
+        let expected_target = self.expected_target_for_next_block()?;
+        if block.header.target != expected_target {
+            return Err(ChainError::UnexpectedTarget {
+                expected: expected_target,
+                got: block.header.target,
+            });
+        }
+
+        let undo = self.collect_block_undo(&block)?;
+        let next_height = self.tip_height().saturating_add(1);
+        validate_and_apply_block(
+            &block,
+            next_height,
+            self.config.block_subsidy,
+            self.config.coinbase_maturity as u64,
+            self.config.network_id.as_bytes(),
+            &mut self.utxos,
+        )?;
+        self.main_chain.push(block_hash);
+        self.undo_data.insert(block_hash, undo);
+        Ok(())
+    }
+
+    fn disconnect_tip_block(&mut self) -> Result<(), ChainError> {
+        if self.main_chain.len() <= 1 {
+            return Err(ChainError::InvalidRuntime(
+                "cannot disconnect genesis block".to_owned(),
+            ));
+        }
+        let tip_hash = self.tip_hash();
+        let undo = self
+            .undo_data
+            .remove(&tip_hash)
+            .ok_or(ChainError::MissingUndoData {
+                block_hash: tip_hash,
+            })?;
+
+        for outpoint in undo.created_outpoints {
+            if self.utxos.remove(&outpoint).is_none() {
+                return Err(ChainError::DisconnectMissingCreatedUtxo {
+                    block_hash: tip_hash,
+                    outpoint,
+                });
+            }
+        }
+        for (outpoint, entry) in undo.spent_entries {
+            self.utxos.insert(outpoint, entry);
+        }
+        self.main_chain.pop();
+        Ok(())
+    }
+
+    fn collect_block_undo(&self, block: &Block) -> Result<BlockUndo, ChainError> {
+        let block_hash = block.header.block_hash();
+        let mut spent_entries = Vec::<(scam_core::OutPoint, UtxoEntry)>::new();
+        for tx in block.transactions.iter().skip(1) {
+            for input in &tx.inputs {
+                let utxo =
+                    self.utxos
+                        .get(&input.prev_out)
+                        .ok_or(ChainError::MissingUndoSpentUtxo {
+                            block_hash,
+                            outpoint: input.prev_out.clone(),
+                        })?;
+                spent_entries.push((input.prev_out.clone(), utxo.clone()));
+            }
+        }
+
+        let mut created_outpoints = Vec::<scam_core::OutPoint>::new();
+        for tx in &block.transactions {
+            let txid = tx.txid();
+            for (vout, _) in tx.outputs.iter().enumerate() {
+                created_outpoints.push(scam_core::OutPoint {
+                    txid,
+                    vout: vout as u32,
+                });
+            }
+        }
+
+        Ok(BlockUndo {
+            spent_entries,
+            created_outpoints,
+        })
     }
 }
 
@@ -507,6 +624,18 @@ pub enum ChainError {
     MissingHeader { block_hash: Hash256 },
     #[error("missing block body for block {block_hash}")]
     MissingBlock { block_hash: Hash256 },
+    #[error("missing undo data for connected block {block_hash}")]
+    MissingUndoData { block_hash: Hash256 },
+    #[error("cannot build undo data for block {block_hash}: missing spent utxo {outpoint:?}")]
+    MissingUndoSpentUtxo {
+        block_hash: Hash256,
+        outpoint: scam_core::OutPoint,
+    },
+    #[error("disconnect failed for block {block_hash}: missing created utxo {outpoint:?}")]
+    DisconnectMissingCreatedUtxo {
+        block_hash: Hash256,
+        outpoint: scam_core::OutPoint,
+    },
     #[error("unexpected block target: expected {expected}, got {got}")]
     UnexpectedTarget { expected: Target, got: Target },
     #[error("unexpected genesis block hash: expected {expected}, got {got}")]

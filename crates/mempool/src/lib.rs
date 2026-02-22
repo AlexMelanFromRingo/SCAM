@@ -1,4 +1,5 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use scam_core::{Hash256, OutPoint, Transaction};
 use thiserror::Error;
@@ -15,6 +16,7 @@ pub struct Mempool {
     revision: u64,
     txs: HashMap<Hash256, MempoolEntry>,
     spent_outpoints: HashMap<OutPoint, Hash256>,
+    feerate_index: BTreeSet<(u128, Reverse<Hash256>)>,
     telemetry: MempoolTelemetry,
 }
 
@@ -116,6 +118,7 @@ impl Mempool {
             revision: 0,
             txs: HashMap::new(),
             spent_outpoints: HashMap::new(),
+            feerate_index: BTreeSet::new(),
             telemetry: MempoolTelemetry::default(),
         })
     }
@@ -163,12 +166,11 @@ impl Mempool {
             if !seen.insert(*txid) {
                 continue;
             }
-            if self.txs.remove(txid).is_some() {
+            if self.remove_entry(*txid).is_some() {
                 removed.push(*txid);
             }
         }
         if !removed.is_empty() {
-            self.rebuild_spent_outpoints();
             self.bump_revision();
             self.telemetry.removed_by_block_total = self
                 .telemetry
@@ -265,26 +267,8 @@ impl Mempool {
                 });
             }
 
-            let required_fee = existing
-                .fee
-                .checked_add(self.min_replacement_fee_delta)
-                .ok_or_else(|| {
-                    MempoolError::InvalidLimit(
-                        "replacement required fee overflow in mempool policy".to_owned(),
-                    )
-                })?;
-            if fee < required_fee {
-                self.telemetry.rejected_conflict_total =
-                    self.telemetry.rejected_conflict_total.saturating_add(1);
-                return Ok(InsertOutcome::RejectedConflictInsufficientFee {
-                    inserted: txid,
-                    existing: existing_txid,
-                    incoming_fee: fee,
-                    required_fee,
-                });
-            }
-
-            let replacement_set = self.collect_replacement_set(existing_txid);
+            let replacement_set =
+                self.collect_replacement_set(existing_txid, self.max_replacement_descendants + 2);
             let descendant_count = replacement_set.len().saturating_sub(1);
             if descendant_count > self.max_replacement_descendants {
                 return Err(MempoolError::ReplacementTooManyDescendants {
@@ -294,9 +278,28 @@ impl Mempool {
                     limit: self.max_replacement_descendants,
                 });
             }
+            let replaced_fee_total = self
+                .total_fee_for_set(&replacement_set)?
+                .checked_add(self.min_replacement_fee_delta as u128)
+                .ok_or_else(|| {
+                    MempoolError::InvalidLimit(
+                        "replacement required fee overflow in mempool policy".to_owned(),
+                    )
+                })?;
+            if (fee as u128) < replaced_fee_total {
+                self.telemetry.rejected_conflict_total =
+                    self.telemetry.rejected_conflict_total.saturating_add(1);
+                let required_fee = u64::try_from(replaced_fee_total).unwrap_or(u64::MAX);
+                return Ok(InsertOutcome::RejectedConflictInsufficientFee {
+                    inserted: txid,
+                    existing: existing_txid,
+                    incoming_fee: fee,
+                    required_fee,
+                });
+            }
 
             let removed = self.remove_txids(replacement_set);
-            self.txs.insert(
+            self.insert_entry(
                 txid,
                 MempoolEntry {
                     tx,
@@ -304,7 +307,6 @@ impl Mempool {
                     serialized_size,
                 },
             );
-            self.rebuild_spent_outpoints();
             self.bump_revision();
             self.telemetry.replaced_total = self.telemetry.replaced_total.saturating_add(1);
             self.telemetry.removed_by_replacement_total = self
@@ -333,7 +335,7 @@ impl Mempool {
             }
 
             let removed = self.remove_with_descendants(victim_txid);
-            self.txs.insert(
+            self.insert_entry(
                 txid,
                 MempoolEntry {
                     tx,
@@ -341,7 +343,6 @@ impl Mempool {
                     serialized_size,
                 },
             );
-            self.rebuild_spent_outpoints();
             self.bump_revision();
             self.telemetry.accepted_total = self.telemetry.accepted_total.saturating_add(1);
             self.telemetry.evicted_total = self
@@ -354,7 +355,7 @@ impl Mempool {
             });
         }
 
-        self.txs.insert(
+        self.insert_entry(
             txid,
             MempoolEntry {
                 tx,
@@ -362,44 +363,44 @@ impl Mempool {
                 serialized_size,
             },
         );
-        self.rebuild_spent_outpoints();
         self.bump_revision();
         self.telemetry.accepted_total = self.telemetry.accepted_total.saturating_add(1);
         Ok(InsertOutcome::Accepted { txid })
     }
 
     fn lowest_feerate_txid(&self) -> Option<(Hash256, u128)> {
-        self.txs
-            .iter()
-            .map(|(txid, entry)| (*txid, feerate_key(entry.fee, entry.serialized_size)))
-            .min_by(|(txid_a, rate_a), (txid_b, rate_b)| {
-                rate_a.cmp(rate_b).then_with(|| txid_b.cmp(txid_a))
-            })
+        self.feerate_index
+            .first()
+            .map(|(rate, txid)| (txid.0, *rate))
     }
 
-    fn collect_replacement_set(&self, root_txid: Hash256) -> Vec<Hash256> {
-        let mut to_remove = HashSet::<Hash256>::new();
-        to_remove.insert(root_txid);
-
-        // Safety bound: each pass must add at least one txid or terminate.
-        for _ in 0..=self.txs.len() {
-            let mut changed = false;
-            for (txid, entry) in &self.txs {
-                if to_remove.contains(txid) {
-                    continue;
-                }
-                if entry
-                    .tx
-                    .inputs
-                    .iter()
-                    .any(|input| to_remove.contains(&input.prev_out.txid))
-                {
-                    to_remove.insert(*txid);
-                    changed = true;
+    fn collect_replacement_set(&self, root_txid: Hash256, max_size: usize) -> Vec<Hash256> {
+        let mut children = HashMap::<Hash256, Vec<Hash256>>::new();
+        for (txid, entry) in &self.txs {
+            for input in &entry.tx.inputs {
+                if self.txs.contains_key(&input.prev_out.txid) {
+                    children.entry(input.prev_out.txid).or_default().push(*txid);
                 }
             }
-            if !changed {
-                break;
+        }
+
+        let mut to_remove = HashSet::<Hash256>::new();
+        let mut queue = VecDeque::<Hash256>::new();
+        to_remove.insert(root_txid);
+        queue.push_back(root_txid);
+
+        while let Some(parent) = queue.pop_front() {
+            if let Some(descendants) = children.get(&parent) {
+                for txid in descendants {
+                    if to_remove.insert(*txid) {
+                        if to_remove.len() > max_size {
+                            let mut overflow = to_remove.into_iter().collect::<Vec<_>>();
+                            overflow.sort_unstable();
+                            return overflow;
+                        }
+                        queue.push_back(*txid);
+                    }
+                }
             }
         }
 
@@ -410,23 +411,48 @@ impl Mempool {
 
     fn remove_txids(&mut self, txids: Vec<Hash256>) -> Vec<Hash256> {
         for txid in &txids {
-            self.txs.remove(txid);
+            self.remove_entry(*txid);
         }
         txids
     }
 
     fn remove_with_descendants(&mut self, root_txid: Hash256) -> Vec<Hash256> {
-        let removed = self.collect_replacement_set(root_txid);
+        let removed = self.collect_replacement_set(root_txid, self.txs.len().saturating_add(1));
         self.remove_txids(removed)
     }
 
-    fn rebuild_spent_outpoints(&mut self) {
-        self.spent_outpoints.clear();
-        for (txid, entry) in &self.txs {
-            for input in &entry.tx.inputs {
-                self.spent_outpoints.insert(input.prev_out.clone(), *txid);
-            }
+    fn insert_entry(&mut self, txid: Hash256, entry: MempoolEntry) {
+        for input in &entry.tx.inputs {
+            self.spent_outpoints.insert(input.prev_out.clone(), txid);
         }
+        let rate = feerate_key(entry.fee, entry.serialized_size);
+        self.feerate_index.insert((rate, Reverse(txid)));
+        self.txs.insert(txid, entry);
+    }
+
+    fn remove_entry(&mut self, txid: Hash256) -> Option<MempoolEntry> {
+        let entry = self.txs.remove(&txid)?;
+        for input in &entry.tx.inputs {
+            self.spent_outpoints.remove(&input.prev_out);
+        }
+        let rate = feerate_key(entry.fee, entry.serialized_size);
+        self.feerate_index.remove(&(rate, Reverse(txid)));
+        Some(entry)
+    }
+
+    fn total_fee_for_set(&self, txids: &[Hash256]) -> Result<u128, MempoolError> {
+        let mut total = 0u128;
+        for txid in txids {
+            let Some(entry) = self.txs.get(txid) else {
+                return Err(MempoolError::InvalidLimit(format!(
+                    "replacement set references unknown tx {txid}"
+                )));
+            };
+            total = total
+                .checked_add(entry.fee as u128)
+                .ok_or_else(|| MempoolError::InvalidLimit("replacement fee overflow".to_owned()))?;
+        }
+        Ok(total)
     }
 
     fn bump_revision(&mut self) {
@@ -937,6 +963,40 @@ mod tests {
         assert!(mempool.contains(&parent_new_id));
         assert!(!mempool.contains(&parent_old_id));
         assert!(!mempool.contains(&child_id));
+    }
+
+    #[test]
+    fn replacement_rejects_when_incoming_fee_does_not_cover_evicted_cpfp_package() {
+        let mut mempool =
+            Mempool::with_policy_and_replacement(100, 0, 1, 25).expect("mempool must initialize");
+        let root = [14u8; 32];
+        let parent_old = mk_tx(root, 0, b"parent-old", 10);
+        let parent_old_id = parent_old.txid();
+        let child_high_fee = mk_tx(parent_old_id.0, 0, b"child-high-fee", 11);
+        let parent_new = mk_tx(root, 0, b"parent-new", 12);
+        let parent_new_id = parent_new.txid();
+
+        mempool
+            .insert_with_fee(parent_old, 1)
+            .expect("insert parent old");
+        mempool
+            .insert_with_fee(child_high_fee, 1_000)
+            .expect("insert high-fee child");
+
+        let outcome = mempool
+            .insert_with_fee(parent_new, 2)
+            .expect("replacement evaluation");
+        assert!(matches!(
+            outcome,
+            InsertOutcome::RejectedConflictInsufficientFee {
+                inserted,
+                existing,
+                incoming_fee: 2,
+                required_fee
+            } if inserted == parent_new_id && existing == parent_old_id && required_fee >= 1_002
+        ));
+        assert!(mempool.contains(&parent_old_id));
+        assert!(!mempool.contains(&parent_new_id));
     }
 
     #[test]
