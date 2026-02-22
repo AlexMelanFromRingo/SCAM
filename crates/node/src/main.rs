@@ -9137,10 +9137,10 @@ fn parse_tx_height_and_index(height_raw: &str, index_raw: &str) -> Option<(u64, 
     }
 }
 
-fn find_tx_by_txid<'a>(
-    block: &'a scam_core::Block,
+fn find_tx_by_txid(
+    block: &scam_core::Block,
     needle_txid: Hash256,
-) -> Option<(usize, &'a Transaction)> {
+) -> Option<(usize, &Transaction)> {
     block
         .transactions
         .iter()
