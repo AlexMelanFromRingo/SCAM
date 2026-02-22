@@ -49,6 +49,9 @@ Action item:
 
 ### WP1: Share ledger + persistence (mandatory)
 
+- [x] Persistent pool accounting DB (redb) tables are implemented (`pool_meta`, `pool_workers`, `pool_shares`, `pool_rounds`, `pool_payout_pending`, `pool_payout_completed`).
+- [x] Anti-duplication constraints are enforced via `share_key` dedup on load/save and in runtime admission.
+- [x] Crash-safe replay/recovery is implemented by loading ledger snapshot on startup and persisting after share/round updates.
 - Add persistent pool accounting DB (redb) tables:
   - workers
   - submitted shares (accepted/rejected, difficulty, timestamp)
@@ -59,6 +62,9 @@ Action item:
 
 ### WP2: Round model (mandatory)
 
+- [x] Round lifecycle implemented: open at tip, close on accepted block, immediately open next round.
+- [x] Reorg policy baseline implemented: closed rounds are marked `orphaned` when their closing block is no longer on active chain; open round is rebased to active tip if fork point moved.
+- [ ] Re-attribution policy for orphaned rounds is still pending (currently accounting marks orphaned rounds without payout redistribution).
 - Define round lifecycle:
   - round opens at current tip,
   - closes when pool finds/accepts a block,
@@ -91,6 +97,9 @@ Action item:
 
 ### WP6: API/UI for pool accounting + hashrate (mandatory)
 
+- [x] RPC routes implemented: `/pool/status`, `/pool/worker/<label>`, `/pool/payouts/pending`, `/pool/payouts/completed`.
+- [x] UI panels implemented for pool status, worker status, pending/completed payouts.
+- [x] UI hashrate visibility implemented for network and pool hashrate cards (`/status` + stratum telemetry).
 - Add RPC routes:
   - pool stats
   - worker stats
@@ -102,6 +111,9 @@ Action item:
 
 ### WP7: Launcher presets (mandatory)
 
+- [x] One-command preset wrapper implemented (`scripts/run-preset.sh` + `.env` profile files).
+- [x] Profiles implemented: node-only, solo-local, solo-remote, pool-shared, two-node realtime lab.
+- [x] Launcher status now includes miner endpoint and accepted-share summary for faster operator checks.
 - Add profile files and wrappers for:
   - node-only,
   - solo-local,
@@ -124,4 +136,3 @@ Action item:
 
 - Full third-party SV2 interop matrix completion.
 - External security audit and long soak runs.
-

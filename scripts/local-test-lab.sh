@@ -320,6 +320,16 @@ status_lab() {
       endpoint="$(cat "${MINER_ENDPOINT_FILE}")"
     fi
     echo "[lab] miner=running pool=${endpoint}"
+    if [[ -f "${MINER_LOG_FILE}" ]]; then
+      local accepted_total
+      accepted_total="$(grep -c "share accepted:" "${MINER_LOG_FILE}" 2>/dev/null || true)"
+      echo "[lab] miner accepted_shares=${accepted_total}"
+      local last_accepted
+      last_accepted="$(grep "share accepted:" "${MINER_LOG_FILE}" 2>/dev/null | tail -n 1 || true)"
+      if [[ -n "${last_accepted}" ]]; then
+        echo "[lab] miner last_accepted='${last_accepted}'"
+      fi
+    fi
   else
     echo "[lab] miner=stopped"
   fi

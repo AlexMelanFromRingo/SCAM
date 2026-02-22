@@ -1364,14 +1364,16 @@ fn load_pool_ledger_from_db_or_new(
             snapshot.network_id, cfg.network_id
         )));
     }
-    Ok(StratumPoolLedgerState::from_snapshot(
+    let mut state = StratumPoolLedgerState::from_snapshot(
         snapshot,
         start_height,
         start_tip_hash,
         now_unix_sec,
         max_share_records,
         max_round_records,
-    ))
+    );
+    let _ = state.reconcile_with_runtime(runtime, now_unix_sec);
+    Ok(state)
 }
 
 fn persist_pool_ledger_db(
@@ -3949,6 +3951,7 @@ struct PoolLedgerStatusSnapshot {
     current_round_age_sec: u64,
     shares_tracked: usize,
     rounds_tracked: usize,
+    orphaned_rounds: usize,
     workers_tracked: usize,
     pending_payouts: usize,
     completed_payouts: usize,
@@ -4004,6 +4007,7 @@ impl StratumPoolLedgerState {
             end_unix_sec: None,
             closed_by_worker: None,
             found_block_hash: None,
+            orphaned: false,
         });
         Self {
             network_id,
@@ -4185,6 +4189,7 @@ impl StratumPoolLedgerState {
             current.end_unix_sec = Some(now_unix_sec);
             current.closed_by_worker = Some(worker.to_owned());
             current.found_block_hash = Some(found_block_hash);
+            current.orphaned = false;
         }
         self.open_next_round(end_height, end_tip_hash, now_unix_sec);
     }
@@ -4204,10 +4209,48 @@ impl StratumPoolLedgerState {
             end_unix_sec: None,
             closed_by_worker: None,
             found_block_hash: None,
+            orphaned: false,
         });
         while self.rounds.len() > self.max_round_records {
             self.rounds.pop_front();
         }
+    }
+
+    fn reconcile_with_runtime(&mut self, runtime: &ChainRuntime, now_unix_sec: u64) -> bool {
+        let mut changed = false;
+        for round in &mut self.rounds {
+            let on_active_chain = match (round.end_height, round.end_tip_hash) {
+                (Some(end_height), Some(end_tip_hash)) => {
+                    runtime.block_hash_at_height(end_height) == Some(end_tip_hash)
+                }
+                _ => true,
+            };
+            let should_mark_orphaned = !on_active_chain;
+            if round.orphaned != should_mark_orphaned {
+                round.orphaned = should_mark_orphaned;
+                changed = true;
+            }
+        }
+
+        if let Some(open_round) = self.rounds.back_mut()
+            && open_round.end_height.is_none()
+        {
+            let open_round_still_on_chain = runtime.block_hash_at_height(open_round.start_height)
+                == Some(open_round.start_tip_hash);
+            if !open_round_still_on_chain {
+                let rebased_height = runtime.tip_height();
+                let rebased_hash = runtime.tip_hash();
+                open_round.start_height = rebased_height;
+                open_round.start_tip_hash = rebased_hash;
+                open_round.start_unix_sec = now_unix_sec;
+                self.current_round_start_height = rebased_height;
+                self.current_round_start_tip_hash = rebased_hash;
+                self.current_round_start_unix_sec = now_unix_sec;
+                changed = true;
+            }
+        }
+
+        changed
     }
 
     fn snapshot(&self) -> PoolLedgerSnapshot {
@@ -10609,6 +10652,11 @@ fn pool_ledger_status_from_snapshot(
                 .find(|round| round.round_id == snapshot.current_round_id)
         })
         .or_else(|| snapshot.rounds.last())?;
+    let orphaned_rounds = snapshot
+        .rounds
+        .iter()
+        .filter(|entry| entry.orphaned)
+        .count();
 
     Some(PoolLedgerStatusSnapshot {
         network_id: snapshot.network_id.clone(),
@@ -10618,6 +10666,7 @@ fn pool_ledger_status_from_snapshot(
         current_round_age_sec: now_unix_sec.saturating_sub(round.start_unix_sec),
         shares_tracked: snapshot.shares.len(),
         rounds_tracked: snapshot.rounds.len(),
+        orphaned_rounds,
         workers_tracked: snapshot.workers.len(),
         pending_payouts: snapshot.pending_payouts.len(),
         completed_payouts: snapshot.completed_payouts.len(),
@@ -14049,6 +14098,92 @@ mod tests {
 
         let missing = super::find_tx_by_txid(&block, Hash256([0x55; 32]));
         assert!(missing.is_none(), "non-matching txid must not be returned");
+    }
+
+    #[test]
+    fn pool_ledger_reconcile_marks_orphaned_round_and_rebases_open_round() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let tip_hash = runtime.tip_hash();
+        let now_unix_sec = 1_770_000_000u64;
+        let mut ledger = super::StratumPoolLedgerState::new(
+            cfg.network_id.clone(),
+            runtime.tip_height(),
+            tip_hash,
+            now_unix_sec,
+            128,
+            32,
+        );
+
+        ledger.close_round_with_block(
+            "miner.alpha",
+            Hash256([0xAA; 32]),
+            1,
+            Hash256([0xBB; 32]),
+            now_unix_sec + 10,
+        );
+
+        let changed = ledger.reconcile_with_runtime(&runtime, now_unix_sec + 20);
+        assert!(changed, "reconcile should update orphan/rebase state");
+        assert_eq!(ledger.rounds.len(), 2, "closed + open rounds expected");
+        let closed = ledger.rounds.front().expect("closed round");
+        assert!(
+            closed.orphaned,
+            "round should be marked orphaned after reorg"
+        );
+        let open = ledger.rounds.back().expect("open round");
+        assert_eq!(open.start_height, runtime.tip_height());
+        assert_eq!(open.start_tip_hash, runtime.tip_hash());
+        assert_eq!(ledger.current_round_start_height, runtime.tip_height());
+        assert_eq!(ledger.current_round_start_tip_hash, runtime.tip_hash());
+    }
+
+    #[test]
+    fn pool_ledger_status_snapshot_reports_orphaned_rounds() {
+        let snapshot = super::PoolLedgerSnapshot {
+            network_id: "devnet".to_owned(),
+            current_round_id: 7,
+            shares: Vec::new(),
+            rounds: vec![
+                super::PoolRoundRecord {
+                    round_id: 6,
+                    start_height: 100,
+                    start_tip_hash: Hash256([0x11; 32]),
+                    start_unix_sec: 10,
+                    end_height: Some(101),
+                    end_tip_hash: Some(Hash256([0x22; 32])),
+                    end_unix_sec: Some(20),
+                    closed_by_worker: Some("miner.alpha".to_owned()),
+                    found_block_hash: Some(Hash256([0x33; 32])),
+                    orphaned: true,
+                },
+                super::PoolRoundRecord {
+                    round_id: 7,
+                    start_height: 101,
+                    start_tip_hash: Hash256([0x22; 32]),
+                    start_unix_sec: 20,
+                    end_height: None,
+                    end_tip_hash: None,
+                    end_unix_sec: None,
+                    closed_by_worker: None,
+                    found_block_hash: None,
+                    orphaned: false,
+                },
+            ],
+            workers: Vec::new(),
+            pending_payouts: Vec::new(),
+            completed_payouts: Vec::new(),
+        };
+
+        let status = super::pool_ledger_status_from_snapshot(&snapshot, 42).expect("status");
+        assert_eq!(status.orphaned_rounds, 1);
+        assert_eq!(status.current_round_id, 7);
+        assert_eq!(status.current_round_start_height, 101);
+        assert_eq!(
+            status.current_round_start_tip_hash,
+            Hash256([0x22; 32]).to_hex()
+        );
     }
 
     #[test]

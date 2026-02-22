@@ -101,6 +101,8 @@ pub struct PoolRoundRecord {
     pub end_unix_sec: Option<u64>,
     pub closed_by_worker: Option<String>,
     pub found_block_hash: Option<Hash256>,
+    #[serde(default)]
+    pub orphaned: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -1540,6 +1542,7 @@ mod tests {
                     end_unix_sec: Some(1_770_763_220),
                     closed_by_worker: Some("miner.a".to_owned()),
                     found_block_hash: Some(Hash256([0x33; 32])),
+                    orphaned: false,
                 },
                 PoolRoundRecord {
                     round_id: 7,
@@ -1551,6 +1554,7 @@ mod tests {
                     end_unix_sec: None,
                     closed_by_worker: None,
                     found_block_hash: None,
+                    orphaned: false,
                 },
             ],
             workers: vec![
