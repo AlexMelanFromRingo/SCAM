@@ -16563,7 +16563,7 @@ mod tests {
             return;
         };
         let listener = TcpListener::bind(&target).expect("bind async worker listener");
-        let (tx, rx) = mpsc::channel::<()>();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept");
             let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
@@ -16601,8 +16601,10 @@ mod tests {
                 1,
                 1,
             ));
-            rx.recv_timeout(Duration::from_secs(6))
-                .expect("async outbound worker should connect");
+            tokio::time::timeout(Duration::from_secs(6), rx)
+                .await
+                .expect("async outbound worker should connect in time")
+                .expect("async outbound worker connect signal");
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
             tokio::time::timeout(Duration::from_secs(8), task)
                 .await
@@ -16651,7 +16653,7 @@ mod tests {
         )
         .expect("save peers");
 
-        let (tx, rx) = mpsc::channel::<()>();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept");
             let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
@@ -16689,8 +16691,10 @@ mod tests {
                 1,
                 1,
             ));
-            rx.recv_timeout(Duration::from_secs(8))
-                .expect("async supervisor should spawn worker and connect");
+            tokio::time::timeout(Duration::from_secs(8), rx)
+                .await
+                .expect("async supervisor should spawn worker and connect in time")
+                .expect("async supervisor connect signal");
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
             tokio::time::timeout(Duration::from_secs(10), supervisor)
                 .await
