@@ -102,6 +102,8 @@ pub struct PoolRoundRecord {
     pub closed_by_worker: Option<String>,
     pub found_block_hash: Option<Hash256>,
     #[serde(default)]
+    pub found_block_reward_atomic: u128,
+    #[serde(default)]
     pub orphaned: bool,
 }
 
@@ -1542,6 +1544,7 @@ mod tests {
                     end_unix_sec: Some(1_770_763_220),
                     closed_by_worker: Some("miner.a".to_owned()),
                     found_block_hash: Some(Hash256([0x33; 32])),
+                    found_block_reward_atomic: 5_000_000_000,
                     orphaned: false,
                 },
                 PoolRoundRecord {
@@ -1554,6 +1557,7 @@ mod tests {
                     end_unix_sec: None,
                     closed_by_worker: None,
                     found_block_hash: None,
+                    found_block_reward_atomic: 0,
                     orphaned: false,
                 },
             ],

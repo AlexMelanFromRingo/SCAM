@@ -653,6 +653,32 @@ struct StratumServeArgs {
     pool_share_retention: usize,
     #[arg(long, default_value_t = 2_000)]
     pool_round_retention: usize,
+    #[arg(long, value_enum, default_value_t = PoolPayoutModeArg::Solo)]
+    pool_payout_mode: PoolPayoutModeArg,
+    #[arg(long, default_value_t = 100)]
+    pool_fee_bps: u16,
+    #[arg(long, default_value_t = 300)]
+    pplns_window_shares: usize,
+    #[arg(long, default_value_t = 0)]
+    pps_share_atomic: u64,
+    #[arg(long, default_value_t = 0)]
+    pps_max_liability_atomic: u128,
+    #[arg(long, default_value_t = 0)]
+    pps_reserve_floor_atomic: u128,
+    #[arg(long, default_value_t = 100_000_000)]
+    pool_payout_threshold_atomic: u128,
+    #[arg(long, default_value_t = 120)]
+    pool_payout_interval_sec: u64,
+    #[arg(long, default_value_t = 500)]
+    pool_payout_tx_fee_atomic: u64,
+    #[arg(long)]
+    pool_payout_mnemonic: Option<String>,
+    #[arg(long, default_value = "")]
+    pool_payout_passphrase: String,
+    #[arg(long, default_value_t = 0)]
+    pool_payout_account: u32,
+    #[arg(long, default_value_t = 0)]
+    pool_payout_index: u32,
 }
 
 #[derive(Debug, Args)]
@@ -1035,6 +1061,24 @@ enum DifficultyAlgoArg {
 enum SecureTransportModeArg {
     Legacy,
     NoiseXx,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
+enum PoolPayoutModeArg {
+    Solo,
+    Pplns,
+    Pps,
+    Hybrid,
+}
+
+impl PoolPayoutModeArg {
+    fn uses_pplns(self) -> bool {
+        matches!(self, Self::Pplns | Self::Hybrid)
+    }
+
+    fn uses_pps(self) -> bool {
+        matches!(self, Self::Pps | Self::Hybrid)
+    }
 }
 
 impl From<DifficultyAlgoArg> for DifficultyAlgorithm {
@@ -1749,6 +1793,19 @@ fn run_mode(args: RunModeArgs) -> Result<(), NodeError> {
             pool_ledger_db: Some(default_pool_ledger_db_path(&runtime_db_path)),
             pool_share_retention: POOL_DEFAULT_SHARE_RETENTION,
             pool_round_retention: POOL_DEFAULT_ROUND_RETENTION,
+            pool_payout_mode: PoolPayoutModeArg::Solo,
+            pool_fee_bps: 100,
+            pplns_window_shares: 300,
+            pps_share_atomic: 0,
+            pps_max_liability_atomic: 0,
+            pps_reserve_floor_atomic: 0,
+            pool_payout_threshold_atomic: 100_000_000,
+            pool_payout_interval_sec: 120,
+            pool_payout_tx_fee_atomic: 500,
+            pool_payout_mnemonic: None,
+            pool_payout_passphrase: String::new(),
+            pool_payout_account: 0,
+            pool_payout_index: 0,
         };
         let tx = done_tx.clone();
         spawn_mode_service("stratum-serve", tx, move || run_stratum_serve(stratum_args));
@@ -4123,9 +4180,39 @@ const STRATUM_TOP_WORKERS_LIMIT: usize = 32;
 const POOL_DEFAULT_SHARE_RETENTION: usize = 50_000;
 const POOL_DEFAULT_ROUND_RETENTION: usize = 2_000;
 
+#[derive(Clone, Debug)]
+struct PoolPayoutConfig {
+    mode: PoolPayoutModeArg,
+    pool_fee_bps: u16,
+    pplns_window_shares: usize,
+    pps_share_atomic: u64,
+    pps_max_liability_atomic: u128,
+    pps_reserve_floor_atomic: u128,
+    payout_threshold_atomic: u128,
+    payout_interval_sec: u64,
+    payout_tx_fee_atomic: u64,
+}
+
+impl Default for PoolPayoutConfig {
+    fn default() -> Self {
+        Self {
+            mode: PoolPayoutModeArg::Solo,
+            pool_fee_bps: 100,
+            pplns_window_shares: 300,
+            pps_share_atomic: 0,
+            pps_max_liability_atomic: 0,
+            pps_reserve_floor_atomic: 0,
+            payout_threshold_atomic: 100_000_000,
+            payout_interval_sec: 120,
+            payout_tx_fee_atomic: 500,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 struct PoolLedgerStatusSnapshot {
     network_id: String,
+    payout_mode: String,
     current_round_id: u64,
     current_round_start_height: u64,
     current_round_start_tip_hash: String,
@@ -4136,6 +4223,8 @@ struct PoolLedgerStatusSnapshot {
     workers_tracked: usize,
     pending_payouts: usize,
     completed_payouts: usize,
+    total_outstanding_atomic: u128,
+    pps_guardrail_alerts_total: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -4166,6 +4255,9 @@ struct StratumPoolLedgerState {
     completed_payouts: VecDeque<PoolPayoutRecord>,
     max_share_records: usize,
     max_round_records: usize,
+    payout_cfg: PoolPayoutConfig,
+    last_payout_run_unix_sec: u64,
+    pps_guardrail_alerts_total: u64,
 }
 
 impl StratumPoolLedgerState {
@@ -4188,6 +4280,7 @@ impl StratumPoolLedgerState {
             end_unix_sec: None,
             closed_by_worker: None,
             found_block_hash: None,
+            found_block_reward_atomic: 0,
             orphaned: false,
         });
         Self {
@@ -4204,6 +4297,9 @@ impl StratumPoolLedgerState {
             completed_payouts: VecDeque::new(),
             max_share_records: max_share_records.max(1),
             max_round_records: max_round_records.max(1),
+            payout_cfg: PoolPayoutConfig::default(),
+            last_payout_run_unix_sec: 0,
+            pps_guardrail_alerts_total: 0,
         }
     }
 
@@ -4255,6 +4351,9 @@ impl StratumPoolLedgerState {
             completed_payouts,
             max_share_records: max_share_records.max(1),
             max_round_records: max_round_records.max(1),
+            payout_cfg: PoolPayoutConfig::default(),
+            last_payout_run_unix_sec: 0,
+            pps_guardrail_alerts_total: 0,
         };
         if let Some(open) = state.rounds.back()
             && open.end_height.is_none()
@@ -4268,6 +4367,236 @@ impl StratumPoolLedgerState {
         }
         state.open_next_round(fallback_start_height, fallback_start_tip_hash, now_unix_sec);
         state
+    }
+
+    fn set_payout_config(&mut self, payout_cfg: PoolPayoutConfig) {
+        self.payout_cfg = payout_cfg;
+        if self.payout_cfg.mode.uses_pplns() {
+            self.recompute_pplns_accruals();
+        } else {
+            for worker in self.workers.values_mut() {
+                worker.pplns_accrual_atomic = 0;
+            }
+        }
+    }
+
+    fn reward_after_pool_fee(&self, gross_reward_atomic: u128) -> u128 {
+        let fee_bps = self.payout_cfg.pool_fee_bps.min(10_000) as u128;
+        gross_reward_atomic.saturating_mul(10_000u128.saturating_sub(fee_bps)) / 10_000u128
+    }
+
+    fn total_outstanding_atomic(&self) -> u128 {
+        self.workers
+            .values()
+            .map(|worker| {
+                worker
+                    .pplns_accrual_atomic
+                    .saturating_add(worker.pps_accrual_atomic)
+                    .saturating_sub(worker.paid_total_atomic)
+            })
+            .fold(0u128, |acc, value| acc.saturating_add(value))
+    }
+
+    fn pps_liability_exceeds_cap(&self, next_credit: u128) -> bool {
+        if self.payout_cfg.pps_max_liability_atomic == 0 {
+            return false;
+        }
+        self.total_outstanding_atomic().saturating_add(next_credit)
+            > self.payout_cfg.pps_max_liability_atomic
+    }
+
+    fn apply_pps_share_credit(&mut self, worker: &str, reserve_spendable_atomic: Option<u128>) {
+        if !self.payout_cfg.mode.uses_pps() {
+            return;
+        }
+        let credit = self.payout_cfg.pps_share_atomic as u128;
+        if credit == 0 {
+            return;
+        }
+        if self.payout_cfg.pps_reserve_floor_atomic > 0 {
+            match reserve_spendable_atomic {
+                Some(reserve) if reserve >= self.payout_cfg.pps_reserve_floor_atomic => {}
+                _ => {
+                    self.pps_guardrail_alerts_total =
+                        self.pps_guardrail_alerts_total.saturating_add(1);
+                    return;
+                }
+            }
+        }
+        if self.pps_liability_exceeds_cap(credit) {
+            self.pps_guardrail_alerts_total = self.pps_guardrail_alerts_total.saturating_add(1);
+            return;
+        }
+        if let Some(entry) = self.workers.get_mut(worker) {
+            entry.pps_accrual_atomic = entry.pps_accrual_atomic.saturating_add(credit);
+        }
+    }
+
+    fn recompute_pplns_accruals(&mut self) {
+        for worker in self.workers.values_mut() {
+            worker.pplns_accrual_atomic = 0;
+        }
+        if !self.payout_cfg.mode.uses_pplns() {
+            return;
+        }
+        let mut accepted = self
+            .shares
+            .iter()
+            .filter(|share| share.accepted)
+            .cloned()
+            .collect::<Vec<_>>();
+        accepted.sort_by(|a, b| {
+            a.timestamp_unix_sec
+                .cmp(&b.timestamp_unix_sec)
+                .then(a.share_key.cmp(&b.share_key))
+        });
+
+        for round in &self.rounds {
+            if round.orphaned {
+                continue;
+            }
+            let Some(end_unix_sec) = round.end_unix_sec else {
+                continue;
+            };
+            let gross = round.found_block_reward_atomic;
+            if gross == 0 {
+                continue;
+            }
+            let reward = self.reward_after_pool_fee(gross);
+            if reward == 0 {
+                continue;
+            }
+            let mut window = accepted
+                .iter()
+                .filter(|share| share.timestamp_unix_sec <= end_unix_sec)
+                .collect::<Vec<_>>();
+            if window.is_empty() {
+                continue;
+            }
+            let window_limit = self.payout_cfg.pplns_window_shares.max(1);
+            if window.len() > window_limit {
+                let start = window.len() - window_limit;
+                window = window[start..].to_vec();
+            }
+            let mut worker_weights = HashMap::<String, f64>::new();
+            let mut total_weight = 0.0f64;
+            for share in window {
+                let weight = share.expected_hashes.max(0.0);
+                if weight <= 0.0 {
+                    continue;
+                }
+                total_weight += weight;
+                *worker_weights.entry(share.worker.clone()).or_insert(0.0) += weight;
+            }
+            if total_weight <= 0.0 {
+                continue;
+            }
+            for (worker, weight) in worker_weights {
+                let payout = ((reward as f64) * (weight / total_weight)).floor() as u128;
+                if payout == 0 {
+                    continue;
+                }
+                if let Some(entry) = self.workers.get_mut(&worker) {
+                    entry.pplns_accrual_atomic = entry.pplns_accrual_atomic.saturating_add(payout);
+                }
+            }
+        }
+    }
+
+    fn queue_due_payouts(&mut self, now_unix_sec: u64) -> Vec<PoolPayoutRecord> {
+        if self.payout_cfg.mode == PoolPayoutModeArg::Solo {
+            return Vec::new();
+        }
+        if now_unix_sec.saturating_sub(self.last_payout_run_unix_sec)
+            < self.payout_cfg.payout_interval_sec.max(1)
+        {
+            return Vec::new();
+        }
+        self.last_payout_run_unix_sec = now_unix_sec;
+
+        let threshold = self.payout_cfg.payout_threshold_atomic.max(1);
+        let mut created = Vec::<PoolPayoutRecord>::new();
+        let pending_workers = self
+            .pending_payouts
+            .iter()
+            .map(|p| p.worker.clone())
+            .collect::<HashSet<_>>();
+        let mut workers = self.workers.keys().cloned().collect::<Vec<_>>();
+        workers.sort();
+        for worker in workers {
+            if pending_workers.contains(&worker) {
+                continue;
+            }
+            let Some(entry) = self.workers.get(&worker) else {
+                continue;
+            };
+            let outstanding = entry
+                .pplns_accrual_atomic
+                .saturating_add(entry.pps_accrual_atomic)
+                .saturating_sub(entry.paid_total_atomic);
+            if outstanding < threshold {
+                continue;
+            }
+            if parse_address(&worker).is_err() {
+                self.pps_guardrail_alerts_total = self.pps_guardrail_alerts_total.saturating_add(1);
+                continue;
+            }
+            let payout = PoolPayoutRecord {
+                payout_id: format!(
+                    "payout-{}-{}-{}",
+                    now_unix_sec,
+                    worker,
+                    self.pending_payouts
+                        .len()
+                        .saturating_add(created.len())
+                        .saturating_add(1)
+                ),
+                worker: worker.clone(),
+                amount_atomic: outstanding,
+                created_unix_sec: now_unix_sec,
+                submitted_txid_hex: None,
+                confirmed: false,
+            };
+            self.pending_payouts.push_back(payout.clone());
+            created.push(payout);
+        }
+        created
+    }
+
+    fn mark_pending_payout_submitted(&mut self, payout_id: &str, txid_hex: &str) -> bool {
+        for payout in &mut self.pending_payouts {
+            if payout.payout_id == payout_id {
+                payout.submitted_txid_hex = Some(txid_hex.to_owned());
+                return true;
+            }
+        }
+        false
+    }
+
+    fn settle_confirmed_payouts(&mut self, runtime: &ChainRuntime) -> usize {
+        let mut moved = 0usize;
+        let mut keep = VecDeque::<PoolPayoutRecord>::new();
+        while let Some(mut payout) = self.pending_payouts.pop_front() {
+            let confirmed = payout
+                .submitted_txid_hex
+                .as_deref()
+                .and_then(|hex| Hash256::from_hex(hex).ok())
+                .is_some_and(|txid| runtime_contains_txid(runtime, txid));
+            if confirmed {
+                payout.confirmed = true;
+                if let Some(worker) = self.workers.get_mut(&payout.worker) {
+                    worker.paid_total_atomic = worker
+                        .paid_total_atomic
+                        .saturating_add(payout.amount_atomic);
+                }
+                self.completed_payouts.push_back(payout);
+                moved = moved.saturating_add(1);
+            } else {
+                keep.push_back(payout);
+            }
+        }
+        self.pending_payouts = keep;
+        moved
     }
 
     fn share_key(channel_id: u32, job_id: u32, nonce: u64, ntime: u64) -> String {
@@ -4286,6 +4615,7 @@ impl StratumPoolLedgerState {
         accepted: bool,
         is_block: bool,
         now_unix_sec: u64,
+        reserve_spendable_atomic: Option<u128>,
     ) -> bool {
         let key = Self::share_key(channel_id, job_id, nonce, ntime);
         if !self.share_index.insert(key.clone()) {
@@ -4334,6 +4664,9 @@ impl StratumPoolLedgerState {
             counters.blocks_found_total = counters.blocks_found_total.saturating_add(1);
         }
         counters.last_share_unix_sec = now_unix_sec;
+        if accepted {
+            self.apply_pps_share_credit(worker, reserve_spendable_atomic);
+        }
         true
     }
 
@@ -4360,6 +4693,7 @@ impl StratumPoolLedgerState {
         &mut self,
         worker: &str,
         found_block_hash: Hash256,
+        found_block_reward_atomic: u128,
         end_height: u64,
         end_tip_hash: Hash256,
         now_unix_sec: u64,
@@ -4370,7 +4704,11 @@ impl StratumPoolLedgerState {
             current.end_unix_sec = Some(now_unix_sec);
             current.closed_by_worker = Some(worker.to_owned());
             current.found_block_hash = Some(found_block_hash);
+            current.found_block_reward_atomic = found_block_reward_atomic;
             current.orphaned = false;
+        }
+        if self.payout_cfg.mode.uses_pplns() {
+            self.recompute_pplns_accruals();
         }
         self.open_next_round(end_height, end_tip_hash, now_unix_sec);
     }
@@ -4390,6 +4728,7 @@ impl StratumPoolLedgerState {
             end_unix_sec: None,
             closed_by_worker: None,
             found_block_hash: None,
+            found_block_reward_atomic: 0,
             orphaned: false,
         });
         while self.rounds.len() > self.max_round_records {
@@ -4429,6 +4768,10 @@ impl StratumPoolLedgerState {
                 self.current_round_start_unix_sec = now_unix_sec;
                 changed = true;
             }
+        }
+
+        if changed && self.payout_cfg.mode.uses_pplns() {
+            self.recompute_pplns_accruals();
         }
 
         changed
@@ -7774,6 +8117,9 @@ struct StratumServerContext {
     telemetry_state: Arc<Mutex<StratumPoolTelemetryState>>,
     pool_ledger_state: Arc<Mutex<StratumPoolLedgerState>>,
     pool_ledger_db_path: PathBuf,
+    pool_payout_cfg: PoolPayoutConfig,
+    pool_payout_key: Option<WalletKey>,
+    pool_coinbase_key_hash20: [u8; 20],
 }
 
 fn lock_runtime<'a>(
@@ -7983,8 +8329,16 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
     let mut last_keepalive = Instant::now();
     let mut last_activity = Instant::now();
     let mut last_tip_hash = load_runtime_tip_hash(&ctx)?;
-    let mut payout_key_hash20 = ctx.cfg.genesis_reward_key_hash20()?;
-    let mut payout_label = stratum_coinbase_label(session.channel_id(), "default");
+    let mut payout_key_hash20 = if ctx.pool_payout_cfg.mode == PoolPayoutModeArg::Solo {
+        ctx.cfg.genesis_reward_key_hash20()?
+    } else {
+        ctx.pool_coinbase_key_hash20
+    };
+    let mut payout_label = if ctx.pool_payout_cfg.mode == PoolPayoutModeArg::Solo {
+        stratum_coinbase_label(session.channel_id(), "default")
+    } else {
+        stratum_coinbase_label(session.channel_id(), "pool")
+    };
     let mut worker_label = "default".to_owned();
 
     loop {
@@ -8011,6 +8365,7 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
                         send_sv2_async!(&Sv2Message::KeepAlive);
                         last_keepalive = Instant::now();
                     }
+                    run_pool_payout_tick_with_warning(&ctx);
                 }
                 if nonzero_limit_reached(ctx.idle_timeout_sec, last_activity.elapsed().as_secs()) {
                     break;
@@ -8028,13 +8383,19 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
                         SessionEvent::SetupAccepted => {}
                         SessionEvent::ChannelOpened { user, .. } => {
                             worker_label = StratumPoolTelemetryState::sanitize_worker_label(&user);
-                            if let Some(parsed) = stratum_user_payout_key_hash20(&user) {
-                                payout_key_hash20 = parsed;
-                                payout_label = stratum_coinbase_label(session.channel_id(), &user);
+                            if ctx.pool_payout_cfg.mode == PoolPayoutModeArg::Solo {
+                                if let Some(parsed) = stratum_user_payout_key_hash20(&user) {
+                                    payout_key_hash20 = parsed;
+                                    payout_label =
+                                        stratum_coinbase_label(session.channel_id(), &user);
+                                } else {
+                                    payout_key_hash20 = ctx.cfg.genesis_reward_key_hash20()?;
+                                    payout_label =
+                                        stratum_coinbase_label(session.channel_id(), "default");
+                                }
                             } else {
-                                payout_key_hash20 = ctx.cfg.genesis_reward_key_hash20()?;
-                                payout_label =
-                                    stratum_coinbase_label(session.channel_id(), "default");
+                                payout_key_hash20 = ctx.pool_coinbase_key_hash20;
+                                payout_label = stratum_coinbase_label(session.channel_id(), "pool");
                             }
                             last_tip_hash = issue_new_stratum_job_async(
                                 &mut session,
@@ -8055,6 +8416,16 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
                             is_block,
                             ..
                         } => {
+                            let reserve_spendable_atomic = if ctx.pool_payout_cfg.mode.uses_pps() {
+                                lock_runtime(&ctx.runtime).ok().map(|runtime| {
+                                    runtime_spendable_balance_for_key_hash(
+                                        &runtime,
+                                        ctx.pool_coinbase_key_hash20,
+                                    )
+                                })
+                            } else {
+                                None
+                            };
                             record_pool_share_accepted(
                                 &ctx,
                                 &worker_label,
@@ -8064,6 +8435,7 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
                                 ntime,
                                 session.share_target(),
                                 is_block,
+                                reserve_spendable_atomic,
                             );
                             record_stratum_share_accepted(
                                 &ctx,
@@ -8093,10 +8465,20 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
                                     },
                                     transactions: work.block_txs,
                                 };
+                                let block_reward_atomic = block
+                                    .transactions
+                                    .first()
+                                    .map(|tx| {
+                                        tx.outputs.iter().fold(0u128, |acc, output| {
+                                            acc.saturating_add(output.value as u128)
+                                        })
+                                    })
+                                    .unwrap_or(ctx.cfg.block_subsidy as u128);
+                                let mut tip_advanced = false;
 
                                 {
                                     let mut runtime = lock_runtime(&ctx.runtime)?;
-                                    let _ = runtime.submit_block(block)?;
+                                    let submission = runtime.submit_block(block)?;
                                     handle_runtime_persist_result(
                                         persist_runtime_db_with_retry(
                                             &runtime,
@@ -8106,40 +8488,70 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
                                         ),
                                         runtime.tip_hash(),
                                     )?;
-                                    record_pool_round_closed(
-                                        &ctx,
-                                        &worker_label,
-                                        runtime.tip_hash(),
-                                        runtime.tip_height(),
-                                        runtime.tip_hash(),
-                                        ntime,
-                                    );
-                                    last_tip_hash = runtime.tip_hash();
+                                    match submission {
+                                        scam_chain::BlockSubmissionOutcome::ExtendedTip {
+                                            new_tip,
+                                            new_height,
+                                        }
+                                        | scam_chain::BlockSubmissionOutcome::Reorged {
+                                            new_tip,
+                                            new_height,
+                                            ..
+                                        } => {
+                                            record_pool_round_closed(
+                                                &ctx,
+                                                &worker_label,
+                                                new_tip,
+                                                block_reward_atomic,
+                                                new_height,
+                                                new_tip,
+                                                ntime,
+                                            );
+                                            last_tip_hash = new_tip;
+                                            tip_advanced = true;
+                                        }
+                                        scam_chain::BlockSubmissionOutcome::AlreadyKnown {
+                                            ..
+                                        }
+                                        | scam_chain::BlockSubmissionOutcome::StoredSideBranch {
+                                            ..
+                                        } => {}
+                                    }
+                                    if tip_advanced
+                                        && let Err(err) = remove_confirmed_txids_from_mempool_db(
+                                            &ctx.cfg,
+                                            &ctx.mempool_db_path,
+                                            &included_txids,
+                                        )
+                                    {
+                                        eprintln!(
+                                            "warning: failed to trim confirmed txids from mempool db: {err}"
+                                        );
+                                    }
                                 }
-                                if let Err(err) = remove_confirmed_txids_from_mempool_db(
-                                    &ctx.cfg,
-                                    &ctx.mempool_db_path,
-                                    &included_txids,
-                                ) {
-                                    eprintln!(
-                                        "warning: failed to trim confirmed txids from mempool db: {err}"
-                                    );
+                                if tip_advanced {
+                                    reconcile_pool_ledger_with_runtime(&ctx, ntime);
                                 }
 
-                                jobs.clear();
-                                if should_reissue_job_for_channel(channel_id, session.channel_id())
-                                {
-                                    last_tip_hash = issue_new_stratum_job_async(
-                                        &mut session,
-                                        &ctx,
-                                        &mut stream,
-                                        &mut secure_transport,
-                                        &mut jobs,
-                                        payout_key_hash20,
-                                        &payout_label,
-                                    )
-                                    .await?;
+                                if tip_advanced {
+                                    jobs.clear();
+                                    if should_reissue_job_for_channel(
+                                        channel_id,
+                                        session.channel_id(),
+                                    ) {
+                                        last_tip_hash = issue_new_stratum_job_async(
+                                            &mut session,
+                                            &ctx,
+                                            &mut stream,
+                                            &mut secure_transport,
+                                            &mut jobs,
+                                            payout_key_hash20,
+                                            &payout_label,
+                                        )
+                                        .await?;
+                                    }
                                 }
+                                run_pool_payout_tick_with_warning(&ctx);
                             }
                         }
                         SessionEvent::ShareRejected { .. } => {
@@ -8478,6 +8890,7 @@ fn record_pool_share_accepted(
     ntime: u64,
     share_target: Target,
     is_block: bool,
+    reserve_spendable_atomic: Option<u128>,
 ) {
     let now_unix_sec = current_unix_sec().unwrap_or(ntime);
     let expected_hashes = expected_hashes_for_target(share_target);
@@ -8499,6 +8912,7 @@ fn record_pool_share_accepted(
             true,
             is_block,
             now_unix_sec,
+            reserve_spendable_atomic,
         )
     };
     if inserted {
@@ -8525,6 +8939,7 @@ fn record_pool_round_closed(
     ctx: &StratumServerContext,
     worker: &str,
     found_block_hash: Hash256,
+    found_block_reward_atomic: u128,
     end_height: u64,
     end_tip_hash: Hash256,
     fallback_unix_sec: u64,
@@ -8541,12 +8956,175 @@ fn record_pool_round_closed(
         ledger.close_round_with_block(
             worker,
             found_block_hash,
+            found_block_reward_atomic,
             end_height,
             end_tip_hash,
             now_unix_sec,
         );
     }
     persist_pool_ledger_with_warning(ctx);
+}
+
+fn reconcile_pool_ledger_with_runtime(ctx: &StratumServerContext, fallback_unix_sec: u64) {
+    let now_unix_sec = current_unix_sec().unwrap_or(fallback_unix_sec);
+    let runtime = match lock_runtime(&ctx.runtime) {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            eprintln!("warning: failed to lock runtime for pool reconcile: {err}");
+            return;
+        }
+    };
+    let changed = {
+        let mut ledger = match ctx.pool_ledger_state.lock() {
+            Ok(ledger) => ledger,
+            Err(_) => {
+                eprintln!("warning: stratum pool ledger mutex poisoned");
+                return;
+            }
+        };
+        ledger.reconcile_with_runtime(&runtime, now_unix_sec)
+    };
+    if changed {
+        persist_pool_ledger_with_warning(ctx);
+    }
+}
+
+fn runtime_spendable_balance_for_key_hash(runtime: &ChainRuntime, key_hash20: [u8; 20]) -> u128 {
+    let tip_height = runtime.tip_height();
+    let maturity = runtime.config().coinbase_maturity as u64;
+    runtime
+        .utxo_set()
+        .values()
+        .filter(|entry| entry.key_hash20 == key_hash20)
+        .filter(|entry| {
+            !(entry.is_coinbase
+                && coinbase_prevout_is_immature(tip_height, entry.created_height, maturity))
+        })
+        .map(|entry| entry.value as u128)
+        .fold(0u128, |acc, value| acc.saturating_add(value))
+}
+
+fn runtime_contains_txid(runtime: &ChainRuntime, needle_txid: Hash256) -> bool {
+    runtime.block_hashes().iter().copied().any(|hash| {
+        runtime
+            .block_by_hash(&hash)
+            .is_some_and(|block| find_tx_by_txid(block, needle_txid).is_some())
+    })
+}
+
+fn maybe_process_pool_payouts(ctx: &StratumServerContext) -> Result<(), NodeError> {
+    if ctx.pool_payout_cfg.mode == PoolPayoutModeArg::Solo {
+        return Ok(());
+    }
+    let now_unix_sec = current_unix_sec()?;
+    let mut changed = false;
+    {
+        let mut ledger = ctx
+            .pool_ledger_state
+            .lock()
+            .map_err(|_| NodeError::Runtime("stratum pool ledger mutex poisoned".to_owned()))?;
+        let created = ledger.queue_due_payouts(now_unix_sec);
+        if !created.is_empty() {
+            changed = true;
+        }
+    }
+    if changed {
+        persist_pool_ledger_with_warning(ctx);
+    }
+
+    let Some(pool_key) = ctx.pool_payout_key.as_ref() else {
+        return Ok(());
+    };
+    let to_submit = {
+        let ledger = ctx
+            .pool_ledger_state
+            .lock()
+            .map_err(|_| NodeError::Runtime("stratum pool ledger mutex poisoned".to_owned()))?;
+        ledger
+            .pending_payouts
+            .iter()
+            .filter(|payout| !payout.confirmed && payout.submitted_txid_hex.is_none())
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+
+    for payout in to_submit {
+        let decoded = match parse_address(&payout.worker) {
+            Ok(decoded) => decoded,
+            Err(_) => continue,
+        };
+        let amount = match u64::try_from(payout.amount_atomic) {
+            Ok(value) if value > 0 => value,
+            _ => continue,
+        };
+        let signed = {
+            let runtime = lock_runtime(&ctx.runtime)?;
+            build_signed_transfer_tx(
+                &runtime,
+                &ctx.cfg.network_id,
+                pool_key,
+                decoded.key_hash20,
+                amount,
+                ctx.pool_payout_cfg.payout_tx_fee_atomic,
+            )
+        };
+        let signed = match signed {
+            Ok(signed) => signed,
+            Err(err) => {
+                eprintln!(
+                    "warning: payout tx build failed for worker={} amount={}: {err}",
+                    payout.worker, payout.amount_atomic
+                );
+                continue;
+            }
+        };
+        let submit = submit_tx_via_mempool_db(
+            &ctx.cfg,
+            &ctx.runtime_db_path,
+            &ctx.mempool_db_path,
+            signed.tx,
+            ctx.pool_payout_cfg.payout_tx_fee_atomic,
+        );
+        let (txid, _outcome, _fee) = match submit {
+            Ok(ok) => ok,
+            Err(err) => {
+                eprintln!(
+                    "warning: payout tx submit failed for worker={} amount={}: {err}",
+                    payout.worker, payout.amount_atomic
+                );
+                continue;
+            }
+        };
+        let mut ledger = ctx
+            .pool_ledger_state
+            .lock()
+            .map_err(|_| NodeError::Runtime("stratum pool ledger mutex poisoned".to_owned()))?;
+        if ledger.mark_pending_payout_submitted(&payout.payout_id, &txid.to_hex()) {
+            changed = true;
+        }
+    }
+
+    {
+        let runtime = lock_runtime(&ctx.runtime)?;
+        let mut ledger = ctx
+            .pool_ledger_state
+            .lock()
+            .map_err(|_| NodeError::Runtime("stratum pool ledger mutex poisoned".to_owned()))?;
+        if ledger.settle_confirmed_payouts(&runtime) > 0 {
+            changed = true;
+        }
+    }
+
+    if changed {
+        persist_pool_ledger_with_warning(ctx);
+    }
+    Ok(())
+}
+
+fn run_pool_payout_tick_with_warning(ctx: &StratumServerContext) {
+    if let Err(err) = maybe_process_pool_payouts(ctx) {
+        eprintln!("warning: pool payout tick failed: {err}");
+    }
 }
 
 fn stratum_user_payout_key_hash20(user: &str) -> Option<[u8; 20]> {
@@ -9085,13 +9663,60 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
         .clone()
         .unwrap_or_else(|| default_pool_ledger_db_path(&runtime_db_path));
     let (runtime, source) = load_runtime_from_db_or_genesis(&cfg, &runtime_db_path)?;
-    let pool_ledger_state = load_pool_ledger_from_db_or_new(
+    let mut pool_ledger_state = load_pool_ledger_from_db_or_new(
         &cfg,
         &runtime,
         &pool_ledger_db_path,
         args.pool_share_retention,
         args.pool_round_retention,
     )?;
+    let payout_cfg = PoolPayoutConfig {
+        mode: args.pool_payout_mode,
+        pool_fee_bps: args.pool_fee_bps,
+        pplns_window_shares: args.pplns_window_shares.max(1),
+        pps_share_atomic: args.pps_share_atomic,
+        pps_max_liability_atomic: args.pps_max_liability_atomic,
+        pps_reserve_floor_atomic: args.pps_reserve_floor_atomic,
+        payout_threshold_atomic: args.pool_payout_threshold_atomic.max(1),
+        payout_interval_sec: args.pool_payout_interval_sec.max(1),
+        payout_tx_fee_atomic: args.pool_payout_tx_fee_atomic.max(1),
+    };
+    if payout_cfg.pool_fee_bps > 10_000 {
+        return Err(NodeError::Runtime(
+            "pool_fee_bps must be <= 10000".to_owned(),
+        ));
+    }
+    if payout_cfg.mode.uses_pps() && payout_cfg.pps_share_atomic == 0 {
+        return Err(NodeError::Runtime(
+            "pps_share_atomic must be > 0 when payout mode includes pps".to_owned(),
+        ));
+    }
+    let pool_payout_key = match args.pool_payout_mnemonic.as_deref() {
+        Some(phrase) => {
+            let mnemonic = WalletMnemonic::parse(phrase)?;
+            let seed = mnemonic.to_seed(&args.pool_payout_passphrase);
+            Some(derive_wallet_key(
+                &seed,
+                args.pool_payout_account,
+                args.pool_payout_index,
+            )?)
+        }
+        None => None,
+    };
+    if payout_cfg.mode != PoolPayoutModeArg::Solo && pool_payout_key.is_none() {
+        return Err(NodeError::Runtime(
+            "pool payout mode requires --pool-payout-mnemonic".to_owned(),
+        ));
+    }
+    let pool_coinbase_key_hash20 = if payout_cfg.mode == PoolPayoutModeArg::Solo {
+        cfg.genesis_reward_key_hash20()?
+    } else {
+        let key = pool_payout_key
+            .as_ref()
+            .ok_or_else(|| NodeError::Runtime("pool payout key is missing".to_owned()))?;
+        scam_core::hash160_blake3(&key.pubkey_compressed())
+    };
+    pool_ledger_state.set_payout_config(payout_cfg.clone());
     let share_target_hex = args
         .share_target_hex
         .as_deref()
@@ -9223,6 +9848,20 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
         args.pool_share_retention.max(1),
         args.pool_round_retention.max(1)
     );
+    println!(
+        "Pool payout: mode={:?} fee_bps={} pplns_window={} pps_share_atomic={} threshold={} interval={}s tx_fee={}",
+        payout_cfg.mode,
+        payout_cfg.pool_fee_bps,
+        payout_cfg.pplns_window_shares,
+        payout_cfg.pps_share_atomic,
+        payout_cfg.payout_threshold_atomic,
+        payout_cfg.payout_interval_sec,
+        payout_cfg.payout_tx_fee_atomic
+    );
+    println!(
+        "Pool payout signer configured: {}",
+        pool_payout_key.is_some()
+    );
     println!("I/O model: async tokio");
     println!(
         "Read timeout={}s keepalive={}s idle timeout={}s",
@@ -9290,6 +9929,9 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
         telemetry_state: Arc::new(Mutex::new(StratumPoolTelemetryState::default())),
         pool_ledger_state: Arc::new(Mutex::new(pool_ledger_state)),
         pool_ledger_db_path,
+        pool_payout_cfg: payout_cfg.clone(),
+        pool_payout_key,
+        pool_coinbase_key_hash20,
     };
     if let Ok(guard) = ctx.pool_ledger_state.lock()
         && let Err(err) =
@@ -10927,6 +11569,7 @@ fn pool_ledger_status_from_snapshot(
 
     Some(PoolLedgerStatusSnapshot {
         network_id: snapshot.network_id.clone(),
+        payout_mode: "unknown".to_owned(),
         current_round_id: snapshot.current_round_id,
         current_round_start_height: round.start_height,
         current_round_start_tip_hash: round.start_tip_hash.to_hex(),
@@ -10937,6 +11580,17 @@ fn pool_ledger_status_from_snapshot(
         workers_tracked: snapshot.workers.len(),
         pending_payouts: snapshot.pending_payouts.len(),
         completed_payouts: snapshot.completed_payouts.len(),
+        total_outstanding_atomic: snapshot
+            .workers
+            .iter()
+            .map(|worker| {
+                worker
+                    .pplns_accrual_atomic
+                    .saturating_add(worker.pps_accrual_atomic)
+                    .saturating_sub(worker.paid_total_atomic)
+            })
+            .fold(0u128, |acc, value| acc.saturating_add(value)),
+        pps_guardrail_alerts_total: 0,
     })
 }
 
@@ -14386,6 +15040,7 @@ mod tests {
         ledger.close_round_with_block(
             "miner.alpha",
             Hash256([0xAA; 32]),
+            cfg.block_subsidy as u128,
             1,
             Hash256([0xBB; 32]),
             now_unix_sec + 10,
@@ -14423,6 +15078,7 @@ mod tests {
                     end_unix_sec: Some(20),
                     closed_by_worker: Some("miner.alpha".to_owned()),
                     found_block_hash: Some(Hash256([0x33; 32])),
+                    found_block_reward_atomic: 50,
                     orphaned: true,
                 },
                 super::PoolRoundRecord {
@@ -14435,6 +15091,7 @@ mod tests {
                     end_unix_sec: None,
                     closed_by_worker: None,
                     found_block_hash: None,
+                    found_block_reward_atomic: 0,
                     orphaned: false,
                 },
             ],
@@ -14450,6 +15107,182 @@ mod tests {
         assert_eq!(
             status.current_round_start_tip_hash,
             Hash256([0x22; 32]).to_hex()
+        );
+    }
+
+    #[test]
+    fn pool_ledger_pplns_recompute_rolls_back_on_orphaned_round() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let mut ledger = super::StratumPoolLedgerState::new(
+            cfg.network_id.clone(),
+            runtime.tip_height(),
+            runtime.tip_hash(),
+            1_770_000_000,
+            1_024,
+            64,
+        );
+        ledger.set_payout_config(super::PoolPayoutConfig {
+            mode: super::PoolPayoutModeArg::Pplns,
+            pool_fee_bps: 0,
+            pplns_window_shares: 10,
+            pps_share_atomic: 0,
+            pps_max_liability_atomic: 0,
+            pps_reserve_floor_atomic: 0,
+            payout_threshold_atomic: 1,
+            payout_interval_sec: 1,
+            payout_tx_fee_atomic: 1,
+        });
+        assert!(ledger.register_share("worker-a", 1, 1, 1, 10, 10.0, true, false, 10, None));
+        assert!(ledger.register_share("worker-b", 1, 2, 2, 11, 30.0, true, false, 11, None));
+
+        ledger.close_round_with_block(
+            "worker-b",
+            Hash256([0xAA; 32]),
+            1_000,
+            1,
+            Hash256([0xBB; 32]),
+            12,
+        );
+        let worker_a = ledger.workers.get("worker-a").expect("worker-a");
+        let worker_b = ledger.workers.get("worker-b").expect("worker-b");
+        assert!(
+            worker_a.pplns_accrual_atomic > 0
+                && worker_b.pplns_accrual_atomic > worker_a.pplns_accrual_atomic
+        );
+
+        let changed = ledger.reconcile_with_runtime(&runtime, 13);
+        assert!(
+            changed,
+            "mismatched closing hash should mark round orphaned"
+        );
+        let worker_a = ledger.workers.get("worker-a").expect("worker-a");
+        let worker_b = ledger.workers.get("worker-b").expect("worker-b");
+        assert_eq!(worker_a.pplns_accrual_atomic, 0);
+        assert_eq!(worker_b.pplns_accrual_atomic, 0);
+    }
+
+    #[test]
+    fn pool_ledger_pps_guardrails_block_credit_when_limits_trip() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let mut ledger = super::StratumPoolLedgerState::new(
+            cfg.network_id.clone(),
+            runtime.tip_height(),
+            runtime.tip_hash(),
+            1_770_000_000,
+            1_024,
+            64,
+        );
+        ledger.set_payout_config(super::PoolPayoutConfig {
+            mode: super::PoolPayoutModeArg::Pps,
+            pool_fee_bps: 0,
+            pplns_window_shares: 10,
+            pps_share_atomic: 100,
+            pps_max_liability_atomic: 150,
+            pps_reserve_floor_atomic: 50,
+            payout_threshold_atomic: 1,
+            payout_interval_sec: 1,
+            payout_tx_fee_atomic: 1,
+        });
+
+        assert!(ledger.register_share("worker-pps", 1, 1, 1, 10, 1.0, true, false, 10, Some(40)));
+        assert_eq!(
+            ledger
+                .workers
+                .get("worker-pps")
+                .expect("worker")
+                .pps_accrual_atomic,
+            0
+        );
+
+        assert!(ledger.register_share("worker-pps", 1, 2, 2, 11, 1.0, true, false, 11, Some(60)));
+        assert_eq!(
+            ledger
+                .workers
+                .get("worker-pps")
+                .expect("worker")
+                .pps_accrual_atomic,
+            100
+        );
+
+        assert!(ledger.register_share("worker-pps", 1, 3, 3, 12, 1.0, true, false, 12, Some(60)));
+        assert_eq!(
+            ledger
+                .workers
+                .get("worker-pps")
+                .expect("worker")
+                .pps_accrual_atomic,
+            100
+        );
+        assert!(ledger.pps_guardrail_alerts_total >= 2);
+    }
+
+    #[test]
+    fn pool_ledger_queue_and_settle_payouts_updates_paid_totals() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let mut ledger = super::StratumPoolLedgerState::new(
+            cfg.network_id.clone(),
+            runtime.tip_height(),
+            runtime.tip_hash(),
+            1_770_000_000,
+            1_024,
+            64,
+        );
+        ledger.set_payout_config(super::PoolPayoutConfig {
+            mode: super::PoolPayoutModeArg::Pps,
+            pool_fee_bps: 0,
+            pplns_window_shares: 10,
+            pps_share_atomic: 250,
+            pps_max_liability_atomic: 0,
+            pps_reserve_floor_atomic: 0,
+            payout_threshold_atomic: 200,
+            payout_interval_sec: 1,
+            payout_tx_fee_atomic: 1,
+        });
+
+        let mnemonic = WalletMnemonic::parse(SOAK_FLOW_MNEMONIC).expect("mnemonic");
+        let seed = mnemonic.to_seed("");
+        let key = derive_wallet_key(&seed, 0, 0).expect("key");
+        let worker_address =
+            scam_wallet::to_address("sd", key.pubkey_compressed()).expect("address");
+        assert!(ledger.register_share(
+            &worker_address,
+            1,
+            1,
+            1,
+            10,
+            1.0,
+            true,
+            false,
+            10,
+            Some(1_000),
+        ));
+
+        let created = ledger.queue_due_payouts(11);
+        assert_eq!(created.len(), 1);
+        let payout = &created[0];
+        assert_eq!(payout.worker, worker_address);
+        let genesis_txid = runtime
+            .block_by_hash(&runtime.tip_hash())
+            .expect("genesis")
+            .transactions[0]
+            .txid();
+        assert!(ledger.mark_pending_payout_submitted(&payout.payout_id, &genesis_txid.to_hex()));
+        assert_eq!(ledger.settle_confirmed_payouts(&runtime), 1);
+        assert!(ledger.pending_payouts.is_empty());
+        assert_eq!(ledger.completed_payouts.len(), 1);
+        assert_eq!(
+            ledger
+                .workers
+                .get(&worker_address)
+                .expect("worker")
+                .paid_total_atomic,
+            payout.amount_atomic
         );
     }
 
@@ -14509,6 +15342,9 @@ mod tests {
             )),
             pool_ledger_state: std::sync::Arc::new(std::sync::Mutex::new(pool_ledger_state)),
             pool_ledger_db_path,
+            pool_payout_cfg: super::PoolPayoutConfig::default(),
+            pool_payout_key: None,
+            pool_coinbase_key_hash20: cfg.genesis_reward_key_hash20().expect("reward key"),
         };
 
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -16066,6 +16902,19 @@ mod tests {
             pool_ledger_db: None,
             pool_share_retention: super::POOL_DEFAULT_SHARE_RETENTION,
             pool_round_retention: super::POOL_DEFAULT_ROUND_RETENTION,
+            pool_payout_mode: super::PoolPayoutModeArg::Solo,
+            pool_fee_bps: 100,
+            pplns_window_shares: 300,
+            pps_share_atomic: 0,
+            pps_max_liability_atomic: 0,
+            pps_reserve_floor_atomic: 0,
+            pool_payout_threshold_atomic: 100_000_000,
+            pool_payout_interval_sec: 120,
+            pool_payout_tx_fee_atomic: 500,
+            pool_payout_mnemonic: None,
+            pool_payout_passphrase: String::new(),
+            pool_payout_account: 0,
+            pool_payout_index: 0,
         })
         .expect_err("share target below min must fail");
         assert!(
@@ -16106,6 +16955,19 @@ mod tests {
             pool_ledger_db: None,
             pool_share_retention: super::POOL_DEFAULT_SHARE_RETENTION,
             pool_round_retention: super::POOL_DEFAULT_ROUND_RETENTION,
+            pool_payout_mode: super::PoolPayoutModeArg::Solo,
+            pool_fee_bps: 100,
+            pplns_window_shares: 300,
+            pps_share_atomic: 0,
+            pps_max_liability_atomic: 0,
+            pps_reserve_floor_atomic: 0,
+            pool_payout_threshold_atomic: 100_000_000,
+            pool_payout_interval_sec: 120,
+            pool_payout_tx_fee_atomic: 500,
+            pool_payout_mnemonic: None,
+            pool_payout_passphrase: String::new(),
+            pool_payout_account: 0,
+            pool_payout_index: 0,
         })
         .expect_err("share target above max must fail");
         assert!(
@@ -16146,6 +17008,19 @@ mod tests {
             pool_ledger_db: None,
             pool_share_retention: super::POOL_DEFAULT_SHARE_RETENTION,
             pool_round_retention: super::POOL_DEFAULT_ROUND_RETENTION,
+            pool_payout_mode: super::PoolPayoutModeArg::Solo,
+            pool_fee_bps: 100,
+            pplns_window_shares: 300,
+            pps_share_atomic: 0,
+            pps_max_liability_atomic: 0,
+            pps_reserve_floor_atomic: 0,
+            pool_payout_threshold_atomic: 100_000_000,
+            pool_payout_interval_sec: 120,
+            pool_payout_tx_fee_atomic: 500,
+            pool_payout_mnemonic: None,
+            pool_payout_passphrase: String::new(),
+            pool_payout_account: 0,
+            pool_payout_index: 0,
         })
         .expect_err("idle timeout validation must trigger after valid share bounds");
         assert!(
@@ -17588,6 +18463,19 @@ mod tests {
             pool_ledger_db: None,
             pool_share_retention: super::POOL_DEFAULT_SHARE_RETENTION,
             pool_round_retention: super::POOL_DEFAULT_ROUND_RETENTION,
+            pool_payout_mode: super::PoolPayoutModeArg::Solo,
+            pool_fee_bps: 100,
+            pplns_window_shares: 300,
+            pps_share_atomic: 0,
+            pps_max_liability_atomic: 0,
+            pps_reserve_floor_atomic: 0,
+            pool_payout_threshold_atomic: 100_000_000,
+            pool_payout_interval_sec: 120,
+            pool_payout_tx_fee_atomic: 500,
+            pool_payout_mnemonic: None,
+            pool_payout_passphrase: String::new(),
+            pool_payout_account: 0,
+            pool_payout_index: 0,
         })
         .expect_err("serve must reject missing noise static key");
         assert!(
