@@ -6054,7 +6054,7 @@ fn relay_disconnect_reason(err: &NodeError) -> &'static str {
 fn relay_session_error_is_fatal(err: &NodeError) -> bool {
     matches!(
         relay_disconnect_reason(err),
-        "internal-error" | "state-poisoned"
+        "internal-error" | "state-poisoned" | "network-mismatch"
     )
 }
 
@@ -14195,7 +14195,7 @@ mod tests {
         );
         assert!(!super::relay_session_error_is_fatal(&timeout_err));
         assert!(!super::relay_session_error_is_fatal(&closed_err));
-        assert!(!super::relay_session_error_is_fatal(&runtime_mismatch));
+        assert!(super::relay_session_error_is_fatal(&runtime_mismatch));
         assert!(super::relay_session_error_is_fatal(&runtime_poison));
         assert!(super::relay_session_error_is_fatal(&runtime_internal));
 
