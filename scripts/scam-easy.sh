@@ -23,8 +23,11 @@ RELAY_BIND="${RELAY_BIND:-0.0.0.0:18444}"
 RPC_BIND="${RPC_BIND:-127.0.0.1:18080}"
 RPC_UI_DIR="${RPC_UI_DIR:-web}"
 RPC_RELAY_TELEMETRY="${RPC_RELAY_TELEMETRY:-data/relay.telemetry.jsonl}"
+RPC_STRATUM_TELEMETRY="${RPC_STRATUM_TELEMETRY:-data/stratum.telemetry.jsonl}"
 POOL_BIND="${POOL_BIND:-127.0.0.1:3347}"
 POOL_ADDR="${POOL_ADDR:-127.0.0.1:3347}"
+POOL_TELEMETRY_OUT="${POOL_TELEMETRY_OUT:-data/stratum.telemetry.jsonl}"
+POOL_TELEMETRY_EVERY_SEC="${POOL_TELEMETRY_EVERY_SEC:-5}"
 MINER_USER="${MINER_USER:-local-miner}"
 HRP="${HRP:-sd}"
 WORDS="${WORDS:-12}"
@@ -88,7 +91,8 @@ Commands:
 Important env vars:
   NETWORK, CONFIG, RUNTIME_DB, PEERS_DIR
   RELAY_BIND, RPC_BIND, RPC_UI_DIR, RPC_RELAY_TELEMETRY
-  POOL_BIND, POOL_ADDR, MINER_USER
+  RPC_STRATUM_TELEMETRY
+  POOL_BIND, POOL_ADDR, POOL_TELEMETRY_OUT, POOL_TELEMETRY_EVERY_SEC, MINER_USER
   MNEMONIC, TO_ADDRESS, AMOUNT, FEE
   ADDRESS
 EOF
@@ -105,10 +109,10 @@ case "${COMMAND}" in
     run_node_cmd relay-serve --network "${NETWORK}" --config "${CONFIG}" --runtime-db "${RUNTIME_DB}" --bind "${RELAY_BIND}" "$@"
     ;;
   rpc)
-    run_node_cmd rpc-serve --network "${NETWORK}" --config "${CONFIG}" --runtime-db "${RUNTIME_DB}" --bind "${RPC_BIND}" --ui-dir "${RPC_UI_DIR}" --relay-telemetry "${RPC_RELAY_TELEMETRY}" "$@"
+    run_node_cmd rpc-serve --network "${NETWORK}" --config "${CONFIG}" --runtime-db "${RUNTIME_DB}" --bind "${RPC_BIND}" --ui-dir "${RPC_UI_DIR}" --relay-telemetry "${RPC_RELAY_TELEMETRY}" --stratum-telemetry "${RPC_STRATUM_TELEMETRY}" "$@"
     ;;
   pool)
-    run_node_cmd stratum-serve --network "${NETWORK}" --config "${CONFIG}" --runtime-db "${RUNTIME_DB}" --bind "${POOL_BIND}" "$@"
+    run_node_cmd stratum-serve --network "${NETWORK}" --config "${CONFIG}" --runtime-db "${RUNTIME_DB}" --bind "${POOL_BIND}" --telemetry-out "${POOL_TELEMETRY_OUT}" --telemetry-every-sec "${POOL_TELEMETRY_EVERY_SEC}" "$@"
     ;;
   miner)
     run_node_cmd stratum-mine --pool "${POOL_ADDR}" --user "${MINER_USER}" "$@"

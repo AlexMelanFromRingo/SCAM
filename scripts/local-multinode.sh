@@ -30,6 +30,7 @@ set -euo pipefail
 #   RELAY_OUTBOUND_CONNECT=true
 #   RELAY_OUTBOUND_REDIAL_SEC=2
 #   STRATUM_READ_TIMEOUT_SEC=30
+#   STRATUM_TELEMETRY_EVERY_SEC=5
 
 COMMAND="${1:-up}"
 
@@ -53,6 +54,7 @@ P2P_WRITE_TIMEOUT_SEC="${P2P_WRITE_TIMEOUT_SEC:-5}"
 RELAY_OUTBOUND_CONNECT="${RELAY_OUTBOUND_CONNECT:-true}"
 RELAY_OUTBOUND_REDIAL_SEC="${RELAY_OUTBOUND_REDIAL_SEC:-2}"
 STRATUM_READ_TIMEOUT_SEC="${STRATUM_READ_TIMEOUT_SEC:-30}"
+STRATUM_TELEMETRY_EVERY_SEC="${STRATUM_TELEMETRY_EVERY_SEC:-5}"
 UI_DIR="${UI_DIR:-web}"
 SCAM_NODE_BIN="${SCAM_NODE_BIN:-}"
 
@@ -213,6 +215,7 @@ start_cluster() {
   require_positive_int "P2P_WRITE_TIMEOUT_SEC" "${P2P_WRITE_TIMEOUT_SEC}"
   require_positive_int "RELAY_OUTBOUND_REDIAL_SEC" "${RELAY_OUTBOUND_REDIAL_SEC}"
   require_positive_int "STRATUM_READ_TIMEOUT_SEC" "${STRATUM_READ_TIMEOUT_SEC}"
+  require_positive_int "STRATUM_TELEMETRY_EVERY_SEC" "${STRATUM_TELEMETRY_EVERY_SEC}"
 
   mkdir -p "${CLUSTER_DIR}"
   local bin
@@ -267,6 +270,7 @@ start_cluster() {
         --bind "127.0.0.1:${rpc_port}" \
         --ui-dir "${UI_DIR}" \
         --relay-telemetry "${nodedir}/relay.telemetry.jsonl" \
+        --stratum-telemetry "${nodedir}/stratum.telemetry.jsonl" \
         > "${logsdir}/rpc.log" 2>&1 &
       write_pid "${nodedir}/rpc.pid" "$!"
       ensure_pid_started "${nodedir}/rpc.pid" "node-${idx} rpc-serve" "${logsdir}/rpc.log"
@@ -281,6 +285,8 @@ start_cluster() {
         --runtime-db "${runtime_db}" \
         --bind "127.0.0.1:${stratum_port}" \
         --read-timeout-sec "${STRATUM_READ_TIMEOUT_SEC}" \
+        --telemetry-out "${nodedir}/stratum.telemetry.jsonl" \
+        --telemetry-every-sec "${STRATUM_TELEMETRY_EVERY_SEC}" \
         > "${logsdir}/stratum.log" 2>&1 &
       write_pid "${nodedir}/stratum.pid" "$!"
       ensure_pid_started "${nodedir}/stratum.pid" "node-${idx} stratum-serve" "${logsdir}/stratum.log"

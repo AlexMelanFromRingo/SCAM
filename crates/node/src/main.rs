@@ -9,8 +9,12 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use num_traits::ToPrimitive;
 use scam_chain::{BlockSubmissionOutcome, ChainError, ChainRuntime};
-use scam_consensus::{TxValidationError, UtxoSet, tx_is_final_for_block, validate_and_apply_block};
+use scam_consensus::{
+    TxValidationError, UtxoSet, chainwork_for_target, tx_is_final_for_block,
+    validate_and_apply_block,
+};
 use scam_core::{
     ChainConfig, ChainConfigError, DifficultyAlgorithm, Hash256, OutPoint, Target, Transaction,
     TxIn, TxOut, block_meets_pow, render_hash_bitmap_16x16,
@@ -637,6 +641,10 @@ struct StratumServeArgs {
     template_provider_addr: Option<String>,
     #[arg(long)]
     job_declarator_addr: Option<String>,
+    #[arg(long)]
+    telemetry_out: Option<PathBuf>,
+    #[arg(long, default_value_t = 5)]
+    telemetry_every_sec: u64,
 }
 
 #[derive(Debug, Args)]
@@ -731,6 +739,8 @@ struct RpcServeArgs {
     ui_dir: PathBuf,
     #[arg(long)]
     relay_telemetry: Option<PathBuf>,
+    #[arg(long)]
+    stratum_telemetry: Option<PathBuf>,
     #[arg(long, default_value_t = 0)]
     mine_blocks: u32,
     #[arg(long, default_value_t = 120)]
@@ -1614,6 +1624,7 @@ fn run_mode(args: RunModeArgs) -> Result<(), NodeError> {
             bind: args.rpc_bind.clone(),
             ui_dir: args.ui_dir.clone(),
             relay_telemetry: None,
+            stratum_telemetry: None,
             mine_blocks: 0,
             interval_sec: cfg.target_block_time_sec,
             max_nonce: 500_000,
@@ -1650,6 +1661,8 @@ fn run_mode(args: RunModeArgs) -> Result<(), NodeError> {
             secure_expected_remote_static_pubkey_hex: None,
             template_provider_addr: None,
             job_declarator_addr: None,
+            telemetry_out: None,
+            telemetry_every_sec: 5,
         };
         let tx = done_tx.clone();
         spawn_mode_service("stratum-serve", tx, move || run_stratum_serve(stratum_args));
@@ -1769,6 +1782,10 @@ fn run_status(args: StatusArgs) -> Result<(), NodeError> {
         tip_hash: runtime.tip_hash().to_hex(),
         utxo_count: runtime.utxo_len(),
         cumulative_work: runtime.cumulative_work().to_str_radix(10),
+        network_hashrate_hps: estimate_network_hashrate_hps(&runtime),
+        stratum_active_clients: None,
+        stratum_workers_active: None,
+        stratum_pool_hashrate_hps: None,
     };
 
     if args.json {
@@ -3781,6 +3798,8 @@ struct RelayServerState {
     peer_compact_pref: HashMap<u64, bool>,
     pending_compact_blocks: HashMap<Hash256, PendingCompactBlock>,
     known_peer_addresses: Vec<PeerAddress>,
+    outbound_worker_starts_total: u64,
+    outbound_supervisor_starts_total: u64,
 }
 
 impl RelayServerState {
@@ -3794,6 +3813,8 @@ impl RelayServerState {
             peer_compact_pref: HashMap::new(),
             pending_compact_blocks: HashMap::new(),
             known_peer_addresses: Vec::new(),
+            outbound_worker_starts_total: 0,
+            outbound_supervisor_starts_total: 0,
         }
     }
 }
@@ -3830,11 +3851,184 @@ struct RelayServerTelemetrySnapshot {
     gossip_replacement_rate_limited_total: u64,
 }
 
+const STRATUM_HASHRATE_WINDOW_SEC: u64 = 120;
+const STRATUM_TOP_WORKERS_LIMIT: usize = 32;
+
+#[derive(Clone, Debug)]
+struct StratumShareSample {
+    timestamp_unix_sec: u64,
+    worker: String,
+    expected_hashes: f64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct StratumWorkerCounters {
+    accepted_total: u64,
+    rejected_total: u64,
+    blocks_found_total: u64,
+    last_share_unix_sec: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct StratumPoolTelemetryState {
+    accepted_total: u64,
+    rejected_total: u64,
+    blocks_found_total: u64,
+    samples: VecDeque<StratumShareSample>,
+    workers: HashMap<String, StratumWorkerCounters>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StratumWorkerHashrateSnapshot {
+    worker: String,
+    hashrate_hps: f64,
+    accepted_total: u64,
+    rejected_total: u64,
+    blocks_found_total: u64,
+    last_share_unix_sec: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StratumServerTelemetrySnapshot {
+    timestamp_unix_sec: u64,
+    active_clients: usize,
+    workers_tracked_total: usize,
+    workers_active: usize,
+    hashrate_window_sec: u64,
+    pool_hashrate_hps: f64,
+    accepted_total: u64,
+    rejected_total: u64,
+    blocks_found_total: u64,
+    top_workers: Vec<StratumWorkerHashrateSnapshot>,
+}
+
+impl StratumPoolTelemetryState {
+    fn sanitize_worker_label(raw: &str) -> String {
+        let compact = raw
+            .chars()
+            .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | ':' | '.'))
+            .take(80)
+            .collect::<String>();
+        if compact.is_empty() {
+            "default".to_owned()
+        } else {
+            compact
+        }
+    }
+
+    fn prune_samples(&mut self, now_unix_sec: u64, window_sec: u64) {
+        while let Some(front) = self.samples.front() {
+            if now_unix_sec.saturating_sub(front.timestamp_unix_sec) <= window_sec {
+                break;
+            }
+            self.samples.pop_front();
+        }
+    }
+
+    fn register_accepted_share(
+        &mut self,
+        worker: &str,
+        now_unix_sec: u64,
+        expected_hashes: f64,
+        is_block: bool,
+    ) {
+        let worker_label = Self::sanitize_worker_label(worker);
+        self.accepted_total = self.accepted_total.saturating_add(1);
+        if is_block {
+            self.blocks_found_total = self.blocks_found_total.saturating_add(1);
+        }
+        let counters = self.workers.entry(worker_label.clone()).or_default();
+        counters.accepted_total = counters.accepted_total.saturating_add(1);
+        if is_block {
+            counters.blocks_found_total = counters.blocks_found_total.saturating_add(1);
+        }
+        counters.last_share_unix_sec = now_unix_sec;
+        self.samples.push_back(StratumShareSample {
+            timestamp_unix_sec: now_unix_sec,
+            worker: worker_label,
+            expected_hashes: expected_hashes.max(0.0),
+        });
+        self.prune_samples(now_unix_sec, STRATUM_HASHRATE_WINDOW_SEC);
+    }
+
+    fn register_rejected_share(&mut self, worker: &str, now_unix_sec: u64) {
+        let worker_label = Self::sanitize_worker_label(worker);
+        self.rejected_total = self.rejected_total.saturating_add(1);
+        let counters = self.workers.entry(worker_label).or_default();
+        counters.rejected_total = counters.rejected_total.saturating_add(1);
+        counters.last_share_unix_sec = now_unix_sec;
+        self.prune_samples(now_unix_sec, STRATUM_HASHRATE_WINDOW_SEC);
+    }
+
+    fn snapshot(
+        &mut self,
+        active_clients: usize,
+        now_unix_sec: u64,
+    ) -> StratumServerTelemetrySnapshot {
+        self.prune_samples(now_unix_sec, STRATUM_HASHRATE_WINDOW_SEC);
+        let window_sec = STRATUM_HASHRATE_WINDOW_SEC.max(1);
+        let mut by_worker_hashes = HashMap::<String, f64>::new();
+        let mut pool_hashes = 0.0f64;
+        for sample in &self.samples {
+            pool_hashes += sample.expected_hashes;
+            *by_worker_hashes.entry(sample.worker.clone()).or_insert(0.0) += sample.expected_hashes;
+        }
+        let pool_hashrate_hps = pool_hashes / window_sec as f64;
+        let mut top_workers = by_worker_hashes
+            .into_iter()
+            .map(|(worker, hashes)| {
+                let counters = self.workers.get(&worker).cloned().unwrap_or_default();
+                StratumWorkerHashrateSnapshot {
+                    worker,
+                    hashrate_hps: hashes / window_sec as f64,
+                    accepted_total: counters.accepted_total,
+                    rejected_total: counters.rejected_total,
+                    blocks_found_total: counters.blocks_found_total,
+                    last_share_unix_sec: counters.last_share_unix_sec,
+                }
+            })
+            .collect::<Vec<_>>();
+        top_workers.sort_by(|a, b| b.hashrate_hps.total_cmp(&a.hashrate_hps));
+        if top_workers.len() > STRATUM_TOP_WORKERS_LIMIT {
+            top_workers.truncate(STRATUM_TOP_WORKERS_LIMIT);
+        }
+        let workers_active = top_workers
+            .iter()
+            .filter(|entry| entry.hashrate_hps > 0.0)
+            .count();
+        StratumServerTelemetrySnapshot {
+            timestamp_unix_sec: now_unix_sec,
+            active_clients,
+            workers_tracked_total: self.workers.len(),
+            workers_active,
+            hashrate_window_sec: window_sec,
+            pool_hashrate_hps,
+            accepted_total: self.accepted_total,
+            rejected_total: self.rejected_total,
+            blocks_found_total: self.blocks_found_total,
+            top_workers,
+        }
+    }
+}
+
 fn relay_fee_hint(tx: &Transaction) -> u64 {
     let txid = tx.txid();
     let mut hint = [0u8; 8];
     hint.copy_from_slice(&txid.0[..8]);
     u64::from_be_bytes(hint).saturating_add(1)
+}
+
+fn relay_mark_outbound_worker_start(state: &Arc<Mutex<RelayServerState>>) {
+    if let Ok(mut guard) = state.lock() {
+        guard.outbound_worker_starts_total = guard.outbound_worker_starts_total.saturating_add(1);
+    }
+}
+
+fn relay_mark_outbound_supervisor_start(state: &Arc<Mutex<RelayServerState>>) {
+    if let Ok(mut guard) = state.lock() {
+        guard.outbound_supervisor_starts_total =
+            guard.outbound_supervisor_starts_total.saturating_add(1);
+    }
 }
 
 fn relay_forget_pending_orphan_block(state: &mut RelayServerState, hash: Hash256) {
@@ -4352,9 +4546,7 @@ fn relay_merge_known_peer_addresses(state: &mut RelayServerState, incoming: &[Pe
     }
     let mut merged = by_addr.into_values().collect::<Vec<_>>();
     merged.sort_unstable_by(|a, b| a.address.cmp(&b.address));
-    if merged.len() > 2_000 {
-        merged.truncate(2_000);
-    }
+    merged.truncate(2_000);
     state.known_peer_addresses = merged;
 }
 
@@ -4687,9 +4879,7 @@ fn load_relay_known_peer_addresses(
         })
         .collect::<Vec<_>>();
     peers.sort_unstable_by(|a, b| a.address.cmp(&b.address));
-    if peers.len() > 2_000 {
-        peers.truncate(2_000);
-    }
+    peers.truncate(2_000);
     Ok(peers)
 }
 
@@ -4799,6 +4989,7 @@ fn run_relay_outbound_worker(
         return;
     }
     let redial_delay = Duration::from_secs(redial_sec.max(1));
+    relay_mark_outbound_worker_start(&state);
     loop {
         if stop_flag.load(Ordering::Relaxed) {
             break;
@@ -4961,6 +5152,7 @@ async fn run_relay_outbound_worker_async(
     write_timeout_sec: u64,
     redial_sec: u64,
 ) {
+    relay_mark_outbound_worker_start(&state);
     if target.trim().is_empty() {
         return;
     }
@@ -5030,6 +5222,7 @@ async fn run_relay_outbound_supervisor_async(
     redial_sec: u64,
 ) {
     let redial_delay = Duration::from_secs(redial_sec.max(1));
+    relay_mark_outbound_supervisor_start(&state);
     let mut workers = JoinSet::<()>::new();
     let mut worker_targets = HashSet::<String>::new();
 
@@ -5185,7 +5378,8 @@ fn run_relay_peer_session<IO: Read + Write>(
                     stop: None,
                 },
             ];
-            if !relay_send_messages_until_closed(stream, &startup, &framing)? {
+            let startup_sent = relay_send_messages_until_closed(stream, &startup, &framing)?;
+            if !startup_sent {
                 return Ok(());
             }
         }
@@ -6774,6 +6968,7 @@ struct StratumServerContext {
     secure_expected_remote_static_public_key: Option<[u8; 32]>,
     template_provider_addr: Option<String>,
     job_declarator_addr: Option<String>,
+    telemetry_state: Arc<Mutex<StratumPoolTelemetryState>>,
 }
 
 fn lock_runtime<'a>(
@@ -6985,6 +7180,7 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
     let mut last_tip_hash = load_runtime_tip_hash(&ctx)?;
     let mut payout_key_hash20 = ctx.cfg.genesis_reward_key_hash20()?;
     let mut payout_label = stratum_coinbase_label(session.channel_id(), "default");
+    let mut worker_label = "default".to_owned();
 
     loop {
         match read_sv2_message_async(&mut stream, secure_transport.as_mut(), read_timeout).await? {
@@ -7026,6 +7222,7 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
                     match event {
                         SessionEvent::SetupAccepted => {}
                         SessionEvent::ChannelOpened { user, .. } => {
+                            worker_label = StratumPoolTelemetryState::sanitize_worker_label(&user);
                             if let Some(parsed) = stratum_user_payout_key_hash20(&user) {
                                 payout_key_hash20 = parsed;
                                 payout_label = stratum_coinbase_label(session.channel_id(), &user);
@@ -7053,6 +7250,13 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
                             is_block,
                             ..
                         } => {
+                            record_stratum_share_accepted(
+                                &ctx,
+                                &worker_label,
+                                session.share_target(),
+                                is_block,
+                                ntime,
+                            );
                             if should_process_share_as_block(is_block) {
                                 let Some(work) = jobs.get(&job_id).cloned() else {
                                     continue;
@@ -7115,7 +7319,9 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
                                 }
                             }
                         }
-                        SessionEvent::ShareRejected { .. } => {}
+                        SessionEvent::ShareRejected { .. } => {
+                            record_stratum_share_rejected(&ctx, &worker_label);
+                        }
                         SessionEvent::ShareTargetChanged { .. } => {}
                         SessionEvent::ChannelClosed { .. } => {
                             session.close();
@@ -7383,6 +7589,46 @@ fn should_process_share_as_block(is_block: bool) -> bool {
 
 fn should_reissue_job_for_channel(channel_id: u32, active_channel_id: u32) -> bool {
     channel_id == active_channel_id
+}
+
+fn expected_hashes_for_target(target: Target) -> f64 {
+    chainwork_for_target(target)
+        .to_f64()
+        .unwrap_or(0.0)
+        .max(0.0)
+}
+
+fn estimate_network_hashrate_hps_from_target(target: Target, target_block_time_sec: u64) -> f64 {
+    let interval_sec = target_block_time_sec.max(1) as f64;
+    expected_hashes_for_target(target) / interval_sec
+}
+
+fn estimate_network_hashrate_hps(runtime: &ChainRuntime) -> f64 {
+    estimate_network_hashrate_hps_from_target(
+        runtime.tip_header().target,
+        runtime.config().target_block_time_sec,
+    )
+}
+
+fn record_stratum_share_accepted(
+    ctx: &StratumServerContext,
+    worker: &str,
+    share_target: Target,
+    is_block: bool,
+    fallback_unix_sec: u64,
+) {
+    let now_unix_sec = current_unix_sec().unwrap_or(fallback_unix_sec);
+    let expected_hashes = expected_hashes_for_target(share_target);
+    if let Ok(mut telemetry) = ctx.telemetry_state.lock() {
+        telemetry.register_accepted_share(worker, now_unix_sec, expected_hashes, is_block);
+    }
+}
+
+fn record_stratum_share_rejected(ctx: &StratumServerContext, worker: &str) {
+    let now_unix_sec = current_unix_sec().unwrap_or(0);
+    if let Ok(mut telemetry) = ctx.telemetry_state.lock() {
+        telemetry.register_rejected_share(worker, now_unix_sec);
+    }
 }
 
 fn stratum_user_payout_key_hash20(user: &str) -> Option<[u8; 20]> {
@@ -8061,6 +8307,13 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
         "Secure expected remote static key configured: {}",
         secure_expected_remote_static_public_key.is_some()
     );
+    if let Some(path) = args.telemetry_out.as_ref() {
+        println!("Telemetry out: {}", path.display());
+        println!(
+            "Telemetry snapshots every {}s",
+            args.telemetry_every_sec.max(1)
+        );
+    }
     if let Some(addr) = &args.template_provider_addr {
         println!("Template provider service: {addr}");
     }
@@ -8099,6 +8352,7 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
         secure_expected_remote_static_public_key,
         template_provider_addr: args.template_provider_addr.clone(),
         job_declarator_addr: args.job_declarator_addr.clone(),
+        telemetry_state: Arc::new(Mutex::new(StratumPoolTelemetryState::default())),
     };
     let worker_threads = std::thread::available_parallelism()
         .map(|n| n.get().max(2))
@@ -8117,6 +8371,40 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
             .map_err(|e| NodeError::Runtime(format!("stratum bind failed on {bind}: {e}")))?;
         let permits = Arc::new(Semaphore::new(max_active_clients));
         let mut workers = JoinSet::<Result<(), NodeError>>::new();
+        let telemetry_stop = Arc::new(AtomicBool::new(false));
+        let telemetry_handle = if let Some(path) = args.telemetry_out.clone() {
+            let telemetry_state = ctx.telemetry_state.clone();
+            let active_clients = ctx.active_clients.clone();
+            let stop = telemetry_stop.clone();
+            let every = Duration::from_secs(args.telemetry_every_sec.max(1));
+            Some(tokio::spawn(async move {
+                while !stop.load(Ordering::Relaxed) {
+                    sleep(every).await;
+                    let now_unix_sec = match current_unix_sec() {
+                        Ok(now) => now,
+                        Err(err) => {
+                            eprintln!("warning: stratum telemetry timestamp failed: {err}");
+                            continue;
+                        }
+                    };
+                    let snapshot = {
+                        let mut state = match telemetry_state.lock() {
+                            Ok(state) => state,
+                            Err(_) => {
+                                eprintln!("warning: stratum telemetry state mutex poisoned");
+                                continue;
+                            }
+                        };
+                        state.snapshot(active_clients.load(Ordering::Relaxed), now_unix_sec)
+                    };
+                    if let Err(err) = append_jsonl_record(&path, &snapshot, "stratum telemetry") {
+                        eprintln!("warning: failed to write stratum telemetry snapshot: {err}");
+                    }
+                }
+            }))
+        } else {
+            None
+        };
         let mut served = 0u32;
 
         loop {
@@ -8166,6 +8454,11 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
                     )));
                 }
             }
+        }
+        telemetry_stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = telemetry_handle {
+            handle.abort();
+            let _ = handle.await;
         }
         Ok(())
     })
@@ -9348,6 +9641,7 @@ struct RpcEventSnapshot {
     tip_hash: String,
     utxo_count: usize,
     cumulative_work: String,
+    network_hashrate_hps: f64,
     mempool_available: bool,
     mempool_tx_count: usize,
     relay_active_peers: Option<usize>,
@@ -9355,6 +9649,10 @@ struct RpcEventSnapshot {
     relay_mempool_len: Option<usize>,
     relay_snapshot_age_sec: Option<u64>,
     sync_lag_blocks: Option<u64>,
+    stratum_active_clients: Option<usize>,
+    stratum_workers_active: Option<usize>,
+    stratum_pool_hashrate_hps: Option<f64>,
+    stratum_snapshot_age_sec: Option<u64>,
     last_block_age_sec: u64,
     unix_sec: u64,
 }
@@ -9571,6 +9869,7 @@ fn build_rpc_event_snapshot(
     runtime: &ChainRuntime,
     mempool_db_path: &Path,
     relay_telemetry_path: Option<&Path>,
+    stratum_telemetry_path: Option<&Path>,
 ) -> Result<RpcEventSnapshot, NodeError> {
     let (mempool_available, mempool_tx_count) = mempool_tx_count_from_db(mempool_db_path)?;
     let now_unix_sec = current_unix_sec()?;
@@ -9589,6 +9888,23 @@ fn build_rpc_event_snapshot(
         };
     let sync_lag_blocks =
         relay_tip_height.map(|relay_tip| runtime.tip_height().abs_diff(relay_tip));
+    let (
+        stratum_active_clients,
+        stratum_workers_active,
+        stratum_pool_hashrate_hps,
+        stratum_snapshot_age_sec,
+    ) = match stratum_telemetry_path {
+        Some(path) => match load_latest_jsonl_record::<StratumServerTelemetrySnapshot>(path)? {
+            Some(snapshot) => (
+                Some(snapshot.active_clients),
+                Some(snapshot.workers_active),
+                Some(snapshot.pool_hashrate_hps),
+                Some(now_unix_sec.saturating_sub(snapshot.timestamp_unix_sec)),
+            ),
+            None => (None, None, None, None),
+        },
+        None => (None, None, None, None),
+    };
     let last_block_age_sec = now_unix_sec.saturating_sub(runtime.tip_header().timestamp);
     Ok(RpcEventSnapshot {
         network_id: cfg.network_id.clone(),
@@ -9596,6 +9912,7 @@ fn build_rpc_event_snapshot(
         tip_hash: runtime.tip_hash().to_hex(),
         utxo_count: runtime.utxo_len(),
         cumulative_work: runtime.cumulative_work().to_str_radix(10),
+        network_hashrate_hps: estimate_network_hashrate_hps(runtime),
         mempool_available,
         mempool_tx_count,
         relay_active_peers,
@@ -9603,6 +9920,10 @@ fn build_rpc_event_snapshot(
         relay_mempool_len,
         relay_snapshot_age_sec,
         sync_lag_blocks,
+        stratum_active_clients,
+        stratum_workers_active,
+        stratum_pool_hashrate_hps,
+        stratum_snapshot_age_sec,
         last_block_age_sec,
         unix_sec: now_unix_sec,
     })
@@ -10107,12 +10428,14 @@ fn reap_finished_rpc_event_workers(handles: &mut Vec<thread::JoinHandle<()>>) {
     *handles = pending;
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_rpc_events_worker(
     stream: &mut impl Write,
     cfg: ChainConfig,
     runtime_db_path: PathBuf,
     mempool_db_path: PathBuf,
     relay_telemetry_path: Option<PathBuf>,
+    stratum_telemetry_path: Option<PathBuf>,
     stop_flag: Arc<AtomicBool>,
     interval: Duration,
 ) -> Result<(), NodeError> {
@@ -10150,6 +10473,7 @@ fn run_rpc_events_worker(
             &runtime,
             &mempool_db_path,
             relay_telemetry_path.as_deref(),
+            stratum_telemetry_path.as_deref(),
         )?;
         let payload = serde_json::to_string(&snapshot)
             .map_err(|e| NodeError::Runtime(format!("events serialization failed: {e}")))?;
@@ -10175,6 +10499,7 @@ fn run_rpc_serve_inner(
         bind,
         ui_dir,
         relay_telemetry,
+        stratum_telemetry,
         mine_blocks,
         interval_sec,
         max_nonce,
@@ -10210,12 +10535,15 @@ fn run_rpc_serve_inner(
         runtime.tip_hash()
     );
     println!(
-        "Endpoints: GET /health, /status, /block/<height>, /tx/<height>/<index>, /txid/<txid>, /mempool, /events; POST /wallet/new, /wallet/address, /wallet/decode, /wallet/balance, /wallet/balance-by-address, /wallet/balance-history-by-address, /wallet/send-preview, /wallet/send, /tx/submit, /wallet/qr"
+        "Endpoints: GET /health, /status, /block/<height>, /tx/<height>/<index>, /txid/<txid>, /mempool, /events, /pool/status, /pool/worker/<label>; POST /wallet/new, /wallet/address, /wallet/decode, /wallet/balance, /wallet/balance-by-address, /wallet/balance-history-by-address, /wallet/send-preview, /wallet/send, /tx/submit, /wallet/qr"
     );
     println!("UI assets directory: {}", ui_dir.display());
     println!("Mempool DB source: {}", mempool_db_path.display());
     if let Some(path) = relay_telemetry.as_ref() {
         println!("Relay telemetry source: {}", path.display());
+    }
+    if let Some(path) = stratum_telemetry.as_ref() {
+        println!("Stratum telemetry source: {}", path.display());
     }
     if max_requests_reached(max_requests, max_requests) {
         println!("Max requests before exit: {}", max_requests);
@@ -10267,6 +10595,7 @@ fn run_rpc_serve_inner(
             let runtime_db_path_clone = runtime_db_path.clone();
             let mempool_db_path_clone = mempool_db_path.clone();
             let relay_telemetry_clone = relay_telemetry.clone();
+            let stratum_telemetry_clone = stratum_telemetry.clone();
             let stop_clone = events_stop_flag.clone();
             events_workers.push(thread::spawn(move || {
                 let mut stream = stream;
@@ -10276,6 +10605,7 @@ fn run_rpc_serve_inner(
                     runtime_db_path_clone,
                     mempool_db_path_clone,
                     relay_telemetry_clone,
+                    stratum_telemetry_clone,
                     stop_clone,
                     events_interval,
                 ) {
@@ -10297,12 +10627,30 @@ fn run_rpc_serve_inner(
         let (status, body) = if rpc_exact_route_matches(method, path, "GET", "/health") {
             ("200 OK", "{\"ok\":true}".to_owned())
         } else if rpc_exact_route_matches(method, path, "GET", "/status") {
+            let (stratum_active_clients, stratum_workers_active, stratum_pool_hashrate_hps) =
+                match stratum_telemetry.as_ref() {
+                    Some(path) => {
+                        match load_latest_jsonl_record::<StratumServerTelemetrySnapshot>(path)? {
+                            Some(snapshot) => (
+                                Some(snapshot.active_clients),
+                                Some(snapshot.workers_active),
+                                Some(snapshot.pool_hashrate_hps),
+                            ),
+                            None => (None, None, None),
+                        }
+                    }
+                    None => (None, None, None),
+                };
             let payload = StatusResponse {
                 network_id: cfg.network_id.clone(),
                 tip_height: runtime.tip_height(),
                 tip_hash: runtime.tip_hash().to_hex(),
                 utxo_count: runtime.utxo_len(),
                 cumulative_work: runtime.cumulative_work().to_str_radix(10),
+                network_hashrate_hps: estimate_network_hashrate_hps(&runtime),
+                stratum_active_clients,
+                stratum_workers_active,
+                stratum_pool_hashrate_hps,
             };
             match to_pretty_json(&payload) {
                 Ok(body) => ("200 OK", body),
@@ -10310,6 +10658,72 @@ fn run_rpc_serve_inner(
                     "500 Internal Server Error",
                     json_error_body(&format!("status serialization failed: {e}")),
                 ),
+            }
+        } else if rpc_exact_route_matches(method, path, "GET", "/pool/status") {
+            let payload = match stratum_telemetry.as_ref() {
+                Some(path) => load_latest_jsonl_record::<StratumServerTelemetrySnapshot>(path)?,
+                None => None,
+            };
+            match payload {
+                Some(snapshot) => match to_pretty_json(&snapshot) {
+                    Ok(body) => ("200 OK", body),
+                    Err(e) => (
+                        "500 Internal Server Error",
+                        json_error_body(&format!("pool status serialization failed: {e}")),
+                    ),
+                },
+                None => (
+                    "404 Not Found",
+                    json_error_body("stratum telemetry snapshot not available"),
+                ),
+            }
+        } else if is_get_method(method) && path.starts_with("/pool/worker/") {
+            let worker_label = path
+                .strip_prefix("/pool/worker/")
+                .unwrap_or_default()
+                .trim();
+            if worker_label.is_empty() {
+                (
+                    "400 Bad Request",
+                    json_error_body("worker label must not be empty"),
+                )
+            } else {
+                let payload = match stratum_telemetry.as_ref() {
+                    Some(path) => load_latest_jsonl_record::<StratumServerTelemetrySnapshot>(path)?,
+                    None => None,
+                };
+                match payload {
+                    Some(snapshot) => {
+                        let normalized =
+                            StratumPoolTelemetryState::sanitize_worker_label(worker_label);
+                        if let Some(worker) = snapshot
+                            .top_workers
+                            .iter()
+                            .find(|entry| entry.worker == normalized)
+                        {
+                            match to_pretty_json(worker) {
+                                Ok(body) => ("200 OK", body),
+                                Err(e) => (
+                                    "500 Internal Server Error",
+                                    json_error_body(&format!(
+                                        "worker status serialization failed: {e}"
+                                    )),
+                                ),
+                            }
+                        } else {
+                            (
+                                "404 Not Found",
+                                json_error_body(&format!(
+                                    "worker {normalized} not found in latest snapshot"
+                                )),
+                            )
+                        }
+                    }
+                    None => (
+                        "404 Not Found",
+                        json_error_body("stratum telemetry snapshot not available"),
+                    ),
+                }
             }
         } else if rpc_exact_route_matches(method, path, "GET", "/mempool") {
             let (mempool_tx_count, mempool_txids) = if mempool_db_path.exists() {
@@ -12524,6 +12938,109 @@ mod tests {
     }
 
     #[test]
+    fn relay_send_message_or_closed_async_classifies_closed_and_fatal_errors() {
+        struct ErrorAsyncWriter {
+            kind: std::io::ErrorKind,
+        }
+
+        impl tokio::io::AsyncWrite for ErrorAsyncWriter {
+            fn poll_write(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                _buf: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                std::task::Poll::Ready(Err(std::io::Error::from(self.kind)))
+            }
+
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        rt.block_on(async {
+            let framing = FramingConfig::default();
+            let message = WireMessage::Ping { nonce: 11 };
+
+            let mut closed = ErrorAsyncWriter {
+                kind: std::io::ErrorKind::BrokenPipe,
+            };
+            let sent =
+                super::relay_send_message_or_closed_async(&mut closed, &message, &framing, 1)
+                    .await
+                    .expect("closed-like io must map to graceful false");
+            assert!(!sent);
+
+            let mut denied = ErrorAsyncWriter {
+                kind: std::io::ErrorKind::PermissionDenied,
+            };
+            let err = super::relay_send_message_or_closed_async(&mut denied, &message, &framing, 1)
+                .await
+                .expect_err("fatal io must bubble up");
+            assert!(err.to_string().contains("io error"));
+        });
+    }
+
+    #[test]
+    fn relay_send_messages_until_closed_async_stops_on_closed_writer() {
+        struct ErrorAsyncWriter;
+        impl tokio::io::AsyncWrite for ErrorAsyncWriter {
+            fn poll_write(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                _buf: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                std::task::Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)))
+            }
+
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        rt.block_on(async {
+            let framing = FramingConfig::default();
+            let messages = vec![
+                WireMessage::Ping { nonce: 1 },
+                WireMessage::Ping { nonce: 2 },
+            ];
+            let mut closed = ErrorAsyncWriter;
+            let sent_all =
+                super::relay_send_messages_until_closed_async(&mut closed, &messages, &framing, 1)
+                    .await
+                    .expect("closed stream should return false");
+            assert!(!sent_all);
+        });
+    }
+
+    #[test]
     fn map_sv2_read_result_handles_timeout_and_fatal_errors() {
         let timeout = super::map_sv2_read_result(Err(scam_stratum::StratumError::Io(
             std::io::Error::from(std::io::ErrorKind::TimedOut),
@@ -12800,6 +13317,9 @@ mod tests {
             secure_expected_remote_static_public_key: None,
             template_provider_addr: None,
             job_declarator_addr: None,
+            telemetry_state: std::sync::Arc::new(std::sync::Mutex::new(
+                super::StratumPoolTelemetryState::default(),
+            )),
         };
 
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -14001,6 +14521,7 @@ mod tests {
             runtime_db,
             mempool_db,
             None,
+            None,
             stop,
             Duration::from_millis(1),
         )
@@ -14249,6 +14770,8 @@ mod tests {
             secure_expected_remote_static_pubkey_hex: None,
             template_provider_addr: None,
             job_declarator_addr: None,
+            telemetry_out: None,
+            telemetry_every_sec: 1,
         })
         .expect_err("share target below min must fail");
         assert!(
@@ -14284,6 +14807,8 @@ mod tests {
             secure_expected_remote_static_pubkey_hex: None,
             template_provider_addr: None,
             job_declarator_addr: None,
+            telemetry_out: None,
+            telemetry_every_sec: 1,
         })
         .expect_err("share target above max must fail");
         assert!(
@@ -14319,6 +14844,8 @@ mod tests {
             secure_expected_remote_static_pubkey_hex: None,
             template_provider_addr: None,
             job_declarator_addr: None,
+            telemetry_out: None,
+            telemetry_every_sec: 1,
         })
         .expect_err("idle timeout validation must trigger after valid share bounds");
         assert!(
@@ -14930,7 +15457,7 @@ mod tests {
         fs::create_dir_all(&work_dir).expect("mkdir");
 
         let missing_mempool = work_dir.join("missing-mempool.redb");
-        let missing = super::build_rpc_event_snapshot(&cfg, &runtime, &missing_mempool, None)
+        let missing = super::build_rpc_event_snapshot(&cfg, &runtime, &missing_mempool, None, None)
             .expect("snapshot without mempool db");
         assert_eq!(missing.network_id, cfg.network_id);
         assert_eq!(missing.tip_height, runtime.tip_height());
@@ -14948,7 +15475,7 @@ mod tests {
             entries: Vec::new(),
         };
         save_mempool_db(&mempool_db, &snapshot).expect("persist empty mempool");
-        let present = super::build_rpc_event_snapshot(&cfg, &runtime, &mempool_db, None)
+        let present = super::build_rpc_event_snapshot(&cfg, &runtime, &mempool_db, None, None)
             .expect("snapshot with mempool db");
         assert!(present.mempool_available);
         assert_eq!(present.mempool_tx_count, 0);
@@ -15088,6 +15615,7 @@ mod tests {
             bind: addr.clone(),
             ui_dir,
             relay_telemetry: None,
+            stratum_telemetry: None,
             mine_blocks: 0,
             interval_sec: 120,
             max_nonce: 500_000,
@@ -15140,6 +15668,7 @@ mod tests {
             bind: addr.clone(),
             ui_dir,
             relay_telemetry: None,
+            stratum_telemetry: None,
             mine_blocks: 0,
             interval_sec: 120,
             max_nonce: 500_000,
@@ -15174,8 +15703,116 @@ mod tests {
         assert!(wallet_send.starts_with("HTTP/1.1 400 Bad Request"));
         let wallet_qr = send_http_json_post(&addr, "/wallet/qr", "{\"address\":\"scam\"}");
         assert!(wallet_qr.starts_with("HTTP/1.1 200 OK"));
+        let pool_status = send_http_request(
+            &addr,
+            "GET /pool/status HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(pool_status.starts_with("HTTP/1.1 404 Not Found"));
+        assert!(pool_status.contains("stratum telemetry snapshot not available"));
 
         stop_rpc_server_for_test(server_shutdown, server, "rpc core routes server");
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
+    fn run_rpc_serve_pool_status_and_worker_routes_use_stratum_telemetry_snapshot() {
+        let _net_guard = network_test_guard();
+        let Some(addr) = allocate_local_addr() else {
+            return;
+        };
+        let work_dir = temp_dir("test-rpc-serve-pool-routes");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let config_path = work_dir.join("devnet.toml");
+        fs::write(&config_path, include_str!("../../../config/devnet.toml")).expect("write cfg");
+        let runtime_db = work_dir.join("runtime.redb");
+        let ui_dir = work_dir.join("ui");
+        fs::create_dir_all(&ui_dir).expect("mkdir ui");
+        fs::write(ui_dir.join("index.html"), "<html>ui</html>").expect("write ui");
+        let stratum_telemetry = work_dir.join("stratum.telemetry.jsonl");
+
+        let snapshot = super::StratumServerTelemetrySnapshot {
+            timestamp_unix_sec: super::current_unix_sec().unwrap_or(1),
+            active_clients: 3,
+            workers_tracked_total: 2,
+            workers_active: 2,
+            hashrate_window_sec: 120,
+            pool_hashrate_hps: 42_000.0,
+            accepted_total: 11,
+            rejected_total: 2,
+            blocks_found_total: 1,
+            top_workers: vec![
+                super::StratumWorkerHashrateSnapshot {
+                    worker: "miner.alpha".to_owned(),
+                    hashrate_hps: 31_000.0,
+                    accepted_total: 9,
+                    rejected_total: 1,
+                    blocks_found_total: 1,
+                    last_share_unix_sec: super::current_unix_sec().unwrap_or(1),
+                },
+                super::StratumWorkerHashrateSnapshot {
+                    worker: "miner.beta".to_owned(),
+                    hashrate_hps: 11_000.0,
+                    accepted_total: 2,
+                    rejected_total: 1,
+                    blocks_found_total: 0,
+                    last_share_unix_sec: super::current_unix_sec().unwrap_or(1),
+                },
+            ],
+        };
+        super::append_jsonl_record(&stratum_telemetry, &snapshot, "test stratum telemetry")
+            .expect("write stratum telemetry");
+
+        let (server_shutdown, server) = spawn_rpc_server_for_test(RpcServeArgs {
+            network: Network::Devnet,
+            config: Some(config_path),
+            runtime_db: Some(runtime_db),
+            bind: addr.clone(),
+            ui_dir,
+            relay_telemetry: None,
+            stratum_telemetry: Some(stratum_telemetry),
+            mine_blocks: 0,
+            interval_sec: 120,
+            max_nonce: 500_000,
+            max_requests: 0,
+        });
+
+        let status = send_http_request(&addr, "GET /status HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        assert!(status.starts_with("HTTP/1.1 200 OK"));
+        assert!(status.contains("\"stratum_active_clients\": 3"));
+        assert!(status.contains("\"stratum_workers_active\": 2"));
+        assert!(status.contains("\"stratum_pool_hashrate_hps\": 42000.0"));
+
+        let pool_status = send_http_request(
+            &addr,
+            "GET /pool/status HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(pool_status.starts_with("HTTP/1.1 200 OK"));
+        assert!(pool_status.contains("\"pool_hashrate_hps\": 42000.0"));
+        assert!(pool_status.contains("\"worker\": \"miner.alpha\""));
+
+        let worker = send_http_request(
+            &addr,
+            "GET /pool/worker/miner.alpha HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(worker.starts_with("HTTP/1.1 200 OK"));
+        assert!(worker.contains("\"worker\": \"miner.alpha\""));
+        assert!(worker.contains("\"hashrate_hps\": 31000.0"));
+
+        let unknown_worker = send_http_request(
+            &addr,
+            "GET /pool/worker/miner.gamma HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(unknown_worker.starts_with("HTTP/1.1 404 Not Found"));
+        assert!(unknown_worker.contains("not found"));
+
+        let missing_worker = send_http_request(
+            &addr,
+            "GET /pool/worker/ HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(missing_worker.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(missing_worker.contains("worker label must not be empty"));
+
+        stop_rpc_server_for_test(server_shutdown, server, "rpc pool routes server");
         let _ = fs::remove_dir_all(work_dir);
     }
 
@@ -15201,6 +15838,7 @@ mod tests {
             bind: addr.clone(),
             ui_dir,
             relay_telemetry: None,
+            stratum_telemetry: None,
             mine_blocks: 0,
             interval_sec: 120,
             max_nonce: 500_000,
@@ -15231,6 +15869,7 @@ mod tests {
             "tip_hash",
             "utxo_count",
             "cumulative_work",
+            "network_hashrate_hps",
             "mempool_available",
             "mempool_tx_count",
             "relay_active_peers",
@@ -15238,6 +15877,10 @@ mod tests {
             "relay_mempool_len",
             "relay_snapshot_age_sec",
             "sync_lag_blocks",
+            "stratum_active_clients",
+            "stratum_workers_active",
+            "stratum_pool_hashrate_hps",
+            "stratum_snapshot_age_sec",
             "last_block_age_sec",
             "unix_sec",
         ] {
@@ -15303,6 +15946,7 @@ mod tests {
             bind: addr.clone(),
             ui_dir: work_dir.join("ui"),
             relay_telemetry: None,
+            stratum_telemetry: None,
             mine_blocks: 0,
             interval_sec: 120,
             max_nonce: 500_000,
@@ -15413,6 +16057,7 @@ mod tests {
             bind: "invalid-bind".to_owned(),
             ui_dir: work_dir.join("ui"),
             relay_telemetry: None,
+            stratum_telemetry: None,
             mine_blocks: 0,
             interval_sec: 120,
             max_nonce: 500_000,
@@ -15461,6 +16106,7 @@ mod tests {
             bind: addr.clone(),
             ui_dir,
             relay_telemetry: None,
+            stratum_telemetry: None,
             mine_blocks: 0,
             interval_sec: 120,
             max_nonce: 500_000,
@@ -15627,6 +16273,8 @@ mod tests {
             secure_expected_remote_static_pubkey_hex: None,
             template_provider_addr: None,
             job_declarator_addr: None,
+            telemetry_out: None,
+            telemetry_every_sec: 1,
         })
         .expect_err("serve must reject missing noise static key");
         assert!(
@@ -16708,6 +17356,105 @@ mod tests {
             "relay outbound async supervisor peer",
         );
         let _ = fs::remove_dir_all(peers_dir);
+    }
+
+    #[test]
+    fn run_relay_outbound_worker_async_marks_start_counter() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let relay = RelayAdmissionState {
+            mempool: Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip: GossipEngine::new(64).expect("gossip"),
+        };
+        let state =
+            std::sync::Arc::new(std::sync::Mutex::new(RelayServerState::new(runtime, relay)));
+        let active = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let next_peer = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        rt.block_on(async {
+            super::run_relay_outbound_worker_async(
+                "127.0.0.1:20000".to_owned(),
+                "127.0.0.1:18444".to_owned(),
+                stop.clone(),
+                next_peer,
+                state.clone(),
+                active,
+                cfg,
+                temp_dir("test-outbound-worker-counter-runtime").join("runtime.redb"),
+                temp_dir("test-outbound-worker-counter-mempool").join("mempool.redb"),
+                64,
+                8,
+                1,
+                1,
+                1,
+            )
+            .await;
+        });
+        let starts = state
+            .lock()
+            .expect("state lock")
+            .outbound_worker_starts_total;
+        assert_eq!(starts, 1);
+    }
+
+    #[test]
+    fn run_relay_outbound_supervisor_async_marks_start_counter() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let relay = RelayAdmissionState {
+            mempool: Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip: GossipEngine::new(64).expect("gossip"),
+        };
+        let state =
+            std::sync::Arc::new(std::sync::Mutex::new(RelayServerState::new(runtime, relay)));
+        let active = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let next_peer = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let peers_dir = temp_dir("test-outbound-supervisor-counter-peers");
+        std::fs::create_dir_all(&peers_dir).expect("mkdir peers");
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        rt.block_on(async {
+            super::run_relay_outbound_supervisor_async(
+                stop.clone(),
+                peers_dir.clone(),
+                "127.0.0.1:18444".to_owned(),
+                next_peer,
+                state.clone(),
+                active,
+                cfg,
+                temp_dir("test-outbound-supervisor-counter-runtime").join("runtime.redb"),
+                temp_dir("test-outbound-supervisor-counter-mempool").join("mempool.redb"),
+                64,
+                8,
+                1,
+                1,
+                1,
+            )
+            .await;
+        });
+        let starts = state
+            .lock()
+            .expect("state lock")
+            .outbound_supervisor_starts_total;
+        assert_eq!(starts, 1);
+        let _ = std::fs::remove_dir_all(peers_dir);
     }
 
     #[test]

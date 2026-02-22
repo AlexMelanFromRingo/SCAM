@@ -12,6 +12,9 @@ const statRelayPeers = document.getElementById("statRelayPeers");
 const statSyncLag = document.getElementById("statSyncLag");
 const statLastBlockAge = document.getElementById("statLastBlockAge");
 const statRelayMempool = document.getElementById("statRelayMempool");
+const statNetworkHashrate = document.getElementById("statNetworkHashrate");
+const statPoolHashrate = document.getElementById("statPoolHashrate");
+const statPoolWorkers = document.getElementById("statPoolWorkers");
 const latestRange = document.getElementById("latestRange");
 const latestBlocksBody = document.getElementById("latestBlocksBody");
 
@@ -55,6 +58,18 @@ function formatAgeSeconds(sec) {
   if (n < 60) return `${Math.floor(n)}s`;
   if (n < 3600) return `${Math.floor(n / 60)}m ${Math.floor(n % 60)}s`;
   return `${Math.floor(n / 3600)}h ${Math.floor((n % 3600) / 60)}m`;
+}
+
+function formatHashrate(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0) return "-";
+  if (n >= 1e18) return `${(n / 1e18).toFixed(2)} EH/s`;
+  if (n >= 1e15) return `${(n / 1e15).toFixed(2)} PH/s`;
+  if (n >= 1e12) return `${(n / 1e12).toFixed(2)} TH/s`;
+  if (n >= 1e9) return `${(n / 1e9).toFixed(2)} GH/s`;
+  if (n >= 1e6) return `${(n / 1e6).toFixed(2)} MH/s`;
+  if (n >= 1e3) return `${(n / 1e3).toFixed(2)} KH/s`;
+  return `${n.toFixed(2)} H/s`;
 }
 
 function formatJson(data) {
@@ -130,6 +145,12 @@ async function loadStatus() {
   statSyncLag.textContent = "-";
   statLastBlockAge.textContent = "-";
   statRelayMempool.textContent = "-";
+  statNetworkHashrate.textContent = formatHashrate(status.network_hashrate_hps);
+  statPoolHashrate.textContent = formatHashrate(status.stratum_pool_hashrate_hps);
+  statPoolWorkers.textContent =
+    status.stratum_workers_active === null || status.stratum_workers_active === undefined
+      ? "-"
+      : `${status.stratum_workers_active}`;
   return status;
 }
 
@@ -224,6 +245,12 @@ function applyLiveSnapshot(snapshot) {
     snapshot.relay_mempool_len === null || snapshot.relay_mempool_len === undefined
       ? "-"
       : `${snapshot.relay_mempool_len}`;
+  statNetworkHashrate.textContent = formatHashrate(snapshot.network_hashrate_hps);
+  statPoolHashrate.textContent = formatHashrate(snapshot.stratum_pool_hashrate_hps);
+  statPoolWorkers.textContent =
+    snapshot.stratum_workers_active === null || snapshot.stratum_workers_active === undefined
+      ? "-"
+      : `${snapshot.stratum_workers_active}`;
 
   const tipHeight = Number(snapshot.tip_height);
   if (Number.isFinite(tipHeight) && tipHeight !== state.lastTipHeight) {

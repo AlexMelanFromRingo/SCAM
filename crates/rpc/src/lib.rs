@@ -9,6 +9,10 @@ pub struct StatusResponse {
     pub tip_hash: String,
     pub utxo_count: usize,
     pub cumulative_work: String,
+    pub network_hashrate_hps: f64,
+    pub stratum_active_clients: Option<usize>,
+    pub stratum_workers_active: Option<usize>,
+    pub stratum_pool_hashrate_hps: Option<f64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
