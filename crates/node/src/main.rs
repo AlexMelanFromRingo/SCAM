@@ -1389,13 +1389,30 @@ fn persist_mempool_db_with_retry(
 }
 
 fn next_stratum_job_timestamp(runtime: &ChainRuntime, _cfg: &ChainConfig) -> u64 {
-    const CONSENSUS_MAX_FUTURE_BLOCK_TIME_SEC: u64 = 2 * 60 * 60;
+    const CONSENSUS_MAX_FUTURE_BLOCK_TIME_SEC: u64 = 7_200;
     let tip_ts = runtime.tip_header().timestamp;
     let min_next = tip_ts.saturating_add(1);
     let wall_now = current_unix_sec().unwrap_or(min_next);
     let max_future = wall_now.saturating_add(CONSENSUS_MAX_FUTURE_BLOCK_TIME_SEC);
     let candidate = wall_now;
     std::cmp::max(min_next, candidate.min(max_future))
+}
+
+fn handle_runtime_persist_result(
+    result: Result<(), NodeError>,
+    tip_hash: Hash256,
+) -> Result<(), NodeError> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(err) if is_runtime_db_lock_conflict(&err) => {
+            eprintln!(
+                "warning: runtime db lock contention while persisting mined block; keeping in-memory tip {}",
+                tip_hash
+            );
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
 }
 
 fn run_node(
@@ -6191,21 +6208,15 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
                                 {
                                     let mut runtime = lock_runtime(&ctx.runtime)?;
                                     let _ = runtime.submit_block(block)?;
-                                    match persist_runtime_db_with_retry(
-                                        &runtime,
-                                        &ctx.runtime_db_path,
-                                        80,
-                                        25,
-                                    ) {
-                                        Ok(()) => {}
-                                        Err(err) if is_runtime_db_lock_conflict(&err) => {
-                                            eprintln!(
-                                                "warning: runtime db lock contention while persisting mined block; keeping in-memory tip {}",
-                                                runtime.tip_hash()
-                                            );
-                                        }
-                                        Err(err) => return Err(err),
-                                    }
+                                    handle_runtime_persist_result(
+                                        persist_runtime_db_with_retry(
+                                            &runtime,
+                                            &ctx.runtime_db_path,
+                                            80,
+                                            25,
+                                        ),
+                                        runtime.tip_hash(),
+                                    )?;
                                     last_tip_hash = runtime.tip_hash();
                                 }
                                 if let Err(err) = remove_confirmed_txids_from_mempool_db(
@@ -6292,6 +6303,25 @@ fn write_role_response<T: Serialize, W: Write>(
 
 fn max_requests_reached(max_requests: u32, served: u32) -> bool {
     max_requests > 0 && served >= max_requests
+}
+
+fn rpc_accept_error_should_retry(shutdown_enabled: bool, err_kind: std::io::ErrorKind) -> bool {
+    shutdown_enabled
+        && matches!(
+            err_kind,
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+        )
+}
+
+fn map_rpc_accept_result(
+    accept_result: std::io::Result<(TcpStream, SocketAddr)>,
+    shutdown_enabled: bool,
+) -> Result<Option<(TcpStream, SocketAddr)>, NodeError> {
+    match accept_result {
+        Ok(accepted) => Ok(Some(accepted)),
+        Err(err) if rpc_accept_error_should_retry(shutdown_enabled, err.kind()) => Ok(None),
+        Err(err) => Err(NodeError::Runtime(format!("rpc accept failed: {err}"))),
+    }
 }
 
 fn map_sv2_read_result(
@@ -6585,7 +6615,9 @@ fn validate_tx_for_local_admission(
             continue;
         };
 
-        if prevout.is_coinbase && tip_height < prevout.created_height.saturating_add(maturity) {
+        if prevout.is_coinbase
+            && coinbase_prevout_is_immature(tip_height, prevout.created_height, maturity)
+        {
             return Err(NodeError::Runtime(format!(
                 "input #{input_index} spends immature coinbase (created_height={}, maturity={})",
                 prevout.created_height, maturity
@@ -6633,6 +6665,10 @@ fn validate_tx_for_local_admission(
     }
     let fee = input_sum.saturating_sub(output_sum);
     u64::try_from(fee).map_err(|_| NodeError::Runtime("transaction fee overflow".to_owned()))
+}
+
+fn coinbase_prevout_is_immature(tip_height: u64, created_height: u64, maturity: u64) -> bool {
+    tip_height < created_height.saturating_add(maturity)
 }
 
 fn mempool_outcome_label(outcome: &InsertOutcome) -> &'static str {
@@ -9086,6 +9122,10 @@ fn rpc_txid_path<'a>(method: &str, path: &'a str) -> Option<&'a str> {
     }
 }
 
+fn rpc_txid_path_is_invalid(txid_raw: &str) -> bool {
+    txid_raw.is_empty() || txid_raw.contains('/')
+}
+
 fn rpc_tx_path_is_invalid(height_raw: &str, index_raw: &str, has_extra: bool) -> bool {
     height_raw.is_empty() || index_raw.is_empty() || has_extra
 }
@@ -9095,6 +9135,17 @@ fn parse_tx_height_and_index(height_raw: &str, index_raw: &str) -> Option<(u64, 
         (Ok(height), Ok(index)) => Some((height, index)),
         _ => None,
     }
+}
+
+fn find_tx_by_txid<'a>(
+    block: &'a scam_core::Block,
+    needle_txid: Hash256,
+) -> Option<(usize, &'a Transaction)> {
+    block
+        .transactions
+        .iter()
+        .enumerate()
+        .find(|(_, tx)| tx.txid() == needle_txid)
 }
 
 fn address_hrp_is_accepted(accepted_hrps: &[String], hrp: &str) -> bool {
@@ -9279,19 +9330,13 @@ fn run_rpc_serve_inner(
             break;
         }
         reap_finished_rpc_event_workers(&mut events_workers);
-        let (mut stream, _) = match listener.accept() {
-            Ok(accepted) => accepted,
-            Err(err)
-                if shutdown_flag.is_some()
-                    && matches!(
-                        err.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
-                    ) =>
-            {
+        let Some((mut stream, _)) =
+            map_rpc_accept_result(listener.accept(), shutdown_flag.is_some())?
+        else {
+            if shutdown_flag.is_some() {
                 thread::sleep(Duration::from_millis(10));
-                continue;
             }
-            Err(err) => return Err(NodeError::Runtime(format!("rpc accept failed: {err}"))),
+            continue;
         };
         configure_stream_timeouts_with_ops(
             |duration| stream.set_read_timeout(duration),
@@ -9500,7 +9545,7 @@ fn run_rpc_serve_inner(
                 }
             }
         } else if let Some(txid_raw) = rpc_txid_path(method, path) {
-            if txid_raw.is_empty() || txid_raw.contains('/') {
+            if rpc_txid_path_is_invalid(txid_raw) {
                 (
                     "400 Bad Request",
                     json_error_body("txid path must be /txid/<hex-txid>"),
@@ -9516,12 +9561,7 @@ fn run_rpc_serve_inner(
                             let Some(block) = runtime.block_by_hash(&block_hash) else {
                                 continue;
                             };
-                            if let Some((index, tx)) = block
-                                .transactions
-                                .iter()
-                                .enumerate()
-                                .find(|(_, tx)| tx.txid() == needle_txid)
-                            {
+                            if let Some((index, tx)) = find_tx_by_txid(block, needle_txid) {
                                 located =
                                     Some((height, index, tx_lookup_response(height, index, tx)));
                                 break;
@@ -10610,6 +10650,14 @@ mod tests {
     }
 
     #[test]
+    fn coinbase_prevout_maturity_boundary_is_strict() {
+        assert!(super::coinbase_prevout_is_immature(9, 0, 10));
+        assert!(!super::coinbase_prevout_is_immature(10, 0, 10));
+        assert!(super::coinbase_prevout_is_immature(104, 100, 5));
+        assert!(!super::coinbase_prevout_is_immature(105, 100, 5));
+    }
+
+    #[test]
     fn helper_guards_for_limits_and_rates_are_consistent() {
         assert!(!super::nonzero_limit_reached(0, 10));
         assert!(!super::nonzero_limit_reached(5, 4));
@@ -10672,6 +10720,22 @@ mod tests {
         assert!(super::http_io_error_is_closed_like(&io_reset));
         assert!(super::http_io_error_is_closed_like(&io_broken_pipe));
         assert!(!super::http_io_error_is_closed_like(&io_denied));
+        assert!(super::rpc_accept_error_should_retry(
+            true,
+            std::io::ErrorKind::WouldBlock
+        ));
+        assert!(super::rpc_accept_error_should_retry(
+            true,
+            std::io::ErrorKind::Interrupted
+        ));
+        assert!(!super::rpc_accept_error_should_retry(
+            false,
+            std::io::ErrorKind::WouldBlock
+        ));
+        assert!(!super::rpc_accept_error_should_retry(
+            true,
+            std::io::ErrorKind::PermissionDenied
+        ));
 
         assert!(!super::should_require_noise_static_key(
             false,
@@ -11593,6 +11657,58 @@ mod tests {
     }
 
     #[test]
+    fn map_rpc_accept_result_retries_only_for_shutdown_nonblocking_errors() {
+        let mapped = super::map_rpc_accept_result(
+            Err(std::io::Error::from(std::io::ErrorKind::Interrupted)),
+            true,
+        )
+        .expect("shutdown mode should treat interrupted accept as retry");
+        assert!(mapped.is_none());
+
+        let retry = super::map_rpc_accept_result(
+            Err(std::io::Error::from(std::io::ErrorKind::WouldBlock)),
+            true,
+        )
+        .expect("shutdown mode should treat would-block as retry");
+        assert!(retry.is_none());
+
+        let no_shutdown = super::map_rpc_accept_result(
+            Err(std::io::Error::from(std::io::ErrorKind::WouldBlock)),
+            false,
+        )
+        .expect_err("without shutdown flag, would-block must be fatal");
+        assert!(no_shutdown.to_string().contains("rpc accept failed"));
+
+        let fatal = super::map_rpc_accept_result(
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            true,
+        )
+        .expect_err("non-retry io errors must stay fatal");
+        assert!(fatal.to_string().contains("rpc accept failed"));
+    }
+
+    #[test]
+    fn handle_runtime_persist_result_only_ignores_lock_conflicts() {
+        let tip_hash = Hash256([0xAB; 32]);
+        super::handle_runtime_persist_result(Ok(()), tip_hash).expect("ok path");
+
+        super::handle_runtime_persist_result(
+            Err(super::NodeError::Runtime(
+                "Database already open".to_owned(),
+            )),
+            tip_hash,
+        )
+        .expect("lock conflict should be ignored");
+
+        let non_lock = super::handle_runtime_persist_result(
+            Err(super::NodeError::Runtime("permission denied".to_owned())),
+            tip_hash,
+        )
+        .expect_err("non-lock errors must bubble up");
+        assert!(non_lock.to_string().contains("permission denied"));
+    }
+
+    #[test]
     fn reconnect_attempts_exhausted_enforces_only_nonzero_limit() {
         assert!(!super::reconnect_attempts_exhausted(0, 10));
         assert!(!super::reconnect_attempts_exhausted(3, 2));
@@ -11695,6 +11811,9 @@ mod tests {
         assert_eq!(super::rpc_txid_path("GET", "/txid/abcd"), Some("abcd"));
         assert_eq!(super::rpc_txid_path("POST", "/txid/abcd"), None);
         assert_eq!(super::rpc_txid_path("GET", "/tx/10/2"), None);
+        assert!(super::rpc_txid_path_is_invalid(""));
+        assert!(super::rpc_txid_path_is_invalid("aa/bb"));
+        assert!(!super::rpc_txid_path_is_invalid("abcd"));
 
         assert!(super::rpc_tx_path_is_invalid("10", "2", true));
         assert!(super::rpc_tx_path_is_invalid("", "2", false));
@@ -11717,6 +11836,20 @@ mod tests {
 
         assert!(super::role_service_response_is_empty(0));
         assert!(!super::role_service_response_is_empty(1));
+    }
+
+    #[test]
+    fn find_tx_by_txid_matches_only_exact_hash() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let block = cfg.build_genesis_block().expect("genesis block");
+        let txid = block.transactions[0].txid();
+        let found = super::find_tx_by_txid(&block, txid).expect("txid should be found");
+        assert_eq!(found.0, 0);
+        assert_eq!(found.1.txid(), txid);
+
+        let missing = super::find_tx_by_txid(&block, Hash256([0x55; 32]));
+        assert!(missing.is_none(), "non-matching txid must not be returned");
     }
 
     #[test]
@@ -12979,13 +13112,23 @@ mod tests {
             let _ = rx.recv();
         });
         let mut handles = vec![finished, blocked];
-        thread::sleep(Duration::from_millis(20));
-        super::reap_finished_rpc_event_workers(&mut handles);
+        let reap_deadline = Instant::now() + Duration::from_secs(1);
+        while handles.len() > 1 && Instant::now() < reap_deadline {
+            super::reap_finished_rpc_event_workers(&mut handles);
+            if handles.len() > 1 {
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
         assert_eq!(handles.len(), 1, "finished worker should be reaped");
 
         let _ = tx.send(());
-        thread::sleep(Duration::from_millis(20));
-        super::reap_finished_rpc_event_workers(&mut handles);
+        let final_reap_deadline = Instant::now() + Duration::from_secs(1);
+        while !handles.is_empty() && Instant::now() < final_reap_deadline {
+            super::reap_finished_rpc_event_workers(&mut handles);
+            if !handles.is_empty() {
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
         assert!(
             handles.is_empty(),
             "remaining worker should be reaped after completion"
@@ -14106,6 +14249,10 @@ mod tests {
             &format!("GET /txid/{genesis_txid} HTTP/1.1\r\nHost: localhost\r\n\r\n"),
         );
         assert!(txid.starts_with("HTTP/1.1 200 OK"));
+        assert!(
+            txid.contains(&genesis_txid),
+            "txid lookup must return the requested txid"
+        );
 
         let wallet_new = send_http_json_post(&addr, "/wallet/new", "{}");
         assert!(wallet_new.starts_with("HTTP/1.1 200 OK"));
@@ -14430,11 +14577,24 @@ mod tests {
             &format!("GET /txid/{genesis_txid} HTTP/1.1\r\nHost: localhost\r\n\r\n"),
         );
         assert!(txid.starts_with("HTTP/1.1 200 OK"));
+        assert!(
+            txid.contains(&genesis_txid),
+            "txid lookup must return the requested txid"
+        );
+        let malformed_txid_path =
+            send_http_request(&addr, "GET /txid/ HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        assert!(malformed_txid_path.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(malformed_txid_path.contains("txid path must be /txid/<hex-txid>"));
+        let extra_segment_txid =
+            send_http_request(&addr, "GET /txid/aa/bb HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        assert!(extra_segment_txid.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(extra_segment_txid.contains("txid path must be /txid/<hex-txid>"));
         let bad_txid = send_http_request(
             &addr,
             "GET /txid/not-hex HTTP/1.1\r\nHost: localhost\r\n\r\n",
         );
         assert!(bad_txid.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(bad_txid.contains("invalid txid hex"));
         let block = send_http_request(&addr, "GET /block/0 HTTP/1.1\r\nHost: localhost\r\n\r\n");
         assert!(block.starts_with("HTTP/1.1 200 OK"));
 
@@ -16137,6 +16297,20 @@ mod tests {
             super::validate_tx_for_local_admission(&cfg, &runtime, &mempool, &signed.tx)
                 .expect("valid tx");
         assert_eq!(implied_fee, valid_fee);
+
+        let zero_fee_signed = build_signed_transfer_tx(
+            &runtime,
+            &cfg.network_id,
+            &sender_key,
+            recipient_key_hash20,
+            900_000,
+            0,
+        )
+        .expect("zero fee signed tx");
+        let zero_fee =
+            super::validate_tx_for_local_admission(&cfg, &runtime, &mempool, &zero_fee_signed.tx)
+                .expect("zero fee tx");
+        assert_eq!(zero_fee, 0);
 
         let mut overspend_tx = signed.tx.clone();
         overspend_tx.outputs[0].value = overspend_tx.outputs[0].value.saturating_add(10_000_000);
