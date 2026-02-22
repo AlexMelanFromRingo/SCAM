@@ -2070,6 +2070,185 @@ fn peer_book_paths(peers_dir: &Path, network_name: &str) -> (PathBuf, PathBuf) {
     )
 }
 
+fn peer_reputation_path(peers_dir: &Path, network_name: &str) -> PathBuf {
+    peers_dir.join(format!("{network_name}.reputation.json"))
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+struct PeerReputationRecord {
+    address: String,
+    replacement_rate_limited_total: u64,
+    last_replacement_rate_limited_unix_sec: u64,
+    last_updated_unix_sec: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+struct PeerReputationBook {
+    network_id: String,
+    peers: Vec<PeerReputationRecord>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct RuntimePeerReputation {
+    replacement_rate_limited_total: u64,
+    last_replacement_rate_limited_unix_sec: u64,
+}
+
+#[derive(Clone, Debug)]
+struct PeerReputationStore {
+    path: PathBuf,
+    network_id: String,
+}
+
+impl PeerReputationStore {
+    fn from_peers_dir(peers_dir: &Path, network_id: &str) -> Self {
+        Self {
+            path: peer_reputation_path(peers_dir, network_id),
+            network_id: network_id.to_owned(),
+        }
+    }
+}
+
+fn load_peer_reputation_book(
+    path: &Path,
+    network_id: &str,
+) -> Result<PeerReputationBook, NodeError> {
+    if !path.exists() {
+        return Ok(PeerReputationBook {
+            network_id: network_id.to_owned(),
+            peers: Vec::new(),
+        });
+    }
+    let raw = fs::read_to_string(path).map_err(|e| {
+        NodeError::Runtime(format!(
+            "failed to read peer reputation file {}: {e}",
+            path.display()
+        ))
+    })?;
+    let mut parsed = serde_json::from_str::<PeerReputationBook>(&raw).map_err(|e| {
+        NodeError::Runtime(format!(
+            "failed to parse peer reputation file {}: {e}",
+            path.display()
+        ))
+    })?;
+    if parsed.network_id != network_id {
+        return Err(NodeError::Runtime(format!(
+            "peer reputation network mismatch in {}: expected '{}', got '{}'",
+            path.display(),
+            network_id,
+            parsed.network_id
+        )));
+    }
+    parsed.peers.sort_by(|a, b| a.address.cmp(&b.address));
+    parsed.peers.dedup_by(|a, b| a.address == b.address);
+    Ok(parsed)
+}
+
+fn save_peer_reputation_book(path: &Path, book: &PeerReputationBook) -> Result<(), NodeError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| {
+            NodeError::Runtime(format!(
+                "failed to create peer reputation dir {}: {e}",
+                parent.display()
+            ))
+        })?;
+    }
+    let body = serde_json::to_string_pretty(book).map_err(|e| {
+        NodeError::Runtime(format!(
+            "failed to encode peer reputation file {}: {e}",
+            path.display()
+        ))
+    })?;
+    let tmp_path = path.with_extension("json.tmp");
+    fs::write(&tmp_path, format!("{body}\n")).map_err(|e| {
+        NodeError::Runtime(format!(
+            "failed to write peer reputation temp file {}: {e}",
+            tmp_path.display()
+        ))
+    })?;
+    fs::rename(&tmp_path, path).map_err(|e| {
+        NodeError::Runtime(format!(
+            "failed to finalize peer reputation file {}: {e}",
+            path.display()
+        ))
+    })?;
+    Ok(())
+}
+
+fn reputation_failure_weight(events: u64, last_unix_sec: u64, now_unix_sec: u64) -> u32 {
+    if events == 0 {
+        return 0;
+    }
+    let age = now_unix_sec.saturating_sub(last_unix_sec);
+    let raw = if age > 7 * 24 * 60 * 60 {
+        0
+    } else if age > 24 * 60 * 60 {
+        events.saturating_add(1) / 2
+    } else {
+        events
+    };
+    raw.min(u32::MAX as u64) as u32
+}
+
+fn load_peer_reputation_weights(
+    store: &PeerReputationStore,
+    now_unix_sec: u64,
+) -> Result<HashMap<String, u32>, NodeError> {
+    let book = load_peer_reputation_book(&store.path, &store.network_id)?;
+    let mut out = HashMap::<String, u32>::new();
+    for peer in book.peers {
+        if peer.address.trim().is_empty() {
+            continue;
+        }
+        let weight = reputation_failure_weight(
+            peer.replacement_rate_limited_total,
+            peer.last_replacement_rate_limited_unix_sec,
+            now_unix_sec,
+        );
+        if weight > 0 {
+            out.insert(peer.address, weight);
+        }
+    }
+    Ok(out)
+}
+
+fn update_peer_reputation_store(
+    store: &PeerReputationStore,
+    address: &str,
+    delta: RuntimePeerReputation,
+    now_unix_sec: u64,
+) -> Result<(), NodeError> {
+    if address.trim().is_empty() || delta.replacement_rate_limited_total == 0 {
+        return Ok(());
+    }
+    let mut book = load_peer_reputation_book(&store.path, &store.network_id)?;
+    let mut updated = false;
+    for peer in &mut book.peers {
+        if peer.address == address {
+            peer.replacement_rate_limited_total = peer
+                .replacement_rate_limited_total
+                .saturating_add(delta.replacement_rate_limited_total);
+            peer.last_replacement_rate_limited_unix_sec = peer
+                .last_replacement_rate_limited_unix_sec
+                .max(delta.last_replacement_rate_limited_unix_sec);
+            peer.last_updated_unix_sec = now_unix_sec;
+            updated = true;
+            break;
+        }
+    }
+    if !updated {
+        book.peers.push(PeerReputationRecord {
+            address: address.to_owned(),
+            replacement_rate_limited_total: delta.replacement_rate_limited_total,
+            last_replacement_rate_limited_unix_sec: delta.last_replacement_rate_limited_unix_sec,
+            last_updated_unix_sec: now_unix_sec,
+        });
+    }
+    book.peers.sort_by(|a, b| a.address.cmp(&b.address));
+    book.peers.dedup_by(|a, b| a.address == b.address);
+    save_peer_reputation_book(&store.path, &book)
+}
+
 fn load_or_init_peer_book(
     network_name: &str,
     peers_db_path: &Path,
@@ -3882,6 +4061,7 @@ struct RelayServerState {
     pending_block_orphan_order: VecDeque<Hash256>,
     last_parent_sync_request_sec: HashMap<Hash256, u64>,
     peer_compact_pref: HashMap<u64, bool>,
+    peer_runtime_reputation: HashMap<u64, RuntimePeerReputation>,
     pending_compact_blocks: HashMap<Hash256, PendingCompactBlock>,
     known_peer_addresses: Vec<PeerAddress>,
     outbound_worker_starts_total: u64,
@@ -3897,6 +4077,7 @@ impl RelayServerState {
             pending_block_orphan_order: VecDeque::new(),
             last_parent_sync_request_sec: HashMap::new(),
             peer_compact_pref: HashMap::new(),
+            peer_runtime_reputation: HashMap::new(),
             pending_compact_blocks: HashMap::new(),
             known_peer_addresses: Vec::new(),
             outbound_worker_starts_total: 0,
@@ -5201,6 +5382,7 @@ fn process_relay_wire_message_inner(
                     items: vec![InventoryItem::Tx(txid)],
                 }]),
                 Err(NodeError::Gossip(GossipError::ReplacementRateLimited { .. })) => {
+                    relay_mark_peer_replacement_rate_limited(state, peer_id, now_unix_sec);
                     Ok(vec![WireMessage::NotFound {
                         items: vec![InventoryItem::Tx(txid)],
                     }])
@@ -5351,6 +5533,26 @@ fn relay_proactive_inventory_messages(
     out
 }
 
+fn relay_mark_peer_replacement_rate_limited(
+    state: &mut RelayServerState,
+    peer_id: u64,
+    now_unix_sec: u64,
+) {
+    let entry = state.peer_runtime_reputation.entry(peer_id).or_default();
+    entry.replacement_rate_limited_total = entry.replacement_rate_limited_total.saturating_add(1);
+    entry.last_replacement_rate_limited_unix_sec = now_unix_sec;
+}
+
+fn relay_take_peer_runtime_reputation(
+    state: &mut RelayServerState,
+    peer_id: u64,
+) -> RuntimePeerReputation {
+    state
+        .peer_runtime_reputation
+        .remove(&peer_id)
+        .unwrap_or_default()
+}
+
 #[derive(Clone, Copy)]
 enum RelayPeerSessionMode {
     Inbound,
@@ -5399,17 +5601,29 @@ fn load_relay_outbound_targets_selected(
     max_peers: usize,
     rotate_after_sec: u64,
 ) -> Result<Vec<String>, NodeError> {
-    let peers = load_relay_known_peer_addresses(peers_dir, &cfg.network_id)?;
+    let (peers_db_path, legacy_txt_path) = peer_book_paths(peers_dir, &cfg.network_id);
+    let mut peer_book = load_or_init_peer_book(&cfg.network_id, &peers_db_path, &legacy_txt_path)?;
+    sort_and_dedup_peer_book(&mut peer_book);
     let now = current_unix_sec()?;
+    let reputation_store = PeerReputationStore::from_peers_dir(peers_dir, &cfg.network_id);
+    let reputation_weights =
+        load_peer_reputation_weights(&reputation_store, now).unwrap_or_else(|err| {
+            eprintln!(
+                "warning: cannot load peer reputation from {}: {err}",
+                reputation_store.path.display()
+            );
+            HashMap::new()
+        });
     let mut candidates = Vec::<PeerCandidate>::new();
-    for peer in peers {
+    for peer in peer_book.peers {
         let Ok(addr) = peer.address.parse::<SocketAddr>() else {
             continue;
         };
+        let reputation_penalty = reputation_weights.get(&peer.address).copied().unwrap_or(0);
         candidates.push(PeerCandidate {
             addr,
             last_connected_unix_sec: peer.last_seen_unix_sec,
-            failure_count: 0,
+            failure_count: peer.ban_score.saturating_add(reputation_penalty),
         });
     }
     if candidates.is_empty() {
@@ -5491,6 +5705,7 @@ fn run_relay_outbound_worker(
     read_timeout_sec: u64,
     write_timeout_sec: u64,
     redial_sec: u64,
+    peer_reputation_store: Option<PeerReputationStore>,
 ) {
     if target.trim().is_empty() {
         return;
@@ -5537,6 +5752,8 @@ fn run_relay_outbound_worker(
             &mempool_db_path,
             max_inv_items,
             read_limit,
+            Some(target.as_str()),
+            peer_reputation_store.as_ref(),
         ) {
             if stop_flag.load(Ordering::Relaxed) {
                 break;
@@ -5567,6 +5784,7 @@ fn run_relay_outbound_supervisor(
     read_timeout_sec: u64,
     write_timeout_sec: u64,
     redial_sec: u64,
+    peer_reputation_store: Option<PeerReputationStore>,
 ) {
     let redial_delay = Duration::from_secs(redial_sec.max(1));
     let mut workers = HashMap::<String, thread::JoinHandle<()>>::new();
@@ -5607,6 +5825,7 @@ fn run_relay_outbound_supervisor(
                     let mempool_db_path_clone = mempool_db_path.clone();
                     let bind_addr_clone = bind_addr.clone();
                     let target_clone = target.clone();
+                    let reputation_store_clone = peer_reputation_store.clone();
                     workers.insert(
                         target,
                         thread::spawn(move || {
@@ -5625,6 +5844,7 @@ fn run_relay_outbound_supervisor(
                                 read_timeout_sec,
                                 write_timeout_sec,
                                 redial_sec,
+                                reputation_store_clone,
                             );
                         }),
                     );
@@ -5661,6 +5881,7 @@ async fn run_relay_outbound_worker_async(
     read_timeout_sec: u64,
     write_timeout_sec: u64,
     redial_sec: u64,
+    peer_reputation_store: Option<PeerReputationStore>,
 ) {
     relay_mark_outbound_worker_start(&state);
     if target.trim().is_empty() {
@@ -5699,6 +5920,8 @@ async fn run_relay_outbound_worker_async(
             read_limit,
             read_timeout_sec,
             write_timeout_sec,
+            Some(target.as_str()),
+            peer_reputation_store.as_ref(),
         )
         .await
         {
@@ -5730,6 +5953,7 @@ async fn run_relay_outbound_supervisor_async(
     read_timeout_sec: u64,
     write_timeout_sec: u64,
     redial_sec: u64,
+    peer_reputation_store: Option<PeerReputationStore>,
 ) {
     let redial_delay = Duration::from_secs(redial_sec.max(1));
     relay_mark_outbound_supervisor_start(&state);
@@ -5783,6 +6007,7 @@ async fn run_relay_outbound_supervisor_async(
             let runtime_db_path_clone = runtime_db_path.clone();
             let mempool_db_path_clone = mempool_db_path.clone();
             let bind_addr_clone = bind_addr.clone();
+            let reputation_store_clone = peer_reputation_store.clone();
             workers.spawn(async move {
                 run_relay_outbound_worker_async(
                     target,
@@ -5799,6 +6024,7 @@ async fn run_relay_outbound_supervisor_async(
                     read_timeout_sec,
                     write_timeout_sec,
                     redial_sec,
+                    reputation_store_clone,
                 )
                 .await
             });
@@ -5841,6 +6067,8 @@ fn run_relay_peer_session<IO: Read + Write>(
     mempool_db_path: &Path,
     max_inv_items: usize,
     read_limit: u32,
+    peer_address: Option<&str>,
+    peer_reputation_store: Option<&PeerReputationStore>,
 ) -> Result<(), NodeError> {
     let result = (|| -> Result<(), NodeError> {
         {
@@ -5868,6 +6096,7 @@ fn run_relay_peer_session<IO: Read + Write>(
                 .map_err(|_| NodeError::Runtime("relay state mutex poisoned".to_owned()))?;
             guard.relay.gossip.connect_peer(peer_id);
             guard.peer_compact_pref.insert(peer_id, false);
+            guard.peer_runtime_reputation.entry(peer_id).or_default();
         }
 
         if matches!(mode, RelayPeerSessionMode::Outbound) {
@@ -6008,12 +6237,25 @@ fn run_relay_peer_session<IO: Read + Write>(
         Ok(())
     })();
 
+    let mut peer_reputation_delta = RuntimePeerReputation::default();
     if let Ok(mut guard) = state.lock() {
+        peer_reputation_delta = relay_take_peer_runtime_reputation(&mut guard, peer_id);
         guard.relay.gossip.disconnect_peer(peer_id);
         guard.peer_compact_pref.remove(&peer_id);
     }
     if let Ok(mut active_guard) = active.lock() {
         *active_guard = active_guard.saturating_sub(1);
+    }
+    if let (Some(store), Some(address)) = (peer_reputation_store, peer_address)
+        && peer_reputation_delta.replacement_rate_limited_total > 0
+    {
+        let now_unix_sec = current_unix_sec()
+            .unwrap_or(peer_reputation_delta.last_replacement_rate_limited_unix_sec);
+        if let Err(err) =
+            update_peer_reputation_store(store, address, peer_reputation_delta, now_unix_sec)
+        {
+            eprintln!("warning: failed to persist peer reputation for {address}: {err}");
+        }
     }
     result
 }
@@ -6033,6 +6275,8 @@ async fn run_relay_peer_session_async<S: AsyncRead + AsyncWrite + Unpin>(
     read_limit: u32,
     read_timeout_sec: u64,
     write_timeout_sec: u64,
+    peer_address: Option<&str>,
+    peer_reputation_store: Option<&PeerReputationStore>,
 ) -> Result<(), NodeError> {
     {
         let mut active_guard = active
@@ -6064,6 +6308,7 @@ async fn run_relay_peer_session_async<S: AsyncRead + AsyncWrite + Unpin>(
                 .map_err(|_| NodeError::Runtime("relay state mutex poisoned".to_owned()))?;
             guard.relay.gossip.connect_peer(peer_id);
             guard.peer_compact_pref.insert(peer_id, false);
+            guard.peer_runtime_reputation.entry(peer_id).or_default();
         }
 
         if matches!(mode, RelayPeerSessionMode::Outbound) {
@@ -6240,12 +6485,25 @@ async fn run_relay_peer_session_async<S: AsyncRead + AsyncWrite + Unpin>(
     }
     .await;
 
+    let mut peer_reputation_delta = RuntimePeerReputation::default();
     if let Ok(mut guard) = state.lock() {
+        peer_reputation_delta = relay_take_peer_runtime_reputation(&mut guard, peer_id);
         guard.relay.gossip.disconnect_peer(peer_id);
         guard.peer_compact_pref.remove(&peer_id);
     }
     if let Ok(mut active_guard) = active.lock() {
         *active_guard = active_guard.saturating_sub(1);
+    }
+    if let (Some(store), Some(address)) = (peer_reputation_store, peer_address)
+        && peer_reputation_delta.replacement_rate_limited_total > 0
+    {
+        let now_unix_sec = current_unix_sec()
+            .unwrap_or(peer_reputation_delta.last_replacement_rate_limited_unix_sec);
+        if let Err(err) =
+            update_peer_reputation_store(store, address, peer_reputation_delta, now_unix_sec)
+        {
+            eprintln!("warning: failed to persist peer reputation for {address}: {err}");
+        }
     }
     session_result
 }
@@ -6332,6 +6590,8 @@ fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
     }
 
     let stop_flag = Arc::new(AtomicBool::new(false));
+    let peer_reputation_store =
+        PeerReputationStore::from_peers_dir(&args.peers_dir, &cfg.network_id);
     let worker_threads = std::thread::available_parallelism()
         .map(|n| n.get().max(2))
         .unwrap_or(4);
@@ -6349,6 +6609,7 @@ fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
     let outbound_redial_sec = args.outbound_redial_sec.max(1);
     let max_clients = args.max_clients;
     let read_limit = args.max_messages_per_peer;
+    let peer_reputation_store_for_runtime = peer_reputation_store.clone();
     let max_active_sessions = relay_max_active_sessions(max_clients);
     println!("Max concurrent sessions: {}", max_active_sessions);
     if outbound_connect {
@@ -6402,6 +6663,7 @@ fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
             let cfg_clone = cfg.clone();
             let runtime_db_path_clone = runtime_db_path.clone();
             let mempool_db_path_clone = mempool_db_path.clone();
+            let peer_reputation_store_clone = peer_reputation_store_for_runtime.clone();
             Some(tokio::spawn(async move {
                 run_relay_outbound_supervisor_async(
                     stop_clone,
@@ -6418,6 +6680,7 @@ fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
                     read_timeout_sec,
                     write_timeout_sec,
                     outbound_redial_sec,
+                    Some(peer_reputation_store_clone),
                 )
                 .await;
             }))
@@ -6431,7 +6694,7 @@ fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
                 .accept()
                 .await
                 .map_err(|e| NodeError::Runtime(format!("relay accept failed: {e}")));
-            let (mut stream, _peer_addr) = match accepted {
+            let (mut stream, peer_addr) = match accepted {
                 Ok(accepted) => accepted,
                 Err(err) => {
                     first_error = Some(err);
@@ -6462,6 +6725,8 @@ fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
             let mempool_db_path_clone = mempool_db_path.clone();
             let stop_clone = stop_flag.clone();
             let max_inv_items_clone = max_inv_items;
+            let peer_reputation_store_clone = peer_reputation_store_for_runtime.clone();
+            let peer_addr_string = peer_addr.to_string();
             workers.spawn(async move {
                 let _permit = permit;
                 run_relay_peer_session_async(
@@ -6478,6 +6743,8 @@ fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
                     read_limit,
                     read_timeout_sec,
                     write_timeout_sec,
+                    Some(peer_addr_string.as_str()),
+                    Some(&peer_reputation_store_clone),
                 )
                 .await
             });
@@ -14357,6 +14624,108 @@ mod tests {
     }
 
     #[test]
+    fn peer_reputation_store_roundtrip_and_weight_decay() {
+        let peers_dir = temp_dir("test-peer-reputation-roundtrip");
+        std::fs::create_dir_all(&peers_dir).expect("mkdir peers");
+        let store = super::PeerReputationStore::from_peers_dir(&peers_dir, "devnet");
+        let now = 1_770_000_000u64;
+
+        super::update_peer_reputation_store(
+            &store,
+            "127.0.0.1:18444",
+            super::RuntimePeerReputation {
+                replacement_rate_limited_total: 3,
+                last_replacement_rate_limited_unix_sec: now,
+            },
+            now,
+        )
+        .expect("first reputation update");
+        super::update_peer_reputation_store(
+            &store,
+            "127.0.0.1:18444",
+            super::RuntimePeerReputation {
+                replacement_rate_limited_total: 2,
+                last_replacement_rate_limited_unix_sec: now + 10,
+            },
+            now + 10,
+        )
+        .expect("second reputation update");
+
+        let loaded =
+            super::load_peer_reputation_book(&store.path, "devnet").expect("load reputation book");
+        assert_eq!(loaded.peers.len(), 1);
+        assert_eq!(loaded.peers[0].replacement_rate_limited_total, 5);
+        assert_eq!(
+            loaded.peers[0].last_replacement_rate_limited_unix_sec,
+            now + 10
+        );
+
+        let immediate =
+            super::load_peer_reputation_weights(&store, now + 10).expect("load immediate weights");
+        assert_eq!(immediate.get("127.0.0.1:18444").copied(), Some(5));
+
+        let decayed = super::load_peer_reputation_weights(&store, now + 2 * 24 * 60 * 60)
+            .expect("load decayed weights");
+        assert_eq!(decayed.get("127.0.0.1:18444").copied(), Some(3));
+
+        let expired = super::load_peer_reputation_weights(&store, now + 8 * 24 * 60 * 60)
+            .expect("load expired weights");
+        assert!(
+            !expired.contains_key("127.0.0.1:18444"),
+            "old reputation should age out of selection penalties"
+        );
+
+        let _ = std::fs::remove_dir_all(peers_dir);
+    }
+
+    #[test]
+    fn load_relay_outbound_targets_selected_applies_reputation_penalty() {
+        let peers_dir = temp_dir("test-relay-selected-targets-reputation");
+        std::fs::create_dir_all(&peers_dir).expect("mkdir peers");
+        let peers_db_path = peers_dir.join("devnet.redb");
+        super::save_peer_book_db(
+            &peers_db_path,
+            &PeerAddressBook {
+                network_id: "devnet".to_owned(),
+                peers: vec![
+                    PeerAddressRecord {
+                        address: "10.1.1.1:19444".to_owned(),
+                        last_seen_unix_sec: 0,
+                        ban_score: 0,
+                    },
+                    PeerAddressRecord {
+                        address: "11.1.1.1:19444".to_owned(),
+                        last_seen_unix_sec: 0,
+                        ban_score: 0,
+                    },
+                ],
+            },
+        )
+        .expect("save peers");
+
+        let store = super::PeerReputationStore::from_peers_dir(&peers_dir, "devnet");
+        let now = super::current_unix_sec().expect("now");
+        super::update_peer_reputation_store(
+            &store,
+            "10.1.1.1:19444",
+            super::RuntimePeerReputation {
+                replacement_rate_limited_total: 20,
+                last_replacement_rate_limited_unix_sec: now,
+            },
+            now,
+        )
+        .expect("persist reputation");
+
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let selected = super::load_relay_outbound_targets_selected(&peers_dir, &cfg, 1, 60)
+            .expect("selected peers");
+        assert_eq!(selected, vec!["11.1.1.1:19444".to_owned()]);
+
+        let _ = std::fs::remove_dir_all(peers_dir);
+    }
+
+    #[test]
     fn configure_stream_timeouts_sets_requested_values() {
         #[derive(Default)]
         struct MockTimeoutState {
@@ -17824,6 +18193,7 @@ mod tests {
                     1,
                     1,
                     1,
+                    None,
                 );
             }
         });
@@ -17872,6 +18242,7 @@ mod tests {
                     1,
                     1,
                     1,
+                    None,
                 );
             }
         });
@@ -17941,6 +18312,7 @@ mod tests {
                     1,
                     1,
                     1,
+                    None,
                 );
             }
         });
@@ -18021,6 +18393,7 @@ mod tests {
                     1,
                     1,
                     1,
+                    None,
                 );
             }
         });
@@ -18111,6 +18484,7 @@ mod tests {
                     1,
                     1,
                     1,
+                    None,
                 );
             }
         });
@@ -18192,6 +18566,7 @@ mod tests {
                 1,
                 1,
                 1,
+                None,
             ));
             tokio::time::timeout(Duration::from_secs(6), rx)
                 .await
@@ -18282,6 +18657,7 @@ mod tests {
                 1,
                 1,
                 1,
+                None,
             ));
             tokio::time::timeout(Duration::from_secs(8), rx)
                 .await
@@ -18340,6 +18716,7 @@ mod tests {
                 1,
                 1,
                 1,
+                None,
             )
             .await;
         });
@@ -18390,6 +18767,7 @@ mod tests {
                 1,
                 1,
                 1,
+                None,
             )
             .await;
         });
@@ -18497,6 +18875,8 @@ mod tests {
                     &mempool_db,
                     128,
                     1,
+                    None,
+                    None,
                 )
             }
         });
@@ -18566,6 +18946,8 @@ mod tests {
             &mempool_db,
             32,
             1,
+            None,
+            None,
         )
         .expect_err("empty stream must fail before handshake");
         assert!(
@@ -18626,6 +19008,8 @@ mod tests {
                     &mempool_db,
                     32,
                     1,
+                    None,
+                    None,
                 )
             }
         });
@@ -18734,6 +19118,8 @@ mod tests {
                     &mempool_db,
                     64,
                     4,
+                    None,
+                    None,
                 )
             }
         });
@@ -18843,6 +19229,8 @@ mod tests {
                         4,
                         1,
                         1,
+                        None,
+                        None,
                     )
                     .await
                 }
