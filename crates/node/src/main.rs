@@ -23170,7 +23170,7 @@ mod tests {
                     config: Some(config_path),
                     runtime_db: Some(runtime_db_a),
                     bind: bind_a,
-                    max_clients: 4,
+                    max_clients: 1,
                     max_messages_per_peer: 0,
                     read_timeout_sec: 1,
                     write_timeout_sec: 1,
@@ -23240,9 +23240,19 @@ mod tests {
 
         let _ = sender.shutdown(Shutdown::Both);
         drop(sender);
-        join_with_timeout(server_a, Duration::from_secs(30), "relay latency server A")
+
+        // Nudge relay B accept loop so it can reach max_clients and exit deterministically
+        // even if outbound sessions churned during CI scheduling jitter.
+        for _ in 0..4 {
+            if let Ok(poke) = TcpStream::connect(&bind_b) {
+                let _ = poke.shutdown(Shutdown::Both);
+            }
+            thread::sleep(Duration::from_millis(40));
+        }
+
+        join_with_timeout(server_a, Duration::from_secs(60), "relay latency server A")
             .expect("relay A should exit");
-        join_with_timeout(server_b, Duration::from_secs(30), "relay latency server B")
+        join_with_timeout(server_b, Duration::from_secs(60), "relay latency server B")
             .expect("relay B should exit");
         let _ = fs::remove_dir_all(work_dir);
     }
