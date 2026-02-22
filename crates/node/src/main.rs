@@ -5754,7 +5754,10 @@ fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
             }
         }
 
-        stop_flag.store(true, Ordering::Relaxed);
+        if first_error.is_some() {
+            // Accept-loop failure should trigger early shutdown for active sessions.
+            stop_flag.store(true, Ordering::Relaxed);
+        }
 
         while let Some(join_result) = workers.join_next().await {
             match join_result {
@@ -5773,6 +5776,9 @@ fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
                 }
             }
         }
+        // Normal max-clients exit should let workers finish organically first,
+        // then stop background telemetry/outbound tasks.
+        stop_flag.store(true, Ordering::Relaxed);
         if let Some(handle) = outbound_handle
             && let Err(err) = handle.await
             && first_error.is_none()
