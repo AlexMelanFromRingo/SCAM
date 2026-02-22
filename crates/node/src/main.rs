@@ -20,7 +20,10 @@ use scam_core::{
     TxIn, TxOut, block_meets_pow, render_hash_bitmap_16x16,
 };
 use scam_mempool::{InsertOutcome, Mempool, MempoolError, OrphanPool};
-use scam_miner::{BlockTemplate, MempoolTemplateParams, build_template_from_mempool, mine_block};
+use scam_miner::{
+    BlockTemplate, MempoolTemplateParams, build_template_from_mempool, mine_block,
+    mine_block_with_extra_nonce,
+};
 use scam_p2p::{
     CompactBlock, FramingConfig, GossipEngine, GossipError, InventoryItem, LocalHandshake,
     PeerAddress, PeerCandidate, PrefilledTxn, ReplacementRateLimit, TransportError, WireMessage,
@@ -3251,6 +3254,8 @@ struct MiningLoopParams {
     print_each: bool,
 }
 
+const LOCAL_MINER_MAX_EXTRA_NONCE: u64 = 1_024;
+
 fn mine_block_with_transactions(
     runtime: &mut ChainRuntime,
     interval_sec: u64,
@@ -3273,11 +3278,15 @@ fn mine_block_with_transactions(
         transactions: block_txs,
     };
 
-    let Some(block) = mine_block(&template, max_nonce) else {
+    let Some(block) =
+        mine_block_with_extra_nonce(&template, LOCAL_MINER_MAX_EXTRA_NONCE, max_nonce)
+            .map(|mined| mined.block)
+    else {
         return Err(NodeError::Runtime(format!(
-            "cannot mine height {} in nonce range 0..={}",
+            "cannot mine height {} in search space extra_nonce=0..={} nonce=0..={}",
             runtime.tip_height() + 1,
-            max_nonce
+            LOCAL_MINER_MAX_EXTRA_NONCE,
+            max_nonce,
         )));
     };
 
@@ -3346,10 +3355,13 @@ fn run_mine_once(args: MineOnceArgs) -> Result<(), NodeError> {
         transactions: vec![coinbase],
     };
 
-    let Some(mined_block) = mine_block(&template, args.max_nonce) else {
+    let Some(mined_block) =
+        mine_block_with_extra_nonce(&template, LOCAL_MINER_MAX_EXTRA_NONCE, args.max_nonce)
+            .map(|mined| mined.block)
+    else {
         println!(
-            "Mining failed: no nonce found in range 0..={}",
-            args.max_nonce
+            "Mining failed: no share in search space extra_nonce=0..={} nonce=0..={}",
+            LOCAL_MINER_MAX_EXTRA_NONCE, args.max_nonce,
         );
         return Ok(());
     };
@@ -10052,20 +10064,23 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
 fn try_find_share_for_job(
     job: &MiningJob,
     share_target: Target,
-    start_nonce: u64,
+    start_cursor: u128,
     attempts: u64,
-) -> Option<(u64, Hash256, bool, u64)> {
+) -> Option<(u64, u64, Hash256, bool, u128)> {
     if attempts == 0 {
         return None;
     }
 
-    for step in 0..attempts {
-        let nonce = start_nonce.wrapping_add(step);
+    for step in 0..attempts as u128 {
+        let cursor = start_cursor.wrapping_add(step);
+        let nonce = cursor as u64;
+        let ntime_offset = (cursor >> 64) as u64;
+        let ntime = job.ntime.saturating_add(ntime_offset);
         let header = scam_core::BlockHeader {
             version: job.version,
             prev_block: job.prev_hash,
             merkle_root: job.merkle_root,
-            timestamp: job.ntime,
+            timestamp: ntime,
             target: job.network_target,
             nonce,
         };
@@ -10073,9 +10088,10 @@ fn try_find_share_for_job(
         if share_target.allows_hash(&hash) {
             return Some((
                 nonce,
+                ntime,
                 hash,
                 job.network_target.allows_hash(&hash),
-                nonce.wrapping_add(1),
+                cursor.wrapping_add(1),
             ));
         }
     }
@@ -10282,7 +10298,7 @@ fn run_stratum_mine(args: StratumMineArgs) -> Result<(), NodeError> {
         let mut channel_id = None::<u32>;
         let mut active_job_id = None::<u32>;
         let mut jobs = HashMap::<u32, MiningJob>::new();
-        let mut nonce_cursor = HashMap::<u32, u64>::new();
+        let mut nonce_cursor = HashMap::<u32, u128>::new();
 
         let mut reconnect_requested = false;
         loop {
@@ -10310,8 +10326,8 @@ fn run_stratum_mine(args: StratumMineArgs) -> Result<(), NodeError> {
                 StratumReadOutcome::Timeout => {
                     if let Some(job_id) = active_job_id {
                         if let Some(job) = jobs.get(&job_id) {
-                            let cursor = *nonce_cursor.get(&job_id).unwrap_or(&0);
-                            if let Some((nonce, hash, is_block, next_cursor)) =
+                            let cursor = *nonce_cursor.get(&job_id).unwrap_or(&0u128);
+                            if let Some((nonce, ntime, hash, is_block, next_cursor)) =
                                 try_find_share_for_job(
                                     job,
                                     share_target,
@@ -10324,18 +10340,18 @@ fn run_stratum_mine(args: StratumMineArgs) -> Result<(), NodeError> {
                                     channel_id: job.channel_id,
                                     job_id,
                                     nonce,
-                                    ntime: job.ntime,
+                                    ntime,
                                 });
                                 submitted_shares = submitted_shares.saturating_add(1);
                                 println!(
-                                    "submitted share: channel={} job={} nonce={} hash={} is_block={}",
-                                    job.channel_id, job_id, nonce, hash, is_block
+                                    "submitted share: channel={} job={} nonce={} ntime={} hash={} is_block={}",
+                                    job.channel_id, job_id, nonce, ntime, hash, is_block
                                 );
                                 last_io = Instant::now();
                             } else {
                                 nonce_cursor.insert(
                                     job_id,
-                                    cursor.wrapping_add(args.max_nonce_per_cycle.saturating_add(1)),
+                                    cursor.wrapping_add(args.max_nonce_per_cycle as u128),
                                 );
                             }
                         }
@@ -21886,7 +21902,27 @@ mod tests {
         let found = try_find_share_for_job(&job, scam_core::Target::MAX, 0, 100)
             .expect("must find share immediately");
         assert_eq!(found.0, 0);
-        assert!(found.2);
+        assert_eq!(found.1, job.ntime);
+        assert!(found.3);
+    }
+
+    #[test]
+    fn try_find_share_for_job_rolls_timestamp_after_nonce_wrap() {
+        let job = scam_stratum::MiningJob {
+            channel_id: 1,
+            job_id: 2,
+            version: 1,
+            prev_hash: Hash256::ZERO,
+            merkle_root: Hash256::ZERO,
+            ntime: 1_770_763_200,
+            network_target: scam_core::Target::MAX,
+        };
+        let wrapped_start = u128::from(u64::MAX) + 1;
+        let found = try_find_share_for_job(&job, scam_core::Target::MAX, wrapped_start, 1)
+            .expect("must find share after nonce wrap");
+        assert_eq!(found.0, 0);
+        assert_eq!(found.1, job.ntime.saturating_add(1));
+        assert!(found.3);
     }
 
     #[test]
