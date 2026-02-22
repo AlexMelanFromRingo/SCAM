@@ -339,3 +339,12 @@ Status: v3 (hardening + SV2 pool-grade gap closure on 2026-02-13)
 - [x] Convert bytes to 256 bits (MSB-first, freeze exact bit order in code docs).
 - [x] Render 16x16 matrix where `1 = white`, `0 = black`.
 - [x] Provide CLI command: `scam-node hash-visual --hash-hex <hex>`.
+
+## 20) Deferred Full Documentation Pack (Post-Feature-Freeze)
+
+- [ ] Write a maximum-detail project manual split by crate (`core`, `consensus`, `chain`, `mempool`, `wallet`, `p2p`, `stratum`, `storage`, `rpc`, `node`, `miner`) with:
+- [ ] module-level architecture and data-flow maps,
+- [ ] per-function behavior/reference notes (inputs, outputs, invariants, side effects, error paths),
+- [ ] protocol walkthroughs (P2P relay/sync, Stratum, wallet tx flow),
+- [ ] operator runbooks and scenario recipes (node-only, solo, solo-pool, shared-pool),
+- [ ] and cross-links to tests/fuzz/mutation coverage; finalize only after code stabilizes.
