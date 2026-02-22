@@ -8,6 +8,8 @@ use thiserror::Error;
 
 use crate::validate::{BlockValidationError, validate_block_basic};
 
+const LOCKTIME_THRESHOLD: u32 = 500_000_000;
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct UtxoEntry {
     pub value: u64,
@@ -54,7 +56,7 @@ pub fn validate_and_apply_block(
         let (input_total, output_total) = validate_non_coinbase_tx(
             tx,
             tx_index,
-            current_height,
+            (current_height, block.header.timestamp),
             coinbase_maturity,
             chain_domain,
             &mut spent_in_block,
@@ -139,14 +141,23 @@ pub fn validate_and_apply_block(
 fn validate_non_coinbase_tx(
     tx: &Transaction,
     tx_index: usize,
-    current_height: u64,
+    block_context: (u64, u64),
     coinbase_maturity: u64,
     chain_domain: &[u8],
     spent_in_block: &mut HashSet<OutPoint>,
     utxos: &UtxoSet,
 ) -> Result<(u128, u128), TxValidationError> {
+    let (current_height, block_timestamp) = block_context;
     if tx.is_coinbase() {
         return Err(TxValidationError::UnexpectedCoinbase { tx_index });
+    }
+    if !tx_is_final_for_block(tx, current_height, block_timestamp) {
+        return Err(TxValidationError::NonFinalTransaction {
+            tx_index,
+            lock_time: tx.lock_time,
+            block_height: current_height,
+            block_time: block_timestamp,
+        });
     }
 
     let secp = Secp256k1::verification_only();
@@ -250,6 +261,21 @@ fn tx_output_total(tx: &Transaction) -> u128 {
     tx.outputs.iter().map(|out| out.value as u128).sum()
 }
 
+pub fn tx_is_final_for_block(tx: &Transaction, block_height: u64, block_time: u64) -> bool {
+    if tx.lock_time == 0 {
+        return true;
+    }
+    let all_inputs_final = tx.inputs.iter().all(|input| input.sequence == u32::MAX);
+    if all_inputs_final {
+        return true;
+    }
+    if tx.lock_time < LOCKTIME_THRESHOLD {
+        (tx.lock_time as u64) <= block_height
+    } else {
+        (tx.lock_time as u64) <= block_time
+    }
+}
+
 fn key_hash20_from_pubkey(pubkey_compressed: &[u8]) -> Option<[u8; 20]> {
     if pubkey_compressed.len() != 33 {
         return None;
@@ -305,6 +331,15 @@ pub enum TxValidationError {
     },
     #[error("negative fee in tx #{tx_index}")]
     NegativeFee { tx_index: usize },
+    #[error(
+        "tx #{tx_index} is non-final at height={block_height} time={block_time} lock_time={lock_time}"
+    )]
+    NonFinalTransaction {
+        tx_index: usize,
+        lock_time: u32,
+        block_height: u64,
+        block_time: u64,
+    },
     #[error("fee overflow in tx #{tx_index}")]
     FeeOverflow { tx_index: usize },
     #[error("coinbase reward overflow")]
@@ -1026,5 +1061,201 @@ mod tests {
             .expect("zero-fee spend should pass");
         assert_eq!(summary.total_fees, 0);
         assert_eq!(summary.coinbase_value, 50);
+    }
+
+    #[test]
+    fn non_final_transaction_is_rejected_when_lock_time_not_reached() {
+        let chain_domain = b"devnet";
+        let (miner_pubkey, miner_key_hash, miner_secret) = key_material([131u8; 32]);
+        let (_, receiver_key_hash, _) = key_material([132u8; 32]);
+
+        let genesis_coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: OutPoint::coinbase(),
+                signature: b"genesis".to_vec(),
+                pubkey_compressed: vec![],
+                sequence: u32::MAX,
+            }],
+            outputs: vec![TxOut {
+                value: 50,
+                key_hash20: miner_key_hash,
+            }],
+            lock_time: 0,
+        };
+        let genesis = make_block(
+            Hash256::ZERO,
+            100,
+            Target::MAX,
+            vec![genesis_coinbase.clone()],
+        );
+        let mut utxos = UtxoSet::new();
+        validate_and_apply_block(&genesis, 0, 50, 1, chain_domain, &mut utxos)
+            .expect("genesis applies");
+
+        let mut spend = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: OutPoint {
+                    txid: genesis_coinbase.txid(),
+                    vout: 0,
+                },
+                signature: vec![],
+                pubkey_compressed: miner_pubkey.to_vec(),
+                sequence: 0,
+            }],
+            outputs: vec![TxOut {
+                value: 49,
+                key_hash20: receiver_key_hash,
+            }],
+            lock_time: 2,
+        };
+        sign_input(&mut spend, 0, chain_domain, &miner_secret);
+
+        let block1_coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: OutPoint::coinbase(),
+                signature: b"b1".to_vec(),
+                pubkey_compressed: vec![],
+                sequence: u32::MAX,
+            }],
+            outputs: vec![TxOut {
+                value: 51,
+                key_hash20: receiver_key_hash,
+            }],
+            lock_time: 0,
+        };
+        let block1 = make_block(
+            genesis.header.block_hash(),
+            220,
+            Target::MAX,
+            vec![block1_coinbase, spend],
+        );
+
+        let err = validate_and_apply_block(&block1, 1, 50, 1, chain_domain, &mut utxos)
+            .expect_err("non-final tx must be rejected");
+        assert!(matches!(err, TxValidationError::NonFinalTransaction { .. }));
+    }
+
+    #[test]
+    fn final_sequence_disables_lock_time_enforcement() {
+        let chain_domain = b"devnet";
+        let (miner_pubkey, miner_key_hash, miner_secret) = key_material([141u8; 32]);
+        let (_, receiver_key_hash, _) = key_material([142u8; 32]);
+
+        let genesis_coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: OutPoint::coinbase(),
+                signature: b"genesis".to_vec(),
+                pubkey_compressed: vec![],
+                sequence: u32::MAX,
+            }],
+            outputs: vec![TxOut {
+                value: 50,
+                key_hash20: miner_key_hash,
+            }],
+            lock_time: 0,
+        };
+        let genesis = make_block(
+            Hash256::ZERO,
+            100,
+            Target::MAX,
+            vec![genesis_coinbase.clone()],
+        );
+        let mut utxos = UtxoSet::new();
+        validate_and_apply_block(&genesis, 0, 50, 1, chain_domain, &mut utxos)
+            .expect("genesis applies");
+
+        let mut spend = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: OutPoint {
+                    txid: genesis_coinbase.txid(),
+                    vout: 0,
+                },
+                signature: vec![],
+                pubkey_compressed: miner_pubkey.to_vec(),
+                sequence: u32::MAX,
+            }],
+            outputs: vec![TxOut {
+                value: 49,
+                key_hash20: receiver_key_hash,
+            }],
+            lock_time: u32::MAX,
+        };
+        sign_input(&mut spend, 0, chain_domain, &miner_secret);
+
+        let block1_coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: OutPoint::coinbase(),
+                signature: b"b1".to_vec(),
+                pubkey_compressed: vec![],
+                sequence: u32::MAX,
+            }],
+            outputs: vec![TxOut {
+                value: 51,
+                key_hash20: receiver_key_hash,
+            }],
+            lock_time: 0,
+        };
+        let block1 = make_block(
+            genesis.header.block_hash(),
+            220,
+            Target::MAX,
+            vec![block1_coinbase, spend],
+        );
+
+        let summary = validate_and_apply_block(&block1, 1, 50, 1, chain_domain, &mut utxos)
+            .expect("final sequence should allow lock_time bypass");
+        assert_eq!(summary.total_fees, 1);
+    }
+
+    #[test]
+    fn tx_is_final_for_block_supports_height_and_time_thresholds() {
+        let tx_height_locked = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: OutPoint {
+                    txid: Hash256([0x22; 32]),
+                    vout: 0,
+                },
+                signature: vec![],
+                pubkey_compressed: vec![0x02; 33],
+                sequence: 1,
+            }],
+            outputs: vec![TxOut {
+                value: 1,
+                key_hash20: [0x33; 20],
+            }],
+            lock_time: 10,
+        };
+        assert!(!super::tx_is_final_for_block(
+            &tx_height_locked,
+            9,
+            1_000_000
+        ));
+        assert!(super::tx_is_final_for_block(
+            &tx_height_locked,
+            10,
+            1_000_000
+        ));
+
+        let tx_time_locked = Transaction {
+            lock_time: 500_000_010,
+            ..tx_height_locked.clone()
+        };
+        assert!(!super::tx_is_final_for_block(
+            &tx_time_locked,
+            1_000,
+            500_000_009
+        ));
+        assert!(super::tx_is_final_for_block(
+            &tx_time_locked,
+            1_000,
+            500_000_010
+        ));
     }
 }

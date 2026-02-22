@@ -10,7 +10,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use scam_chain::{BlockSubmissionOutcome, ChainError, ChainRuntime};
-use scam_consensus::{TxValidationError, UtxoSet, validate_and_apply_block};
+use scam_consensus::{TxValidationError, UtxoSet, tx_is_final_for_block, validate_and_apply_block};
 use scam_core::{
     ChainConfig, ChainConfigError, DifficultyAlgorithm, Hash256, OutPoint, Target, Transaction,
     TxIn, TxOut, block_meets_pow, render_hash_bitmap_16x16,
@@ -23,7 +23,10 @@ use scam_p2p::{
     read_message, request_blocks, request_headers, select_block_hashes_for_peer,
     select_headers_for_peer, select_outbound_peers, send_message, server_handshake,
 };
-use scam_rpc::{StatusResponse, TxResponse, header_to_block_response, to_pretty_json};
+use scam_rpc::{
+    StatusResponse, TxResponse, TxSubmitRpcRequest, decode_tx_submit_request,
+    header_to_block_response, to_pretty_json,
+};
 use scam_storage::{
     ChainArchive, ChainStateSnapshot, MempoolSnapshot, MempoolTxRecord, PeerAddressBook,
     PeerAddressRecord, StorageError, load_chain_archive_db, load_mempool_db, load_peer_book_db,
@@ -6497,18 +6500,6 @@ fn wallet_send_preview_has_invalid_amount(amount: u64) -> bool {
     amount == 0
 }
 
-fn tx_submit_has_invalid_payload(tx_hex: &str) -> bool {
-    tx_hex.trim().is_empty()
-}
-
-fn decode_tx_from_bincode_hex(raw: &str) -> Result<Transaction, NodeError> {
-    let trimmed = raw.trim();
-    let decoded =
-        hex::decode(trimmed).map_err(|e| NodeError::Runtime(format!("invalid tx_hex: {e}")))?;
-    bincode::deserialize::<Transaction>(&decoded)
-        .map_err(|e| NodeError::Runtime(format!("invalid tx payload: {e}")))
-}
-
 #[derive(Clone, Copy)]
 struct ResolvedPrevout {
     value: u64,
@@ -6560,6 +6551,14 @@ fn validate_tx_for_local_admission(
         return Err(NodeError::Runtime(
             "transaction must include at least one output".to_owned(),
         ));
+    }
+    let candidate_height = runtime.tip_height().saturating_add(1);
+    let candidate_time = runtime.tip_header().timestamp.saturating_add(1);
+    if !tx_is_final_for_block(tx, candidate_height, candidate_time) {
+        return Err(NodeError::Runtime(format!(
+            "transaction is non-final for next block (height={candidate_height}, time={candidate_time}, lock_time={})",
+            tx.lock_time
+        )));
     }
 
     let mut seen = HashSet::<OutPoint>::new();
@@ -8255,22 +8254,6 @@ impl Default for WalletSendPreviewRpcRequest {
             index: 0,
             to: String::new(),
             amount: 0,
-            fee: 1,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(default)]
-struct TxSubmitRpcRequest {
-    tx_hex: String,
-    fee: u64,
-}
-
-impl Default for TxSubmitRpcRequest {
-    fn default() -> Self {
-        Self {
-            tx_hex: String::new(),
             fee: 1,
         }
     }
@@ -10058,12 +10041,7 @@ fn run_rpc_serve_inner(
                     continue;
                 }
             };
-            if tx_submit_has_invalid_payload(&req.tx_hex) {
-                let body = json_error_body("tx_hex must not be empty");
-                write_http_json_response(&mut stream, "400 Bad Request", &body)?;
-                continue;
-            }
-            let tx = match decode_tx_from_bincode_hex(&req.tx_hex) {
+            let (tx, requested_fee) = match decode_tx_submit_request(&req) {
                 Ok(value) => value,
                 Err(err) => {
                     let body = json_error_body(&err.to_string());
@@ -10076,7 +10054,7 @@ fn run_rpc_serve_inner(
                 &runtime_db_path,
                 &mempool_db_path,
                 tx,
-                req.fee,
+                requested_fee,
             ) {
                 Ok(value) => value,
                 Err(err) => {
@@ -10801,8 +10779,12 @@ mod tests {
         assert!(super::should_emit_miner_keepalive(11));
         assert!(super::wallet_send_preview_has_invalid_amount(0));
         assert!(!super::wallet_send_preview_has_invalid_amount(1));
-        assert!(super::tx_submit_has_invalid_payload("   \n\t"));
-        assert!(!super::tx_submit_has_invalid_payload("00"));
+        let tx_submit_empty = scam_rpc::decode_tx_submit_request(&scam_rpc::TxSubmitRpcRequest {
+            tx_hex: "   \n\t".to_owned(),
+            fee: 1,
+        })
+        .expect_err("empty tx submit payload must fail");
+        assert!(tx_submit_empty.to_string().contains("must not be empty"));
         assert!(!super::should_reply_bad_http_request(
             &super::NodeError::Runtime(
                 "http read timeout while waiting for full request: timed out".to_owned()
@@ -16311,6 +16293,42 @@ mod tests {
             super::validate_tx_for_local_admission(&cfg, &runtime, &mempool, &zero_fee_signed.tx)
                 .expect("zero fee tx");
         assert_eq!(zero_fee, 0);
+
+        let mut non_final_tx = signed.tx.clone();
+        non_final_tx.lock_time = runtime.tip_height().saturating_add(3) as u32;
+        for input in &mut non_final_tx.inputs {
+            input.sequence = 0;
+        }
+        for input_index in 0..non_final_tx.inputs.len() {
+            let digest = non_final_tx
+                .signing_digest_with_chain_domain(input_index, cfg.network_id.as_bytes())
+                .expect("non-final digest");
+            let signature =
+                scam_wallet::sign_digest(&sender_key, digest.0).expect("non-final sign");
+            non_final_tx.inputs[input_index].signature = signature.to_vec();
+        }
+        let non_final_err =
+            super::validate_tx_for_local_admission(&cfg, &runtime, &mempool, &non_final_tx)
+                .expect_err("non-final tx must fail local admission");
+        assert!(non_final_err.to_string().contains("non-final"));
+
+        let mut final_sequence_tx = signed.tx.clone();
+        final_sequence_tx.lock_time = u32::MAX;
+        for input in &mut final_sequence_tx.inputs {
+            input.sequence = u32::MAX;
+        }
+        for input_index in 0..final_sequence_tx.inputs.len() {
+            let digest = final_sequence_tx
+                .signing_digest_with_chain_domain(input_index, cfg.network_id.as_bytes())
+                .expect("final-seq digest");
+            let signature =
+                scam_wallet::sign_digest(&sender_key, digest.0).expect("final-seq sign");
+            final_sequence_tx.inputs[input_index].signature = signature.to_vec();
+        }
+        let final_sequence_fee =
+            super::validate_tx_for_local_admission(&cfg, &runtime, &mempool, &final_sequence_tx)
+                .expect("final sequence should bypass lock_time");
+        assert_eq!(final_sequence_fee, valid_fee);
 
         let mut overspend_tx = signed.tx.clone();
         overspend_tx.outputs[0].value = overspend_tx.outputs[0].value.saturating_add(10_000_000);

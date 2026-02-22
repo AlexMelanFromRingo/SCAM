@@ -1054,9 +1054,12 @@ dependencies = [
 name = "scam-rpc"
 version = "0.1.0"
 dependencies = [
+ "bincode",
+ "hex",
  "scam-core",
  "serde",
  "serde_json",
+ "thiserror",
 ]
 
 [[package]]
