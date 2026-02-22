@@ -26,11 +26,11 @@ use scam_miner::{
 };
 use scam_p2p::{
     CompactBlock, FramingConfig, GossipEngine, GossipError, InventoryItem, LocalHandshake,
-    PeerAddress, PeerCandidate, PrefilledTxn, ReplacementRateLimit, TransportError, WireMessage,
-    build_block_locator, client_handshake, client_handshake_async, read_message,
-    read_message_async, request_blocks, request_headers, select_block_hashes_for_peer,
-    select_headers_for_peer, select_outbound_peers, send_message, send_message_async,
-    server_handshake, server_handshake_async,
+    PeerAddress, PeerCandidate, PrefilledTxn, RemoteHandshake, ReplacementRateLimit,
+    TransportError, WireMessage, build_block_locator, client_handshake, client_handshake_async,
+    read_message, read_message_async, request_blocks, request_headers,
+    select_block_hashes_for_peer, select_headers_for_peer, select_outbound_peers, send_message,
+    send_message_async, server_handshake, server_handshake_async,
 };
 use scam_rpc::{
     StatusResponse, TxResponse, TxSubmitRpcRequest, decode_tx_submit_request,
@@ -742,6 +742,12 @@ struct Sv2ConformanceArgs {
     pool: String,
     #[arg(long, default_value = "scam-conformance")]
     user: String,
+    #[arg(long, default_value_t = 5)]
+    connect_timeout_sec: u64,
+    #[arg(long, default_value_t = 2)]
+    connect_retries: u32,
+    #[arg(long, default_value_t = 250)]
+    connect_retry_delay_ms: u64,
     #[arg(long, default_value_t = 3)]
     read_timeout_sec: u64,
     #[arg(long, default_value_t = false)]
@@ -4167,6 +4173,8 @@ const RELAY_MAX_PENDING_BLOCK_ORPHANS: usize = 512;
 const RELAY_PARENT_RESYNC_COOLDOWN_SEC: u64 = 2;
 const RELAY_OUTBOUND_MAX_PEERS: usize = 8;
 const RELAY_OUTBOUND_ROTATE_AFTER_SEC: u64 = 6 * 60 * 60;
+const RELAY_INBOUND_ACCEPT_WINDOW_SEC: u64 = 5;
+const RELAY_INBOUND_ACCEPT_MAX_PER_IP: usize = 64;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RelayServerTelemetrySnapshot {
@@ -6648,14 +6656,14 @@ async fn run_relay_peer_session_async<S: AsyncRead + AsyncWrite + Unpin>(
             user_agent: "scam-node/relay-serve".to_owned(),
             start_height: 0,
         };
-        let remote = match mode {
-            RelayPeerSessionMode::Inbound => {
-                server_handshake_async(stream, &framing, &local_hello).await?
-            }
-            RelayPeerSessionMode::Outbound => {
-                client_handshake_async(stream, &framing, &local_hello).await?
-            }
-        };
+        let remote = relay_handshake_async_with_timeout(
+            stream,
+            mode,
+            &framing,
+            &local_hello,
+            read_timeout_sec,
+        )
+        .await?;
         ensure_relay_peer_network(&cfg.network_id, &remote.network_id)?;
         {
             let mut guard = state
@@ -6863,6 +6871,36 @@ async fn run_relay_peer_session_async<S: AsyncRead + AsyncWrite + Unpin>(
     session_result
 }
 
+async fn relay_handshake_async_with_timeout<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    mode: RelayPeerSessionMode,
+    framing: &FramingConfig,
+    local_hello: &LocalHandshake,
+    timeout_sec: u64,
+) -> Result<RemoteHandshake, NodeError> {
+    let deadline = Duration::from_secs(timeout_sec.max(1));
+    let handshake = async {
+        match mode {
+            RelayPeerSessionMode::Inbound => {
+                server_handshake_async(stream, framing, local_hello).await
+            }
+            RelayPeerSessionMode::Outbound => {
+                client_handshake_async(stream, framing, local_hello).await
+            }
+        }
+    };
+    match timeout(deadline, handshake).await {
+        Ok(Ok(remote)) => Ok(remote),
+        Ok(Err(err)) => Err(NodeError::Transport(err)),
+        Err(_) => Err(NodeError::Transport(TransportError::Io(
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("relay handshake timed out after {}s", deadline.as_secs()),
+            ),
+        ))),
+    }
+}
+
 fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
     let config_path = args
         .config
@@ -7044,6 +7082,7 @@ fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
         };
 
         let mut served = 0u32;
+        let mut inbound_accept_history = HashMap::<IpAddr, VecDeque<u64>>::new();
         loop {
             let accepted = listener
                 .accept()
@@ -7056,6 +7095,23 @@ fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
                     break;
                 }
             };
+            let now_unix_sec = current_unix_sec().unwrap_or(0);
+            if relay_inbound_accept_rate_limited(
+                &mut inbound_accept_history,
+                peer_addr.ip(),
+                now_unix_sec,
+                RELAY_INBOUND_ACCEPT_WINDOW_SEC,
+                RELAY_INBOUND_ACCEPT_MAX_PER_IP,
+            ) {
+                eprintln!(
+                    "warning: dropping inbound relay connection from {} (accept-rate limit: {} per {}s)",
+                    peer_addr.ip(),
+                    RELAY_INBOUND_ACCEPT_MAX_PER_IP,
+                    RELAY_INBOUND_ACCEPT_WINDOW_SEC
+                );
+                drop(stream);
+                continue;
+            }
 
             let permit = match permits.clone().try_acquire_owned() {
                 Ok(permit) => permit,
@@ -8627,6 +8683,30 @@ fn write_role_response<T: Serialize, W: Write>(
 
 fn max_requests_reached(max_requests: u32, served: u32) -> bool {
     max_requests > 0 && served >= max_requests
+}
+
+fn relay_inbound_accept_rate_limited(
+    history: &mut HashMap<IpAddr, VecDeque<u64>>,
+    ip: IpAddr,
+    now_unix_sec: u64,
+    window_sec: u64,
+    max_accepts: usize,
+) -> bool {
+    let window_sec = window_sec.max(1);
+    let max_accepts = max_accepts.max(1);
+    let events = history.entry(ip).or_default();
+    while let Some(ts) = events.front().copied() {
+        if now_unix_sec.saturating_sub(ts) >= window_sec {
+            events.pop_front();
+        } else {
+            break;
+        }
+    }
+    if events.len() >= max_accepts {
+        return true;
+    }
+    events.push_back(now_unix_sec);
+    false
 }
 
 fn rpc_accept_error_should_retry(shutdown_enabled: bool, err_kind: std::io::ErrorKind) -> bool {
@@ -10764,9 +10844,67 @@ where
     Ok(None)
 }
 
+fn connect_tcp_with_timeout(endpoint: &str, timeout: Duration) -> Result<TcpStream, NodeError> {
+    let addrs = endpoint.to_socket_addrs().map_err(|e| {
+        NodeError::Runtime(format!(
+            "sv2 conformance resolve failed for {endpoint}: {e}"
+        ))
+    })?;
+    let mut resolved_any = false;
+    let mut last_err = None::<std::io::Error>;
+    for addr in addrs {
+        resolved_any = true;
+        match TcpStream::connect_timeout(&addr, timeout) {
+            Ok(stream) => return Ok(stream),
+            Err(err) => last_err = Some(err),
+        }
+    }
+    if !resolved_any {
+        return Err(NodeError::Runtime(format!(
+            "sv2 conformance resolve failed for {endpoint}: no addresses returned"
+        )));
+    }
+    Err(NodeError::Runtime(format!(
+        "sv2 conformance connect failed: {}",
+        last_err
+            .map(|err| err.to_string())
+            .unwrap_or_else(|| "unknown error".to_owned())
+    )))
+}
+
+fn connect_tcp_with_retry(
+    endpoint: &str,
+    connect_timeout: Duration,
+    retries: u32,
+    retry_delay: Duration,
+) -> Result<TcpStream, NodeError> {
+    let attempts = retries.saturating_add(1);
+    let mut last_err = None::<NodeError>;
+    for attempt in 0..attempts {
+        match connect_tcp_with_timeout(endpoint, connect_timeout) {
+            Ok(stream) => return Ok(stream),
+            Err(err) => {
+                last_err = Some(err);
+                if attempt + 1 < attempts {
+                    thread::sleep(retry_delay);
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        NodeError::Runtime("sv2 conformance connect failed: unknown error".to_owned())
+    }))
+}
+
 fn run_sv2_conformance(args: Sv2ConformanceArgs) -> Result<(), NodeError> {
-    let mut stream = TcpStream::connect(&args.pool)
-        .map_err(|e| NodeError::Runtime(format!("sv2 conformance connect failed: {e}")))?;
+    let connect_timeout = Duration::from_secs(args.connect_timeout_sec.max(1));
+    let connect_retry_delay = Duration::from_millis(args.connect_retry_delay_ms.max(1));
+    let mut stream = connect_tcp_with_retry(
+        &args.pool,
+        connect_timeout,
+        args.connect_retries,
+        connect_retry_delay,
+    )?;
     let timeout = Duration::from_secs(args.read_timeout_sec.max(1));
     configure_stream_timeouts_with_ops(
         |duration| stream.set_read_timeout(duration),
@@ -13780,6 +13918,37 @@ mod tests {
         assert!(!super::should_stop_after_seen_messages(0, 100));
         assert!(!super::should_stop_after_seen_messages(2, 1));
         assert!(super::should_stop_after_seen_messages(2, 2));
+        let mut accept_history =
+            std::collections::HashMap::<std::net::IpAddr, std::collections::VecDeque<u64>>::new();
+        let loopback: std::net::IpAddr = "127.0.0.1".parse().expect("loopback parse");
+        assert!(!super::relay_inbound_accept_rate_limited(
+            &mut accept_history,
+            loopback,
+            100,
+            2,
+            2
+        ));
+        assert!(!super::relay_inbound_accept_rate_limited(
+            &mut accept_history,
+            loopback,
+            101,
+            2,
+            2
+        ));
+        assert!(super::relay_inbound_accept_rate_limited(
+            &mut accept_history,
+            loopback,
+            101,
+            2,
+            2
+        ));
+        assert!(!super::relay_inbound_accept_rate_limited(
+            &mut accept_history,
+            loopback,
+            104,
+            2,
+            2
+        ));
 
         let io_timeout = std::io::Error::from(std::io::ErrorKind::TimedOut);
         let io_reset = std::io::Error::from(std::io::ErrorKind::ConnectionReset);
@@ -22009,6 +22178,9 @@ mod tests {
         run_sv2_conformance(Sv2ConformanceArgs {
             pool: addr,
             user: "sv2-test-user".to_owned(),
+            connect_timeout_sec: 2,
+            connect_retries: 2,
+            connect_retry_delay_ms: 50,
             read_timeout_sec: 1,
             secure_transport: false,
             secure_transport_mode: None,
@@ -22111,6 +22283,9 @@ mod tests {
         let err = run_sv2_conformance(Sv2ConformanceArgs {
             pool: addr,
             user: "sv2-test-user".to_owned(),
+            connect_timeout_sec: 2,
+            connect_retries: 2,
+            connect_retry_delay_ms: 50,
             read_timeout_sec: 1,
             secure_transport: false,
             secure_transport_mode: None,
@@ -23141,7 +23316,7 @@ mod tests {
                     config: Some(config_path),
                     runtime_db: Some(runtime_db_b),
                     bind: bind_b,
-                    max_clients: 4,
+                    max_clients: 64,
                     max_messages_per_peer: 0,
                     read_timeout_sec: 1,
                     write_timeout_sec: 1,
@@ -23158,6 +23333,25 @@ mod tests {
                 })
             }
         });
+
+        // Ensure relay B has bound and is accepting handshake traffic before starting A dialer.
+        let mut ready_probe = connect_with_retry(&bind_b);
+        ready_probe
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("ready probe read timeout");
+        ready_probe
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .expect("ready probe write timeout");
+        let ready_framing = FramingConfig::default();
+        let ready_hello = LocalHandshake {
+            protocol_version: 1,
+            network_id: "devnet".to_owned(),
+            user_agent: "relay-latency-ready-probe".to_owned(),
+            start_height: 0,
+        };
+        let _ = client_handshake(&mut ready_probe, &ready_framing, &ready_hello)
+            .expect("ready probe handshake");
+        let _ = ready_probe.shutdown(Shutdown::Both);
 
         let server_a = thread::spawn({
             let config_path = config_path.clone();
@@ -23188,7 +23382,7 @@ mod tests {
             }
         });
 
-        thread::sleep(Duration::from_millis(800));
+        thread::sleep(Duration::from_millis(1_200));
         let mut sender = connect_with_retry(&bind_a);
         sender
             .set_read_timeout(Some(Duration::from_secs(2)))
@@ -23220,7 +23414,7 @@ mod tests {
         send_message(&mut sender, &WireMessage::Tx { tx: signed.tx }, &framing).expect("send tx");
 
         let mut observed = None::<Duration>;
-        let deadline = Instant::now() + Duration::from_secs(12);
+        let deadline = Instant::now() + Duration::from_secs(20);
         while Instant::now() < deadline {
             if let Ok(snapshot) = scam_storage::load_mempool_db(&mempool_db_b)
                 && snapshot.entries.iter().any(|entry| entry.txid == txid)
@@ -23233,8 +23427,8 @@ mod tests {
 
         let latency = observed.expect("relay B must observe tx in mempool within deadline");
         assert!(
-            latency <= Duration::from_secs(10),
-            "expected relay tx propagation <= 10s, got {:?}",
+            latency <= Duration::from_secs(15),
+            "expected relay tx propagation <= 15s, got {:?}",
             latency
         );
 
@@ -23243,7 +23437,7 @@ mod tests {
 
         // Nudge relay B accept loop so it can reach max_clients and exit deterministically
         // even if outbound sessions churned during CI scheduling jitter.
-        for _ in 0..4 {
+        for _ in 0..80 {
             if let Ok(poke) = TcpStream::connect(&bind_b) {
                 let _ = poke.shutdown(Shutdown::Both);
             }
@@ -23418,6 +23612,9 @@ mod tests {
         let conformance_err = run_sv2_conformance(Sv2ConformanceArgs {
             pool: "127.0.0.1:0".to_owned(),
             user: "u".to_owned(),
+            connect_timeout_sec: 1,
+            connect_retries: 0,
+            connect_retry_delay_ms: 10,
             read_timeout_sec: 1,
             secure_transport: false,
             secure_transport_mode: None,

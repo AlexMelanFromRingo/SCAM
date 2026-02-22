@@ -8,6 +8,9 @@ POOL_BIND="${POOL_BIND:-127.0.0.1:3347}"
 SECURE_POOL_BIND="${SECURE_POOL_BIND:-127.0.0.1:3348}"
 SV2_EXTERNAL_TARGETS_FILE="${SV2_EXTERNAL_TARGETS_FILE:-}"
 EXTERNAL_RESULTS_JSONL="${OUT_DIR}/external-target-results.jsonl"
+SV2_CONFORMANCE_CONNECT_TIMEOUT_SEC="${SV2_CONFORMANCE_CONNECT_TIMEOUT_SEC:-5}"
+SV2_CONFORMANCE_CONNECT_RETRIES="${SV2_CONFORMANCE_CONNECT_RETRIES:-4}"
+SV2_CONFORMANCE_CONNECT_RETRY_DELAY_MS="${SV2_CONFORMANCE_CONNECT_RETRY_DELAY_MS:-300}"
 unexpected_external_failures=0
 
 mkdir -p "${OUT_DIR}"
@@ -23,10 +26,43 @@ run_conformance_target() {
   local vendor="${7:-}"
   local version="${8:-}"
 
+  if [[ -z "${stack_name}" || -z "${endpoint}" ]]; then
+    echo "[sv2-matrix] invalid target entry: missing stack_name or endpoint"
+    unexpected_external_failures=$((unexpected_external_failures + 1))
+    return
+  fi
+  case "${secure}" in
+    true|false) ;;
+    *)
+      echo "[sv2-matrix] warning: secure must be true|false for ${stack_name}; got '${secure}', forcing false"
+      secure="false"
+      ;;
+  esac
+  case "${mode}" in
+    legacy|noise-xx|noise_xx) ;;
+    *)
+      echo "[sv2-matrix] warning: unsupported mode '${mode}' for ${stack_name}; forcing legacy"
+      mode="legacy"
+      ;;
+  esac
+  if [[ "${mode}" == "noise_xx" ]]; then
+    mode="noise-xx"
+  fi
+  case "${expected}" in
+    pass|fail) ;;
+    *)
+      echo "[sv2-matrix] warning: expected must be pass|fail for ${stack_name}; got '${expected}', forcing pass"
+      expected="pass"
+      ;;
+  esac
+
   local args=(
     --pool "${endpoint}"
     --stack-name "${stack_name}"
     --user "matrix-${stack_name}"
+    --connect-timeout-sec "${SV2_CONFORMANCE_CONNECT_TIMEOUT_SEC}"
+    --connect-retries "${SV2_CONFORMANCE_CONNECT_RETRIES}"
+    --connect-retry-delay-ms "${SV2_CONFORMANCE_CONNECT_RETRY_DELAY_MS}"
     --corpus "${CORPUS}"
     --out "${OUT_DIR}/${stack_name}.json"
   )

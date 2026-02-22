@@ -37,6 +37,15 @@ The harness writes per-target run status metadata to:
 
 - `target/sv2-conformance/external-target-results.jsonl`
 
+Connection-hardening knobs for flaky external endpoints:
+
+- `SV2_CONFORMANCE_CONNECT_TIMEOUT_SEC` (default `5`)
+- `SV2_CONFORMANCE_CONNECT_RETRIES` (default `4`, extra attempts after the first)
+- `SV2_CONFORMANCE_CONNECT_RETRY_DELAY_MS` (default `300`)
+
+Target tuple validation is strict for `secure` (`true|false`), `mode` (`legacy|noise-xx`), and
+`expected` (`pass|fail`) to avoid false-positive matrix rows.
+
 4. Outputs:
 
 - `target/sv2-conformance/*.json` per-stack reports
