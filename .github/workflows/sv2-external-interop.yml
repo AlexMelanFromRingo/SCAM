@@ -5,7 +5,6 @@ on:
 
 jobs:
   external-interop:
-    if: ${{ secrets.SV2_EXTERNAL_TARGETS_JSON != '' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -18,11 +17,15 @@ jobs:
           workspaces: |
             . -> target
       - name: Prepare external target manifest
+        env:
+          TARGETS_JSON: ${{ secrets.SV2_EXTERNAL_TARGETS_JSON }}
         run: |
+          if [[ -z "${TARGETS_JSON}" ]]; then
+            echo "SV2_EXTERNAL_TARGETS_JSON secret is required for external interop workflow" >&2
+            exit 1
+          fi
           mkdir -p target/sv2-conformance
-          cat > target/sv2-conformance/external-targets.json <<'JSON'
-          ${{ secrets.SV2_EXTERNAL_TARGETS_JSON }}
-          JSON
+          printf '%s\n' "${TARGETS_JSON}" > target/sv2-conformance/external-targets.json
       - name: Run external SV2 conformance matrix
         env:
           SV2_EXTERNAL_TARGETS_FILE: target/sv2-conformance/external-targets.json
