@@ -5116,6 +5116,14 @@ fn relay_runtime_or_mempool_changed(
     (tip_after != tip_before, mempool_after != mempool_before)
 }
 
+fn relay_max_active_sessions(max_clients: u32) -> usize {
+    if max_clients > 0 {
+        max_clients as usize
+    } else {
+        512
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(not(test), allow(dead_code))]
 fn run_relay_peer_session<IO: Read + Write>(
@@ -5611,11 +5619,7 @@ fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
     let outbound_redial_sec = args.outbound_redial_sec.max(1);
     let max_clients = args.max_clients;
     let read_limit = args.max_messages_per_peer;
-    let max_active_sessions = if max_clients > 0 {
-        max_clients as usize
-    } else {
-        512
-    };
+    let max_active_sessions = relay_max_active_sessions(max_clients);
     println!("Max concurrent sessions: {}", max_active_sessions);
     if outbound_connect {
         println!(
@@ -11139,7 +11143,8 @@ mod tests {
     use scam_miner::{BlockTemplate, mine_block};
     use scam_p2p::{
         FramingConfig, GossipEngine, InventoryItem, LocalHandshake, ReplacementRateLimit,
-        WireMessage, client_handshake, read_message, send_message, server_handshake,
+        WireMessage, client_handshake, read_message, read_message_async, send_message,
+        send_message_async, server_handshake, server_handshake_async,
     };
     use scam_storage::{
         MempoolSnapshot, PeerAddressBook, PeerAddressRecord, load_chain_archive_db,
@@ -11553,6 +11558,11 @@ mod tests {
 
     #[test]
     fn helper_guards_for_limits_and_rates_are_consistent() {
+        assert_eq!(super::RELAY_OUTBOUND_ROTATE_AFTER_SEC, 21_600);
+        assert_eq!(super::relay_max_active_sessions(0), 512);
+        assert_eq!(super::relay_max_active_sessions(1), 1);
+        assert_eq!(super::relay_max_active_sessions(7), 7);
+
         assert!(!super::nonzero_limit_reached(0, 10));
         assert!(!super::nonzero_limit_reached(5, 4));
         assert!(super::nonzero_limit_reached(5, 5));
@@ -16087,6 +16097,106 @@ mod tests {
     }
 
     #[test]
+    fn load_relay_known_peer_addresses_filters_invalid_entries_and_caps_output() {
+        let peers_dir = temp_dir("test-relay-known-peer-addresses");
+        fs::create_dir_all(&peers_dir).expect("mkdir");
+        let peers_db_path = peers_dir.join("devnet.redb");
+
+        super::save_peer_book_db(
+            &peers_db_path,
+            &PeerAddressBook {
+                network_id: "devnet".to_owned(),
+                peers: vec![
+                    PeerAddressRecord {
+                        address: "127.0.0.1:19000".to_owned(),
+                        last_seen_unix_sec: 1,
+                        ban_score: 0,
+                    },
+                    PeerAddressRecord {
+                        address: "127.0.0.1:19000".to_owned(),
+                        last_seen_unix_sec: 5,
+                        ban_score: 0,
+                    },
+                    PeerAddressRecord {
+                        address: "127.0.0.1:19001".to_owned(),
+                        last_seen_unix_sec: 2,
+                        ban_score: 0,
+                    },
+                ],
+            },
+        )
+        .expect("save peer book");
+
+        let peers = super::load_relay_known_peer_addresses(&peers_dir, "devnet")
+            .expect("load known peer addresses");
+        assert_eq!(
+            peers
+                .iter()
+                .map(|entry| entry.address.clone())
+                .collect::<Vec<_>>(),
+            vec!["127.0.0.1:19000".to_owned(), "127.0.0.1:19001".to_owned()]
+        );
+        assert!(peers.iter().all(|entry| !entry.address.trim().is_empty()));
+
+        let many_records = (0..2_101u32)
+            .map(|idx| PeerAddressRecord {
+                address: format!("127.0.0.1:{}", 20_000 + idx),
+                last_seen_unix_sec: idx as u64,
+                ban_score: 0,
+            })
+            .collect::<Vec<_>>();
+        super::save_peer_book_db(
+            &peers_db_path,
+            &PeerAddressBook {
+                network_id: "devnet".to_owned(),
+                peers: many_records,
+            },
+        )
+        .expect("save large peer book");
+
+        let capped = super::load_relay_known_peer_addresses(&peers_dir, "devnet")
+            .expect("load capped known peers");
+        assert_eq!(capped.len(), 2_000);
+
+        let _ = fs::remove_dir_all(peers_dir);
+    }
+
+    #[test]
+    fn load_relay_outbound_targets_selected_returns_only_valid_socket_addresses() {
+        let peers_dir = temp_dir("test-relay-selected-targets");
+        fs::create_dir_all(&peers_dir).expect("mkdir");
+        let peers_db_path = peers_dir.join("devnet.redb");
+
+        super::save_peer_book_db(
+            &peers_db_path,
+            &PeerAddressBook {
+                network_id: "devnet".to_owned(),
+                peers: vec![
+                    PeerAddressRecord {
+                        address: "not-a-socket".to_owned(),
+                        last_seen_unix_sec: 0,
+                        ban_score: 0,
+                    },
+                    PeerAddressRecord {
+                        address: "127.0.0.1:19444".to_owned(),
+                        last_seen_unix_sec: 0,
+                        ban_score: 0,
+                    },
+                ],
+            },
+        )
+        .expect("save peer book");
+
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let targets = super::load_relay_outbound_targets_selected(&peers_dir, &cfg, 8, 60)
+            .expect("load selected targets");
+        assert_eq!(targets, vec!["127.0.0.1:19444".to_owned()]);
+
+        let _ = fs::remove_dir_all(peers_dir);
+    }
+
+    #[test]
     fn run_relay_outbound_worker_skips_self_target_immediately() {
         let cfg: ChainConfig =
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
@@ -16431,6 +16541,172 @@ mod tests {
     }
 
     #[test]
+    fn run_relay_outbound_worker_async_connects_and_performs_handshake() {
+        let _net_guard = network_test_guard();
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let relay = RelayAdmissionState {
+            mempool: Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip: GossipEngine::new(64).expect("gossip"),
+        };
+        let state =
+            std::sync::Arc::new(std::sync::Mutex::new(RelayServerState::new(runtime, relay)));
+        let active = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let next_peer = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        let Some(target) = allocate_local_addr() else {
+            return;
+        };
+        let listener = TcpListener::bind(&target).expect("bind async worker listener");
+        let (tx, rx) = mpsc::channel::<()>();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+            let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+            let framing = FramingConfig::default();
+            let local_hello = LocalHandshake {
+                protocol_version: 1,
+                network_id: "devnet".to_owned(),
+                user_agent: "test-async-outbound-peer".to_owned(),
+                start_height: 0,
+            };
+            let remote = server_handshake(&mut stream, &framing, &local_hello).expect("handshake");
+            assert_eq!(remote.network_id, "devnet");
+            let _ = tx.send(());
+        });
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        rt.block_on(async {
+            let task = tokio::spawn(super::run_relay_outbound_worker_async(
+                target,
+                "127.0.0.1:18444".to_owned(),
+                stop.clone(),
+                next_peer,
+                state,
+                active,
+                cfg,
+                temp_dir("test-outbound-worker-async-runtime").join("runtime.redb"),
+                temp_dir("test-outbound-worker-async-mempool").join("mempool.redb"),
+                128,
+                8,
+                1,
+                1,
+                1,
+            ));
+            rx.recv_timeout(Duration::from_secs(6))
+                .expect("async outbound worker should connect");
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            tokio::time::timeout(Duration::from_secs(8), task)
+                .await
+                .expect("worker async join timeout")
+                .expect("worker async task");
+        });
+        join_with_timeout(server, Duration::from_secs(5), "relay outbound async peer");
+    }
+
+    #[test]
+    fn run_relay_outbound_supervisor_async_spawns_worker_from_peer_book() {
+        let _net_guard = network_test_guard();
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let relay = RelayAdmissionState {
+            mempool: Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip: GossipEngine::new(64).expect("gossip"),
+        };
+        let state =
+            std::sync::Arc::new(std::sync::Mutex::new(RelayServerState::new(runtime, relay)));
+        let active = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let next_peer = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        let Some(target) = allocate_local_addr() else {
+            return;
+        };
+        let listener = TcpListener::bind(&target).expect("bind async supervisor listener");
+
+        let peers_dir = temp_dir("test-outbound-supervisor-async-peers");
+        fs::create_dir_all(&peers_dir).expect("mkdir peers");
+        super::save_peer_book_db(
+            &peers_dir.join("devnet.redb"),
+            &PeerAddressBook {
+                network_id: "devnet".to_owned(),
+                peers: vec![PeerAddressRecord {
+                    address: target.clone(),
+                    last_seen_unix_sec: 0,
+                    ban_score: 0,
+                }],
+            },
+        )
+        .expect("save peers");
+
+        let (tx, rx) = mpsc::channel::<()>();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+            let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+            let framing = FramingConfig::default();
+            let local_hello = LocalHandshake {
+                protocol_version: 1,
+                network_id: "devnet".to_owned(),
+                user_agent: "test-async-supervisor-peer".to_owned(),
+                start_height: 0,
+            };
+            let remote = server_handshake(&mut stream, &framing, &local_hello).expect("handshake");
+            assert_eq!(remote.network_id, "devnet");
+            let _ = tx.send(());
+        });
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        rt.block_on(async {
+            let supervisor = tokio::spawn(super::run_relay_outbound_supervisor_async(
+                stop.clone(),
+                peers_dir.clone(),
+                "127.0.0.1:18444".to_owned(),
+                next_peer,
+                state,
+                active,
+                cfg,
+                temp_dir("test-outbound-supervisor-async-runtime").join("runtime.redb"),
+                temp_dir("test-outbound-supervisor-async-mempool").join("mempool.redb"),
+                128,
+                8,
+                1,
+                1,
+                1,
+            ));
+            rx.recv_timeout(Duration::from_secs(8))
+                .expect("async supervisor should spawn worker and connect");
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            tokio::time::timeout(Duration::from_secs(10), supervisor)
+                .await
+                .expect("supervisor async join timeout")
+                .expect("supervisor async task");
+        });
+
+        join_with_timeout(
+            server,
+            Duration::from_secs(5),
+            "relay outbound async supervisor peer",
+        );
+        let _ = fs::remove_dir_all(peers_dir);
+    }
+
+    #[test]
     fn run_relay_peer_session_persists_mempool_delta_to_db() {
         let _net_guard = network_test_guard();
         let mut cfg: ChainConfig =
@@ -16684,6 +16960,263 @@ mod tests {
 
         join_with_timeout(server, Duration::from_secs(5), "relay peer session unix")
             .expect("session result");
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_relay_peer_session_outbound_survives_timeout_and_answers_multiple_pings() {
+        use std::os::unix::net::UnixStream;
+
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let relay = RelayAdmissionState {
+            mempool: Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip: GossipEngine::new(16).expect("gossip"),
+        };
+        let state =
+            std::sync::Arc::new(std::sync::Mutex::new(RelayServerState::new(runtime, relay)));
+        let active = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let work_dir = temp_dir("test-relay-peer-session-outbound-stability");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let runtime_db = work_dir.join("runtime.redb");
+        let mempool_db = work_dir.join("mempool.redb");
+        {
+            let guard = state.lock().expect("state");
+            persist_runtime_db(&guard.runtime, &runtime_db).expect("persist runtime");
+        }
+
+        let (mut session_stream, mut remote_stream) = UnixStream::pair().expect("unix pair");
+        if let Err(err) = session_stream.set_read_timeout(Some(Duration::from_secs(1))) {
+            if err.kind() == std::io::ErrorKind::PermissionDenied {
+                let _ = fs::remove_dir_all(work_dir);
+                return;
+            }
+            panic!("session read timeout: {err}");
+        }
+        if let Err(err) = session_stream.set_write_timeout(Some(Duration::from_secs(1))) {
+            if err.kind() == std::io::ErrorKind::PermissionDenied {
+                let _ = fs::remove_dir_all(work_dir);
+                return;
+            }
+            panic!("session write timeout: {err}");
+        }
+        if let Err(err) = remote_stream.set_read_timeout(Some(Duration::from_secs(2))) {
+            if err.kind() == std::io::ErrorKind::PermissionDenied {
+                let _ = fs::remove_dir_all(work_dir);
+                return;
+            }
+            panic!("remote read timeout: {err}");
+        }
+        if let Err(err) = remote_stream.set_write_timeout(Some(Duration::from_secs(2))) {
+            if err.kind() == std::io::ErrorKind::PermissionDenied {
+                let _ = fs::remove_dir_all(work_dir);
+                return;
+            }
+            panic!("remote write timeout: {err}");
+        }
+
+        let session = thread::spawn({
+            let state = state.clone();
+            let active = active.clone();
+            let stop = stop.clone();
+            let cfg = cfg.clone();
+            move || {
+                super::run_relay_peer_session(
+                    &mut session_stream,
+                    super::RelayPeerSessionMode::Outbound,
+                    66,
+                    &state,
+                    &active,
+                    &stop,
+                    &cfg,
+                    &runtime_db,
+                    &mempool_db,
+                    64,
+                    4,
+                )
+            }
+        });
+
+        let framing = FramingConfig::default();
+        let local_hello = LocalHandshake {
+            protocol_version: 1,
+            network_id: "devnet".to_owned(),
+            user_agent: "relay-outbound-test-remote".to_owned(),
+            start_height: 0,
+        };
+        let remote =
+            server_handshake(&mut remote_stream, &framing, &local_hello).expect("server handshake");
+        assert_eq!(remote.network_id, "devnet");
+        for _ in 0..3 {
+            read_message(&mut remote_stream, &framing).expect("outbound startup message");
+        }
+
+        send_message(
+            &mut remote_stream,
+            &WireMessage::Ping { nonce: 1 },
+            &framing,
+        )
+        .expect("send ping1");
+        let pong1 = read_message(&mut remote_stream, &framing).expect("read pong1");
+        assert!(matches!(pong1, WireMessage::Pong { nonce: 1 }));
+
+        thread::sleep(Duration::from_millis(1_250));
+        send_message(
+            &mut remote_stream,
+            &WireMessage::Ping { nonce: 2 },
+            &framing,
+        )
+        .expect("send ping2");
+        let mut saw_pong2 = false;
+        for _ in 0..6 {
+            let msg = read_message(&mut remote_stream, &framing).expect("read message after ping2");
+            if matches!(msg, WireMessage::Pong { nonce: 2 }) {
+                saw_pong2 = true;
+                break;
+            }
+        }
+        assert!(
+            saw_pong2,
+            "outbound session must keep responding after timeout"
+        );
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        drop(remote_stream);
+        join_with_timeout(
+            session,
+            Duration::from_secs(6),
+            "relay peer session outbound stability",
+        )
+        .expect("session result");
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
+    fn run_relay_peer_session_async_outbound_survives_timeout_and_answers_multiple_pings() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let relay = RelayAdmissionState {
+            mempool: Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip: GossipEngine::new(16).expect("gossip"),
+        };
+        let state =
+            std::sync::Arc::new(std::sync::Mutex::new(RelayServerState::new(runtime, relay)));
+        let active = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let work_dir = temp_dir("test-relay-peer-session-async-outbound-stability");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let runtime_db = work_dir.join("runtime.redb");
+        let mempool_db = work_dir.join("mempool.redb");
+        {
+            let guard = state.lock().expect("state");
+            persist_runtime_db(&guard.runtime, &runtime_db).expect("persist runtime");
+        }
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        rt.block_on(async {
+            let (mut remote_stream, mut session_stream) = tokio::io::duplex(64 * 1024);
+            let session = tokio::spawn({
+                let state = state.clone();
+                let active = active.clone();
+                let stop = stop.clone();
+                let cfg = cfg.clone();
+                async move {
+                    super::run_relay_peer_session_async(
+                        &mut session_stream,
+                        super::RelayPeerSessionMode::Outbound,
+                        88,
+                        &state,
+                        &active,
+                        &stop,
+                        &cfg,
+                        &runtime_db,
+                        &mempool_db,
+                        64,
+                        4,
+                        1,
+                        1,
+                    )
+                    .await
+                }
+            });
+
+            let framing = FramingConfig::default();
+            let local_hello = LocalHandshake {
+                protocol_version: 1,
+                network_id: "devnet".to_owned(),
+                user_agent: "relay-async-outbound-test-remote".to_owned(),
+                start_height: 0,
+            };
+            let remote = server_handshake_async(&mut remote_stream, &framing, &local_hello)
+                .await
+                .expect("server handshake async");
+            assert_eq!(remote.network_id, "devnet");
+            for _ in 0..3 {
+                read_message_async(&mut remote_stream, &framing)
+                    .await
+                    .expect("outbound startup message");
+            }
+
+            send_message_async(
+                &mut remote_stream,
+                &WireMessage::Ping { nonce: 1 },
+                &framing,
+            )
+            .await
+            .expect("send ping1");
+            let pong1 = read_message_async(&mut remote_stream, &framing)
+                .await
+                .expect("read pong1");
+            assert!(matches!(pong1, WireMessage::Pong { nonce: 1 }));
+
+            tokio::time::sleep(Duration::from_millis(1_250)).await;
+            send_message_async(
+                &mut remote_stream,
+                &WireMessage::Ping { nonce: 2 },
+                &framing,
+            )
+            .await
+            .expect("send ping2");
+            let mut saw_pong2 = false;
+            for _ in 0..8 {
+                let msg = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    read_message_async(&mut remote_stream, &framing),
+                )
+                .await
+                .expect("read timeout")
+                .expect("read message after ping2");
+                if matches!(msg, WireMessage::Pong { nonce: 2 }) {
+                    saw_pong2 = true;
+                    break;
+                }
+            }
+            assert!(
+                saw_pong2,
+                "async outbound session must keep responding after timeout"
+            );
+
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            drop(remote_stream);
+            tokio::time::timeout(Duration::from_secs(8), session)
+                .await
+                .expect("async session join timeout")
+                .expect("async session task")
+                .expect("async session result");
+        });
         let _ = fs::remove_dir_all(work_dir);
     }
 
@@ -18069,6 +18602,279 @@ mod tests {
                 .any(|msg| matches!(msg, WireMessage::Inv { .. })),
             "legacy peer must keep inv announcements"
         );
+    }
+
+    #[test]
+    fn relay_compact_short_txid_and_lookup_are_stable() {
+        let hash = Hash256([0xAB; 32]);
+        let short = super::compact_short_txid(hash);
+        assert_eq!(short, u64::from_be_bytes([0xAB; 8]));
+        assert_ne!(short, 0);
+        assert_ne!(short, 1);
+
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let mut mempool =
+            Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool");
+
+        let tx_a = relay_tx(
+            OutPoint {
+                txid: Hash256([0x21; 32]),
+                vout: 0,
+            },
+            1,
+            11,
+        );
+        let tx_b = relay_tx(
+            OutPoint {
+                txid: Hash256([0x22; 32]),
+                vout: 0,
+            },
+            2,
+            12,
+        );
+        let txid_a = tx_a.txid();
+        let txid_b = tx_b.txid();
+        mempool.insert_with_fee(tx_a, 1_000).expect("insert tx_a");
+        mempool
+            .insert_with_fee(tx_b.clone(), 2_000)
+            .expect("insert tx_b");
+
+        let short_b = super::compact_short_txid(txid_b);
+        let found = super::relay_lookup_mempool_tx_by_short_txid(&mempool, short_b)
+            .expect("lookup by short txid");
+        assert_eq!(found.txid(), txid_b);
+
+        let short_a = super::compact_short_txid(txid_a);
+        let mut missing = short_b.wrapping_add(1);
+        while missing == short_a || missing == short_b {
+            missing = missing.wrapping_add(1);
+        }
+        assert!(
+            super::relay_lookup_mempool_tx_by_short_txid(&mempool, missing).is_none(),
+            "unknown short txid must not return an unrelated transaction"
+        );
+    }
+
+    #[test]
+    fn relay_inventory_message_adapter_preserves_order_and_never_emits_empty_inv() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let relay = RelayAdmissionState {
+            mempool: Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip: GossipEngine::new(64).expect("gossip"),
+        };
+        let mut state = RelayServerState::new(runtime, relay);
+        state.peer_compact_pref.insert(8, true);
+        let known_block = state.runtime.tip_hash();
+        let unknown_block = Hash256([0x44; 32]);
+        let tx_item = InventoryItem::Tx(Hash256([0x55; 32]));
+
+        let mapped = super::relay_inventory_messages_for_peer(
+            &state,
+            8,
+            vec![
+                tx_item.clone(),
+                InventoryItem::Block(known_block),
+                InventoryItem::Block(unknown_block),
+            ],
+        );
+        assert_eq!(mapped.len(), 3, "expected inv/compact/inv sequence");
+        assert!(
+            matches!(&mapped[0], WireMessage::Inv { items } if items == &vec![tx_item.clone()])
+        );
+        assert!(matches!(&mapped[1], WireMessage::CmpctBlock { .. }));
+        assert!(
+            matches!(&mapped[2], WireMessage::Inv { items } if items == &vec![InventoryItem::Block(unknown_block)])
+        );
+        assert!(
+            mapped
+                .iter()
+                .all(|msg| !matches!(msg, WireMessage::Inv { items } if items.is_empty())),
+            "adapter must not emit empty inv messages"
+        );
+
+        let known_only = super::relay_inventory_messages_for_peer(
+            &state,
+            8,
+            vec![InventoryItem::Block(known_block)],
+        );
+        assert_eq!(
+            known_only.len(),
+            1,
+            "single known block should map to exactly one compact announcement"
+        );
+        assert!(matches!(known_only[0], WireMessage::CmpctBlock { .. }));
+
+        let passthrough = super::relay_messages_for_peer(
+            &state,
+            8,
+            vec![
+                WireMessage::Ping { nonce: 7 },
+                WireMessage::Inv {
+                    items: vec![InventoryItem::Block(known_block)],
+                },
+            ],
+        );
+        assert_eq!(passthrough.len(), 2);
+        assert!(matches!(passthrough[0], WireMessage::Ping { nonce: 7 }));
+        assert!(matches!(passthrough[1], WireMessage::CmpctBlock { .. }));
+    }
+
+    #[test]
+    fn relay_merge_known_peer_addresses_merges_service_flags_and_enforces_cap() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let relay = RelayAdmissionState {
+            mempool: Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip: GossipEngine::new(64).expect("gossip"),
+        };
+        let mut state = RelayServerState::new(runtime, relay);
+        state.known_peer_addresses = vec![super::PeerAddress {
+            address: "127.0.0.1:2000".to_owned(),
+            services: 0b001,
+            last_seen_unix_sec: 10,
+        }];
+
+        super::relay_merge_known_peer_addresses(
+            &mut state,
+            &[
+                super::PeerAddress {
+                    address: "127.0.0.1:2000".to_owned(),
+                    services: 0b010,
+                    last_seen_unix_sec: 20,
+                },
+                super::PeerAddress {
+                    address: " ".to_owned(),
+                    services: 0b111,
+                    last_seen_unix_sec: 99,
+                },
+                super::PeerAddress {
+                    address: "127.0.0.1:2001".to_owned(),
+                    services: 0b100,
+                    last_seen_unix_sec: 15,
+                },
+            ],
+        );
+
+        assert_eq!(state.known_peer_addresses.len(), 2);
+        assert_eq!(state.known_peer_addresses[0].address, "127.0.0.1:2000");
+        assert_eq!(state.known_peer_addresses[0].services, 0b011);
+        assert_eq!(state.known_peer_addresses[0].last_seen_unix_sec, 20);
+        assert_eq!(state.known_peer_addresses[1].address, "127.0.0.1:2001");
+
+        let many = (0..2_100u32)
+            .map(|idx| super::PeerAddress {
+                address: format!("10.0.0.{}:{}", idx % 250, 30_000 + idx),
+                services: 1,
+                last_seen_unix_sec: idx as u64,
+            })
+            .collect::<Vec<_>>();
+        super::relay_merge_known_peer_addresses(&mut state, &many);
+        assert_eq!(
+            state.known_peer_addresses.len(),
+            2_000,
+            "known peer list must be capped at 2,000 records"
+        );
+        assert!(
+            state
+                .known_peer_addresses
+                .iter()
+                .all(|entry| !entry.address.trim().is_empty())
+        );
+    }
+
+    #[test]
+    fn process_relay_wire_message_sendcmpct_and_getblocktxn_bounds_are_strict() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let relay = RelayAdmissionState {
+            mempool: Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip: GossipEngine::new(64).expect("gossip"),
+        };
+        let mut state = RelayServerState::new(runtime, relay);
+        let peer_id = 41;
+
+        process_relay_wire_message(
+            &mut state,
+            peer_id,
+            WireMessage::SendCmpct {
+                high_bandwidth: true,
+                version: 1,
+            },
+            1_000,
+        )
+        .expect("enable compact");
+        assert_eq!(state.peer_compact_pref.get(&peer_id).copied(), Some(true));
+
+        process_relay_wire_message(
+            &mut state,
+            peer_id,
+            WireMessage::SendCmpct {
+                high_bandwidth: false,
+                version: 1,
+            },
+            1_001,
+        )
+        .expect("disable compact");
+        assert_eq!(state.peer_compact_pref.get(&peer_id).copied(), Some(false));
+
+        process_relay_wire_message(
+            &mut state,
+            peer_id,
+            WireMessage::SendCmpct {
+                high_bandwidth: true,
+                version: 0,
+            },
+            1_002,
+        )
+        .expect("version gate");
+        assert_eq!(state.peer_compact_pref.get(&peer_id).copied(), Some(false));
+
+        let block_hash = state.runtime.tip_hash();
+        let ok = process_relay_wire_message(
+            &mut state,
+            peer_id,
+            WireMessage::GetBlockTxn {
+                block_hash,
+                indexes: vec![0],
+            },
+            1_003,
+        )
+        .expect("valid index");
+        assert!(
+            matches!(
+                ok.as_slice(),
+                [WireMessage::BlockTxn { block_hash: got, transactions }]
+                    if *got == block_hash && transactions.len() == 1
+            ),
+            "valid getblocktxn index must return blocktxn payload"
+        );
+
+        let err = process_relay_wire_message(
+            &mut state,
+            peer_id,
+            WireMessage::GetBlockTxn {
+                block_hash,
+                indexes: vec![1],
+            },
+            1_004,
+        )
+        .expect_err("out-of-range index must fail");
+        assert!(err.to_string().contains("out of bounds"));
     }
 
     #[test]
