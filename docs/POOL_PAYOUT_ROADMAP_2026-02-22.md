@@ -64,7 +64,7 @@ Action item:
 
 - [x] Round lifecycle implemented: open at tip, close on accepted block, immediately open next round.
 - [x] Reorg policy baseline implemented: closed rounds are marked `orphaned` when their closing block is no longer on active chain; open round is rebased to active tip if fork point moved.
-- [ ] Re-attribution policy for orphaned rounds is still pending (currently accounting marks orphaned rounds without payout redistribution).
+- [x] Re-attribution policy for orphaned rounds is implemented (PPLNS accruals are recomputed from non-orphaned rounds; orphaned-round rewards are excluded from payable balances).
 - Define round lifecycle:
   - round opens at current tip,
   - closes when pool finds/accepts a block,
@@ -75,25 +75,25 @@ Action item:
 
 ### WP3: PPLNS engine (mandatory)
 
-- Implement N-window selection over accepted shares.
-- Weighting rule (difficulty-weighted shares).
-- Per-worker reward split after pool fee.
-- Deterministic payout snapshot for a closed round.
+- [x] Implemented N-window selection over accepted shares.
+- [x] Implemented difficulty-weighted share accounting.
+- [x] Implemented per-worker reward split after pool fee.
+- [x] Implemented deterministic payout snapshot recompute for closed rounds.
 
 ### WP4: PPS engine (mandatory)
 
-- Implement fixed pay-per-share accrual.
-- Solvency guardrails:
+- [x] Implemented fixed pay-per-share accrual.
+- [x] Implemented solvency guardrails:
   - reserve checks,
-  - max PPS liability,
-  - operator alerts.
+  - max PPS liability checks,
+  - guardrail alert counters.
 
 ### WP5: Payout transaction pipeline (mandatory)
 
-- Build payout transaction batches from accrued balances.
-- Support payout thresholds + payout interval.
-- Submit payouts through mempool path with retries and telemetry.
-- Track payout transaction lifecycle (created/submitted/confirmed/failed).
+- [x] Implemented payout batch creation from accrued balances.
+- [x] Implemented payout threshold + payout interval scheduling.
+- [x] Implemented payout submission through mempool path with telemetry/state updates.
+- [x] Implemented payout lifecycle tracking (pending/submitted/confirmed with failure-safe retry readiness).
 
 ### WP6: API/UI for pool accounting + hashrate (mandatory)
 

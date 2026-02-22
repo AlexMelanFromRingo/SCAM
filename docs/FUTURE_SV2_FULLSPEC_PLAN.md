@@ -49,6 +49,8 @@ Clarification: consensus is already functionally implemented; future items touch
 - Track compatibility quirks by stack/version with explicit workarounds.
 - Baseline harness support is in place for structured target manifests (`SV2_EXTERNAL_TARGETS_FILE`)
   with per-target expected outcome + vendor/version metadata artifacts.
+- Added dedicated manual CI workflow for external stacks (`.github/workflows/sv2-external-interop.yml`)
+  driven by secret manifest `SV2_EXTERNAL_TARGETS_JSON`.
 
 ### D. Scale and Reliability
 

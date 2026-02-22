@@ -70,4 +70,4 @@ Scope: double-spend race behavior and DoS pressure around conflicting UTXO spend
 
 ## Next Optional Hardening
 
-- Add peer-identity reputation persistence across restarts for replacement-spam history.
+- [x] Added peer-identity reputation persistence across restarts for replacement-spam history.

@@ -45,3 +45,10 @@ The harness writes per-target run status metadata to:
 - `target/sv2-conformance/external-target-results.jsonl` (if external targets were configured)
 
 CI uploads the same directory as artifact (`sv2-conformance`).
+
+5. Optional GitHub Actions run against external stacks:
+
+- Workflow: `.github/workflows/sv2-external-interop.yml`
+- Trigger: manual (`workflow_dispatch`)
+- Required secret: `SV2_EXTERNAL_TARGETS_JSON` (same JSON schema as `SV2_EXTERNAL_TARGETS_FILE`)
+- Artifact: `sv2-external-conformance`

@@ -1,0 +1,34 @@
+name: SV2 External Interop
+
+on:
+  workflow_dispatch:
+
+jobs:
+  external-interop:
+    if: ${{ secrets.SV2_EXTERNAL_TARGETS_JSON != '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: scam-rust-${{ runner.os }}
+          workspaces: |
+            . -> target
+      - name: Prepare external target manifest
+        run: |
+          mkdir -p target/sv2-conformance
+          cat > target/sv2-conformance/external-targets.json <<'JSON'
+          ${{ secrets.SV2_EXTERNAL_TARGETS_JSON }}
+          JSON
+      - name: Run external SV2 conformance matrix
+        env:
+          SV2_EXTERNAL_TARGETS_FILE: target/sv2-conformance/external-targets.json
+        run: scripts/sv2-conformance-matrix.sh
+      - name: Upload conformance artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sv2-external-conformance
+          path: target/sv2-conformance
