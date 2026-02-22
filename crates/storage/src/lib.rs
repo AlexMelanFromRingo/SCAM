@@ -430,6 +430,31 @@ pub fn load_chain_archive_db(path: &Path) -> Result<ChainArchive, StorageError> 
     })
 }
 
+pub fn load_block_by_hash_db(path: &Path, hash: Hash256) -> Result<Option<Block>, StorageError> {
+    let db = Database::open(path).map_err(|e| StorageError::Db(e.to_string()))?;
+    let read_txn = db
+        .begin_read()
+        .map_err(|e| StorageError::Db(e.to_string()))?;
+    let blocks_table = read_txn
+        .open_table(BLOCK_TABLE)
+        .map_err(|e| StorageError::Db(e.to_string()))?;
+    let Some(block_raw) = blocks_table
+        .get(hash.0.as_slice())
+        .map_err(|e| StorageError::Db(e.to_string()))?
+    else {
+        return Ok(None);
+    };
+
+    let block: Block = bincode::deserialize(block_raw.value()).map_err(StorageError::Decode)?;
+    if block.header.block_hash() != hash {
+        return Err(StorageError::InvalidArchive(format!(
+            "block hash mismatch for key {}",
+            hash
+        )));
+    }
+    Ok(Some(block))
+}
+
 pub fn save_peer_book_db(path: &Path, peer_book: &PeerAddressBook) -> Result<(), StorageError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| StorageError::CreateDir {
@@ -743,9 +768,9 @@ mod tests {
 
     use crate::{
         ChainArchive, ChainStateSnapshot, MempoolSnapshot, MempoolTxRecord, PeerAddressBook,
-        PeerAddressRecord, UtxoRecord, load_chain_archive_db, load_mempool_db, load_peer_book_db,
-        load_snapshot, load_snapshot_db, save_chain_archive_db, save_mempool_db, save_peer_book_db,
-        save_snapshot, save_snapshot_db,
+        PeerAddressRecord, UtxoRecord, load_block_by_hash_db, load_chain_archive_db,
+        load_mempool_db, load_peer_book_db, load_snapshot, load_snapshot_db, save_chain_archive_db,
+        save_mempool_db, save_peer_book_db, save_snapshot, save_snapshot_db,
     };
 
     fn temp_test_file(stem: &str, ext: &str) -> PathBuf {
@@ -911,6 +936,55 @@ mod tests {
         assert_eq!(loaded.blocks_by_height.len(), 2);
         assert_eq!(loaded.blocks_by_height[0], genesis);
         assert_eq!(loaded.blocks_by_height[1], block1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn chain_archive_db_load_block_by_hash_roundtrip() {
+        let genesis = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_block: Hash256::ZERO,
+                merkle_root: Hash256::from_hex(
+                    "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                )
+                .expect("hash"),
+                timestamp: 1_770_763_200,
+                target: Target::MAX,
+                nonce: 11,
+            },
+            transactions: vec![],
+        };
+        let block1 = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_block: genesis.header.block_hash(),
+                merkle_root: Hash256::from_hex(
+                    "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                )
+                .expect("hash"),
+                timestamp: 1_770_763_320,
+                target: Target::MAX,
+                nonce: 22,
+            },
+            transactions: vec![],
+        };
+        let archive = ChainArchive {
+            network_id: "devnet".to_owned(),
+            blocks_by_height: vec![genesis.clone(), block1.clone()],
+        };
+
+        let path = temp_test_file("chain-archive-by-hash", "redb");
+        save_chain_archive_db(&path, &archive).expect("save archive");
+
+        let block_hash = block1.header.block_hash();
+        let loaded = load_block_by_hash_db(&path, block_hash).expect("load by hash");
+        assert_eq!(loaded, Some(block1));
+
+        let missing =
+            load_block_by_hash_db(&path, Hash256::from_hex(&"11".repeat(32)).expect("hash"))
+                .expect("load missing hash");
+        assert_eq!(missing, None);
         let _ = std::fs::remove_file(path);
     }
 

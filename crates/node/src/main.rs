@@ -35,9 +35,9 @@ use scam_rpc::{
 };
 use scam_storage::{
     ChainArchive, ChainStateSnapshot, MempoolSnapshot, MempoolTxRecord, PeerAddressBook,
-    PeerAddressRecord, StorageError, load_chain_archive_db, load_mempool_db, load_peer_book_db,
-    load_snapshot, load_snapshot_db, save_chain_archive_db, save_mempool_db, save_peer_book_db,
-    save_snapshot, save_snapshot_db,
+    PeerAddressRecord, StorageError, load_block_by_hash_db, load_chain_archive_db, load_mempool_db,
+    load_peer_book_db, load_snapshot, load_snapshot_db, save_chain_archive_db, save_mempool_db,
+    save_peer_book_db, save_snapshot, save_snapshot_db,
 };
 use scam_stratum::{
     IdentityTranslator, JobDeclarator, MiningJob, MiningTemplate, NoiseSv2Transport,
@@ -4578,7 +4578,118 @@ fn relay_submit_incoming_block(
     }
 }
 
+fn relay_collect_getdata_from_memory(
+    state: &RelayServerState,
+    items: Vec<InventoryItem>,
+) -> (Vec<WireMessage>, Vec<Hash256>, Vec<InventoryItem>) {
+    let mut out = Vec::<WireMessage>::new();
+    let mut missing_block_hashes = Vec::<Hash256>::new();
+    let mut not_found = Vec::<InventoryItem>::new();
+
+    for item in items {
+        match item {
+            InventoryItem::Tx(txid) => {
+                if let Some(tx) = state.relay.mempool.get(&txid).cloned() {
+                    out.push(WireMessage::Tx { tx });
+                } else {
+                    not_found.push(InventoryItem::Tx(txid));
+                }
+            }
+            InventoryItem::Block(hash) => {
+                if let Some(block) = state.runtime.block_by_hash(&hash).cloned() {
+                    out.push(WireMessage::Block { block });
+                } else {
+                    missing_block_hashes.push(hash);
+                }
+            }
+        }
+    }
+
+    (out, missing_block_hashes, not_found)
+}
+
+fn process_relay_wire_message_with_archive(
+    state: &mut RelayServerState,
+    peer_id: u64,
+    message: WireMessage,
+    now_unix_sec: u64,
+    archive_db_path: Option<&Path>,
+) -> Result<Vec<WireMessage>, NodeError> {
+    match message {
+        WireMessage::GetData { items } => {
+            let (mut out, missing_block_hashes, mut not_found) =
+                relay_collect_getdata_from_memory(state, items);
+            for hash in missing_block_hashes {
+                let from_archive = match archive_db_path {
+                    Some(path) => load_block_by_hash_db(path, hash)?,
+                    None => None,
+                };
+                if let Some(block) = from_archive {
+                    out.push(WireMessage::Block { block });
+                } else {
+                    not_found.push(InventoryItem::Block(hash));
+                }
+            }
+            if has_inventory_delta_changes(0, not_found.len()) {
+                out.push(WireMessage::NotFound { items: not_found });
+            }
+            Ok(out)
+        }
+        other => process_relay_wire_message_inner(state, peer_id, other, now_unix_sec),
+    }
+}
+
+#[cfg(test)]
 fn process_relay_wire_message(
+    state: &mut RelayServerState,
+    peer_id: u64,
+    message: WireMessage,
+    now_unix_sec: u64,
+) -> Result<Vec<WireMessage>, NodeError> {
+    process_relay_wire_message_with_archive(state, peer_id, message, now_unix_sec, None)
+}
+
+async fn process_relay_getdata_with_archive_async(
+    state: &Arc<Mutex<RelayServerState>>,
+    items: Vec<InventoryItem>,
+    runtime_db_path: &Path,
+) -> Result<Vec<WireMessage>, NodeError> {
+    let (mut out, missing_block_hashes, mut not_found) = {
+        let guard = state
+            .lock()
+            .map_err(|_| NodeError::Runtime("relay state mutex poisoned".to_owned()))?;
+        relay_collect_getdata_from_memory(&guard, items)
+    };
+
+    if !missing_block_hashes.is_empty() {
+        let runtime_db_path = runtime_db_path.to_path_buf();
+        let looked_up = tokio::task::spawn_blocking(move || {
+            let mut blocks = Vec::<(Hash256, Option<scam_core::Block>)>::new();
+            for hash in missing_block_hashes {
+                let block = load_block_by_hash_db(&runtime_db_path, hash)?;
+                blocks.push((hash, block));
+            }
+            Ok::<Vec<(Hash256, Option<scam_core::Block>)>, NodeError>(blocks)
+        })
+        .await
+        .map_err(|err| NodeError::Runtime(format!("relay archive lookup task failed: {err}")))??;
+
+        for (hash, block) in looked_up {
+            if let Some(block) = block {
+                out.push(WireMessage::Block { block });
+            } else {
+                not_found.push(InventoryItem::Block(hash));
+            }
+        }
+    }
+
+    if has_inventory_delta_changes(0, not_found.len()) {
+        out.push(WireMessage::NotFound { items: not_found });
+    }
+    Ok(out)
+}
+
+fn process_relay_wire_message_inner(
     state: &mut RelayServerState,
     peer_id: u64,
     message: WireMessage,
@@ -4635,25 +4746,10 @@ fn process_relay_wire_message(
             Ok(vec![WireMessage::Inv { items }])
         }
         WireMessage::GetData { items } => {
-            let mut out = Vec::<WireMessage>::new();
-            let mut not_found = Vec::<InventoryItem>::new();
-            for item in items {
-                match item {
-                    InventoryItem::Tx(txid) => {
-                        if let Some(tx) = state.relay.mempool.get(&txid).cloned() {
-                            out.push(WireMessage::Tx { tx });
-                        } else {
-                            not_found.push(InventoryItem::Tx(txid));
-                        }
-                    }
-                    InventoryItem::Block(hash) => {
-                        if let Some(block) = state.runtime.block_by_hash(&hash).cloned() {
-                            out.push(WireMessage::Block { block });
-                        } else {
-                            not_found.push(InventoryItem::Block(hash));
-                        }
-                    }
-                }
+            let (mut out, missing_block_hashes, mut not_found) =
+                relay_collect_getdata_from_memory(state, items);
+            for hash in missing_block_hashes {
+                not_found.push(InventoryItem::Block(hash));
             }
             if has_inventory_delta_changes(0, not_found.len()) {
                 out.push(WireMessage::NotFound { items: not_found });
@@ -5449,7 +5545,13 @@ fn run_relay_peer_session<IO: Read + Write>(
                     .map_err(|_| NodeError::Runtime("relay state mutex poisoned".to_owned()))?;
                 let tip_before = guard.runtime.tip_hash();
                 let mempool_before = guard.relay.mempool.revision();
-                let outbound = process_relay_wire_message(&mut guard, peer_id, inbound, now)?;
+                let outbound = process_relay_wire_message_with_archive(
+                    &mut guard,
+                    peer_id,
+                    inbound,
+                    now,
+                    Some(runtime_db_path),
+                )?;
                 let outbound = relay_messages_for_peer(&guard, peer_id, outbound);
                 let tip_after = guard.runtime.tip_hash();
                 let mempool_after = guard.relay.mempool.revision();
@@ -5646,23 +5748,43 @@ async fn run_relay_peer_session_async<S: AsyncRead + AsyncWrite + Unpin>(
 
             seen = seen.saturating_add(1);
             let now = current_unix_sec()?;
-            let (outbound, runtime_changed, mempool_changed) = {
-                let mut guard = state
-                    .lock()
-                    .map_err(|_| NodeError::Runtime("relay state mutex poisoned".to_owned()))?;
-                let tip_before = guard.runtime.tip_hash();
-                let mempool_before = guard.relay.mempool.revision();
-                let outbound = process_relay_wire_message(&mut guard, peer_id, inbound, now)?;
-                let outbound = relay_messages_for_peer(&guard, peer_id, outbound);
-                let tip_after = guard.runtime.tip_hash();
-                let mempool_after = guard.relay.mempool.revision();
-                let (runtime_changed, mempool_changed) = relay_runtime_or_mempool_changed(
-                    tip_before,
-                    tip_after,
-                    mempool_before,
-                    mempool_after,
-                );
-                (outbound, runtime_changed, mempool_changed)
+            let (outbound, runtime_changed, mempool_changed) = match inbound {
+                WireMessage::GetData { items } => {
+                    let outbound =
+                        process_relay_getdata_with_archive_async(state, items, runtime_db_path)
+                            .await?;
+                    let outbound = {
+                        let guard = state.lock().map_err(|_| {
+                            NodeError::Runtime("relay state mutex poisoned".to_owned())
+                        })?;
+                        relay_messages_for_peer(&guard, peer_id, outbound)
+                    };
+                    (outbound, false, false)
+                }
+                inbound => {
+                    let mut guard = state
+                        .lock()
+                        .map_err(|_| NodeError::Runtime("relay state mutex poisoned".to_owned()))?;
+                    let tip_before = guard.runtime.tip_hash();
+                    let mempool_before = guard.relay.mempool.revision();
+                    let outbound = process_relay_wire_message_with_archive(
+                        &mut guard,
+                        peer_id,
+                        inbound,
+                        now,
+                        Some(runtime_db_path),
+                    )?;
+                    let outbound = relay_messages_for_peer(&guard, peer_id, outbound);
+                    let tip_after = guard.runtime.tip_hash();
+                    let mempool_after = guard.relay.mempool.revision();
+                    let (runtime_changed, mempool_changed) = relay_runtime_or_mempool_changed(
+                        tip_before,
+                        tip_after,
+                        mempool_before,
+                        mempool_after,
+                    );
+                    (outbound, runtime_changed, mempool_changed)
+                }
             };
 
             if runtime_changed {
@@ -11575,8 +11697,9 @@ mod tests {
         accepted_hrps_for_network, admit_peer_tx_into_relay, build_coinbase_tx,
         build_signed_transfer_tx, execute_soak_rounds, load_chain_config,
         mine_block_with_transactions, mine_blocks_on_runtime, persist_runtime_db,
-        process_relay_wire_message, relay_fee_hint, request_template_from_provider, run_add_peer,
-        run_config_scaffold, run_reindex_runtime, run_rpc_serve, run_stratum_mine,
+        process_relay_getdata_with_archive_async, process_relay_wire_message,
+        process_relay_wire_message_with_archive, relay_fee_hint, request_template_from_provider,
+        run_add_peer, run_config_scaffold, run_reindex_runtime, run_rpc_serve, run_stratum_mine,
         run_stratum_serve, run_sv2_conformance, run_sv2_job_declarator, run_sv2_template_provider,
         run_sv2_translator, run_sync_book, run_wallet, select_utxos_for_amount,
         translate_remote_job_with_service, try_find_share_for_job,
@@ -20178,6 +20301,134 @@ mod tests {
                 .any(|msg| matches!(msg, WireMessage::NotFound { .. })),
             "known inventory must not generate notfound"
         );
+    }
+
+    #[test]
+    fn relay_getdata_archive_fallback_serves_block_when_absent_in_memory() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        cfg.validate().expect("config validate");
+        let miner_key_hash = cfg.genesis_reward_key_hash20().expect("reward key");
+
+        let mut producer = ChainRuntime::from_config(cfg.clone()).expect("producer runtime");
+        mine_blocks_on_runtime(
+            &mut producer,
+            &super::MiningLoopParams {
+                count: 1,
+                interval_sec: cfg.target_block_time_sec,
+                max_nonce: 500_000,
+                subsidy: cfg.block_subsidy,
+                miner_key_hash,
+                label_prefix: "relay-getdata-archive-fallback",
+                print_each: false,
+            },
+        )
+        .expect("mine producer chain");
+        let archived_hash = *producer.block_hashes().last().expect("producer tip hash");
+
+        let runtime_dir = temp_dir("test-relay-getdata-archive-fallback");
+        let runtime_db_path = runtime_dir.join("runtime.redb");
+        super::persist_runtime_db(&producer, &runtime_db_path).expect("persist runtime archive");
+
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("consumer runtime");
+        let relay = RelayAdmissionState {
+            mempool: Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip: GossipEngine::new(64).expect("gossip"),
+        };
+        let mut state = RelayServerState::new(runtime, relay);
+
+        let out = process_relay_wire_message_with_archive(
+            &mut state,
+            1,
+            WireMessage::GetData {
+                items: vec![InventoryItem::Block(archived_hash)],
+            },
+            1_000,
+            Some(&runtime_db_path),
+        )
+        .expect("getdata fallback");
+        assert!(
+            out.iter().any(|msg| matches!(
+                msg,
+                WireMessage::Block { block } if block.header.block_hash() == archived_hash
+            )),
+            "archive fallback should serve block from runtime db"
+        );
+        assert!(
+            !out.iter()
+                .any(|msg| matches!(msg, WireMessage::NotFound { .. })),
+            "archive hit must not emit notfound"
+        );
+        let _ = std::fs::remove_dir_all(runtime_dir);
+    }
+
+    #[test]
+    fn relay_getdata_archive_fallback_async_serves_block_when_absent_in_memory() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        cfg.validate().expect("config validate");
+        let miner_key_hash = cfg.genesis_reward_key_hash20().expect("reward key");
+
+        let mut producer = ChainRuntime::from_config(cfg.clone()).expect("producer runtime");
+        mine_blocks_on_runtime(
+            &mut producer,
+            &super::MiningLoopParams {
+                count: 1,
+                interval_sec: cfg.target_block_time_sec,
+                max_nonce: 500_000,
+                subsidy: cfg.block_subsidy,
+                miner_key_hash,
+                label_prefix: "relay-getdata-archive-async-fallback",
+                print_each: false,
+            },
+        )
+        .expect("mine producer chain");
+        let archived_hash = *producer.block_hashes().last().expect("producer tip hash");
+
+        let runtime_dir = temp_dir("test-relay-getdata-archive-async-fallback");
+        let runtime_db_path = runtime_dir.join("runtime.redb");
+        super::persist_runtime_db(&producer, &runtime_db_path).expect("persist runtime archive");
+
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("consumer runtime");
+        let relay = RelayAdmissionState {
+            mempool: Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip: GossipEngine::new(64).expect("gossip"),
+        };
+        let state =
+            std::sync::Arc::new(std::sync::Mutex::new(RelayServerState::new(runtime, relay)));
+        let request_items = vec![InventoryItem::Block(archived_hash)];
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let out = rt
+            .block_on(process_relay_getdata_with_archive_async(
+                &state,
+                request_items,
+                &runtime_db_path,
+            ))
+            .expect("async getdata fallback");
+
+        assert!(
+            out.iter().any(|msg| matches!(
+                msg,
+                WireMessage::Block { block } if block.header.block_hash() == archived_hash
+            )),
+            "async archive fallback should serve block from runtime db"
+        );
+        assert!(
+            !out.iter()
+                .any(|msg| matches!(msg, WireMessage::NotFound { .. })),
+            "async archive hit must not emit notfound"
+        );
+        let _ = std::fs::remove_dir_all(runtime_dir);
     }
 
     #[test]
