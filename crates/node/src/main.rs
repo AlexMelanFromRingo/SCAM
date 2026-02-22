@@ -35,9 +35,11 @@ use scam_rpc::{
 };
 use scam_storage::{
     ChainArchive, ChainStateSnapshot, MempoolSnapshot, MempoolTxRecord, PeerAddressBook,
-    PeerAddressRecord, StorageError, load_block_by_hash_db, load_chain_archive_db, load_mempool_db,
-    load_peer_book_db, load_snapshot, load_snapshot_db, save_chain_archive_db, save_mempool_db,
-    save_peer_book_db, save_snapshot, save_snapshot_db,
+    PeerAddressRecord, PoolLedgerSnapshot, PoolPayoutRecord, PoolRoundRecord, PoolShareRecord,
+    PoolWorkerAccrualRecord, StorageError, load_block_by_hash_db, load_chain_archive_db,
+    load_mempool_db, load_peer_book_db, load_pool_ledger_db, load_snapshot, load_snapshot_db,
+    save_chain_archive_db, save_mempool_db, save_peer_book_db, save_pool_ledger_db, save_snapshot,
+    save_snapshot_db,
 };
 use scam_stratum::{
     IdentityTranslator, JobDeclarator, MiningJob, MiningTemplate, NoiseSv2Transport,
@@ -645,6 +647,12 @@ struct StratumServeArgs {
     telemetry_out: Option<PathBuf>,
     #[arg(long, default_value_t = 5)]
     telemetry_every_sec: u64,
+    #[arg(long)]
+    pool_ledger_db: Option<PathBuf>,
+    #[arg(long, default_value_t = 50_000)]
+    pool_share_retention: usize,
+    #[arg(long, default_value_t = 2_000)]
+    pool_round_retention: usize,
 }
 
 #[derive(Debug, Args)]
@@ -741,6 +749,8 @@ struct RpcServeArgs {
     relay_telemetry: Option<PathBuf>,
     #[arg(long)]
     stratum_telemetry: Option<PathBuf>,
+    #[arg(long)]
+    pool_ledger: Option<PathBuf>,
     #[arg(long, default_value_t = 0)]
     mine_blocks: u32,
     #[arg(long, default_value_t = 120)]
@@ -1159,6 +1169,10 @@ fn default_mempool_db_path(runtime_db_path: &Path) -> PathBuf {
     runtime_db_path.with_file_name("mempool.redb")
 }
 
+fn default_pool_ledger_db_path(runtime_db_path: &Path) -> PathBuf {
+    runtime_db_path.with_file_name("pool.ledger.redb")
+}
+
 fn runtime_to_archive(runtime: &ChainRuntime) -> Result<ChainArchive, NodeError> {
     let blocks_by_height = runtime.main_chain_blocks()?;
     Ok(ChainArchive {
@@ -1318,6 +1332,57 @@ fn is_mempool_db_lock_conflict(err: &NodeError) -> bool {
     msg.contains("Database already open") || msg.contains("Cannot acquire lock")
 }
 
+fn is_pool_ledger_db_lock_conflict(err: &NodeError) -> bool {
+    let msg = err.to_string();
+    msg.contains("Database already open") || msg.contains("Cannot acquire lock")
+}
+
+fn load_pool_ledger_from_db_or_new(
+    cfg: &ChainConfig,
+    runtime: &ChainRuntime,
+    pool_ledger_db_path: &Path,
+    max_share_records: usize,
+    max_round_records: usize,
+) -> Result<StratumPoolLedgerState, NodeError> {
+    let now_unix_sec = current_unix_sec()?;
+    let start_height = runtime.tip_height();
+    let start_tip_hash = runtime.tip_hash();
+    if !pool_ledger_db_path.exists() {
+        return Ok(StratumPoolLedgerState::new(
+            cfg.network_id.clone(),
+            start_height,
+            start_tip_hash,
+            now_unix_sec,
+            max_share_records,
+            max_round_records,
+        ));
+    }
+    let snapshot = load_pool_ledger_db(pool_ledger_db_path)?;
+    if snapshot.network_id != cfg.network_id {
+        return Err(NodeError::Runtime(format!(
+            "pool ledger db network mismatch: db='{}', config='{}'",
+            snapshot.network_id, cfg.network_id
+        )));
+    }
+    Ok(StratumPoolLedgerState::from_snapshot(
+        snapshot,
+        start_height,
+        start_tip_hash,
+        now_unix_sec,
+        max_share_records,
+        max_round_records,
+    ))
+}
+
+fn persist_pool_ledger_db(
+    pool_ledger_db_path: &Path,
+    state: &StratumPoolLedgerState,
+) -> Result<(), NodeError> {
+    let snapshot = state.snapshot();
+    save_pool_ledger_db(pool_ledger_db_path, &snapshot)?;
+    Ok(())
+}
+
 fn persist_with_retry<F>(
     attempts: usize,
     backoff_ms: u64,
@@ -1400,6 +1465,21 @@ fn persist_mempool_db_with_retry(
         is_mempool_db_lock_conflict,
         "mempool db persist failed for unknown reason",
         || persist_mempool_db(cfg, mempool, mempool_db_path),
+    )
+}
+
+fn persist_pool_ledger_db_with_retry(
+    pool_ledger_db_path: &Path,
+    state: &StratumPoolLedgerState,
+    attempts: usize,
+    backoff_ms: u64,
+) -> Result<(), NodeError> {
+    persist_with_retry(
+        attempts,
+        backoff_ms,
+        is_pool_ledger_db_lock_conflict,
+        "pool ledger db persist failed for unknown reason",
+        || persist_pool_ledger_db(pool_ledger_db_path, state),
     )
 }
 
@@ -1625,6 +1705,7 @@ fn run_mode(args: RunModeArgs) -> Result<(), NodeError> {
             ui_dir: args.ui_dir.clone(),
             relay_telemetry: None,
             stratum_telemetry: None,
+            pool_ledger: Some(default_pool_ledger_db_path(&runtime_db_path)),
             mine_blocks: 0,
             interval_sec: cfg.target_block_time_sec,
             max_nonce: 500_000,
@@ -1663,6 +1744,9 @@ fn run_mode(args: RunModeArgs) -> Result<(), NodeError> {
             job_declarator_addr: None,
             telemetry_out: None,
             telemetry_every_sec: 5,
+            pool_ledger_db: Some(default_pool_ledger_db_path(&runtime_db_path)),
+            pool_share_retention: POOL_DEFAULT_SHARE_RETENTION,
+            pool_round_retention: POOL_DEFAULT_ROUND_RETENTION,
         };
         let tx = done_tx.clone();
         spawn_mode_service("stratum-serve", tx, move || run_stratum_serve(stratum_args));
@@ -3853,6 +3937,293 @@ struct RelayServerTelemetrySnapshot {
 
 const STRATUM_HASHRATE_WINDOW_SEC: u64 = 120;
 const STRATUM_TOP_WORKERS_LIMIT: usize = 32;
+const POOL_DEFAULT_SHARE_RETENTION: usize = 50_000;
+const POOL_DEFAULT_ROUND_RETENTION: usize = 2_000;
+
+#[derive(Clone, Debug, Serialize)]
+struct PoolLedgerStatusSnapshot {
+    network_id: String,
+    current_round_id: u64,
+    current_round_start_height: u64,
+    current_round_start_tip_hash: String,
+    current_round_age_sec: u64,
+    shares_tracked: usize,
+    rounds_tracked: usize,
+    workers_tracked: usize,
+    pending_payouts: usize,
+    completed_payouts: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct PoolWorkerStatusSnapshot {
+    worker: String,
+    accepted_total: u64,
+    rejected_total: u64,
+    blocks_found_total: u64,
+    expected_hashes_accumulated: f64,
+    pplns_accrual_atomic: u128,
+    pps_accrual_atomic: u128,
+    paid_total_atomic: u128,
+    last_share_unix_sec: u64,
+}
+
+#[derive(Clone, Debug)]
+struct StratumPoolLedgerState {
+    network_id: String,
+    current_round_id: u64,
+    current_round_start_height: u64,
+    current_round_start_tip_hash: Hash256,
+    current_round_start_unix_sec: u64,
+    shares: VecDeque<PoolShareRecord>,
+    share_index: HashSet<String>,
+    rounds: VecDeque<PoolRoundRecord>,
+    workers: HashMap<String, PoolWorkerAccrualRecord>,
+    pending_payouts: VecDeque<PoolPayoutRecord>,
+    completed_payouts: VecDeque<PoolPayoutRecord>,
+    max_share_records: usize,
+    max_round_records: usize,
+}
+
+impl StratumPoolLedgerState {
+    fn new(
+        network_id: String,
+        start_height: u64,
+        start_tip_hash: Hash256,
+        now_unix_sec: u64,
+        max_share_records: usize,
+        max_round_records: usize,
+    ) -> Self {
+        let mut rounds = VecDeque::<PoolRoundRecord>::new();
+        rounds.push_back(PoolRoundRecord {
+            round_id: 1,
+            start_height,
+            start_tip_hash,
+            start_unix_sec: now_unix_sec,
+            end_height: None,
+            end_tip_hash: None,
+            end_unix_sec: None,
+            closed_by_worker: None,
+            found_block_hash: None,
+        });
+        Self {
+            network_id,
+            current_round_id: 1,
+            current_round_start_height: start_height,
+            current_round_start_tip_hash: start_tip_hash,
+            current_round_start_unix_sec: now_unix_sec,
+            shares: VecDeque::new(),
+            share_index: HashSet::new(),
+            rounds,
+            workers: HashMap::new(),
+            pending_payouts: VecDeque::new(),
+            completed_payouts: VecDeque::new(),
+            max_share_records: max_share_records.max(1),
+            max_round_records: max_round_records.max(1),
+        }
+    }
+
+    fn from_snapshot(
+        snapshot: PoolLedgerSnapshot,
+        fallback_start_height: u64,
+        fallback_start_tip_hash: Hash256,
+        now_unix_sec: u64,
+        max_share_records: usize,
+        max_round_records: usize,
+    ) -> Self {
+        let mut shares = snapshot.shares.into_iter().collect::<VecDeque<_>>();
+        while shares.len() > max_share_records.max(1) {
+            shares.pop_front();
+        }
+        let share_index = shares
+            .iter()
+            .map(|share| share.share_key.clone())
+            .collect::<HashSet<_>>();
+        let mut rounds = snapshot.rounds.into_iter().collect::<VecDeque<_>>();
+        while rounds.len() > max_round_records.max(1) {
+            rounds.pop_front();
+        }
+        let workers = snapshot
+            .workers
+            .into_iter()
+            .map(|record| (record.worker.clone(), record))
+            .collect::<HashMap<_, _>>();
+        let pending_payouts = snapshot
+            .pending_payouts
+            .into_iter()
+            .collect::<VecDeque<_>>();
+        let completed_payouts = snapshot
+            .completed_payouts
+            .into_iter()
+            .collect::<VecDeque<_>>();
+
+        let mut state = Self {
+            network_id: snapshot.network_id,
+            current_round_id: snapshot.current_round_id.max(1),
+            current_round_start_height: fallback_start_height,
+            current_round_start_tip_hash: fallback_start_tip_hash,
+            current_round_start_unix_sec: now_unix_sec,
+            shares,
+            share_index,
+            rounds,
+            workers,
+            pending_payouts,
+            completed_payouts,
+            max_share_records: max_share_records.max(1),
+            max_round_records: max_round_records.max(1),
+        };
+        if let Some(open) = state.rounds.back()
+            && open.end_height.is_none()
+            && open.end_tip_hash.is_none()
+        {
+            state.current_round_id = open.round_id;
+            state.current_round_start_height = open.start_height;
+            state.current_round_start_tip_hash = open.start_tip_hash;
+            state.current_round_start_unix_sec = open.start_unix_sec;
+            return state;
+        }
+        state.open_next_round(fallback_start_height, fallback_start_tip_hash, now_unix_sec);
+        state
+    }
+
+    fn share_key(channel_id: u32, job_id: u32, nonce: u64, ntime: u64) -> String {
+        format!("{channel_id}:{job_id}:{nonce}:{ntime}")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn register_share(
+        &mut self,
+        worker: &str,
+        channel_id: u32,
+        job_id: u32,
+        nonce: u64,
+        ntime: u64,
+        expected_hashes: f64,
+        accepted: bool,
+        is_block: bool,
+        now_unix_sec: u64,
+    ) -> bool {
+        let key = Self::share_key(channel_id, job_id, nonce, ntime);
+        if !self.share_index.insert(key.clone()) {
+            return false;
+        }
+        self.shares.push_back(PoolShareRecord {
+            share_key: key,
+            worker: worker.to_owned(),
+            timestamp_unix_sec: now_unix_sec,
+            channel_id,
+            job_id,
+            nonce,
+            ntime,
+            expected_hashes,
+            accepted,
+            is_block,
+        });
+        while self.shares.len() > self.max_share_records {
+            if let Some(front) = self.shares.pop_front() {
+                self.share_index.remove(&front.share_key);
+            }
+        }
+
+        let counters =
+            self.workers
+                .entry(worker.to_owned())
+                .or_insert_with(|| PoolWorkerAccrualRecord {
+                    worker: worker.to_owned(),
+                    accepted_total: 0,
+                    rejected_total: 0,
+                    blocks_found_total: 0,
+                    expected_hashes_accumulated: 0.0,
+                    pplns_accrual_atomic: 0,
+                    pps_accrual_atomic: 0,
+                    paid_total_atomic: 0,
+                    last_share_unix_sec: 0,
+                });
+        if accepted {
+            counters.accepted_total = counters.accepted_total.saturating_add(1);
+            counters.expected_hashes_accumulated =
+                (counters.expected_hashes_accumulated + expected_hashes.max(0.0)).max(0.0);
+        } else {
+            counters.rejected_total = counters.rejected_total.saturating_add(1);
+        }
+        if is_block && accepted {
+            counters.blocks_found_total = counters.blocks_found_total.saturating_add(1);
+        }
+        counters.last_share_unix_sec = now_unix_sec;
+        true
+    }
+
+    fn register_rejected_only(&mut self, worker: &str, now_unix_sec: u64) {
+        let counters =
+            self.workers
+                .entry(worker.to_owned())
+                .or_insert_with(|| PoolWorkerAccrualRecord {
+                    worker: worker.to_owned(),
+                    accepted_total: 0,
+                    rejected_total: 0,
+                    blocks_found_total: 0,
+                    expected_hashes_accumulated: 0.0,
+                    pplns_accrual_atomic: 0,
+                    pps_accrual_atomic: 0,
+                    paid_total_atomic: 0,
+                    last_share_unix_sec: 0,
+                });
+        counters.rejected_total = counters.rejected_total.saturating_add(1);
+        counters.last_share_unix_sec = now_unix_sec;
+    }
+
+    fn close_round_with_block(
+        &mut self,
+        worker: &str,
+        found_block_hash: Hash256,
+        end_height: u64,
+        end_tip_hash: Hash256,
+        now_unix_sec: u64,
+    ) {
+        if let Some(current) = self.rounds.back_mut() {
+            current.end_height = Some(end_height);
+            current.end_tip_hash = Some(end_tip_hash);
+            current.end_unix_sec = Some(now_unix_sec);
+            current.closed_by_worker = Some(worker.to_owned());
+            current.found_block_hash = Some(found_block_hash);
+        }
+        self.open_next_round(end_height, end_tip_hash, now_unix_sec);
+    }
+
+    fn open_next_round(&mut self, start_height: u64, start_tip_hash: Hash256, now_unix_sec: u64) {
+        self.current_round_id = self.current_round_id.saturating_add(1);
+        self.current_round_start_height = start_height;
+        self.current_round_start_tip_hash = start_tip_hash;
+        self.current_round_start_unix_sec = now_unix_sec;
+        self.rounds.push_back(PoolRoundRecord {
+            round_id: self.current_round_id,
+            start_height,
+            start_tip_hash,
+            start_unix_sec: now_unix_sec,
+            end_height: None,
+            end_tip_hash: None,
+            end_unix_sec: None,
+            closed_by_worker: None,
+            found_block_hash: None,
+        });
+        while self.rounds.len() > self.max_round_records {
+            self.rounds.pop_front();
+        }
+    }
+
+    fn snapshot(&self) -> PoolLedgerSnapshot {
+        let mut workers = self.workers.values().cloned().collect::<Vec<_>>();
+        workers.sort_by(|a, b| a.worker.cmp(&b.worker));
+        PoolLedgerSnapshot {
+            network_id: self.network_id.clone(),
+            current_round_id: self.current_round_id,
+            shares: self.shares.iter().cloned().collect(),
+            rounds: self.rounds.iter().cloned().collect(),
+            workers,
+            pending_payouts: self.pending_payouts.iter().cloned().collect(),
+            completed_payouts: self.completed_payouts.iter().cloned().collect(),
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 struct StratumShareSample {
@@ -7091,6 +7462,8 @@ struct StratumServerContext {
     template_provider_addr: Option<String>,
     job_declarator_addr: Option<String>,
     telemetry_state: Arc<Mutex<StratumPoolTelemetryState>>,
+    pool_ledger_state: Arc<Mutex<StratumPoolLedgerState>>,
+    pool_ledger_db_path: PathBuf,
 }
 
 fn lock_runtime<'a>(
@@ -7372,6 +7745,16 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
                             is_block,
                             ..
                         } => {
+                            record_pool_share_accepted(
+                                &ctx,
+                                &worker_label,
+                                channel_id,
+                                job_id,
+                                nonce,
+                                ntime,
+                                session.share_target(),
+                                is_block,
+                            );
                             record_stratum_share_accepted(
                                 &ctx,
                                 &worker_label,
@@ -7413,6 +7796,14 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
                                         ),
                                         runtime.tip_hash(),
                                     )?;
+                                    record_pool_round_closed(
+                                        &ctx,
+                                        &worker_label,
+                                        runtime.tip_hash(),
+                                        runtime.tip_height(),
+                                        runtime.tip_hash(),
+                                        ntime,
+                                    );
                                     last_tip_hash = runtime.tip_hash();
                                 }
                                 if let Err(err) = remove_confirmed_txids_from_mempool_db(
@@ -7442,6 +7833,7 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
                             }
                         }
                         SessionEvent::ShareRejected { .. } => {
+                            record_pool_share_rejected(&ctx, &worker_label);
                             record_stratum_share_rejected(&ctx, &worker_label);
                         }
                         SessionEvent::ShareTargetChanged { .. } => {}
@@ -7751,6 +8143,100 @@ fn record_stratum_share_rejected(ctx: &StratumServerContext, worker: &str) {
     if let Ok(mut telemetry) = ctx.telemetry_state.lock() {
         telemetry.register_rejected_share(worker, now_unix_sec);
     }
+}
+
+fn persist_pool_ledger_with_warning(ctx: &StratumServerContext) {
+    let guard = match ctx.pool_ledger_state.lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            eprintln!("warning: stratum pool ledger mutex poisoned");
+            return;
+        }
+    };
+    if let Err(err) = persist_pool_ledger_db_with_retry(&ctx.pool_ledger_db_path, &guard, 40, 20) {
+        eprintln!("warning: failed to persist pool ledger db: {err}");
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_pool_share_accepted(
+    ctx: &StratumServerContext,
+    worker: &str,
+    channel_id: u32,
+    job_id: u32,
+    nonce: u64,
+    ntime: u64,
+    share_target: Target,
+    is_block: bool,
+) {
+    let now_unix_sec = current_unix_sec().unwrap_or(ntime);
+    let expected_hashes = expected_hashes_for_target(share_target);
+    let inserted = {
+        let mut ledger = match ctx.pool_ledger_state.lock() {
+            Ok(ledger) => ledger,
+            Err(_) => {
+                eprintln!("warning: stratum pool ledger mutex poisoned");
+                return;
+            }
+        };
+        ledger.register_share(
+            worker,
+            channel_id,
+            job_id,
+            nonce,
+            ntime,
+            expected_hashes,
+            true,
+            is_block,
+            now_unix_sec,
+        )
+    };
+    if inserted {
+        persist_pool_ledger_with_warning(ctx);
+    }
+}
+
+fn record_pool_share_rejected(ctx: &StratumServerContext, worker: &str) {
+    let now_unix_sec = current_unix_sec().unwrap_or(0);
+    {
+        let mut ledger = match ctx.pool_ledger_state.lock() {
+            Ok(ledger) => ledger,
+            Err(_) => {
+                eprintln!("warning: stratum pool ledger mutex poisoned");
+                return;
+            }
+        };
+        ledger.register_rejected_only(worker, now_unix_sec);
+    }
+    persist_pool_ledger_with_warning(ctx);
+}
+
+fn record_pool_round_closed(
+    ctx: &StratumServerContext,
+    worker: &str,
+    found_block_hash: Hash256,
+    end_height: u64,
+    end_tip_hash: Hash256,
+    fallback_unix_sec: u64,
+) {
+    let now_unix_sec = current_unix_sec().unwrap_or(fallback_unix_sec);
+    {
+        let mut ledger = match ctx.pool_ledger_state.lock() {
+            Ok(ledger) => ledger,
+            Err(_) => {
+                eprintln!("warning: stratum pool ledger mutex poisoned");
+                return;
+            }
+        };
+        ledger.close_round_with_block(
+            worker,
+            found_block_hash,
+            end_height,
+            end_tip_hash,
+            now_unix_sec,
+        );
+    }
+    persist_pool_ledger_with_warning(ctx);
 }
 
 fn stratum_user_payout_key_hash20(user: &str) -> Option<[u8; 20]> {
@@ -8284,7 +8770,18 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
         .runtime_db
         .unwrap_or_else(|| default_runtime_db_path(args.network));
     let mempool_db_path = default_mempool_db_path(&runtime_db_path);
+    let pool_ledger_db_path = args
+        .pool_ledger_db
+        .clone()
+        .unwrap_or_else(|| default_pool_ledger_db_path(&runtime_db_path));
     let (runtime, source) = load_runtime_from_db_or_genesis(&cfg, &runtime_db_path)?;
+    let pool_ledger_state = load_pool_ledger_from_db_or_new(
+        &cfg,
+        &runtime,
+        &pool_ledger_db_path,
+        args.pool_share_retention,
+        args.pool_round_retention,
+    )?;
     let share_target_hex = args
         .share_target_hex
         .as_deref()
@@ -8395,6 +8892,7 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
         runtime.tip_hash()
     );
     println!("Mempool DB: {}", mempool_db_path.display());
+    println!("Pool ledger DB: {}", pool_ledger_db_path.display());
     println!("Share target: {share_target}");
     println!(
         "VarDiff target shares/min: {}",
@@ -8410,6 +8908,11 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
     );
     println!("Max jobs/channel: {}", max_jobs_per_channel);
     println!("Max active clients: {}", max_active_clients);
+    println!(
+        "Pool ledger retention: shares={} rounds={}",
+        args.pool_share_retention.max(1),
+        args.pool_round_retention.max(1)
+    );
     println!("I/O model: async tokio");
     println!(
         "Read timeout={}s keepalive={}s idle timeout={}s",
@@ -8475,7 +8978,15 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
         template_provider_addr: args.template_provider_addr.clone(),
         job_declarator_addr: args.job_declarator_addr.clone(),
         telemetry_state: Arc::new(Mutex::new(StratumPoolTelemetryState::default())),
+        pool_ledger_state: Arc::new(Mutex::new(pool_ledger_state)),
+        pool_ledger_db_path,
     };
+    if let Ok(guard) = ctx.pool_ledger_state.lock()
+        && let Err(err) =
+            persist_pool_ledger_db_with_retry(&ctx.pool_ledger_db_path, &guard, 40, 20)
+    {
+        eprintln!("warning: failed to initialize pool ledger db: {err}");
+    }
     let worker_threads = std::thread::available_parallelism()
         .map(|n| n.get().max(2))
         .unwrap_or(4);
@@ -9779,6 +10290,27 @@ struct RpcEventSnapshot {
     unix_sec: u64,
 }
 
+#[derive(Debug, Serialize)]
+struct PoolStatusRpcResponse {
+    telemetry: Option<StratumServerTelemetrySnapshot>,
+    ledger: Option<PoolLedgerStatusSnapshot>,
+}
+
+#[derive(Debug, Serialize)]
+struct PoolWorkerRpcResponse {
+    worker: String,
+    telemetry: Option<StratumWorkerHashrateSnapshot>,
+    ledger: Option<PoolWorkerStatusSnapshot>,
+}
+
+#[derive(Debug, Serialize)]
+struct PoolPayoutsRpcResponse {
+    network_id: String,
+    source: String,
+    count: usize,
+    payouts: Vec<PoolPayoutRecord>,
+}
+
 fn tx_lookup_response(block_height: u64, tx_index: usize, tx: &Transaction) -> TxLookupRpcResponse {
     TxLookupRpcResponse {
         block_height,
@@ -10049,6 +10581,68 @@ fn build_rpc_event_snapshot(
         last_block_age_sec,
         unix_sec: now_unix_sec,
     })
+}
+
+fn load_pool_ledger_snapshot_with_retry(
+    pool_ledger_db_path: &Path,
+) -> Result<Option<PoolLedgerSnapshot>, NodeError> {
+    if !pool_ledger_db_path.exists() {
+        return Ok(None);
+    }
+    load_with_retry(10, 15, is_pool_ledger_db_lock_conflict, || {
+        load_pool_ledger_db(pool_ledger_db_path).map_err(NodeError::from)
+    })
+}
+
+fn pool_ledger_status_from_snapshot(
+    snapshot: &PoolLedgerSnapshot,
+    now_unix_sec: u64,
+) -> Option<PoolLedgerStatusSnapshot> {
+    let round = snapshot
+        .rounds
+        .iter()
+        .find(|round| round.round_id == snapshot.current_round_id && round.end_height.is_none())
+        .or_else(|| {
+            snapshot
+                .rounds
+                .iter()
+                .find(|round| round.round_id == snapshot.current_round_id)
+        })
+        .or_else(|| snapshot.rounds.last())?;
+
+    Some(PoolLedgerStatusSnapshot {
+        network_id: snapshot.network_id.clone(),
+        current_round_id: snapshot.current_round_id,
+        current_round_start_height: round.start_height,
+        current_round_start_tip_hash: round.start_tip_hash.to_hex(),
+        current_round_age_sec: now_unix_sec.saturating_sub(round.start_unix_sec),
+        shares_tracked: snapshot.shares.len(),
+        rounds_tracked: snapshot.rounds.len(),
+        workers_tracked: snapshot.workers.len(),
+        pending_payouts: snapshot.pending_payouts.len(),
+        completed_payouts: snapshot.completed_payouts.len(),
+    })
+}
+
+fn pool_worker_status_from_snapshot(
+    snapshot: &PoolLedgerSnapshot,
+    worker_label: &str,
+) -> Option<PoolWorkerStatusSnapshot> {
+    snapshot
+        .workers
+        .iter()
+        .find(|entry| entry.worker == worker_label)
+        .map(|entry| PoolWorkerStatusSnapshot {
+            worker: entry.worker.clone(),
+            accepted_total: entry.accepted_total,
+            rejected_total: entry.rejected_total,
+            blocks_found_total: entry.blocks_found_total,
+            expected_hashes_accumulated: entry.expected_hashes_accumulated,
+            pplns_accrual_atomic: entry.pplns_accrual_atomic,
+            pps_accrual_atomic: entry.pps_accrual_atomic,
+            paid_total_atomic: entry.paid_total_atomic,
+            last_share_unix_sec: entry.last_share_unix_sec,
+        })
 }
 
 fn write_http_response<W: Write>(
@@ -10622,6 +11216,7 @@ fn run_rpc_serve_inner(
         ui_dir,
         relay_telemetry,
         stratum_telemetry,
+        pool_ledger,
         mine_blocks,
         interval_sec,
         max_nonce,
@@ -10631,6 +11226,9 @@ fn run_rpc_serve_inner(
         .clone()
         .unwrap_or_else(|| default_runtime_db_path(network));
     let mempool_db_path = default_mempool_db_path(&runtime_db_path);
+    let pool_ledger_db_path = pool_ledger
+        .clone()
+        .unwrap_or_else(|| default_pool_ledger_db_path(&runtime_db_path));
     let (cfg, mut runtime) = build_runtime_for_query(
         network,
         config,
@@ -10657,7 +11255,7 @@ fn run_rpc_serve_inner(
         runtime.tip_hash()
     );
     println!(
-        "Endpoints: GET /health, /status, /block/<height>, /tx/<height>/<index>, /txid/<txid>, /mempool, /events, /pool/status, /pool/worker/<label>; POST /wallet/new, /wallet/address, /wallet/decode, /wallet/balance, /wallet/balance-by-address, /wallet/balance-history-by-address, /wallet/send-preview, /wallet/send, /tx/submit, /wallet/qr"
+        "Endpoints: GET /health, /status, /block/<height>, /tx/<height>/<index>, /txid/<txid>, /mempool, /events, /pool/status, /pool/worker/<label>, /pool/payouts/pending, /pool/payouts/completed; POST /wallet/new, /wallet/address, /wallet/decode, /wallet/balance, /wallet/balance-by-address, /wallet/balance-history-by-address, /wallet/send-preview, /wallet/send, /tx/submit, /wallet/qr"
     );
     println!("UI assets directory: {}", ui_dir.display());
     println!("Mempool DB source: {}", mempool_db_path.display());
@@ -10667,6 +11265,7 @@ fn run_rpc_serve_inner(
     if let Some(path) = stratum_telemetry.as_ref() {
         println!("Stratum telemetry source: {}", path.display());
     }
+    println!("Pool ledger source: {}", pool_ledger_db_path.display());
     if max_requests_reached(max_requests, max_requests) {
         println!("Max requests before exit: {}", max_requests);
     }
@@ -10782,22 +11381,29 @@ fn run_rpc_serve_inner(
                 ),
             }
         } else if rpc_exact_route_matches(method, path, "GET", "/pool/status") {
-            let payload = match stratum_telemetry.as_ref() {
+            let telemetry = match stratum_telemetry.as_ref() {
                 Some(path) => load_latest_jsonl_record::<StratumServerTelemetrySnapshot>(path)?,
                 None => None,
             };
-            match payload {
-                Some(snapshot) => match to_pretty_json(&snapshot) {
+            let ledger_snapshot = load_pool_ledger_snapshot_with_retry(&pool_ledger_db_path)?;
+            let now_unix_sec = current_unix_sec().unwrap_or(0);
+            let ledger = ledger_snapshot
+                .as_ref()
+                .and_then(|snapshot| pool_ledger_status_from_snapshot(snapshot, now_unix_sec));
+            if telemetry.is_none() && ledger.is_none() {
+                (
+                    "404 Not Found",
+                    json_error_body("pool telemetry and ledger snapshots are not available"),
+                )
+            } else {
+                let payload = PoolStatusRpcResponse { telemetry, ledger };
+                match to_pretty_json(&payload) {
                     Ok(body) => ("200 OK", body),
                     Err(e) => (
                         "500 Internal Server Error",
                         json_error_body(&format!("pool status serialization failed: {e}")),
                     ),
-                },
-                None => (
-                    "404 Not Found",
-                    json_error_body("stratum telemetry snapshot not available"),
-                ),
+                }
             }
         } else if is_get_method(method) && path.starts_with("/pool/worker/") {
             let worker_label = path
@@ -10810,42 +11416,87 @@ fn run_rpc_serve_inner(
                     json_error_body("worker label must not be empty"),
                 )
             } else {
-                let payload = match stratum_telemetry.as_ref() {
+                let normalized = StratumPoolTelemetryState::sanitize_worker_label(worker_label);
+                let telemetry = match stratum_telemetry.as_ref() {
                     Some(path) => load_latest_jsonl_record::<StratumServerTelemetrySnapshot>(path)?,
                     None => None,
                 };
-                match payload {
-                    Some(snapshot) => {
-                        let normalized =
-                            StratumPoolTelemetryState::sanitize_worker_label(worker_label);
-                        if let Some(worker) = snapshot
-                            .top_workers
-                            .iter()
-                            .find(|entry| entry.worker == normalized)
-                        {
-                            match to_pretty_json(worker) {
-                                Ok(body) => ("200 OK", body),
-                                Err(e) => (
-                                    "500 Internal Server Error",
-                                    json_error_body(&format!(
-                                        "worker status serialization failed: {e}"
-                                    )),
-                                ),
-                            }
-                        } else {
-                            (
-                                "404 Not Found",
-                                json_error_body(&format!(
-                                    "worker {normalized} not found in latest snapshot"
-                                )),
-                            )
-                        }
-                    }
-                    None => (
+                let telemetry_worker = telemetry.as_ref().and_then(|snapshot| {
+                    snapshot
+                        .top_workers
+                        .iter()
+                        .find(|entry| entry.worker == normalized)
+                        .cloned()
+                });
+                let ledger = load_pool_ledger_snapshot_with_retry(&pool_ledger_db_path)?;
+                let ledger_worker = ledger
+                    .as_ref()
+                    .and_then(|snapshot| pool_worker_status_from_snapshot(snapshot, &normalized));
+                if telemetry_worker.is_none() && ledger_worker.is_none() {
+                    (
                         "404 Not Found",
-                        json_error_body("stratum telemetry snapshot not available"),
-                    ),
+                        json_error_body(&format!(
+                            "worker {normalized} not found in telemetry or pool ledger"
+                        )),
+                    )
+                } else {
+                    let payload = PoolWorkerRpcResponse {
+                        worker: normalized,
+                        telemetry: telemetry_worker,
+                        ledger: ledger_worker,
+                    };
+                    match to_pretty_json(&payload) {
+                        Ok(body) => ("200 OK", body),
+                        Err(e) => (
+                            "500 Internal Server Error",
+                            json_error_body(&format!("worker status serialization failed: {e}")),
+                        ),
+                    }
                 }
+            }
+        } else if rpc_exact_route_matches(method, path, "GET", "/pool/payouts/pending") {
+            match load_pool_ledger_snapshot_with_retry(&pool_ledger_db_path)? {
+                Some(snapshot) => {
+                    let payload = PoolPayoutsRpcResponse {
+                        network_id: snapshot.network_id.clone(),
+                        source: pool_ledger_db_path.display().to_string(),
+                        count: snapshot.pending_payouts.len(),
+                        payouts: snapshot.pending_payouts,
+                    };
+                    match to_pretty_json(&payload) {
+                        Ok(body) => ("200 OK", body),
+                        Err(e) => (
+                            "500 Internal Server Error",
+                            json_error_body(&format!("pool payout serialization failed: {e}")),
+                        ),
+                    }
+                }
+                None => (
+                    "404 Not Found",
+                    json_error_body("pool ledger snapshot not available"),
+                ),
+            }
+        } else if rpc_exact_route_matches(method, path, "GET", "/pool/payouts/completed") {
+            match load_pool_ledger_snapshot_with_retry(&pool_ledger_db_path)? {
+                Some(snapshot) => {
+                    let payload = PoolPayoutsRpcResponse {
+                        network_id: snapshot.network_id.clone(),
+                        source: pool_ledger_db_path.display().to_string(),
+                        count: snapshot.completed_payouts.len(),
+                        payouts: snapshot.completed_payouts,
+                    };
+                    match to_pretty_json(&payload) {
+                        Ok(body) => ("200 OK", body),
+                        Err(e) => (
+                            "500 Internal Server Error",
+                            json_error_body(&format!("pool payout serialization failed: {e}")),
+                        ),
+                    }
+                }
+                None => (
+                    "404 Not Found",
+                    json_error_body("pool ledger snapshot not available"),
+                ),
             }
         } else if rpc_exact_route_matches(method, path, "GET", "/mempool") {
             let (mempool_tx_count, mempool_txids) = if mempool_db_path.exists() {
@@ -13405,8 +14056,19 @@ mod tests {
         let cfg: ChainConfig =
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
         let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let runtime_tip_height = runtime.tip_height();
+        let runtime_tip_hash = runtime.tip_hash();
         let runtime_db_path = temp_dir("test-stratum-client-async-logic").join("runtime.redb");
         let mempool_db_path = runtime_db_path.with_file_name("mempool.redb");
+        let pool_ledger_db_path = runtime_db_path.with_file_name("pool-ledger.redb");
+        let pool_ledger_state = super::StratumPoolLedgerState::new(
+            cfg.network_id.clone(),
+            runtime_tip_height,
+            runtime_tip_hash,
+            super::current_unix_sec().unwrap_or(1),
+            super::POOL_DEFAULT_SHARE_RETENTION,
+            super::POOL_DEFAULT_ROUND_RETENTION,
+        );
         let ctx = super::StratumServerContext {
             cfg: cfg.clone(),
             runtime: std::sync::Arc::new(std::sync::Mutex::new(runtime)),
@@ -13443,6 +14105,8 @@ mod tests {
             telemetry_state: std::sync::Arc::new(std::sync::Mutex::new(
                 super::StratumPoolTelemetryState::default(),
             )),
+            pool_ledger_state: std::sync::Arc::new(std::sync::Mutex::new(pool_ledger_state)),
+            pool_ledger_db_path,
         };
 
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -14895,6 +15559,9 @@ mod tests {
             job_declarator_addr: None,
             telemetry_out: None,
             telemetry_every_sec: 1,
+            pool_ledger_db: None,
+            pool_share_retention: super::POOL_DEFAULT_SHARE_RETENTION,
+            pool_round_retention: super::POOL_DEFAULT_ROUND_RETENTION,
         })
         .expect_err("share target below min must fail");
         assert!(
@@ -14932,6 +15599,9 @@ mod tests {
             job_declarator_addr: None,
             telemetry_out: None,
             telemetry_every_sec: 1,
+            pool_ledger_db: None,
+            pool_share_retention: super::POOL_DEFAULT_SHARE_RETENTION,
+            pool_round_retention: super::POOL_DEFAULT_ROUND_RETENTION,
         })
         .expect_err("share target above max must fail");
         assert!(
@@ -14969,6 +15639,9 @@ mod tests {
             job_declarator_addr: None,
             telemetry_out: None,
             telemetry_every_sec: 1,
+            pool_ledger_db: None,
+            pool_share_retention: super::POOL_DEFAULT_SHARE_RETENTION,
+            pool_round_retention: super::POOL_DEFAULT_ROUND_RETENTION,
         })
         .expect_err("idle timeout validation must trigger after valid share bounds");
         assert!(
@@ -15739,6 +16412,7 @@ mod tests {
             ui_dir,
             relay_telemetry: None,
             stratum_telemetry: None,
+            pool_ledger: None,
             mine_blocks: 0,
             interval_sec: 120,
             max_nonce: 500_000,
@@ -15792,6 +16466,7 @@ mod tests {
             ui_dir,
             relay_telemetry: None,
             stratum_telemetry: None,
+            pool_ledger: None,
             mine_blocks: 0,
             interval_sec: 120,
             max_nonce: 500_000,
@@ -15893,6 +16568,7 @@ mod tests {
             ui_dir,
             relay_telemetry: None,
             stratum_telemetry: Some(stratum_telemetry),
+            pool_ledger: None,
             mine_blocks: 0,
             interval_sec: 120,
             max_nonce: 500_000,
@@ -15962,6 +16638,7 @@ mod tests {
             ui_dir,
             relay_telemetry: None,
             stratum_telemetry: None,
+            pool_ledger: None,
             mine_blocks: 0,
             interval_sec: 120,
             max_nonce: 500_000,
@@ -16070,6 +16747,7 @@ mod tests {
             ui_dir: work_dir.join("ui"),
             relay_telemetry: None,
             stratum_telemetry: None,
+            pool_ledger: None,
             mine_blocks: 0,
             interval_sec: 120,
             max_nonce: 500_000,
@@ -16181,6 +16859,7 @@ mod tests {
             ui_dir: work_dir.join("ui"),
             relay_telemetry: None,
             stratum_telemetry: None,
+            pool_ledger: None,
             mine_blocks: 0,
             interval_sec: 120,
             max_nonce: 500_000,
@@ -16230,6 +16909,7 @@ mod tests {
             ui_dir,
             relay_telemetry: None,
             stratum_telemetry: None,
+            pool_ledger: None,
             mine_blocks: 0,
             interval_sec: 120,
             max_nonce: 500_000,
@@ -16398,6 +17078,9 @@ mod tests {
             job_declarator_addr: None,
             telemetry_out: None,
             telemetry_every_sec: 1,
+            pool_ledger_db: None,
+            pool_share_retention: super::POOL_DEFAULT_SHARE_RETENTION,
+            pool_round_retention: super::POOL_DEFAULT_ROUND_RETENTION,
         })
         .expect_err("serve must reject missing noise static key");
         assert!(

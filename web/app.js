@@ -30,6 +30,13 @@ const txidInput = document.getElementById("txidInput");
 const txLookupOut = document.getElementById("txLookupOut");
 
 const mempoolOut = document.getElementById("mempoolOut");
+const poolStatusForm = document.getElementById("poolStatusForm");
+const poolStatusOut = document.getElementById("poolStatusOut");
+const poolWorkerForm = document.getElementById("poolWorkerForm");
+const poolWorkerInput = document.getElementById("poolWorkerInput");
+const poolWorkerOut = document.getElementById("poolWorkerOut");
+const poolPayoutPendingOut = document.getElementById("poolPayoutPendingOut");
+const poolPayoutCompletedOut = document.getElementById("poolPayoutCompletedOut");
 const walletOut = document.getElementById("walletOut");
 
 const DASHBOARD_POLL_INTERVAL_MS = 5000;
@@ -212,13 +219,42 @@ async function loadMempool() {
   }
 }
 
+async function loadPoolStatus() {
+  try {
+    const status = await request("/pool/status");
+    setResult(poolStatusOut, status);
+  } catch (error) {
+    setResult(poolStatusOut, `Cannot load pool status: ${error.message}`, true);
+  }
+}
+
+async function loadPoolPayouts() {
+  try {
+    const pending = await request("/pool/payouts/pending");
+    setResult(poolPayoutPendingOut, pending);
+  } catch (error) {
+    setResult(poolPayoutPendingOut, `Cannot load pending payouts: ${error.message}`, true);
+  }
+  try {
+    const completed = await request("/pool/payouts/completed");
+    setResult(poolPayoutCompletedOut, completed);
+  } catch (error) {
+    setResult(poolPayoutCompletedOut, `Cannot load completed payouts: ${error.message}`, true);
+  }
+}
+
 async function refreshDashboard() {
   try {
     const status = await loadStatus();
     state.lastTipHeight = Number.isFinite(Number(status.tip_height))
       ? Number(status.tip_height)
       : state.lastTipHeight;
-    await Promise.all([loadLatestBlocks(status.tip_height), loadMempool()]);
+    await Promise.all([
+      loadLatestBlocks(status.tip_height),
+      loadMempool(),
+      loadPoolStatus(),
+      loadPoolPayouts(),
+    ]);
   } catch (error) {
     setResult(blockLookupOut, `Dashboard refresh failed: ${error.message}`, true);
     setResult(txLookupOut, `Dashboard refresh failed: ${error.message}`, true);
@@ -363,6 +399,31 @@ function initExplorerActions() {
       setResult(txLookupOut, error.message, true);
     }
   });
+
+  if (poolStatusForm) {
+    poolStatusForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      await loadPoolStatus();
+      await loadPoolPayouts();
+    });
+  }
+
+  if (poolWorkerForm) {
+    poolWorkerForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const worker = (poolWorkerInput.value || "").trim();
+      if (!worker) {
+        setResult(poolWorkerOut, "worker label is required", true);
+        return;
+      }
+      try {
+        const data = await request(`/pool/worker/${encodeURIComponent(worker)}`);
+        setResult(poolWorkerOut, data);
+      } catch (error) {
+        setResult(poolWorkerOut, error.message, true);
+      }
+    });
+  }
 }
 
 function initWalletActions() {

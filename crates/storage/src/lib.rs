@@ -14,6 +14,14 @@ const HEADER_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("header
 const BLOCK_INDEX_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("block_index");
 const PEER_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("peers");
 const MEMPOOL_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("mempool_by_txid");
+const POOL_META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("pool_meta");
+const POOL_WORKER_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("pool_workers");
+const POOL_SHARE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("pool_shares");
+const POOL_ROUND_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("pool_rounds");
+const POOL_PAYOUT_PENDING_TABLE: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("pool_payout_pending");
+const POOL_PAYOUT_COMPLETED_TABLE: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("pool_payout_completed");
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChainStateSnapshot {
@@ -66,6 +74,67 @@ pub struct MempoolTxRecord {
 struct MempoolStoredValue {
     tx: Transaction,
     fee: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct PoolShareRecord {
+    pub share_key: String,
+    pub worker: String,
+    pub timestamp_unix_sec: u64,
+    pub channel_id: u32,
+    pub job_id: u32,
+    pub nonce: u64,
+    pub ntime: u64,
+    pub expected_hashes: f64,
+    pub accepted: bool,
+    pub is_block: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct PoolRoundRecord {
+    pub round_id: u64,
+    pub start_height: u64,
+    pub start_tip_hash: Hash256,
+    pub start_unix_sec: u64,
+    pub end_height: Option<u64>,
+    pub end_tip_hash: Option<Hash256>,
+    pub end_unix_sec: Option<u64>,
+    pub closed_by_worker: Option<String>,
+    pub found_block_hash: Option<Hash256>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct PoolWorkerAccrualRecord {
+    pub worker: String,
+    pub accepted_total: u64,
+    pub rejected_total: u64,
+    pub blocks_found_total: u64,
+    pub expected_hashes_accumulated: f64,
+    pub pplns_accrual_atomic: u128,
+    pub pps_accrual_atomic: u128,
+    pub paid_total_atomic: u128,
+    pub last_share_unix_sec: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct PoolPayoutRecord {
+    pub payout_id: String,
+    pub worker: String,
+    pub amount_atomic: u128,
+    pub created_unix_sec: u64,
+    pub submitted_txid_hex: Option<String>,
+    pub confirmed: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct PoolLedgerSnapshot {
+    pub network_id: String,
+    pub current_round_id: u64,
+    pub shares: Vec<PoolShareRecord>,
+    pub rounds: Vec<PoolRoundRecord>,
+    pub workers: Vec<PoolWorkerAccrualRecord>,
+    pub pending_payouts: Vec<PoolPayoutRecord>,
+    pub completed_payouts: Vec<PoolPayoutRecord>,
 }
 
 impl ChainStateSnapshot {
@@ -667,6 +736,316 @@ pub fn load_mempool_db(path: &Path) -> Result<MempoolSnapshot, StorageError> {
     })
 }
 
+pub fn save_pool_ledger_db(path: &Path, snapshot: &PoolLedgerSnapshot) -> Result<(), StorageError> {
+    if snapshot.network_id.trim().is_empty() {
+        return Err(StorageError::InvalidPoolLedger(
+            "network_id must not be empty".to_owned(),
+        ));
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|source| StorageError::CreateDir {
+            path: parent.display().to_string(),
+            source,
+        })?;
+    }
+    let tmp_path = temp_db_path(path);
+    if tmp_path.exists() {
+        fs::remove_file(&tmp_path).map_err(|source| StorageError::Write {
+            path: tmp_path.display().to_string(),
+            source,
+        })?;
+    }
+
+    let mut share_dedup = std::collections::HashMap::<String, PoolShareRecord>::new();
+    for share in &snapshot.shares {
+        if share.share_key.trim().is_empty() {
+            return Err(StorageError::InvalidPoolLedger(
+                "share_key must not be empty".to_owned(),
+            ));
+        }
+        if share.worker.trim().is_empty() {
+            return Err(StorageError::InvalidPoolLedger(
+                "share worker must not be empty".to_owned(),
+            ));
+        }
+        share_dedup.insert(share.share_key.clone(), share.clone());
+    }
+    let mut shares = share_dedup.into_values().collect::<Vec<_>>();
+    shares.sort_by(|a, b| a.share_key.cmp(&b.share_key));
+
+    let mut round_dedup = std::collections::HashMap::<u64, PoolRoundRecord>::new();
+    for round in &snapshot.rounds {
+        round_dedup.insert(round.round_id, round.clone());
+    }
+    let mut rounds = round_dedup.into_values().collect::<Vec<_>>();
+    rounds.sort_by_key(|round| round.round_id);
+
+    let mut worker_dedup = std::collections::HashMap::<String, PoolWorkerAccrualRecord>::new();
+    for worker in &snapshot.workers {
+        if worker.worker.trim().is_empty() {
+            return Err(StorageError::InvalidPoolLedger(
+                "worker label must not be empty".to_owned(),
+            ));
+        }
+        worker_dedup.insert(worker.worker.clone(), worker.clone());
+    }
+    let mut workers = worker_dedup.into_values().collect::<Vec<_>>();
+    workers.sort_by(|a, b| a.worker.cmp(&b.worker));
+
+    let mut pending_dedup = std::collections::HashMap::<String, PoolPayoutRecord>::new();
+    for payout in &snapshot.pending_payouts {
+        if payout.payout_id.trim().is_empty() {
+            return Err(StorageError::InvalidPoolLedger(
+                "pending payout_id must not be empty".to_owned(),
+            ));
+        }
+        pending_dedup.insert(payout.payout_id.clone(), payout.clone());
+    }
+    let mut pending_payouts = pending_dedup.into_values().collect::<Vec<_>>();
+    pending_payouts.sort_by(|a, b| a.payout_id.cmp(&b.payout_id));
+
+    let mut completed_dedup = std::collections::HashMap::<String, PoolPayoutRecord>::new();
+    for payout in &snapshot.completed_payouts {
+        if payout.payout_id.trim().is_empty() {
+            return Err(StorageError::InvalidPoolLedger(
+                "completed payout_id must not be empty".to_owned(),
+            ));
+        }
+        completed_dedup.insert(payout.payout_id.clone(), payout.clone());
+    }
+    let mut completed_payouts = completed_dedup.into_values().collect::<Vec<_>>();
+    completed_payouts.sort_by(|a, b| a.payout_id.cmp(&b.payout_id));
+
+    let db = Database::create(&tmp_path).map_err(|e| StorageError::Db(e.to_string()))?;
+    let write_txn = db
+        .begin_write()
+        .map_err(|e| StorageError::Db(e.to_string()))?;
+    {
+        let mut meta = write_txn
+            .open_table(POOL_META_TABLE)
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+        let current_round_id_bytes = snapshot.current_round_id.to_le_bytes();
+        meta.insert("network_id", snapshot.network_id.as_bytes())
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+        meta.insert("current_round_id", current_round_id_bytes.as_slice())
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+    }
+    {
+        let mut table = write_txn
+            .open_table(POOL_WORKER_TABLE)
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+        for worker in workers {
+            let value = bincode::serialize(&worker).map_err(StorageError::Encode)?;
+            table
+                .insert(worker.worker.as_str(), value.as_slice())
+                .map_err(|e| StorageError::Db(e.to_string()))?;
+        }
+    }
+    {
+        let mut table = write_txn
+            .open_table(POOL_SHARE_TABLE)
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+        for share in shares {
+            let value = bincode::serialize(&share).map_err(StorageError::Encode)?;
+            table
+                .insert(share.share_key.as_str(), value.as_slice())
+                .map_err(|e| StorageError::Db(e.to_string()))?;
+        }
+    }
+    {
+        let mut table = write_txn
+            .open_table(POOL_ROUND_TABLE)
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+        for round in rounds {
+            let value = bincode::serialize(&round).map_err(StorageError::Encode)?;
+            table
+                .insert(round.round_id, value.as_slice())
+                .map_err(|e| StorageError::Db(e.to_string()))?;
+        }
+    }
+    {
+        let mut table = write_txn
+            .open_table(POOL_PAYOUT_PENDING_TABLE)
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+        for payout in pending_payouts {
+            let value = bincode::serialize(&payout).map_err(StorageError::Encode)?;
+            table
+                .insert(payout.payout_id.as_str(), value.as_slice())
+                .map_err(|e| StorageError::Db(e.to_string()))?;
+        }
+    }
+    {
+        let mut table = write_txn
+            .open_table(POOL_PAYOUT_COMPLETED_TABLE)
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+        for payout in completed_payouts {
+            let value = bincode::serialize(&payout).map_err(StorageError::Encode)?;
+            table
+                .insert(payout.payout_id.as_str(), value.as_slice())
+                .map_err(|e| StorageError::Db(e.to_string()))?;
+        }
+    }
+    write_txn
+        .commit()
+        .map_err(|e| StorageError::Db(e.to_string()))?;
+    atomic_replace_file(&tmp_path, path)?;
+    Ok(())
+}
+
+pub fn load_pool_ledger_db(path: &Path) -> Result<PoolLedgerSnapshot, StorageError> {
+    let db = Database::open(path).map_err(|e| StorageError::Db(e.to_string()))?;
+    let read_txn = db
+        .begin_read()
+        .map_err(|e| StorageError::Db(e.to_string()))?;
+
+    let (network_id, current_round_id) = {
+        let meta = read_txn
+            .open_table(POOL_META_TABLE)
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+        let network_id_raw = meta
+            .get("network_id")
+            .map_err(|e| StorageError::Db(e.to_string()))?
+            .ok_or_else(|| StorageError::MissingMeta("network_id".to_owned()))?;
+        let current_round_id_raw = meta
+            .get("current_round_id")
+            .map_err(|e| StorageError::Db(e.to_string()))?
+            .ok_or_else(|| StorageError::MissingMeta("current_round_id".to_owned()))?;
+        let network_id = std::str::from_utf8(network_id_raw.value())
+            .map_err(StorageError::InvalidUtf8)?
+            .to_owned();
+        let round_bytes = current_round_id_raw.value();
+        if round_bytes.len() != 8 {
+            return Err(StorageError::InvalidMetaFormat {
+                key: "current_round_id".to_owned(),
+                details: format!("expected 8 bytes, got {}", round_bytes.len()),
+            });
+        }
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(round_bytes);
+        (network_id, u64::from_le_bytes(buf))
+    };
+
+    let worker_table = read_txn
+        .open_table(POOL_WORKER_TABLE)
+        .map_err(|e| StorageError::Db(e.to_string()))?;
+    let mut workers = Vec::<PoolWorkerAccrualRecord>::new();
+    for row in worker_table
+        .iter()
+        .map_err(|e| StorageError::Db(e.to_string()))?
+    {
+        let (key, value) = row.map_err(|e| StorageError::Db(e.to_string()))?;
+        let key_worker = key.value().to_owned();
+        let record: PoolWorkerAccrualRecord =
+            bincode::deserialize(value.value()).map_err(StorageError::Decode)?;
+        if record.worker != key_worker {
+            return Err(StorageError::InvalidPoolLedger(format!(
+                "worker key mismatch: key={key_worker}, record={}",
+                record.worker
+            )));
+        }
+        workers.push(record);
+    }
+    workers.sort_by(|a, b| a.worker.cmp(&b.worker));
+
+    let share_table = read_txn
+        .open_table(POOL_SHARE_TABLE)
+        .map_err(|e| StorageError::Db(e.to_string()))?;
+    let mut shares = Vec::<PoolShareRecord>::new();
+    for row in share_table
+        .iter()
+        .map_err(|e| StorageError::Db(e.to_string()))?
+    {
+        let (key, value) = row.map_err(|e| StorageError::Db(e.to_string()))?;
+        let key_share = key.value().to_owned();
+        let record: PoolShareRecord =
+            bincode::deserialize(value.value()).map_err(StorageError::Decode)?;
+        if record.share_key != key_share {
+            return Err(StorageError::InvalidPoolLedger(format!(
+                "share key mismatch: key={key_share}, record={}",
+                record.share_key
+            )));
+        }
+        shares.push(record);
+    }
+    shares.sort_by(|a, b| a.share_key.cmp(&b.share_key));
+
+    let round_table = read_txn
+        .open_table(POOL_ROUND_TABLE)
+        .map_err(|e| StorageError::Db(e.to_string()))?;
+    let mut rounds = Vec::<PoolRoundRecord>::new();
+    for row in round_table
+        .iter()
+        .map_err(|e| StorageError::Db(e.to_string()))?
+    {
+        let (key, value) = row.map_err(|e| StorageError::Db(e.to_string()))?;
+        let round_id = key.value();
+        let record: PoolRoundRecord =
+            bincode::deserialize(value.value()).map_err(StorageError::Decode)?;
+        if record.round_id != round_id {
+            return Err(StorageError::InvalidPoolLedger(format!(
+                "round key mismatch: key={round_id}, record={}",
+                record.round_id
+            )));
+        }
+        rounds.push(record);
+    }
+    rounds.sort_by_key(|round| round.round_id);
+
+    let pending_table = read_txn
+        .open_table(POOL_PAYOUT_PENDING_TABLE)
+        .map_err(|e| StorageError::Db(e.to_string()))?;
+    let mut pending_payouts = Vec::<PoolPayoutRecord>::new();
+    for row in pending_table
+        .iter()
+        .map_err(|e| StorageError::Db(e.to_string()))?
+    {
+        let (key, value) = row.map_err(|e| StorageError::Db(e.to_string()))?;
+        let payout_id = key.value().to_owned();
+        let record: PoolPayoutRecord =
+            bincode::deserialize(value.value()).map_err(StorageError::Decode)?;
+        if record.payout_id != payout_id {
+            return Err(StorageError::InvalidPoolLedger(format!(
+                "pending payout key mismatch: key={payout_id}, record={}",
+                record.payout_id
+            )));
+        }
+        pending_payouts.push(record);
+    }
+    pending_payouts.sort_by(|a, b| a.payout_id.cmp(&b.payout_id));
+
+    let completed_table = read_txn
+        .open_table(POOL_PAYOUT_COMPLETED_TABLE)
+        .map_err(|e| StorageError::Db(e.to_string()))?;
+    let mut completed_payouts = Vec::<PoolPayoutRecord>::new();
+    for row in completed_table
+        .iter()
+        .map_err(|e| StorageError::Db(e.to_string()))?
+    {
+        let (key, value) = row.map_err(|e| StorageError::Db(e.to_string()))?;
+        let payout_id = key.value().to_owned();
+        let record: PoolPayoutRecord =
+            bincode::deserialize(value.value()).map_err(StorageError::Decode)?;
+        if record.payout_id != payout_id {
+            return Err(StorageError::InvalidPoolLedger(format!(
+                "completed payout key mismatch: key={payout_id}, record={}",
+                record.payout_id
+            )));
+        }
+        completed_payouts.push(record);
+    }
+    completed_payouts.sort_by(|a, b| a.payout_id.cmp(&b.payout_id));
+
+    Ok(PoolLedgerSnapshot {
+        network_id,
+        current_round_id,
+        shares,
+        rounds,
+        workers,
+        pending_payouts,
+        completed_payouts,
+    })
+}
+
 fn atomic_replace_file(tmp_path: &Path, final_path: &Path) -> Result<(), StorageError> {
     fs::rename(tmp_path, final_path).map_err(|source| StorageError::Write {
         path: final_path.display().to_string(),
@@ -754,6 +1133,8 @@ pub enum StorageError {
     InvalidPeerBook(String),
     #[error("invalid mempool snapshot: {0}")]
     InvalidMempool(String),
+    #[error("invalid pool ledger snapshot: {0}")]
+    InvalidPoolLedger(String),
 }
 
 #[cfg(test)]
@@ -768,9 +1149,11 @@ mod tests {
 
     use crate::{
         ChainArchive, ChainStateSnapshot, MempoolSnapshot, MempoolTxRecord, PeerAddressBook,
-        PeerAddressRecord, UtxoRecord, load_block_by_hash_db, load_chain_archive_db,
-        load_mempool_db, load_peer_book_db, load_snapshot, load_snapshot_db, save_chain_archive_db,
-        save_mempool_db, save_peer_book_db, save_snapshot, save_snapshot_db,
+        PeerAddressRecord, PoolLedgerSnapshot, PoolPayoutRecord, PoolRoundRecord, PoolShareRecord,
+        PoolWorkerAccrualRecord, UtxoRecord, load_block_by_hash_db, load_chain_archive_db,
+        load_mempool_db, load_peer_book_db, load_pool_ledger_db, load_snapshot, load_snapshot_db,
+        save_chain_archive_db, save_mempool_db, save_peer_book_db, save_pool_ledger_db,
+        save_snapshot, save_snapshot_db,
     };
 
     fn temp_test_file(stem: &str, ext: &str) -> PathBuf {
@@ -1112,5 +1495,134 @@ mod tests {
         let path = temp_test_file("mempool-invalid", "redb");
         let err = save_mempool_db(&path, &snapshot).expect_err("must reject mismatch");
         assert!(matches!(err, crate::StorageError::InvalidMempool(_)));
+    }
+
+    #[test]
+    fn pool_ledger_db_roundtrip_and_dedup() {
+        let snapshot = PoolLedgerSnapshot {
+            network_id: "devnet".to_owned(),
+            current_round_id: 7,
+            shares: vec![
+                PoolShareRecord {
+                    share_key: "1:2:3:4".to_owned(),
+                    worker: "miner.a".to_owned(),
+                    timestamp_unix_sec: 1_770_763_200,
+                    channel_id: 1,
+                    job_id: 2,
+                    nonce: 3,
+                    ntime: 4,
+                    expected_hashes: 12_000.0,
+                    accepted: true,
+                    is_block: false,
+                },
+                // duplicate key: last one should win
+                PoolShareRecord {
+                    share_key: "1:2:3:4".to_owned(),
+                    worker: "miner.a".to_owned(),
+                    timestamp_unix_sec: 1_770_763_201,
+                    channel_id: 1,
+                    job_id: 2,
+                    nonce: 3,
+                    ntime: 4,
+                    expected_hashes: 22_000.0,
+                    accepted: true,
+                    is_block: true,
+                },
+            ],
+            rounds: vec![
+                PoolRoundRecord {
+                    round_id: 6,
+                    start_height: 100,
+                    start_tip_hash: Hash256([0x11; 32]),
+                    start_unix_sec: 1_770_763_100,
+                    end_height: Some(101),
+                    end_tip_hash: Some(Hash256([0x22; 32])),
+                    end_unix_sec: Some(1_770_763_220),
+                    closed_by_worker: Some("miner.a".to_owned()),
+                    found_block_hash: Some(Hash256([0x33; 32])),
+                },
+                PoolRoundRecord {
+                    round_id: 7,
+                    start_height: 101,
+                    start_tip_hash: Hash256([0x22; 32]),
+                    start_unix_sec: 1_770_763_220,
+                    end_height: None,
+                    end_tip_hash: None,
+                    end_unix_sec: None,
+                    closed_by_worker: None,
+                    found_block_hash: None,
+                },
+            ],
+            workers: vec![
+                PoolWorkerAccrualRecord {
+                    worker: "miner.a".to_owned(),
+                    accepted_total: 2,
+                    rejected_total: 1,
+                    blocks_found_total: 1,
+                    expected_hashes_accumulated: 34_000.0,
+                    pplns_accrual_atomic: 10_000,
+                    pps_accrual_atomic: 2_000,
+                    paid_total_atomic: 500,
+                    last_share_unix_sec: 1_770_763_201,
+                },
+                PoolWorkerAccrualRecord {
+                    worker: "miner.a".to_owned(),
+                    accepted_total: 3,
+                    rejected_total: 1,
+                    blocks_found_total: 2,
+                    expected_hashes_accumulated: 44_000.0,
+                    pplns_accrual_atomic: 20_000,
+                    pps_accrual_atomic: 4_000,
+                    paid_total_atomic: 1_000,
+                    last_share_unix_sec: 1_770_763_202,
+                },
+            ],
+            pending_payouts: vec![PoolPayoutRecord {
+                payout_id: "p-1".to_owned(),
+                worker: "miner.a".to_owned(),
+                amount_atomic: 1_500,
+                created_unix_sec: 1_770_763_230,
+                submitted_txid_hex: None,
+                confirmed: false,
+            }],
+            completed_payouts: vec![PoolPayoutRecord {
+                payout_id: "p-0".to_owned(),
+                worker: "miner.b".to_owned(),
+                amount_atomic: 800,
+                created_unix_sec: 1_770_763_120,
+                submitted_txid_hex: Some("aa".repeat(32)),
+                confirmed: true,
+            }],
+        };
+
+        let path = temp_test_file("pool-ledger", "redb");
+        save_pool_ledger_db(&path, &snapshot).expect("save pool ledger");
+        let loaded = load_pool_ledger_db(&path).expect("load pool ledger");
+        assert_eq!(loaded.network_id, "devnet");
+        assert_eq!(loaded.current_round_id, 7);
+        assert_eq!(loaded.shares.len(), 1);
+        assert!(loaded.shares[0].is_block);
+        assert_eq!(loaded.workers.len(), 1);
+        assert_eq!(loaded.workers[0].accepted_total, 3);
+        assert_eq!(loaded.rounds.len(), 2);
+        assert_eq!(loaded.pending_payouts.len(), 1);
+        assert_eq!(loaded.completed_payouts.len(), 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn pool_ledger_rejects_empty_identity_fields() {
+        let path = temp_test_file("pool-ledger-invalid", "redb");
+        let bad = PoolLedgerSnapshot {
+            network_id: "".to_owned(),
+            current_round_id: 0,
+            shares: vec![],
+            rounds: vec![],
+            workers: vec![],
+            pending_payouts: vec![],
+            completed_payouts: vec![],
+        };
+        let err = save_pool_ledger_db(&path, &bad).expect_err("must reject invalid pool ledger");
+        assert!(matches!(err, crate::StorageError::InvalidPoolLedger(_)));
     }
 }
