@@ -241,6 +241,17 @@ scripts/local-test-lab.sh status
 scripts/local-test-lab.sh down
 ```
 
+Scenario presets (single command profile loader):
+
+```bash
+scripts/run-preset.sh list
+scripts/run-preset.sh lab-solo-local up
+scripts/run-preset.sh lab-solo-local status
+scripts/run-preset.sh lab-solo-local down
+```
+
+Available preset files live in `scripts/presets/*.env` and can be copied/edited for custom operator flows.
+
 Binary-only run:
 
 ```bash

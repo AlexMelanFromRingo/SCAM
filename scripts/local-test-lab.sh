@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Local functional lab:
 # - launches 2+ relay nodes with RPC+Web UI
-# - launches one Stratum miner against node-0
+# - optionally launches one Stratum miner against a selected node or remote pool
 # - generates two demo wallets (mnemonic+address files)
 #
 # Commands:
@@ -22,11 +22,17 @@ BUILD="${BUILD:-true}"
 CARGO_PROFILE="${CARGO_PROFILE:-debug}"
 UI_DIR="${UI_DIR:-web}"
 SCAM_NODE_BIN="${SCAM_NODE_BIN:-}"
+LAB_RUN_RPC="${LAB_RUN_RPC:-true}"
+LAB_RUN_STRATUM="${LAB_RUN_STRATUM:-true}"
+GENERATE_WALLETS="${GENERATE_WALLETS:-true}"
 
 BASE_P2P_PORT="${BASE_P2P_PORT:-19444}"
 BASE_RPC_PORT="${BASE_RPC_PORT:-19080}"
 BASE_STRATUM_PORT="${BASE_STRATUM_PORT:-19347}"
 
+RUN_MINER="${RUN_MINER:-true}"
+MINER_TARGET_NODE="${MINER_TARGET_NODE:-0}"
+MINER_POOL_ADDR="${MINER_POOL_ADDR:-}"
 MINER_USER="${MINER_USER:-lab-miner-01}"
 MINER_READ_TIMEOUT_SEC="${MINER_READ_TIMEOUT_SEC:-2}"
 MINER_MAX_NONCE_PER_CYCLE="${MINER_MAX_NONCE_PER_CYCLE:-250000}"
@@ -46,6 +52,7 @@ RESOLVED_WALLET_HRP=""
 ENDPOINTS_FILE="${CLUSTER_DIR}/endpoints.tsv"
 MINER_PID_FILE="${CLUSTER_DIR}/miner.pid"
 MINER_LOG_FILE="${CLUSTER_DIR}/miner.log"
+MINER_ENDPOINT_FILE="${CLUSTER_DIR}/miner.endpoint"
 WALLETS_DIR="${CLUSTER_DIR}/wallets"
 FOLLOW_SYNC_DIR="${CLUSTER_DIR}/follower-sync"
 
@@ -176,6 +183,16 @@ start_lab() {
     echo "[lab] NODE_COUNT must be >= 2 for sync checks" >&2
     exit 2
   fi
+  if [[ -z "${MINER_POOL_ADDR}" ]]; then
+    if ! [[ "${MINER_TARGET_NODE}" =~ ^[0-9]+$ ]]; then
+      echo "[lab] MINER_TARGET_NODE must be a non-negative integer, got '${MINER_TARGET_NODE}'" >&2
+      exit 2
+    fi
+    if (( MINER_TARGET_NODE >= NODE_COUNT )); then
+      echo "[lab] MINER_TARGET_NODE=${MINER_TARGET_NODE} is out of range for NODE_COUNT=${NODE_COUNT}" >&2
+      exit 2
+    fi
+  fi
 
   NODE_COUNT="${NODE_COUNT}" \
   NETWORK="${NETWORK}" \
@@ -188,8 +205,8 @@ start_lab() {
   RELAY_OUTBOUND_CONNECT="${RELAY_OUTBOUND_CONNECT}" \
   RELAY_OUTBOUND_REDIAL_SEC="${RELAY_OUTBOUND_REDIAL_SEC}" \
   STRATUM_READ_TIMEOUT_SEC="${STRATUM_READ_TIMEOUT_SEC}" \
-  RUN_RPC=true \
-  RUN_STRATUM=true \
+  RUN_RPC="${LAB_RUN_RPC}" \
+  RUN_STRATUM="${LAB_RUN_STRATUM}" \
   BUILD="${BUILD}" \
   CARGO_PROFILE="${CARGO_PROFILE}" \
   SYNC_BOOK=true \
@@ -202,42 +219,61 @@ start_lab() {
   bin="$(resolve_binary)"
   RESOLVED_WALLET_HRP="$(resolve_wallet_hrp)"
 
-  mkdir -p "${WALLETS_DIR}"
-  : > "${WALLETS_DIR}/wallets.env"
-  generate_demo_wallet "${bin}" "01"
-  generate_demo_wallet "${bin}" "02"
-  local wallet01_addr
-  wallet01_addr="$(sed -n 's/^Address: //p' "${WALLETS_DIR}/wallet-01.txt" | head -n 1)"
-  if [[ -z "${wallet01_addr}" ]]; then
-    echo "[lab] failed to parse wallet-01 address from ${WALLETS_DIR}/wallet-01.txt" >&2
-    exit 1
+  local wallet01_addr=""
+  if is_true "${GENERATE_WALLETS}"; then
+    mkdir -p "${WALLETS_DIR}"
+    : > "${WALLETS_DIR}/wallets.env"
+    generate_demo_wallet "${bin}" "01"
+    generate_demo_wallet "${bin}" "02"
+    wallet01_addr="$(sed -n 's/^Address: //p' "${WALLETS_DIR}/wallet-01.txt" | head -n 1)"
+    if [[ -z "${wallet01_addr}" ]]; then
+      echo "[lab] failed to parse wallet-01 address from ${WALLETS_DIR}/wallet-01.txt" >&2
+      exit 1
+    fi
   fi
+
   local miner_user_effective="${MINER_USER}"
   if [[ "${miner_user_effective}" == "lab-miner-01" ]]; then
-    miner_user_effective="${wallet01_addr}"
+    if [[ -n "${wallet01_addr}" ]]; then
+      miner_user_effective="${wallet01_addr}"
+    elif ! is_true "${RUN_MINER}"; then
+      miner_user_effective="lab-miner-01"
+    else
+      echo "[lab] RUN_MINER=true with default MINER_USER requires GENERATE_WALLETS=true or explicit MINER_USER" >&2
+      exit 2
+    fi
   fi
 
-  local pool_port
-  pool_port="$(extract_col "0" "4")"
-  if [[ -z "${pool_port}" || "${pool_port}" == "-" ]]; then
-    echo "[lab] cannot find node-0 stratum port in ${ENDPOINTS_FILE}" >&2
-    exit 1
-  fi
+  local miner_endpoint=""
+  if is_true "${RUN_MINER}"; then
+    if [[ -n "${MINER_POOL_ADDR}" ]]; then
+      miner_endpoint="${MINER_POOL_ADDR}"
+    else
+      local pool_port
+      pool_port="$(extract_col "${MINER_TARGET_NODE}" "4")"
+      if [[ -z "${pool_port}" || "${pool_port}" == "-" ]]; then
+        echo "[lab] cannot find node-${MINER_TARGET_NODE} stratum port in ${ENDPOINTS_FILE}" >&2
+        exit 1
+      fi
+      miner_endpoint="127.0.0.1:${pool_port}"
+    fi
 
-  "${bin}" stratum-mine \
-    --pool "127.0.0.1:${pool_port}" \
-    --user "${miner_user_effective}" \
-    --read-timeout-sec "${MINER_READ_TIMEOUT_SEC}" \
-    --max-nonce-per-cycle "${MINER_MAX_NONCE_PER_CYCLE}" \
-    --max-shares "${MINER_MAX_SHARES}" \
-    --max-runtime-sec "${MINER_MAX_RUNTIME_SEC}" \
-    > "${MINER_LOG_FILE}" 2>&1 &
-  echo "$!" > "${MINER_PID_FILE}"
-  sleep 0.3
-  if ! pid_is_alive "$(cat "${MINER_PID_FILE}")"; then
-    echo "[lab] miner exited immediately; see ${MINER_LOG_FILE}" >&2
-    tail -n 60 "${MINER_LOG_FILE}" >&2 || true
-    exit 1
+    "${bin}" stratum-mine \
+      --pool "${miner_endpoint}" \
+      --user "${miner_user_effective}" \
+      --read-timeout-sec "${MINER_READ_TIMEOUT_SEC}" \
+      --max-nonce-per-cycle "${MINER_MAX_NONCE_PER_CYCLE}" \
+      --max-shares "${MINER_MAX_SHARES}" \
+      --max-runtime-sec "${MINER_MAX_RUNTIME_SEC}" \
+      > "${MINER_LOG_FILE}" 2>&1 &
+    echo "$!" > "${MINER_PID_FILE}"
+    printf "%s\n" "${miner_endpoint}" > "${MINER_ENDPOINT_FILE}"
+    sleep 0.3
+    if ! pid_is_alive "$(cat "${MINER_PID_FILE}")"; then
+      echo "[lab] miner exited immediately; see ${MINER_LOG_FILE}" >&2
+      tail -n 60 "${MINER_LOG_FILE}" >&2 || true
+      exit 1
+    fi
   fi
 
   start_follower_sync_loops "${bin}"
@@ -249,18 +285,28 @@ start_lab() {
   echo "[lab] up"
   echo "[lab] node-0 UI: http://127.0.0.1:${rpc0}/"
   echo "[lab] node-1 UI: http://127.0.0.1:${rpc1}/"
-  echo "[lab] miner log: ${MINER_LOG_FILE}"
-  echo "[lab] miner user: ${miner_user_effective}"
-  echo "[lab] miner payout default wallet: ${wallet01_addr}"
+  if is_true "${RUN_MINER}"; then
+    echo "[lab] miner log: ${MINER_LOG_FILE}"
+    echo "[lab] miner endpoint: ${miner_endpoint}"
+    echo "[lab] miner user: ${miner_user_effective}"
+    if [[ -n "${wallet01_addr}" ]]; then
+      echo "[lab] miner payout default wallet: ${wallet01_addr}"
+    fi
+  else
+    echo "[lab] miner: disabled (RUN_MINER=${RUN_MINER})"
+  fi
   echo "[lab] wallet hrp: ${RESOLVED_WALLET_HRP}"
-  echo "[lab] demo wallets:"
-  echo "  ${WALLETS_DIR}/wallet-01.txt"
-  echo "  ${WALLETS_DIR}/wallet-02.txt"
-  echo "  ${WALLETS_DIR}/wallets.env"
+  if is_true "${GENERATE_WALLETS}"; then
+    echo "[lab] demo wallets:"
+    echo "  ${WALLETS_DIR}/wallet-01.txt"
+    echo "  ${WALLETS_DIR}/wallet-02.txt"
+    echo "  ${WALLETS_DIR}/wallets.env"
+  fi
 }
 
 down_lab() {
   stop_pid_file "${MINER_PID_FILE}"
+  rm -f "${MINER_ENDPOINT_FILE}"
   stop_follower_sync_loops
   CLUSTER_DIR="${CLUSTER_DIR}" scripts/local-multinode.sh down
   echo "[lab] down"
@@ -269,7 +315,11 @@ down_lab() {
 status_lab() {
   CLUSTER_DIR="${CLUSTER_DIR}" scripts/local-multinode.sh status
   if [[ -f "${MINER_PID_FILE}" ]] && pid_is_alive "$(cat "${MINER_PID_FILE}")"; then
-    echo "[lab] miner=running pool=127.0.0.1:$(extract_col "0" "4")"
+    local endpoint="unknown"
+    if [[ -f "${MINER_ENDPOINT_FILE}" ]]; then
+      endpoint="$(cat "${MINER_ENDPOINT_FILE}")"
+    fi
+    echo "[lab] miner=running pool=${endpoint}"
   else
     echo "[lab] miner=stopped"
   fi
@@ -290,6 +340,7 @@ status_lab() {
 clean_lab() {
   down_lab || true
   rm -f "${MINER_LOG_FILE}"
+  rm -f "${MINER_ENDPOINT_FILE}"
   rm -rf "${WALLETS_DIR}"
   CLUSTER_DIR="${CLUSTER_DIR}" scripts/local-multinode.sh clean
 }

@@ -173,6 +173,18 @@ scripts/local-test-lab.sh down
 scripts/local-test-lab.sh clean
 ```
 
+Preset launcher (recommended for repeatable scenarios):
+
+```bash
+scripts/run-preset.sh list
+scripts/run-preset.sh lab-solo-local up
+scripts/run-preset.sh lab-node-only up
+scripts/run-preset.sh lab-shared-pool-base up
+scripts/run-preset.sh lab-solo-remote up
+```
+
+Preset definitions are plain env files in `scripts/presets/*.env`, so operators can copy and tune them.
+
 You can then open UIs:
 - `http://127.0.0.1:19080/` (node-0 by default)
 - `http://127.0.0.1:19081/` (node-1 by default)
