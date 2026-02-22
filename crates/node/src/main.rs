@@ -18,10 +18,12 @@ use scam_core::{
 use scam_mempool::{InsertOutcome, Mempool, MempoolError, OrphanPool};
 use scam_miner::{BlockTemplate, MempoolTemplateParams, build_template_from_mempool, mine_block};
 use scam_p2p::{
-    FramingConfig, GossipEngine, GossipError, InventoryItem, LocalHandshake, PeerCandidate,
-    ReplacementRateLimit, TransportError, WireMessage, build_block_locator, client_handshake,
-    read_message, request_blocks, request_headers, select_block_hashes_for_peer,
-    select_headers_for_peer, select_outbound_peers, send_message, server_handshake,
+    CompactBlock, FramingConfig, GossipEngine, GossipError, InventoryItem, LocalHandshake,
+    PeerAddress, PeerCandidate, PrefilledTxn, ReplacementRateLimit, TransportError, WireMessage,
+    build_block_locator, client_handshake, client_handshake_async, read_message,
+    read_message_async, request_blocks, request_headers, select_block_hashes_for_peer,
+    select_headers_for_peer, select_outbound_peers, send_message, send_message_async,
+    server_handshake, server_handshake_async,
 };
 use scam_rpc::{
     StatusResponse, TxResponse, TxSubmitRpcRequest, decode_tx_submit_request,
@@ -54,7 +56,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::runtime::Builder as TokioRuntimeBuilder;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 
 #[derive(Debug, Parser)]
 #[command(name = "scam-node")]
@@ -3776,6 +3778,9 @@ struct RelayServerState {
     pending_block_orphans: HashMap<Hash256, scam_core::Block>,
     pending_block_orphan_order: VecDeque<Hash256>,
     last_parent_sync_request_sec: HashMap<Hash256, u64>,
+    peer_compact_pref: HashMap<u64, bool>,
+    pending_compact_blocks: HashMap<Hash256, PendingCompactBlock>,
+    known_peer_addresses: Vec<PeerAddress>,
 }
 
 impl RelayServerState {
@@ -3786,12 +3791,25 @@ impl RelayServerState {
             pending_block_orphans: HashMap::new(),
             pending_block_orphan_order: VecDeque::new(),
             last_parent_sync_request_sec: HashMap::new(),
+            peer_compact_pref: HashMap::new(),
+            pending_compact_blocks: HashMap::new(),
+            known_peer_addresses: Vec::new(),
         }
     }
 }
 
+#[derive(Clone)]
+struct PendingCompactBlock {
+    header: scam_core::BlockHeader,
+    tx_count: usize,
+    transactions: Vec<Option<Transaction>>,
+    missing_indexes: Vec<u32>,
+}
+
 const RELAY_MAX_PENDING_BLOCK_ORPHANS: usize = 512;
 const RELAY_PARENT_RESYNC_COOLDOWN_SEC: u64 = 2;
+const RELAY_OUTBOUND_MAX_PEERS: usize = 8;
+const RELAY_OUTBOUND_ROTATE_AFTER_SEC: u64 = 6 * 60 * 60;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RelayServerTelemetrySnapshot {
@@ -4132,6 +4150,242 @@ fn append_role_service_telemetry(
     append_jsonl_record(path, &snapshot, "role-service")
 }
 
+fn compact_short_txid(txid: Hash256) -> u64 {
+    let mut short = [0u8; 8];
+    short.copy_from_slice(&txid.0[..8]);
+    u64::from_be_bytes(short)
+}
+
+fn relay_compact_block_from_block(block: &scam_core::Block) -> CompactBlock {
+    let prefilled = block
+        .transactions
+        .first()
+        .map(|tx| {
+            vec![PrefilledTxn {
+                index: 0,
+                tx: tx.clone(),
+            }]
+        })
+        .unwrap_or_default();
+    let short_txids = block
+        .transactions
+        .iter()
+        .skip(1)
+        .map(|tx| compact_short_txid(tx.txid()))
+        .collect::<Vec<_>>();
+    CompactBlock {
+        header: block.header.clone(),
+        tx_count: block.transactions.len() as u32,
+        short_txids,
+        prefilled,
+    }
+}
+
+fn relay_lookup_mempool_tx_by_short_txid(
+    mempool: &Mempool,
+    short_txid: u64,
+) -> Option<Transaction> {
+    mempool
+        .txids_by_feerate_desc()
+        .into_iter()
+        .find_map(|txid| {
+            if compact_short_txid(txid) == short_txid {
+                mempool.get(&txid).cloned()
+            } else {
+                None
+            }
+        })
+}
+
+fn relay_reconstruct_compact_transactions(
+    mempool: &Mempool,
+    compact: &CompactBlock,
+) -> Result<(Vec<Option<Transaction>>, Vec<u32>), NodeError> {
+    let tx_count = compact.tx_count as usize;
+    if tx_count == 0 {
+        return Err(NodeError::Runtime(
+            "compact block has zero transaction count".to_owned(),
+        ));
+    }
+
+    let mut transactions = vec![None; tx_count];
+    for entry in &compact.prefilled {
+        let index = entry.index as usize;
+        if index >= tx_count {
+            return Err(NodeError::Runtime(format!(
+                "compact block prefilled index {} out of bounds for tx_count {}",
+                entry.index, tx_count
+            )));
+        }
+        transactions[index] = Some(entry.tx.clone());
+    }
+
+    let mut short_iter = compact.short_txids.iter().copied();
+    let mut missing = Vec::<u32>::new();
+    for (index, slot) in transactions.iter_mut().enumerate() {
+        if slot.is_some() {
+            continue;
+        }
+        let Some(short_txid) = short_iter.next() else {
+            return Err(NodeError::Runtime(
+                "compact block short txid list is shorter than required".to_owned(),
+            ));
+        };
+        match relay_lookup_mempool_tx_by_short_txid(mempool, short_txid) {
+            Some(tx) => *slot = Some(tx),
+            None => missing.push(index as u32),
+        }
+    }
+    if short_iter.next().is_some() {
+        return Err(NodeError::Runtime(
+            "compact block short txid list is longer than required".to_owned(),
+        ));
+    }
+    Ok((transactions, missing))
+}
+
+fn relay_try_build_block_from_compact(
+    header: &scam_core::BlockHeader,
+    transactions: &[Option<Transaction>],
+) -> Option<scam_core::Block> {
+    if transactions.iter().any(Option::is_none) {
+        return None;
+    }
+    Some(scam_core::Block {
+        header: header.clone(),
+        transactions: transactions
+            .iter()
+            .filter_map(Clone::clone)
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn relay_compact_announcement_enabled(state: &RelayServerState, peer_id: u64) -> bool {
+    state
+        .peer_compact_pref
+        .get(&peer_id)
+        .copied()
+        .unwrap_or(false)
+}
+
+fn relay_inventory_messages_for_peer(
+    state: &RelayServerState,
+    peer_id: u64,
+    items: Vec<InventoryItem>,
+) -> Vec<WireMessage> {
+    if !relay_compact_announcement_enabled(state, peer_id) {
+        return vec![WireMessage::Inv { items }];
+    }
+    let mut out = Vec::<WireMessage>::new();
+    let mut pending = Vec::<InventoryItem>::new();
+    for item in items {
+        match item {
+            InventoryItem::Block(hash) => {
+                if !pending.is_empty() {
+                    out.push(WireMessage::Inv {
+                        items: std::mem::take(&mut pending),
+                    });
+                }
+                if let Some(block) = state.runtime.block_by_hash(&hash) {
+                    out.push(WireMessage::CmpctBlock {
+                        block: relay_compact_block_from_block(block),
+                    });
+                } else {
+                    pending.push(InventoryItem::Block(hash));
+                }
+            }
+            other => pending.push(other),
+        }
+    }
+    if !pending.is_empty() {
+        out.push(WireMessage::Inv { items: pending });
+    }
+    out
+}
+
+fn relay_messages_for_peer(
+    state: &RelayServerState,
+    peer_id: u64,
+    messages: Vec<WireMessage>,
+) -> Vec<WireMessage> {
+    let mut out = Vec::<WireMessage>::new();
+    for message in messages {
+        match message {
+            WireMessage::Inv { items } => {
+                out.extend(relay_inventory_messages_for_peer(state, peer_id, items));
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+fn relay_known_peer_addresses(state: &RelayServerState, max_items: usize) -> Vec<PeerAddress> {
+    state
+        .known_peer_addresses
+        .iter()
+        .take(max_items)
+        .cloned()
+        .collect::<Vec<_>>()
+}
+
+fn relay_merge_known_peer_addresses(state: &mut RelayServerState, incoming: &[PeerAddress]) {
+    if incoming.is_empty() {
+        return;
+    }
+    let mut by_addr = HashMap::<String, PeerAddress>::new();
+    for entry in &state.known_peer_addresses {
+        by_addr.insert(entry.address.clone(), entry.clone());
+    }
+    for entry in incoming {
+        if entry.address.trim().is_empty() {
+            continue;
+        }
+        by_addr
+            .entry(entry.address.clone())
+            .and_modify(|existing| {
+                existing.last_seen_unix_sec =
+                    existing.last_seen_unix_sec.max(entry.last_seen_unix_sec);
+                existing.services |= entry.services;
+            })
+            .or_insert_with(|| entry.clone());
+    }
+    let mut merged = by_addr.into_values().collect::<Vec<_>>();
+    merged.sort_unstable_by(|a, b| a.address.cmp(&b.address));
+    if merged.len() > 2_000 {
+        merged.truncate(2_000);
+    }
+    state.known_peer_addresses = merged;
+}
+
+fn relay_submit_incoming_block(
+    state: &mut RelayServerState,
+    block: scam_core::Block,
+    now_unix_sec: u64,
+) -> Result<Vec<WireMessage>, NodeError> {
+    let block_hash = block.header.block_hash();
+    state.pending_compact_blocks.remove(&block_hash);
+    let chain_before = state.runtime.block_hashes().to_vec();
+    match state.runtime.submit_block(block.clone()) {
+        Ok(_) => {
+            let chain_after = state.runtime.block_hashes().to_vec();
+            relay_apply_main_chain_transition(state, &chain_before, &chain_after, now_unix_sec);
+            relay_forget_pending_orphan_block(state, block_hash);
+            relay_try_apply_pending_orphans(state, now_unix_sec);
+            Ok(Vec::new())
+        }
+        Err(ChainError::UnknownParent { parent, .. }) => {
+            relay_store_pending_orphan_block(state, block);
+            Ok(relay_recovery_messages_for_unknown_parent(
+                state,
+                parent,
+                now_unix_sec,
+            ))
+        }
+        Err(err) => Err(NodeError::Chain(err)),
+    }
+}
+
 fn process_relay_wire_message(
     state: &mut RelayServerState,
     peer_id: u64,
@@ -4140,8 +4394,30 @@ fn process_relay_wire_message(
 ) -> Result<Vec<WireMessage>, NodeError> {
     match message {
         WireMessage::Ping { nonce } => Ok(vec![WireMessage::Pong { nonce }]),
-        WireMessage::Version { .. } => Ok(vec![WireMessage::Verack]),
+        WireMessage::Version { .. } => Ok(vec![
+            WireMessage::Verack,
+            WireMessage::SendCmpct {
+                high_bandwidth: false,
+                version: 1,
+            },
+            WireMessage::GetAddr,
+        ]),
         WireMessage::Verack | WireMessage::Pong { .. } | WireMessage::Headers { .. } => {
+            Ok(Vec::new())
+        }
+        WireMessage::GetAddr => Ok(vec![WireMessage::Addr {
+            peers: relay_known_peer_addresses(state, 250),
+        }]),
+        WireMessage::Addr { peers } => {
+            relay_merge_known_peer_addresses(state, &peers);
+            Ok(Vec::new())
+        }
+        WireMessage::SendCmpct {
+            high_bandwidth,
+            version,
+        } => {
+            let enabled = high_bandwidth && version >= 1;
+            state.peer_compact_pref.insert(peer_id, enabled);
             Ok(Vec::new())
         }
         WireMessage::GetHeaders { locator, stop } => {
@@ -4197,11 +4473,16 @@ fn process_relay_wire_message(
                 .relay
                 .gossip
                 .on_message(peer_id, WireMessage::Inv { items })?;
-            Ok(outbound
-                .into_iter()
-                .filter(|msg| msg.peer_id == peer_id)
-                .map(|msg| msg.message)
-                .collect())
+            let mut out = Vec::<WireMessage>::new();
+            for msg in outbound.into_iter().filter(|msg| msg.peer_id == peer_id) {
+                match msg.message {
+                    WireMessage::Inv { items } => {
+                        out.extend(relay_inventory_messages_for_peer(state, peer_id, items));
+                    }
+                    other => out.push(other),
+                }
+            }
+            Ok(out)
         }
         WireMessage::Tx { tx } => {
             let txid = tx.txid();
@@ -4226,32 +4507,107 @@ fn process_relay_wire_message(
                 Err(err) => Err(err),
             }
         }
-        WireMessage::Block { block } => {
-            let chain_before = state.runtime.block_hashes().to_vec();
-            match state.runtime.submit_block(block.clone()) {
-                Ok(_) => {
-                    let chain_after = state.runtime.block_hashes().to_vec();
-                    relay_apply_main_chain_transition(
-                        state,
-                        &chain_before,
-                        &chain_after,
-                        now_unix_sec,
-                    );
-                    relay_forget_pending_orphan_block(state, block.header.block_hash());
-                    relay_try_apply_pending_orphans(state, now_unix_sec);
-                    Ok(Vec::new())
-                }
-                Err(ChainError::UnknownParent { parent, .. }) => {
-                    relay_store_pending_orphan_block(state, block);
-                    Ok(relay_recovery_messages_for_unknown_parent(
-                        state,
-                        parent,
-                        now_unix_sec,
-                    ))
-                }
-                Err(err) => Err(NodeError::Chain(err)),
+        WireMessage::CmpctBlock { block } => {
+            let block_hash = block.header.block_hash();
+            let (transactions, missing_indexes) =
+                relay_reconstruct_compact_transactions(&state.relay.mempool, &block)?;
+            if missing_indexes.is_empty() {
+                let block = relay_try_build_block_from_compact(&block.header, &transactions)
+                    .ok_or_else(|| {
+                        NodeError::Runtime(
+                            "compact block reconstruction expected all transactions".to_owned(),
+                        )
+                    })?;
+                return relay_submit_incoming_block(state, block, now_unix_sec);
             }
+            state.pending_compact_blocks.insert(
+                block_hash,
+                PendingCompactBlock {
+                    header: block.header,
+                    tx_count: transactions.len(),
+                    transactions,
+                    missing_indexes: missing_indexes.clone(),
+                },
+            );
+            Ok(vec![WireMessage::GetBlockTxn {
+                block_hash,
+                indexes: missing_indexes,
+            }])
         }
+        WireMessage::GetBlockTxn {
+            block_hash,
+            indexes,
+        } => {
+            let Some(block) = state.runtime.block_by_hash(&block_hash) else {
+                return Ok(vec![WireMessage::NotFound {
+                    items: vec![InventoryItem::Block(block_hash)],
+                }]);
+            };
+            let mut transactions = Vec::<Transaction>::new();
+            for index in indexes {
+                let idx = index as usize;
+                if idx >= block.transactions.len() {
+                    return Err(NodeError::Runtime(format!(
+                        "getblocktxn index {} out of bounds for block {} tx_count={}",
+                        index,
+                        block_hash,
+                        block.transactions.len()
+                    )));
+                }
+                transactions.push(block.transactions[idx].clone());
+            }
+            Ok(vec![WireMessage::BlockTxn {
+                block_hash,
+                transactions,
+            }])
+        }
+        WireMessage::BlockTxn {
+            block_hash,
+            transactions,
+        } => {
+            let Some(mut pending) = state.pending_compact_blocks.remove(&block_hash) else {
+                return Ok(Vec::new());
+            };
+            if pending.tx_count != pending.transactions.len() {
+                return Err(NodeError::Runtime(format!(
+                    "pending compact block {} has inconsistent transaction slots",
+                    block_hash
+                )));
+            }
+            if transactions.len() != pending.missing_indexes.len() {
+                return Err(NodeError::Runtime(format!(
+                    "blocktxn transaction count {} does not match expected missing indexes {} for {}",
+                    transactions.len(),
+                    pending.missing_indexes.len(),
+                    block_hash
+                )));
+            }
+            for (index, tx) in pending
+                .missing_indexes
+                .iter()
+                .copied()
+                .zip(transactions.into_iter())
+            {
+                let idx = index as usize;
+                if idx >= pending.transactions.len() {
+                    return Err(NodeError::Runtime(format!(
+                        "blocktxn index {} out of bounds for {}",
+                        index, block_hash
+                    )));
+                }
+                pending.transactions[idx] = Some(tx);
+            }
+            let Some(block) =
+                relay_try_build_block_from_compact(&pending.header, &pending.transactions)
+            else {
+                return Err(NodeError::Runtime(format!(
+                    "blocktxn still missing transactions for {}",
+                    block_hash
+                )));
+            };
+            relay_submit_incoming_block(state, block, now_unix_sec)
+        }
+        WireMessage::Block { block } => relay_submit_incoming_block(state, block, now_unix_sec),
         WireMessage::NotFound { .. } => Ok(Vec::new()),
     }
 }
@@ -4313,6 +4669,57 @@ fn load_relay_outbound_targets(
         .collect::<Vec<_>>())
 }
 
+fn load_relay_known_peer_addresses(
+    peers_dir: &Path,
+    network_name: &str,
+) -> Result<Vec<PeerAddress>, NodeError> {
+    let (peers_db_path, legacy_txt_path) = peer_book_paths(peers_dir, network_name);
+    let mut peer_book = load_or_init_peer_book(network_name, &peers_db_path, &legacy_txt_path)?;
+    sort_and_dedup_peer_book(&mut peer_book);
+    let mut peers = peer_book
+        .peers
+        .into_iter()
+        .filter(|record| !record.address.trim().is_empty())
+        .map(|record| PeerAddress {
+            address: record.address,
+            services: 1,
+            last_seen_unix_sec: record.last_seen_unix_sec,
+        })
+        .collect::<Vec<_>>();
+    peers.sort_unstable_by(|a, b| a.address.cmp(&b.address));
+    if peers.len() > 2_000 {
+        peers.truncate(2_000);
+    }
+    Ok(peers)
+}
+
+fn load_relay_outbound_targets_selected(
+    peers_dir: &Path,
+    cfg: &ChainConfig,
+    max_peers: usize,
+    rotate_after_sec: u64,
+) -> Result<Vec<String>, NodeError> {
+    let peers = load_relay_known_peer_addresses(peers_dir, &cfg.network_id)?;
+    let now = current_unix_sec()?;
+    let mut candidates = Vec::<PeerCandidate>::new();
+    for peer in peers {
+        let Ok(addr) = peer.address.parse::<SocketAddr>() else {
+            continue;
+        };
+        candidates.push(PeerCandidate {
+            addr,
+            last_connected_unix_sec: peer.last_seen_unix_sec,
+            failure_count: 0,
+        });
+    }
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let selected = select_outbound_peers(&candidates, max_peers, rotate_after_sec, now);
+    let selected = apply_bucket_cap(selected, cfg.p2p_max_outbound_per_bucket);
+    Ok(selected.into_iter().map(|addr| addr.to_string()).collect())
+}
+
 fn relay_target_matches_bind(bind_addr: &str, target: &str) -> bool {
     if bind_addr == target {
         return true;
@@ -4368,6 +4775,7 @@ fn relay_disconnect_reason(err: &NodeError) -> &'static str {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(test), allow(dead_code))]
 fn run_relay_outbound_worker(
     target: String,
     bind_addr: String,
@@ -4442,6 +4850,7 @@ fn run_relay_outbound_worker(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(test), allow(dead_code))]
 fn run_relay_outbound_supervisor(
     stop_flag: Arc<AtomicBool>,
     peers_dir: PathBuf,
@@ -4535,6 +4944,169 @@ fn run_relay_outbound_supervisor(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn run_relay_outbound_worker_async(
+    target: String,
+    bind_addr: String,
+    stop_flag: Arc<AtomicBool>,
+    next_peer_id: Arc<AtomicU64>,
+    state: Arc<Mutex<RelayServerState>>,
+    active_peers: Arc<Mutex<usize>>,
+    cfg: ChainConfig,
+    runtime_db_path: PathBuf,
+    mempool_db_path: PathBuf,
+    max_inv_items: usize,
+    read_limit: u32,
+    read_timeout_sec: u64,
+    write_timeout_sec: u64,
+    redial_sec: u64,
+) {
+    if target.trim().is_empty() {
+        return;
+    }
+    if relay_target_matches_bind(&bind_addr, &target) {
+        return;
+    }
+    let redial_delay = Duration::from_secs(redial_sec.max(1));
+    loop {
+        if stop_flag.load(Ordering::Relaxed) {
+            break;
+        }
+        let mut stream = match tokio::net::TcpStream::connect(&target).await {
+            Ok(stream) => stream,
+            Err(err) => {
+                eprintln!("warning: outbound relay connect to {target} failed: {err}");
+                sleep(redial_delay).await;
+                continue;
+            }
+        };
+        let peer_id = next_peer_id
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        if let Err(err) = run_relay_peer_session_async(
+            &mut stream,
+            RelayPeerSessionMode::Outbound,
+            peer_id,
+            &state,
+            &active_peers,
+            &stop_flag,
+            &cfg,
+            &runtime_db_path,
+            &mempool_db_path,
+            max_inv_items,
+            read_limit,
+            read_timeout_sec,
+            write_timeout_sec,
+        )
+        .await
+        {
+            if stop_flag.load(Ordering::Relaxed) {
+                break;
+            }
+            eprintln!(
+                "warning: outbound relay session with {target} ended: reason={} detail={err}",
+                relay_disconnect_reason(&err)
+            );
+        }
+        sleep(redial_delay).await;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_relay_outbound_supervisor_async(
+    stop_flag: Arc<AtomicBool>,
+    peers_dir: PathBuf,
+    bind_addr: String,
+    next_peer_id: Arc<AtomicU64>,
+    state: Arc<Mutex<RelayServerState>>,
+    active_peers: Arc<Mutex<usize>>,
+    cfg: ChainConfig,
+    runtime_db_path: PathBuf,
+    mempool_db_path: PathBuf,
+    max_inv_items: usize,
+    read_limit: u32,
+    read_timeout_sec: u64,
+    write_timeout_sec: u64,
+    redial_sec: u64,
+) {
+    let redial_delay = Duration::from_secs(redial_sec.max(1));
+    let mut workers = JoinSet::<()>::new();
+    let mut worker_targets = HashSet::<String>::new();
+
+    loop {
+        if stop_flag.load(Ordering::Relaxed) {
+            break;
+        }
+
+        while let Some(joined) = workers.try_join_next() {
+            match joined {
+                Ok(()) => {}
+                Err(err) => {
+                    eprintln!("warning: outbound relay worker task failed: {err}");
+                }
+            }
+        }
+
+        let targets = match load_relay_outbound_targets_selected(
+            &peers_dir,
+            &cfg,
+            RELAY_OUTBOUND_MAX_PEERS,
+            RELAY_OUTBOUND_ROTATE_AFTER_SEC,
+        ) {
+            Ok(targets) => targets,
+            Err(err) => {
+                eprintln!(
+                    "warning: outbound relay peer-book reload failed ({}): {err}",
+                    peers_dir.display()
+                );
+                sleep(redial_delay).await;
+                continue;
+            }
+        };
+
+        for target in targets {
+            if worker_targets.contains(&target) {
+                continue;
+            }
+            if relay_target_matches_bind(&bind_addr, &target) {
+                continue;
+            }
+            worker_targets.insert(target.clone());
+            let stop_clone = stop_flag.clone();
+            let next_peer_clone = next_peer_id.clone();
+            let state_clone = state.clone();
+            let active_clone = active_peers.clone();
+            let cfg_clone = cfg.clone();
+            let runtime_db_path_clone = runtime_db_path.clone();
+            let mempool_db_path_clone = mempool_db_path.clone();
+            let bind_addr_clone = bind_addr.clone();
+            workers.spawn(async move {
+                run_relay_outbound_worker_async(
+                    target,
+                    bind_addr_clone,
+                    stop_clone,
+                    next_peer_clone,
+                    state_clone,
+                    active_clone,
+                    cfg_clone,
+                    runtime_db_path_clone,
+                    mempool_db_path_clone,
+                    max_inv_items,
+                    read_limit,
+                    read_timeout_sec,
+                    write_timeout_sec,
+                    redial_sec,
+                )
+                .await
+            });
+        }
+
+        sleep(redial_delay).await;
+    }
+
+    workers.shutdown().await;
+}
+
 fn relay_runtime_or_mempool_changed(
     tip_before: Hash256,
     tip_after: Hash256,
@@ -4545,6 +5117,7 @@ fn relay_runtime_or_mempool_changed(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(test), allow(dead_code))]
 fn run_relay_peer_session<IO: Read + Write>(
     stream: &mut IO,
     mode: RelayPeerSessionMode,
@@ -4583,6 +5156,7 @@ fn run_relay_peer_session<IO: Read + Write>(
                 .lock()
                 .map_err(|_| NodeError::Runtime("relay state mutex poisoned".to_owned()))?;
             guard.relay.gossip.connect_peer(peer_id);
+            guard.peer_compact_pref.insert(peer_id, false);
         }
 
         if matches!(mode, RelayPeerSessionMode::Outbound) {
@@ -4592,14 +5166,20 @@ fn run_relay_peer_session<IO: Read + Write>(
                     .map_err(|_| NodeError::Runtime("relay state mutex poisoned".to_owned()))?;
                 build_block_locator(guard.runtime.block_hashes())
             };
-            send_message(
-                stream,
-                &WireMessage::GetBlocks {
+            let startup = vec![
+                WireMessage::SendCmpct {
+                    high_bandwidth: true,
+                    version: 1,
+                },
+                WireMessage::GetAddr,
+                WireMessage::GetBlocks {
                     locator,
                     stop: None,
                 },
-                &framing,
-            )?;
+            ];
+            if !relay_send_messages_until_closed(stream, &startup, &framing)? {
+                return Ok(());
+            }
         }
 
         let mut seen = 0u32;
@@ -4641,12 +5221,13 @@ fn run_relay_peer_session<IO: Read + Write>(
                         let guard = state.lock().map_err(|_| {
                             NodeError::Runtime("relay state mutex poisoned".to_owned())
                         })?;
-                        relay_proactive_inventory_messages(
+                        let proactive = relay_proactive_inventory_messages(
                             &guard,
                             &mut last_tip_announced,
                             &mut announced_txids,
                             max_inv_items,
-                        )
+                        );
+                        relay_messages_for_peer(&guard, peer_id, proactive)
                     };
                     match relay_send_messages_until_closed(stream, &proactive, &framing)? {
                         true => {}
@@ -4667,6 +5248,7 @@ fn run_relay_peer_session<IO: Read + Write>(
                 let tip_before = guard.runtime.tip_hash();
                 let mempool_before = guard.relay.mempool.revision();
                 let outbound = process_relay_wire_message(&mut guard, peer_id, inbound, now)?;
+                let outbound = relay_messages_for_peer(&guard, peer_id, outbound);
                 let tip_after = guard.runtime.tip_hash();
                 let mempool_after = guard.relay.mempool.revision();
                 let (runtime_changed, mempool_changed) = relay_runtime_or_mempool_changed(
@@ -4710,11 +5292,224 @@ fn run_relay_peer_session<IO: Read + Write>(
 
     if let Ok(mut guard) = state.lock() {
         guard.relay.gossip.disconnect_peer(peer_id);
+        guard.peer_compact_pref.remove(&peer_id);
     }
     if let Ok(mut active_guard) = active.lock() {
         *active_guard = active_guard.saturating_sub(1);
     }
     result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_relay_peer_session_async<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    mode: RelayPeerSessionMode,
+    peer_id: u64,
+    state: &Arc<Mutex<RelayServerState>>,
+    active: &Arc<Mutex<usize>>,
+    stop_flag: &Arc<AtomicBool>,
+    cfg: &ChainConfig,
+    runtime_db_path: &Path,
+    mempool_db_path: &Path,
+    max_inv_items: usize,
+    read_limit: u32,
+    read_timeout_sec: u64,
+    write_timeout_sec: u64,
+) -> Result<(), NodeError> {
+    {
+        let mut active_guard = active
+            .lock()
+            .map_err(|_| NodeError::Runtime("relay active peer mutex poisoned".to_owned()))?;
+        *active_guard = active_guard.saturating_add(1);
+    }
+
+    let session_result = async {
+        let framing = FramingConfig::default();
+        let local_hello = LocalHandshake {
+            protocol_version: 1,
+            network_id: cfg.network_id.clone(),
+            user_agent: "scam-node/relay-serve".to_owned(),
+            start_height: 0,
+        };
+        let remote = match mode {
+            RelayPeerSessionMode::Inbound => {
+                server_handshake_async(stream, &framing, &local_hello).await?
+            }
+            RelayPeerSessionMode::Outbound => {
+                client_handshake_async(stream, &framing, &local_hello).await?
+            }
+        };
+        ensure_relay_peer_network(&cfg.network_id, &remote.network_id)?;
+        {
+            let mut guard = state
+                .lock()
+                .map_err(|_| NodeError::Runtime("relay state mutex poisoned".to_owned()))?;
+            guard.relay.gossip.connect_peer(peer_id);
+            guard.peer_compact_pref.insert(peer_id, false);
+        }
+
+        if matches!(mode, RelayPeerSessionMode::Outbound) {
+            let locator = {
+                let guard = state
+                    .lock()
+                    .map_err(|_| NodeError::Runtime("relay state mutex poisoned".to_owned()))?;
+                build_block_locator(guard.runtime.block_hashes())
+            };
+            let first_sync = vec![
+                WireMessage::SendCmpct {
+                    high_bandwidth: true,
+                    version: 1,
+                },
+                WireMessage::GetAddr,
+                WireMessage::GetBlocks {
+                    locator,
+                    stop: None,
+                },
+            ];
+            if !relay_send_messages_until_closed_async(
+                stream,
+                &first_sync,
+                &framing,
+                write_timeout_sec,
+            )
+            .await?
+            {
+                return Ok(());
+            }
+        }
+
+        let mut seen = 0u32;
+        let mut runtime_db_seen_mtime = runtime_db_mtime(runtime_db_path);
+        let mut mempool_db_seen_mtime = mempool_db_mtime(mempool_db_path);
+        let mut last_tip_announced = None::<Hash256>;
+        let mut announced_txids = HashSet::<Hash256>::new();
+        loop {
+            if stop_flag.load(Ordering::Relaxed) {
+                break;
+            }
+            if should_stop_after_seen_messages(read_limit, seen) {
+                break;
+            }
+            {
+                let mut guard = state
+                    .lock()
+                    .map_err(|_| NodeError::Runtime("relay state mutex poisoned".to_owned()))?;
+                refresh_runtime_from_db_if_changed(
+                    cfg,
+                    &mut guard.runtime,
+                    runtime_db_path,
+                    &mut runtime_db_seen_mtime,
+                )?;
+                refresh_mempool_from_db_if_changed(
+                    cfg,
+                    &mut guard.relay,
+                    mempool_db_path,
+                    &mut mempool_db_seen_mtime,
+                )?;
+            }
+
+            let inbound =
+                match relay_read_with_timeout_async(stream, &framing, read_timeout_sec).await? {
+                    RelayReadOutcome::Timeout => {
+                        if stop_flag.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let proactive = {
+                            let guard = state.lock().map_err(|_| {
+                                NodeError::Runtime("relay state mutex poisoned".to_owned())
+                            })?;
+                            let proactive = relay_proactive_inventory_messages(
+                                &guard,
+                                &mut last_tip_announced,
+                                &mut announced_txids,
+                                max_inv_items,
+                            );
+                            relay_messages_for_peer(&guard, peer_id, proactive)
+                        };
+                        if !relay_send_messages_until_closed_async(
+                            stream,
+                            &proactive,
+                            &framing,
+                            write_timeout_sec,
+                        )
+                        .await?
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+                    RelayReadOutcome::Closed => break,
+                    RelayReadOutcome::Message(message) => message,
+                };
+
+            seen = seen.saturating_add(1);
+            let now = current_unix_sec()?;
+            let (outbound, runtime_changed, mempool_changed) = {
+                let mut guard = state
+                    .lock()
+                    .map_err(|_| NodeError::Runtime("relay state mutex poisoned".to_owned()))?;
+                let tip_before = guard.runtime.tip_hash();
+                let mempool_before = guard.relay.mempool.revision();
+                let outbound = process_relay_wire_message(&mut guard, peer_id, inbound, now)?;
+                let outbound = relay_messages_for_peer(&guard, peer_id, outbound);
+                let tip_after = guard.runtime.tip_hash();
+                let mempool_after = guard.relay.mempool.revision();
+                let (runtime_changed, mempool_changed) = relay_runtime_or_mempool_changed(
+                    tip_before,
+                    tip_after,
+                    mempool_before,
+                    mempool_after,
+                );
+                (outbound, runtime_changed, mempool_changed)
+            };
+
+            if runtime_changed {
+                let guard = state
+                    .lock()
+                    .map_err(|_| NodeError::Runtime("relay state mutex poisoned".to_owned()))?;
+                persist_runtime_db_with_retry(&guard.runtime, runtime_db_path, 80, 25)?;
+                runtime_db_seen_mtime = runtime_db_mtime(runtime_db_path);
+            }
+            if mempool_changed {
+                let guard = state
+                    .lock()
+                    .map_err(|_| NodeError::Runtime("relay state mutex poisoned".to_owned()))?;
+                persist_mempool_db_with_retry(cfg, &guard.relay.mempool, mempool_db_path, 80, 25)?;
+                mempool_db_seen_mtime = mempool_db_mtime(mempool_db_path);
+            }
+            if !relay_send_messages_until_closed_async(
+                stream,
+                &outbound,
+                &framing,
+                write_timeout_sec,
+            )
+            .await?
+            {
+                break;
+            }
+            let banned = {
+                let guard = state
+                    .lock()
+                    .map_err(|_| NodeError::Runtime("relay state mutex poisoned".to_owned()))?;
+                guard.relay.gossip.is_banned(peer_id)
+            };
+            if banned {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+    .await;
+
+    if let Ok(mut guard) = state.lock() {
+        guard.relay.gossip.disconnect_peer(peer_id);
+        guard.peer_compact_pref.remove(&peer_id);
+    }
+    if let Ok(mut active_guard) = active.lock() {
+        *active_guard = active_guard.saturating_sub(1);
+    }
+    session_result
 }
 
 fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
@@ -4758,9 +5553,19 @@ fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
     let state = Arc::new(Mutex::new(RelayServerState::new(runtime, relay)));
     let active_peers = Arc::new(Mutex::new(0usize));
     let next_peer_id = Arc::new(AtomicU64::new(0));
-
-    let listener = TcpListener::bind(&args.bind)
-        .map_err(|e| NodeError::Runtime(format!("relay bind failed on {}: {e}", args.bind)))?;
+    match load_relay_known_peer_addresses(&args.peers_dir, &cfg.network_id) {
+        Ok(known) => {
+            if let Ok(mut guard) = state.lock() {
+                guard.known_peer_addresses = known;
+            }
+        }
+        Err(err) => {
+            eprintln!(
+                "warning: cannot preload known peer addresses from {}: {err}",
+                args.peers_dir.display()
+            );
+        }
+    }
     println!(
         "P2P relay serving on {} network={} source={} (tx mempool admission active)",
         args.bind, cfg.network_id, source
@@ -4780,6 +5585,7 @@ fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
         replacement.max_replacements,
         replacement.penalty
     );
+    println!("I/O model: async tokio");
     {
         let guard = state
             .lock()
@@ -4788,151 +5594,202 @@ fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
     }
 
     let stop_flag = Arc::new(AtomicBool::new(false));
-    let telemetry_handle = if let Some(path) = args.telemetry_out.clone() {
-        let path_clone = path.clone();
-        let state_clone = state.clone();
-        let active_clone = active_peers.clone();
-        let stop_clone = stop_flag.clone();
-        let every_sec = args.telemetry_every_sec.max(1);
-        Some(thread::spawn(move || {
-            while relay_telemetry_thread_running(&stop_clone) {
-                thread::sleep(Duration::from_secs(every_sec));
-                let now = match current_unix_sec() {
-                    Ok(now) => now,
-                    Err(_) => continue,
-                };
-                let peers = match active_clone.lock() {
-                    Ok(guard) => *guard,
-                    Err(_) => continue,
-                };
-                let snapshot = match state_clone.lock() {
-                    Ok(guard) => relay_server_snapshot(&guard, peers, now),
-                    Err(_) => continue,
-                };
-                let _ = append_relay_telemetry_snapshot(&path_clone, &snapshot);
-            }
-        }))
+    let worker_threads = std::thread::available_parallelism()
+        .map(|n| n.get().max(2))
+        .unwrap_or(4);
+    let runtime = TokioRuntimeBuilder::new_multi_thread()
+        .enable_all()
+        .worker_threads(worker_threads)
+        .build()
+        .map_err(|e| NodeError::Runtime(format!("relay async runtime init failed: {e}")))?;
+
+    let bind = args.bind.clone();
+    let peers_dir = args.peers_dir.clone();
+    let telemetry_out = args.telemetry_out.clone();
+    let telemetry_every_sec = args.telemetry_every_sec.max(1);
+    let outbound_connect = args.outbound_connect;
+    let outbound_redial_sec = args.outbound_redial_sec.max(1);
+    let max_clients = args.max_clients;
+    let read_limit = args.max_messages_per_peer;
+    let max_active_sessions = if max_clients > 0 {
+        max_clients as usize
     } else {
-        None
+        512
     };
-    let outbound_handle = if args.outbound_connect {
-        let stop_clone = stop_flag.clone();
-        let peers_dir_clone = args.peers_dir.clone();
-        let bind_addr_clone = args.bind.clone();
-        let next_peer_clone = next_peer_id.clone();
-        let state_clone = state.clone();
-        let active_clone = active_peers.clone();
-        let cfg_clone = cfg.clone();
-        let runtime_db_path_clone = runtime_db_path.clone();
-        let mempool_db_path_clone = mempool_db_path.clone();
-        let read_limit = args.max_messages_per_peer;
-        let outbound_redial_sec = args.outbound_redial_sec.max(1);
+    println!("Max concurrent sessions: {}", max_active_sessions);
+    if outbound_connect {
         println!(
             "Outbound relay dialer: enabled (redial={}s)",
             outbound_redial_sec
         );
-        Some(thread::spawn(move || {
-            run_relay_outbound_supervisor(
-                stop_clone,
-                peers_dir_clone,
-                bind_addr_clone,
-                next_peer_clone,
-                state_clone,
-                active_clone,
-                cfg_clone,
-                runtime_db_path_clone,
-                mempool_db_path_clone,
-                max_inv_items,
-                read_limit,
-                read_timeout_sec,
-                write_timeout_sec,
-                outbound_redial_sec,
-            )
-        }))
     } else {
         println!("Outbound relay dialer: disabled");
-        None
-    };
+    }
 
-    let mut served = 0u32;
-    let mut handles = Vec::new();
-    let mut accept_error = None::<NodeError>;
-    for incoming in listener.incoming() {
-        let mut stream = match incoming {
-            Ok(stream) => stream,
-            Err(e) => {
-                accept_error = Some(NodeError::Runtime(format!("relay accept failed: {e}")));
+    runtime.block_on(async move {
+        let listener = tokio::net::TcpListener::bind(&bind)
+            .await
+            .map_err(|e| NodeError::Runtime(format!("relay bind failed on {bind}: {e}")))?;
+        let permits = Arc::new(Semaphore::new(max_active_sessions.max(1)));
+        let mut workers = JoinSet::<Result<(), NodeError>>::new();
+        let mut first_error = None::<NodeError>;
+
+        let telemetry_handle = if let Some(path) = telemetry_out {
+            let state_clone = state.clone();
+            let active_clone = active_peers.clone();
+            let stop_clone = stop_flag.clone();
+            Some(tokio::spawn(async move {
+                while relay_telemetry_thread_running(&stop_clone) {
+                    sleep(Duration::from_secs(telemetry_every_sec)).await;
+                    let now = match current_unix_sec() {
+                        Ok(now) => now,
+                        Err(_) => continue,
+                    };
+                    let peers = match active_clone.lock() {
+                        Ok(guard) => *guard,
+                        Err(_) => continue,
+                    };
+                    let snapshot = match state_clone.lock() {
+                        Ok(guard) => relay_server_snapshot(&guard, peers, now),
+                        Err(_) => continue,
+                    };
+                    let _ = append_relay_telemetry_snapshot(&path, &snapshot);
+                }
+            }))
+        } else {
+            None
+        };
+
+        let outbound_handle = if outbound_connect {
+            let stop_clone = stop_flag.clone();
+            let next_peer_clone = next_peer_id.clone();
+            let state_clone = state.clone();
+            let active_clone = active_peers.clone();
+            let cfg_clone = cfg.clone();
+            let runtime_db_path_clone = runtime_db_path.clone();
+            let mempool_db_path_clone = mempool_db_path.clone();
+            Some(tokio::spawn(async move {
+                run_relay_outbound_supervisor_async(
+                    stop_clone,
+                    peers_dir,
+                    bind,
+                    next_peer_clone,
+                    state_clone,
+                    active_clone,
+                    cfg_clone,
+                    runtime_db_path_clone,
+                    mempool_db_path_clone,
+                    max_inv_items,
+                    read_limit,
+                    read_timeout_sec,
+                    write_timeout_sec,
+                    outbound_redial_sec,
+                )
+                .await;
+            }))
+        } else {
+            None
+        };
+
+        let mut served = 0u32;
+        loop {
+            let accepted = listener
+                .accept()
+                .await
+                .map_err(|e| NodeError::Runtime(format!("relay accept failed: {e}")));
+            let (mut stream, _peer_addr) = match accepted {
+                Ok(accepted) => accepted,
+                Err(err) => {
+                    first_error = Some(err);
+                    break;
+                }
+            };
+
+            let permit = match permits.clone().try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    eprintln!(
+                        "warning: dropping inbound relay connection (active={} max_active={})",
+                        active_peers.lock().map(|g| *g).unwrap_or_default(),
+                        max_active_sessions
+                    );
+                    drop(stream);
+                    continue;
+                }
+            };
+
+            let peer_id = next_peer_id
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1);
+            let state_clone = state.clone();
+            let active_clone = active_peers.clone();
+            let cfg_clone = cfg.clone();
+            let runtime_db_path_clone = runtime_db_path.clone();
+            let mempool_db_path_clone = mempool_db_path.clone();
+            let stop_clone = stop_flag.clone();
+            let max_inv_items_clone = max_inv_items;
+            workers.spawn(async move {
+                let _permit = permit;
+                run_relay_peer_session_async(
+                    &mut stream,
+                    RelayPeerSessionMode::Inbound,
+                    peer_id,
+                    &state_clone,
+                    &active_clone,
+                    &stop_clone,
+                    &cfg_clone,
+                    &runtime_db_path_clone,
+                    &mempool_db_path_clone,
+                    max_inv_items_clone,
+                    read_limit,
+                    read_timeout_sec,
+                    write_timeout_sec,
+                )
+                .await
+            });
+
+            served = served.saturating_add(1);
+            if max_requests_reached(max_clients, served) {
                 break;
             }
-        };
-        configure_stream_timeouts_with_ops(
-            |duration| stream.set_read_timeout(duration),
-            |duration| stream.set_write_timeout(duration),
-            Duration::from_secs(read_timeout_sec),
-            Duration::from_secs(write_timeout_sec),
-        )?;
-        let peer_id = next_peer_id
-            .fetch_add(1, Ordering::Relaxed)
-            .saturating_add(1);
-        let state_clone = state.clone();
-        let active_clone = active_peers.clone();
-        let cfg_clone = cfg.clone();
-        let runtime_db_path_clone = runtime_db_path.clone();
-        let mempool_db_path_clone = mempool_db_path.clone();
-        let stop_clone = stop_flag.clone();
-        let max_inv_items_clone = max_inv_items;
-        let read_limit = args.max_messages_per_peer;
-        handles.push(thread::spawn(move || {
-            run_relay_peer_session(
-                &mut stream,
-                RelayPeerSessionMode::Inbound,
-                peer_id,
-                &state_clone,
-                &active_clone,
-                &stop_clone,
-                &cfg_clone,
-                &runtime_db_path_clone,
-                &mempool_db_path_clone,
-                max_inv_items_clone,
-                read_limit,
-            )
-        }));
-
-        served = served.saturating_add(1);
-        if max_requests_reached(args.max_clients, served) {
-            break;
         }
-    }
 
-    let mut first_error = accept_error;
-    for handle in handles {
-        match handle.join() {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => {
-                if first_error.is_none() {
-                    first_error = Some(err);
+        stop_flag.store(true, Ordering::Relaxed);
+
+        while let Some(join_result) = workers.join_next().await {
+            match join_result {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    if first_error.is_none() {
+                        first_error = Some(err);
+                    }
                 }
-            }
-            Err(_) => {
-                if first_error.is_none() {
-                    first_error = Some(NodeError::Runtime(
-                        "relay worker thread panicked".to_owned(),
-                    ));
+                Err(err) => {
+                    if first_error.is_none() {
+                        first_error = Some(NodeError::Runtime(format!(
+                            "relay worker task failed: {err}"
+                        )));
+                    }
                 }
             }
         }
-    }
-    stop_flag.store(true, Ordering::Relaxed);
-    if let Some(handle) = outbound_handle {
-        let _ = handle.join();
-    }
-    if let Some(handle) = telemetry_handle {
-        let _ = handle.join();
-    }
-    if let Some(err) = first_error {
-        return Err(err);
-    }
-    Ok(())
+        if let Some(handle) = outbound_handle
+            && let Err(err) = handle.await
+            && first_error.is_none()
+        {
+            first_error = Some(NodeError::Runtime(format!(
+                "outbound relay supervisor task failed: {err}"
+            )));
+        }
+        if let Some(handle) = telemetry_handle {
+            let _ = handle.await;
+        }
+        if let Some(err) = first_error {
+            Err(err)
+        } else {
+            Ok(())
+        }
+    })
 }
 
 fn run_reindex_runtime(args: ReindexRuntimeArgs) -> Result<(), NodeError> {
@@ -6411,6 +7268,7 @@ fn map_relay_read_result(
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn relay_send_message_or_closed<IO: Write>(
     stream: &mut IO,
     message: &WireMessage,
@@ -6423,6 +7281,7 @@ fn relay_send_message_or_closed<IO: Write>(
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn relay_send_messages_until_closed<IO: Write>(
     stream: &mut IO,
     messages: &[WireMessage],
@@ -6432,6 +7291,57 @@ fn relay_send_messages_until_closed<IO: Write>(
         match relay_send_message_or_closed(stream, message, framing)? {
             true => {}
             false => return Ok(false),
+        }
+    }
+    Ok(true)
+}
+
+async fn relay_read_with_timeout_async<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    framing: &FramingConfig,
+    read_timeout_sec: u64,
+) -> Result<RelayReadOutcome, NodeError> {
+    match timeout(
+        Duration::from_secs(read_timeout_sec.max(1)),
+        read_message_async(stream, framing),
+    )
+    .await
+    {
+        Ok(result) => map_relay_read_result(result),
+        Err(_) => Ok(RelayReadOutcome::Timeout),
+    }
+}
+
+async fn relay_send_message_or_closed_async<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    message: &WireMessage,
+    framing: &FramingConfig,
+    write_timeout_sec: u64,
+) -> Result<bool, NodeError> {
+    match timeout(
+        Duration::from_secs(write_timeout_sec.max(1)),
+        send_message_async(stream, message, framing),
+    )
+    .await
+    {
+        Ok(Ok(())) => Ok(true),
+        Ok(Err(TransportError::Io(err))) if relay_io_error_is_closed_like(&err) => Ok(false),
+        Ok(Err(err)) => Err(NodeError::Transport(err)),
+        Err(_) => Err(NodeError::Transport(TransportError::Io(
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "relay async write timed out"),
+        ))),
+    }
+}
+
+async fn relay_send_messages_until_closed_async<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    messages: &[WireMessage],
+    framing: &FramingConfig,
+    write_timeout_sec: u64,
+) -> Result<bool, NodeError> {
+    for message in messages {
+        if !relay_send_message_or_closed_async(stream, message, framing, write_timeout_sec).await? {
+            return Ok(false);
         }
     }
     Ok(true)
@@ -16960,6 +17870,198 @@ mod tests {
         assert!(
             second.is_empty(),
             "second proactive pass must not re-announce unchanged inventory"
+        );
+    }
+
+    #[test]
+    fn relay_getaddr_and_addr_messages_exchange_known_peers() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let relay = RelayAdmissionState {
+            mempool: Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip: GossipEngine::new(64).expect("gossip"),
+        };
+        let mut state = RelayServerState::new(runtime, relay);
+        state.known_peer_addresses = vec![super::PeerAddress {
+            address: "127.0.0.1:18444".to_owned(),
+            services: 1,
+            last_seen_unix_sec: 10,
+        }];
+
+        let response =
+            process_relay_wire_message(&mut state, 1, WireMessage::GetAddr, 100).expect("getaddr");
+        assert!(
+            response.iter().any(|message| matches!(
+                message,
+                WireMessage::Addr { peers } if peers.iter().any(|entry| entry.address == "127.0.0.1:18444")
+            )),
+            "getaddr response must contain known peer records"
+        );
+
+        process_relay_wire_message(
+            &mut state,
+            1,
+            WireMessage::Addr {
+                peers: vec![super::PeerAddress {
+                    address: "127.0.0.1:19444".to_owned(),
+                    services: 1,
+                    last_seen_unix_sec: 20,
+                }],
+            },
+            101,
+        )
+        .expect("addr merge");
+        assert!(
+            state
+                .known_peer_addresses
+                .iter()
+                .any(|entry| entry.address == "127.0.0.1:19444")
+        );
+    }
+
+    #[test]
+    fn relay_compact_block_roundtrip_requests_missing_tx_then_accepts_blocktxn() {
+        let mut cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        cfg.coinbase_maturity = 1;
+        cfg.validate().expect("config validate");
+
+        let mnemonic = WalletMnemonic::parse(SOAK_FLOW_MNEMONIC).expect("mnemonic");
+        let seed = mnemonic.to_seed("");
+        let sender_key = derive_wallet_key(&seed, 0, 0).expect("sender key");
+        let recipient_key = derive_wallet_key(&seed, 0, 1).expect("recipient key");
+        let sender_key_hash20 = scam_core::hash160_blake3(&sender_key.pubkey_compressed());
+        let recipient_key_hash20 = scam_core::hash160_blake3(&recipient_key.pubkey_compressed());
+
+        let mut runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        mine_blocks_on_runtime(
+            &mut runtime,
+            &super::MiningLoopParams {
+                count: 2,
+                interval_sec: cfg.target_block_time_sec,
+                max_nonce: 500_000,
+                subsidy: cfg.block_subsidy,
+                miner_key_hash: sender_key_hash20,
+                label_prefix: "compact-seed",
+                print_each: false,
+            },
+        )
+        .expect("mine maturity");
+
+        let signed = build_signed_transfer_tx(
+            &runtime,
+            &cfg.network_id,
+            &sender_key,
+            recipient_key_hash20,
+            1_000_000,
+            500,
+        )
+        .expect("signed tx");
+        let expected_target = runtime.expected_target_for_next_block().expect("target");
+        let template = BlockTemplate {
+            version: 1,
+            prev_block: runtime.tip_hash(),
+            timestamp: runtime
+                .tip_header()
+                .timestamp
+                .saturating_add(cfg.target_block_time_sec),
+            target: expected_target,
+            transactions: vec![
+                build_coinbase_tx(
+                    "compact-test".to_owned(),
+                    cfg.block_subsidy,
+                    sender_key_hash20,
+                ),
+                signed.tx.clone(),
+            ],
+        };
+        let block = mine_block(&template, 500_000).expect("mine block");
+        let block_hash = block.header.block_hash();
+        let compact = super::relay_compact_block_from_block(&block);
+
+        let relay = RelayAdmissionState {
+            mempool: Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip: GossipEngine::new(64).expect("gossip"),
+        };
+        let mut state = RelayServerState::new(runtime, relay);
+
+        let out = process_relay_wire_message(
+            &mut state,
+            11,
+            WireMessage::CmpctBlock { block: compact },
+            10_000,
+        )
+        .expect("process cmpct block");
+        assert!(
+            out.iter().any(|msg| matches!(
+                msg,
+                WireMessage::GetBlockTxn { block_hash: got, indexes }
+                    if *got == block_hash && indexes == &vec![1]
+            )),
+            "compact block with missing tx must request missing indexes"
+        );
+
+        let out = process_relay_wire_message(
+            &mut state,
+            11,
+            WireMessage::BlockTxn {
+                block_hash,
+                transactions: vec![signed.tx.clone()],
+            },
+            10_001,
+        )
+        .expect("process blocktxn");
+        assert!(out.is_empty());
+        assert_eq!(state.runtime.tip_hash(), block_hash);
+        assert_eq!(state.runtime.tip_height(), 3);
+    }
+
+    #[test]
+    fn relay_inventory_messages_emit_compact_block_when_peer_prefers_it() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let relay = RelayAdmissionState {
+            mempool: Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip: GossipEngine::new(64).expect("gossip"),
+        };
+        let mut state = RelayServerState::new(runtime, relay);
+        let tip_hash = state.runtime.tip_hash();
+        state.peer_compact_pref.insert(42, true);
+
+        let compact = super::relay_inventory_messages_for_peer(
+            &state,
+            42,
+            vec![InventoryItem::Block(tip_hash)],
+        );
+        assert!(
+            compact
+                .iter()
+                .any(|msg| matches!(msg, WireMessage::CmpctBlock { .. })),
+            "compact-enabled peer must receive compact block announcement"
+        );
+
+        state.peer_compact_pref.insert(42, false);
+        let legacy = super::relay_inventory_messages_for_peer(
+            &state,
+            42,
+            vec![InventoryItem::Block(tip_hash)],
+        );
+        assert!(
+            legacy
+                .iter()
+                .any(|msg| matches!(msg, WireMessage::Inv { .. })),
+            "legacy peer must keep inv announcements"
         );
     }
 

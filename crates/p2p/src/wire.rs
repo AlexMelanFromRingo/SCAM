@@ -49,6 +49,46 @@ pub enum WireMessage {
     Headers {
         headers: Vec<BlockHeader>,
     },
+    GetAddr,
+    Addr {
+        peers: Vec<PeerAddress>,
+    },
+    SendCmpct {
+        high_bandwidth: bool,
+        version: u64,
+    },
+    CmpctBlock {
+        block: CompactBlock,
+    },
+    GetBlockTxn {
+        block_hash: Hash256,
+        indexes: Vec<u32>,
+    },
+    BlockTxn {
+        block_hash: Hash256,
+        transactions: Vec<Transaction>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PeerAddress {
+    pub address: String,
+    pub services: u64,
+    pub last_seen_unix_sec: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PrefilledTxn {
+    pub index: u32,
+    pub tx: Transaction,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CompactBlock {
+    pub header: BlockHeader,
+    pub tx_count: u32,
+    pub short_txids: Vec<u64>,
+    pub prefilled: Vec<PrefilledTxn>,
 }
 
 pub fn encode_message(message: &WireMessage) -> Result<Vec<u8>, WireError> {
@@ -77,7 +117,10 @@ pub enum WireError {
 
 #[cfg(test)]
 mod tests {
-    use super::{InventoryItem, WireMessage, decode_message, encode_message};
+    use super::{
+        CompactBlock, InventoryItem, PeerAddress, PrefilledTxn, WireMessage, decode_message,
+        encode_message,
+    };
     use scam_core::hash::hash256;
 
     #[test]
@@ -104,5 +147,54 @@ mod tests {
         let err = decode_message(&encoded, encoded.len().saturating_sub(1))
             .expect_err("smaller limit must reject");
         assert!(matches!(err, super::WireError::MessageTooLarge { .. }));
+    }
+
+    #[test]
+    fn compact_and_addr_messages_roundtrip() {
+        let header = scam_core::BlockHeader {
+            version: 1,
+            prev_block: hash256(b"prev"),
+            merkle_root: hash256(b"merkle"),
+            timestamp: 1_770_763_200,
+            target: scam_core::Target::MAX,
+            nonce: 7,
+        };
+        let tx = scam_core::Transaction {
+            version: 1,
+            inputs: vec![scam_core::TxIn {
+                prev_out: scam_core::OutPoint {
+                    txid: hash256(b"spend"),
+                    vout: 0,
+                },
+                signature: vec![1u8; 64],
+                pubkey_compressed: vec![0x02; 33],
+                sequence: 0,
+            }],
+            outputs: vec![scam_core::TxOut {
+                value: 42,
+                key_hash20: [3u8; 20],
+            }],
+            lock_time: 0,
+        };
+        let compact = WireMessage::CmpctBlock {
+            block: CompactBlock {
+                header,
+                tx_count: 2,
+                short_txids: vec![9],
+                prefilled: vec![PrefilledTxn { index: 0, tx }],
+            },
+        };
+        let addr = WireMessage::Addr {
+            peers: vec![PeerAddress {
+                address: "127.0.0.1:18444".to_owned(),
+                services: 1,
+                last_seen_unix_sec: 1,
+            }],
+        };
+        for msg in [compact, addr] {
+            let encoded = encode_message(&msg).expect("encode");
+            let decoded = decode_message(&encoded, 8 * 1024).expect("decode");
+            assert_eq!(decoded, msg);
+        }
     }
 }

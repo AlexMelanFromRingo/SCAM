@@ -245,7 +245,13 @@ impl GossipEngine {
             | WireMessage::NotFound { .. }
             | WireMessage::GetHeaders { .. }
             | WireMessage::GetBlocks { .. }
-            | WireMessage::Headers { .. } => Ok(Vec::new()),
+            | WireMessage::Headers { .. }
+            | WireMessage::GetAddr
+            | WireMessage::Addr { .. }
+            | WireMessage::SendCmpct { .. }
+            | WireMessage::CmpctBlock { .. }
+            | WireMessage::GetBlockTxn { .. }
+            | WireMessage::BlockTxn { .. } => Ok(Vec::new()),
         }
     }
 

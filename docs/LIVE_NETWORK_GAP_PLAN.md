@@ -4,6 +4,8 @@
 - Consensus/UTXO/PoW validation: works.
 - Stratum mining to local node: works (blocks produced).
 - Node-to-node synchronization: realtime INV propagation works for active relay connections; relay has outbound peer auto-dial from peer-book (`--outbound-connect`) and now tolerates out-of-order block arrival via unknown-parent recovery + pending orphan promotion.
+- Relay runtime model: async tokio accept/session loop with bounded concurrent permits (no runtime thread-per-connection growth in `relay-serve` path).
+- P2P protocol baseline: now includes `getaddr/addr` exchange and compact-block negotiation/recovery (`sendcmpct/cmpctblock/getblocktxn/blocktxn`) in addition to legacy `inv/getdata`.
 - Wallet UX transfer pipeline: live submit path (`wallet/send`, `tx/submit`) is wired to mempool DB admission and mined confirmation flow.
 - UI: SSE push stream (`/events`) with polling fallback (5s) is active; dashboard now shows relay peers, relay mempool, sync lag, and last-block age.
 
@@ -40,6 +42,9 @@
 - [x] Add integration test: multi-node realtime propagation without `sync-book` assistance.
 - [x] Add integration test: node restart + catch-up + mempool rebroadcast.
 - [x] Add deterministic failure logs for peer disconnect reasons (protocol error, timeout, ban, io reset).
+- [x] Remove runtime thread-per-connection in `relay-serve` by migrating to async tokio socket handling.
+- [x] Add compact-block fallback path (request missing txs by index and reconstruct block before apply).
+- [x] Add addr exchange path (`getaddr/addr`) for live peer discovery enrichment.
 
 ## P2 (launch confidence)
 - [ ] Soak test profile for 24h: 2-5 nodes + miner + tx spam profile.

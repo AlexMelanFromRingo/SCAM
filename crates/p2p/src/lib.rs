@@ -10,7 +10,12 @@ pub use gossip::{
 };
 pub use sync::{build_block_locator, select_block_hashes_for_peer, select_headers_for_peer};
 pub use transport::{
-    FramingConfig, LocalHandshake, RemoteHandshake, TransportError, client_handshake, read_message,
-    request_blocks, request_headers, send_message, server_handshake,
+    FramingConfig, LocalHandshake, RemoteHandshake, TransportError, client_handshake,
+    client_handshake_async, read_message, read_message_async, request_blocks, request_blocks_async,
+    request_headers, request_headers_async, send_message, send_message_async, server_handshake,
+    server_handshake_async,
 };
-pub use wire::{InventoryItem, WireError, WireMessage, decode_message, encode_message};
+pub use wire::{
+    CompactBlock, InventoryItem, PeerAddress, PrefilledTxn, WireError, WireMessage, decode_message,
+    encode_message,
+};
