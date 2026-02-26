@@ -23286,8 +23286,8 @@ mod tests {
             require_observed_sequence: vec![
                 "SetupConnectionSuccess".to_owned(),
                 "OpenStandardMiningChannelSuccess".to_owned(),
-                "SetTarget".to_owned(),
                 "SubmitSharesSuccess".to_owned(),
+                "SetTarget".to_owned(),
             ],
             forbid_observed_kind: vec!["SubmitSharesError".to_owned()],
             secure_transport: false,
