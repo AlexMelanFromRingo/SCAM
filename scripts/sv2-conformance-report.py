@@ -120,18 +120,31 @@ def main() -> int:
         "",
         "## Built-in / Local Targets",
         "",
-        "| stack | endpoint | secure | mode | pass | setup | channel | jobs | min_jobs | set_target | expect_set_target |",
-        "|---|---|---:|---|---:|---:|---:|---:|---:|---:|---:|",
+        "| stack | endpoint | secure | mode | pass | setup | setup_version | setup_flags | req_version | req_flags | forbid_flags | channel | jobs | min_jobs | set_target | expect_set_target |",
+        "|---|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for report in reports:
         lines.append(
-            "| {stack} | {endpoint} | {secure} | {mode} | {pass_} | {setup} | {channel} | {jobs} | {min_jobs} | {target} | {expect_target} |".format(
+            "| {stack} | {endpoint} | {secure} | {mode} | {pass_} | {setup} | {setup_version} | {setup_flags} | {req_version} | {req_flags} | {forbid_flags} | {channel} | {jobs} | {min_jobs} | {target} | {expect_target} |".format(
                 stack=markdown_cell(report.get("stack_name", "unknown")),
                 endpoint=markdown_cell(report.get("endpoint", "unknown")),
                 secure=str(bool(report.get("secure_transport"))).lower(),
                 mode=markdown_cell(report.get("secure_transport_mode", "unknown")),
                 pass_=str(bool(report.get("pass"))).lower(),
                 setup=str(bool(report.get("setup_success"))).lower(),
+                setup_version=markdown_cell(report.get("setup_used_version", "")),
+                setup_flags=markdown_cell(
+                    f"0x{int(report.get('setup_flags', 0)):08x}"
+                    if report.get("setup_flags") is not None
+                    else ""
+                ),
+                req_version=markdown_cell(report.get("require_setup_version", "")),
+                req_flags=markdown_cell(
+                    f"0x{int(report.get('require_setup_flags_mask', 0)):08x}"
+                ),
+                forbid_flags=markdown_cell(
+                    f"0x{int(report.get('forbid_setup_flags_mask', 0)):08x}"
+                ),
                 channel=str(bool(report.get("channel_opened"))).lower(),
                 jobs=int(report.get("job_messages_seen", 0)),
                 min_jobs=int(report.get("min_job_messages_required", 0)),
@@ -173,11 +186,23 @@ def main() -> int:
             )
             required = record.get("required_observed_kinds") or []
             forbidden = record.get("forbidden_observed_kinds") or []
-            if required or forbidden:
+            req_setup_version = record.get("require_setup_version")
+            req_setup_flags_mask = int(record.get("require_setup_flags_mask", 0))
+            forbid_setup_flags_mask = int(record.get("forbid_setup_flags_mask", 0))
+            if (
+                required
+                or forbidden
+                or req_setup_version is not None
+                or req_setup_flags_mask != 0
+                or forbid_setup_flags_mask != 0
+            ):
                 lines.append(
-                    "|  |  |  |  |  |  |  |  |  |  |  |  | require={required} forbid={forbidden} |  |".format(
+                    "|  |  |  |  |  |  |  |  |  |  |  |  | require={required} forbid={forbidden}; req_setup_version={req_setup_version}; req_setup_flags=0x{req_setup_flags_mask:08x}; forbid_setup_flags=0x{forbid_setup_flags_mask:08x} |  |".format(
                         required=markdown_cell(",".join(required)),
                         forbidden=markdown_cell(",".join(forbidden)),
+                        req_setup_version=markdown_cell(req_setup_version),
+                        req_setup_flags_mask=req_setup_flags_mask,
+                        forbid_setup_flags_mask=forbid_setup_flags_mask,
                     )
                 )
         lines.extend(["", "## Vendor Quirks / Workarounds", ""])

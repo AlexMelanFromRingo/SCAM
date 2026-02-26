@@ -24,6 +24,16 @@ args=(
   --out "${OUT}"
 )
 
+if [[ -n "${REQUIRE_SETUP_VERSION:-}" ]]; then
+  args+=(--require-setup-version "${REQUIRE_SETUP_VERSION}")
+fi
+if [[ "${REQUIRE_SETUP_FLAGS_MASK:-0}" != "0" ]]; then
+  args+=(--require-setup-flags-mask "${REQUIRE_SETUP_FLAGS_MASK}")
+fi
+if [[ "${FORBID_SETUP_FLAGS_MASK:-0}" != "0" ]]; then
+  args+=(--forbid-setup-flags-mask "${FORBID_SETUP_FLAGS_MASK}")
+fi
+
 if [[ "${EXPECT_SET_TARGET:-false}" == "true" ]]; then
   args+=(--expect-set-target)
 fi

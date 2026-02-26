@@ -14,6 +14,9 @@ SV2_CONFORMANCE_CONNECT_RETRY_DELAY_MS="${SV2_CONFORMANCE_CONNECT_RETRY_DELAY_MS
 SV2_CONFORMANCE_READ_TIMEOUT_SEC="${SV2_CONFORMANCE_READ_TIMEOUT_SEC:-3}"
 SV2_CONFORMANCE_MIN_JOB_MESSAGES="${SV2_CONFORMANCE_MIN_JOB_MESSAGES:-1}"
 SV2_CONFORMANCE_EXPECT_SET_TARGET="${SV2_CONFORMANCE_EXPECT_SET_TARGET:-true}"
+SV2_CONFORMANCE_REQUIRE_SETUP_VERSION="${SV2_CONFORMANCE_REQUIRE_SETUP_VERSION:-}"
+SV2_CONFORMANCE_REQUIRE_SETUP_FLAGS_MASK="${SV2_CONFORMANCE_REQUIRE_SETUP_FLAGS_MASK:-0}"
+SV2_CONFORMANCE_FORBID_SETUP_FLAGS_MASK="${SV2_CONFORMANCE_FORBID_SETUP_FLAGS_MASK:-0}"
 SV2_CONFORMANCE_REQUIRED_OBSERVED_KINDS="${SV2_CONFORMANCE_REQUIRED_OBSERVED_KINDS:-}"
 SV2_CONFORMANCE_FORBIDDEN_OBSERVED_KINDS="${SV2_CONFORMANCE_FORBIDDEN_OBSERVED_KINDS:-}"
 unexpected_external_failures=0
@@ -42,6 +45,9 @@ run_conformance_target() {
   local notes="${18:-}"
   local required_observed_kinds="${19:-${SV2_CONFORMANCE_REQUIRED_OBSERVED_KINDS}}"
   local forbidden_observed_kinds="${20:-${SV2_CONFORMANCE_FORBIDDEN_OBSERVED_KINDS}}"
+  local require_setup_version="${21:-${SV2_CONFORMANCE_REQUIRE_SETUP_VERSION}}"
+  local require_setup_flags_mask="${22:-${SV2_CONFORMANCE_REQUIRE_SETUP_FLAGS_MASK}}"
+  local forbid_setup_flags_mask="${23:-${SV2_CONFORMANCE_FORBID_SETUP_FLAGS_MASK}}"
 
   if [[ -z "${stack_name}" || -z "${endpoint}" ]]; then
     echo "[sv2-matrix] invalid target entry: missing stack_name or endpoint"
@@ -114,6 +120,15 @@ run_conformance_target() {
   if [[ "${expect_set_target}" == "true" ]]; then
     args+=(--expect-set-target)
   fi
+  if [[ -n "${require_setup_version}" ]]; then
+    args+=(--require-setup-version "${require_setup_version}")
+  fi
+  if [[ "${require_setup_flags_mask}" != "0" ]]; then
+    args+=(--require-setup-flags-mask "${require_setup_flags_mask}")
+  fi
+  if [[ "${forbid_setup_flags_mask}" != "0" ]]; then
+    args+=(--forbid-setup-flags-mask "${forbid_setup_flags_mask}")
+  fi
   if [[ -n "${required_observed_kinds}" ]]; then
     IFS=';' read -ra required_kinds <<<"${required_observed_kinds}"
     for kind in "${required_kinds[@]}"; do
@@ -147,7 +162,7 @@ run_conformance_target() {
     rc=$?
   fi
 
-  python3 - <<'PY' "${EXTERNAL_RESULTS_JSONL}" "${stack_name}" "${endpoint}" "${secure}" "${mode}" "${expected}" "${vendor}" "${version}" "${role}" "${read_timeout_sec}" "${connect_timeout_sec}" "${connect_retries}" "${connect_retry_delay_ms}" "${expect_set_target}" "${min_job_messages}" "${workaround}" "${notes}" "${required_observed_kinds}" "${forbidden_observed_kinds}" "${result}" "${rc}"
+  python3 - <<'PY' "${EXTERNAL_RESULTS_JSONL}" "${stack_name}" "${endpoint}" "${secure}" "${mode}" "${expected}" "${vendor}" "${version}" "${role}" "${read_timeout_sec}" "${connect_timeout_sec}" "${connect_retries}" "${connect_retry_delay_ms}" "${expect_set_target}" "${min_job_messages}" "${workaround}" "${notes}" "${required_observed_kinds}" "${forbidden_observed_kinds}" "${require_setup_version}" "${require_setup_flags_mask}" "${forbid_setup_flags_mask}" "${result}" "${rc}"
 import json
 import pathlib
 import sys
@@ -172,8 +187,11 @@ record = {
     "notes": sys.argv[17] or None,
     "required_observed_kinds": [k for k in sys.argv[18].split(";") if k],
     "forbidden_observed_kinds": [k for k in sys.argv[19].split(";") if k],
-    "result": sys.argv[20],
-    "exit_code": int(sys.argv[21]),
+    "require_setup_version": int(sys.argv[20]) if sys.argv[20] else None,
+    "require_setup_flags_mask": int(sys.argv[21], 0),
+    "forbid_setup_flags_mask": int(sys.argv[22], 0),
+    "result": sys.argv[23],
+    "exit_code": int(sys.argv[24]),
 }
 path.parent.mkdir(parents=True, exist_ok=True)
 with path.open("a", encoding="utf-8") as fh:
@@ -240,7 +258,8 @@ if [[ -n "${SV2_EXTERNAL_TARGETS:-}" ]]; then
   # Extended format:
   # "name,endpoint,secure,mode,secret,expected,vendor,version,role,corpus,read_timeout_sec,\
   #  connect_timeout_sec,connect_retries,connect_retry_delay_ms,expect_set_target,\
-  #  min_job_messages,workaround,notes"
+  #  min_job_messages,workaround,notes,required_observed_kinds,forbidden_observed_kinds,\
+  #  require_setup_version,require_setup_flags_mask,forbid_setup_flags_mask"
   IFS=';' read -ra targets <<<"${SV2_EXTERNAL_TARGETS}"
   for target in "${targets[@]}"; do
     [[ -z "${target}" ]] && continue
@@ -264,7 +283,10 @@ if [[ -n "${SV2_EXTERNAL_TARGETS:-}" ]]; then
       workaround \
       notes \
       required_observed_kinds \
-      forbidden_observed_kinds <<<"${target}"
+      forbidden_observed_kinds \
+      require_setup_version \
+      require_setup_flags_mask \
+      forbid_setup_flags_mask <<<"${target}"
     run_conformance_target \
       "${stack_name}" \
       "${endpoint}" \
@@ -285,7 +307,10 @@ if [[ -n "${SV2_EXTERNAL_TARGETS:-}" ]]; then
       "${workaround:-}" \
       "${notes:-}" \
       "${required_observed_kinds:-}" \
-      "${forbidden_observed_kinds:-}"
+      "${forbidden_observed_kinds:-}" \
+      "${require_setup_version:-}" \
+      "${require_setup_flags_mask:-0}" \
+      "${forbid_setup_flags_mask:-0}"
   done
 fi
 
@@ -310,7 +335,10 @@ if [[ -n "${SV2_EXTERNAL_TARGETS_FILE}" ]]; then
     workaround \
     notes \
     required_observed_kinds \
-    forbidden_observed_kinds; do
+    forbidden_observed_kinds \
+    require_setup_version \
+    require_setup_flags_mask \
+    forbid_setup_flags_mask; do
     [[ -z "${stack_name}" ]] && continue
     run_conformance_target \
       "${stack_name}" \
@@ -332,7 +360,10 @@ if [[ -n "${SV2_EXTERNAL_TARGETS_FILE}" ]]; then
       "${workaround:-}" \
       "${notes:-}" \
       "${required_observed_kinds:-}" \
-      "${forbidden_observed_kinds:-}"
+      "${forbidden_observed_kinds:-}" \
+      "${require_setup_version:-}" \
+      "${require_setup_flags_mask:-0}" \
+      "${forbid_setup_flags_mask:-0}"
   done < <(python3 - <<'PY' "${SV2_EXTERNAL_TARGETS_FILE}"
 import json
 import pathlib
@@ -374,6 +405,9 @@ for target in targets:
                 str(target.get("notes", "")),
                 join_kinds(target.get("required_observed_kinds", [])),
                 join_kinds(target.get("forbidden_observed_kinds", [])),
+                str(target.get("require_setup_version", "")),
+                str(target.get("require_setup_flags_mask", "0")),
+                str(target.get("forbid_setup_flags_mask", "0")),
             ]
         )
     )

@@ -754,6 +754,12 @@ struct Sv2ConformanceArgs {
     expect_set_target: bool,
     #[arg(long, default_value_t = 0)]
     min_job_messages: u32,
+    #[arg(long)]
+    require_setup_version: Option<u16>,
+    #[arg(long, default_value_t = 0)]
+    require_setup_flags_mask: u32,
+    #[arg(long, default_value_t = 0)]
+    forbid_setup_flags_mask: u32,
     #[arg(long = "require-observed-kind")]
     require_observed_kind: Vec<String>,
     #[arg(long = "forbid-observed-kind")]
@@ -10739,8 +10745,13 @@ struct Sv2ConformanceReport {
     submit_error_seen: bool,
     discovered_channel_id: Option<u32>,
     discovered_job_id: Option<u32>,
+    setup_used_version: Option<u16>,
+    setup_flags: Option<u32>,
     min_job_messages_required: u32,
     expect_set_target: bool,
+    require_setup_version: Option<u16>,
+    require_setup_flags_mask: u32,
+    forbid_setup_flags_mask: u32,
     required_observed_kinds: Vec<String>,
     forbidden_observed_kinds: Vec<String>,
     missing_required_observed_kinds: Vec<String>,
@@ -10797,6 +10808,8 @@ struct Sv2ConformanceState {
     discovered_channel_id: Option<u32>,
     discovered_job_id: Option<u32>,
     discovered_job_ntime: Option<u64>,
+    setup_used_version: Option<u16>,
+    setup_flags: Option<u32>,
 }
 
 fn update_sv2_conformance_state(
@@ -10805,7 +10818,11 @@ fn update_sv2_conformance_state(
     response: &Sv2Message,
 ) {
     match response {
-        Sv2Message::SetupConnectionSuccess { .. } => state.setup_success = true,
+        Sv2Message::SetupConnectionSuccess { used_version, flags } => {
+            state.setup_success = true;
+            state.setup_used_version = Some(*used_version);
+            state.setup_flags = Some(*flags);
+        }
         Sv2Message::SetupConnectionError { code, reason } => {
             errors.push(format!("setup error: code={code} reason={reason}"));
         }
@@ -11154,6 +11171,9 @@ fn run_sv2_conformance(args: Sv2ConformanceArgs) -> Result<(), NodeError> {
 
     let min_job_messages_required = args.min_job_messages;
     let expect_set_target = args.expect_set_target;
+    let require_setup_version = args.require_setup_version;
+    let require_setup_flags_mask = args.require_setup_flags_mask;
+    let forbid_setup_flags_mask = args.forbid_setup_flags_mask;
     let required_observed_kinds = args
         .require_observed_kind
         .iter()
@@ -11192,6 +11212,27 @@ fn run_sv2_conformance(args: Sv2ConformanceArgs) -> Result<(), NodeError> {
     if expect_set_target && !state.set_target_seen {
         errors.push("required SetTarget was not observed".to_owned());
     }
+    if let Some(expected_version) = require_setup_version {
+        if state.setup_used_version != Some(expected_version) {
+            errors.push(format!(
+                "setup version requirement not met: required {}, observed {:?}",
+                expected_version, state.setup_used_version
+            ));
+        }
+    }
+    let observed_setup_flags = state.setup_flags.unwrap_or_default();
+    if require_setup_flags_mask != 0
+        && (observed_setup_flags & require_setup_flags_mask) != require_setup_flags_mask
+    {
+        errors.push(format!(
+            "setup flags requirement not met: required mask=0x{require_setup_flags_mask:08x}, observed=0x{observed_setup_flags:08x}"
+        ));
+    }
+    if forbid_setup_flags_mask != 0 && (observed_setup_flags & forbid_setup_flags_mask) != 0 {
+        errors.push(format!(
+            "forbidden setup flags present: forbidden mask=0x{forbid_setup_flags_mask:08x}, observed=0x{observed_setup_flags:08x}"
+        ));
+    }
     let pass = sv2_conformance_pass(
         state.setup_success,
         state.channel_opened,
@@ -11219,8 +11260,13 @@ fn run_sv2_conformance(args: Sv2ConformanceArgs) -> Result<(), NodeError> {
         submit_error_seen: state.submit_error_seen,
         discovered_channel_id: state.discovered_channel_id,
         discovered_job_id: state.discovered_job_id,
+        setup_used_version: state.setup_used_version,
+        setup_flags: state.setup_flags,
         min_job_messages_required,
         expect_set_target,
+        require_setup_version,
+        require_setup_flags_mask,
+        forbid_setup_flags_mask,
         required_observed_kinds,
         forbidden_observed_kinds,
         missing_required_observed_kinds,
@@ -17554,6 +17600,8 @@ mod tests {
         assert_eq!(state.discovered_channel_id, Some(2));
         assert_eq!(state.discovered_job_id, Some(42));
         assert_eq!(state.discovered_job_ntime, Some(1_800_000_000));
+        assert_eq!(state.setup_used_version, Some(2));
+        assert_eq!(state.setup_flags, Some(0));
         assert!(errors.is_empty());
         assert!(super::sv2_conformance_pass(
             state.setup_success,
@@ -22373,6 +22421,9 @@ mod tests {
             read_timeout_sec: 1,
             expect_set_target: true,
             min_job_messages: 1,
+            require_setup_version: Some(2),
+            require_setup_flags_mask: 0,
+            forbid_setup_flags_mask: 0,
             require_observed_kind: Vec::new(),
             forbid_observed_kind: Vec::new(),
             secure_transport: false,
@@ -22482,6 +22533,9 @@ mod tests {
             read_timeout_sec: 1,
             expect_set_target: true,
             min_job_messages: 1,
+            require_setup_version: None,
+            require_setup_flags_mask: 0,
+            forbid_setup_flags_mask: 0,
             require_observed_kind: Vec::new(),
             forbid_observed_kind: Vec::new(),
             secure_transport: false,
@@ -22512,6 +22566,116 @@ mod tests {
                 .any(|entry| { entry.as_str().unwrap_or_default().contains("setup error") }),
             "expected setup error entry"
         );
+
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
+    fn sv2_conformance_enforces_setup_version_and_flags_requirements() {
+        let _net_guard = network_test_guard();
+        let Some(addr) = allocate_local_addr() else {
+            return;
+        };
+        let listener = match TcpListener::bind(&addr) {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("bind failed: {err}"),
+        };
+        let work_dir = temp_dir("test-sv2-conformance-setup-gate");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let report_path = work_dir.join("report.json");
+
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("set read timeout");
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .expect("set write timeout");
+
+            let setup = read_frame(&mut stream).expect("read setup").expect("setup");
+            assert!(matches!(setup, Sv2Message::SetupConnection { .. }));
+            write_frame(
+                &mut stream,
+                &Sv2Message::SetupConnectionSuccess {
+                    used_version: 2,
+                    flags: 0x0000_0002,
+                },
+            )
+            .expect("write setup success");
+
+            let open = read_frame(&mut stream).expect("read open").expect("open");
+            let request_id = match open {
+                Sv2Message::OpenStandardMiningChannel { request_id, .. } => request_id,
+                other => panic!("unexpected open message: {other:?}"),
+            };
+            write_frame(
+                &mut stream,
+                &Sv2Message::OpenStandardMiningChannelSuccess {
+                    request_id,
+                    channel_id: 5,
+                    target_hex: scam_core::Target::MAX.to_hex(),
+                    extranonce_prefix_hex: "00000005".to_owned(),
+                },
+            )
+            .expect("write open success");
+
+            let keepalive = read_frame(&mut stream)
+                .expect("read keepalive")
+                .expect("keepalive");
+            assert!(matches!(keepalive, Sv2Message::KeepAlive));
+            write_frame(&mut stream, &Sv2Message::KeepAlive).expect("write keepalive");
+        });
+
+        let err = run_sv2_conformance(Sv2ConformanceArgs {
+            pool: addr,
+            user: "sv2-test-user".to_owned(),
+            connect_timeout_sec: 2,
+            connect_retries: 2,
+            connect_retry_delay_ms: 50,
+            read_timeout_sec: 1,
+            expect_set_target: false,
+            min_job_messages: 0,
+            require_setup_version: Some(3),
+            require_setup_flags_mask: 0x0000_0001,
+            forbid_setup_flags_mask: 0x0000_0002,
+            require_observed_kind: Vec::new(),
+            forbid_observed_kind: Vec::new(),
+            secure_transport: false,
+            secure_transport_mode: None,
+            secure_rekey_interval_messages: 10_000,
+            secure_static_secret_key_hex: None,
+            secure_expected_remote_static_pubkey_hex: None,
+            corpus: None,
+            out: Some(report_path.clone()),
+            stack_name: Some("mock-setup-gate".to_owned()),
+        })
+        .expect_err("setup version/flags mismatch must fail conformance");
+        assert!(err.to_string().contains("conformance check failed"));
+        join_with_timeout(server, Duration::from_secs(5), "sv2 conformance setup gate");
+
+        let rendered = fs::read_to_string(&report_path).expect("read report");
+        let report: serde_json::Value = serde_json::from_str(&rendered).expect("parse report");
+        let errors = report["errors"].as_array().expect("errors array");
+        assert!(errors.iter().any(|entry| {
+            entry
+                .as_str()
+                .unwrap_or_default()
+                .contains("setup version requirement not met")
+        }));
+        assert!(errors.iter().any(|entry| {
+            entry
+                .as_str()
+                .unwrap_or_default()
+                .contains("setup flags requirement not met")
+        }));
+        assert!(errors.iter().any(|entry| {
+            entry
+                .as_str()
+                .unwrap_or_default()
+                .contains("forbidden setup flags present")
+        }));
 
         let _ = fs::remove_dir_all(work_dir);
     }
@@ -22649,6 +22813,9 @@ mod tests {
             read_timeout_sec: 1,
             expect_set_target: true,
             min_job_messages: 1,
+            require_setup_version: Some(2),
+            require_setup_flags_mask: 0,
+            forbid_setup_flags_mask: 0,
             require_observed_kind: vec![
                 "SetupConnectionSuccess".to_owned(),
                 "OpenStandardMiningChannelSuccess".to_owned(),
@@ -23992,6 +24159,9 @@ mod tests {
             read_timeout_sec: 1,
             expect_set_target: false,
             min_job_messages: 0,
+            require_setup_version: None,
+            require_setup_flags_mask: 0,
+            forbid_setup_flags_mask: 0,
             require_observed_kind: Vec::new(),
             forbid_observed_kind: Vec::new(),
             secure_transport: false,

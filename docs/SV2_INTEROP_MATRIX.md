@@ -29,7 +29,7 @@ where:
 Full tuple (for strict automation and per-vendor quirks capture):
 
 ```text
-name,endpoint,secure,mode,secret_hex,expected,vendor,version,role,corpus,read_timeout_sec,connect_timeout_sec,connect_retries,connect_retry_delay_ms,expect_set_target,min_job_messages,workaround,notes,required_observed_kinds,forbidden_observed_kinds
+name,endpoint,secure,mode,secret_hex,expected,vendor,version,role,corpus,read_timeout_sec,connect_timeout_sec,connect_retries,connect_retry_delay_ms,expect_set_target,min_job_messages,workaround,notes,required_observed_kinds,forbidden_observed_kinds,require_setup_version,require_setup_flags_mask,forbid_setup_flags_mask
 ```
 
 3. Optional JSON-driven target list (recommended for multi-vendor runs):
@@ -53,6 +53,9 @@ scripts/sv2-conformance-matrix.sh
 - `notes`
 - `required_observed_kinds` (array of message kind strings)
 - `forbidden_observed_kinds` (array of message kind strings)
+- `require_setup_version` (optional, strict `SetupConnectionSuccess.used_version` gate)
+- `require_setup_flags_mask` (optional bitmask, all bits must be present in `SetupConnectionSuccess.flags`)
+- `forbid_setup_flags_mask` (optional bitmask, no bits may be present in `SetupConnectionSuccess.flags`)
 - `enabled` (optional; `false` skips the row)
 
 The harness writes per-target run status metadata to:
@@ -69,6 +72,9 @@ Connection-hardening knobs for flaky external endpoints:
 - `SV2_CONFORMANCE_EXPECT_SET_TARGET` (default `true`)
 - `SV2_CONFORMANCE_REQUIRED_OBSERVED_KINDS` (semicolon-separated, optional)
 - `SV2_CONFORMANCE_FORBIDDEN_OBSERVED_KINDS` (semicolon-separated, optional)
+- `SV2_CONFORMANCE_REQUIRE_SETUP_VERSION` (optional)
+- `SV2_CONFORMANCE_REQUIRE_SETUP_FLAGS_MASK` (default `0`)
+- `SV2_CONFORMANCE_FORBID_SETUP_FLAGS_MASK` (default `0`)
 
 Target tuple validation is strict for `secure` (`true|false`), `mode` (`legacy|noise-xx`), and
 `expected` (`pass|fail`) to avoid false-positive matrix rows.

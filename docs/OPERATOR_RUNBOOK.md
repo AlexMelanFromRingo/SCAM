@@ -139,6 +139,9 @@ POOL=203.0.113.20:3347 \
 CORPUS=docs/sv2-corpus/full-spec-submit.json \
 MIN_JOB_MESSAGES=1 \
 EXPECT_SET_TARGET=true \
+REQUIRE_SETUP_VERSION=2 \
+REQUIRE_SETUP_FLAGS_MASK=0 \
+FORBID_SETUP_FLAGS_MASK=0 \
 REQUIRE_OBSERVED_KINDS="SetupConnectionSuccess;OpenStandardMiningChannelSuccess;SubmitSharesSuccess;SetTarget" \
 FORBID_OBSERVED_KINDS="SetupConnectionError;OpenStandardMiningChannelError;SubmitSharesError" \
 scripts/sv2-corpus-replay.sh

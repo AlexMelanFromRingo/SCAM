@@ -12,6 +12,9 @@
     "connect_retry_delay_ms": 300,
     "expect_set_target": true,
     "min_job_messages": 1,
+    "require_setup_version": 2,
+    "require_setup_flags_mask": 0,
+    "forbid_setup_flags_mask": 0,
     "required_observed_kinds": [
       "SetupConnectionSuccess",
       "OpenStandardMiningChannelSuccess"
@@ -40,6 +43,9 @@
     "connect_retry_delay_ms": 500,
     "expect_set_target": true,
     "min_job_messages": 1,
+    "require_setup_version": 2,
+    "require_setup_flags_mask": 0,
+    "forbid_setup_flags_mask": 0,
     "required_observed_kinds": [
       "SetTarget"
     ],
@@ -59,6 +65,9 @@
     "role": "proxy",
     "expect_set_target": false,
     "min_job_messages": 0,
+    "require_setup_version": 2,
+    "require_setup_flags_mask": 0,
+    "forbid_setup_flags_mask": 0,
     "required_observed_kinds": [
       "OpenStandardMiningChannelError"
     ],
