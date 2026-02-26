@@ -742,6 +742,14 @@ struct Sv2ConformanceArgs {
     pool: String,
     #[arg(long, default_value = "scam-conformance")]
     user: String,
+    #[arg(long, default_value_t = scam_stratum::SV2_MINING_PROTOCOL_ID)]
+    setup_protocol: u16,
+    #[arg(long, default_value_t = SUPPORTED_SV2_VERSION)]
+    setup_min_version: u16,
+    #[arg(long, default_value_t = SUPPORTED_SV2_VERSION)]
+    setup_max_version: u16,
+    #[arg(long, default_value_t = 0)]
+    setup_flags: u32,
     #[arg(long, default_value_t = 5)]
     connect_timeout_sec: u64,
     #[arg(long, default_value_t = 2)]
@@ -8415,6 +8423,8 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
         max_share_target: ctx.max_share_target,
         max_jobs: ctx.max_jobs_per_channel,
         supported_version: SUPPORTED_SV2_VERSION,
+        supported_setup_flags: scam_stratum::SV2_SETUP_FLAGS_KNOWN_MASK,
+        required_setup_flags: 0,
         vardiff_target_shares_per_minute: ctx.vardiff_target_shares_per_minute,
         vardiff_retarget_interval_shares: ctx.vardiff_retarget_interval_shares,
         vardiff_clamp_up: ctx.vardiff_clamp_up,
@@ -10737,6 +10747,10 @@ struct Sv2ConformanceReport {
     secure_transport: bool,
     secure_transport_mode: String,
     corpus_source: String,
+    setup_protocol: u16,
+    setup_min_version: u16,
+    setup_max_version: u16,
+    setup_flags_requested: u32,
     setup_success: bool,
     channel_opened: bool,
     job_messages_seen: u32,
@@ -10952,6 +10966,31 @@ fn load_sv2_corpus(path: &Path, user: &str) -> Result<Vec<Sv2Message>, NodeError
     )))
 }
 
+fn apply_sv2_setup_overrides(
+    mut corpus: Vec<Sv2Message>,
+    setup_protocol: u16,
+    setup_min_version: u16,
+    setup_max_version: u16,
+    setup_flags: u32,
+) -> Vec<Sv2Message> {
+    for message in &mut corpus {
+        if let Sv2Message::SetupConnection {
+            protocol,
+            min_version,
+            max_version,
+            flags,
+            ..
+        } = message
+        {
+            *protocol = setup_protocol;
+            *min_version = setup_min_version;
+            *max_version = setup_max_version;
+            *flags = setup_flags;
+        }
+    }
+    corpus
+}
+
 fn read_next_sv2_message_with<F>(
     attempts: usize,
     mut read_once: F,
@@ -11022,6 +11061,12 @@ fn connect_tcp_with_retry(
 }
 
 fn run_sv2_conformance(args: Sv2ConformanceArgs) -> Result<(), NodeError> {
+    if args.setup_min_version > args.setup_max_version {
+        return Err(NodeError::Runtime(format!(
+            "invalid setup version range: min={} max={}",
+            args.setup_min_version, args.setup_max_version
+        )));
+    }
     let connect_timeout = Duration::from_secs(args.connect_timeout_sec.max(1));
     let connect_retry_delay = Duration::from_millis(args.connect_retry_delay_ms.max(1));
     let mut stream = connect_tcp_with_retry(
@@ -11120,7 +11165,7 @@ fn run_sv2_conformance(args: Sv2ConformanceArgs) -> Result<(), NodeError> {
         }};
     }
 
-    let (corpus, corpus_source) = if let Some(path) = args.corpus.as_ref() {
+    let (raw_corpus, corpus_source) = if let Some(path) = args.corpus.as_ref() {
         (
             load_sv2_corpus(path, &args.user)?,
             path.display().to_string(),
@@ -11131,6 +11176,13 @@ fn run_sv2_conformance(args: Sv2ConformanceArgs) -> Result<(), NodeError> {
             "builtin/default".to_owned(),
         )
     };
+    let corpus = apply_sv2_setup_overrides(
+        raw_corpus,
+        args.setup_protocol,
+        args.setup_min_version,
+        args.setup_max_version,
+        args.setup_flags,
+    );
 
     let mut state = Sv2ConformanceState::default();
     let mut observed_messages = Vec::<String>::new();
@@ -11255,6 +11307,10 @@ fn run_sv2_conformance(args: Sv2ConformanceArgs) -> Result<(), NodeError> {
         secure_transport: args.secure_transport,
         secure_transport_mode: secure_transport_mode.as_str().to_owned(),
         corpus_source,
+        setup_protocol: args.setup_protocol,
+        setup_min_version: args.setup_min_version,
+        setup_max_version: args.setup_max_version,
+        setup_flags_requested: args.setup_flags,
         setup_success: state.setup_success,
         channel_opened: state.channel_opened,
         job_messages_seen: state.job_messages_seen,
@@ -22358,6 +22414,32 @@ mod tests {
     }
 
     #[test]
+    fn apply_sv2_setup_overrides_rewrites_setup_messages_and_keeps_other_kinds() {
+        let corpus = vec![
+            Sv2Message::SetupConnection {
+                protocol: 2,
+                min_version: 2,
+                max_version: 2,
+                flags: 0,
+                user_agent: "ua".to_owned(),
+            },
+            Sv2Message::KeepAlive,
+        ];
+        let overridden = super::apply_sv2_setup_overrides(corpus, 2, 1, 3, 0x5);
+        assert!(matches!(
+            overridden.first(),
+            Some(Sv2Message::SetupConnection {
+                protocol: 2,
+                min_version: 1,
+                max_version: 3,
+                flags: 0x5,
+                ..
+            })
+        ));
+        assert!(matches!(overridden.get(1), Some(Sv2Message::KeepAlive)));
+    }
+
+    #[test]
     fn sv2_conformance_happy_path_reports_expected_sequence() {
         let _net_guard = network_test_guard();
         let Some(addr) = allocate_local_addr() else {
@@ -22418,6 +22500,10 @@ mod tests {
         run_sv2_conformance(Sv2ConformanceArgs {
             pool: addr,
             user: "sv2-test-user".to_owned(),
+            setup_protocol: 2,
+            setup_min_version: 2,
+            setup_max_version: 2,
+            setup_flags: 0,
             connect_timeout_sec: 2,
             connect_retries: 2,
             connect_retry_delay_ms: 50,
@@ -22530,6 +22616,10 @@ mod tests {
         let err = run_sv2_conformance(Sv2ConformanceArgs {
             pool: addr,
             user: "sv2-test-user".to_owned(),
+            setup_protocol: 2,
+            setup_min_version: 2,
+            setup_max_version: 2,
+            setup_flags: 0,
             connect_timeout_sec: 2,
             connect_retries: 2,
             connect_retry_delay_ms: 50,
@@ -22634,6 +22724,10 @@ mod tests {
         let err = run_sv2_conformance(Sv2ConformanceArgs {
             pool: addr,
             user: "sv2-test-user".to_owned(),
+            setup_protocol: 2,
+            setup_min_version: 2,
+            setup_max_version: 2,
+            setup_flags: 0,
             connect_timeout_sec: 2,
             connect_retries: 2,
             connect_retry_delay_ms: 50,
@@ -22810,6 +22904,10 @@ mod tests {
         run_sv2_conformance(Sv2ConformanceArgs {
             pool: addr,
             user: "sv2-submit-autofill".to_owned(),
+            setup_protocol: 2,
+            setup_min_version: 2,
+            setup_max_version: 2,
+            setup_flags: 0,
             connect_timeout_sec: 2,
             connect_retries: 2,
             connect_retry_delay_ms: 50,
@@ -24156,6 +24254,10 @@ mod tests {
         let conformance_err = run_sv2_conformance(Sv2ConformanceArgs {
             pool: "127.0.0.1:0".to_owned(),
             user: "u".to_owned(),
+            setup_protocol: 2,
+            setup_min_version: 2,
+            setup_max_version: 2,
+            setup_flags: 0,
             connect_timeout_sec: 1,
             connect_retries: 0,
             connect_retry_delay_ms: 10,
@@ -24181,6 +24283,40 @@ mod tests {
             conformance_err
                 .to_string()
                 .contains("sv2 conformance connect failed")
+        );
+
+        let invalid_setup_err = run_sv2_conformance(Sv2ConformanceArgs {
+            pool: "127.0.0.1:0".to_owned(),
+            user: "u".to_owned(),
+            setup_protocol: 2,
+            setup_min_version: 3,
+            setup_max_version: 2,
+            setup_flags: 0,
+            connect_timeout_sec: 1,
+            connect_retries: 0,
+            connect_retry_delay_ms: 10,
+            read_timeout_sec: 1,
+            expect_set_target: false,
+            min_job_messages: 0,
+            require_setup_version: None,
+            require_setup_flags_mask: 0,
+            forbid_setup_flags_mask: 0,
+            require_observed_kind: Vec::new(),
+            forbid_observed_kind: Vec::new(),
+            secure_transport: false,
+            secure_transport_mode: None,
+            secure_rekey_interval_messages: 10_000,
+            secure_static_secret_key_hex: None,
+            secure_expected_remote_static_pubkey_hex: None,
+            corpus: None,
+            out: None,
+            stack_name: None,
+        })
+        .expect_err("invalid setup range must fail before connect");
+        assert!(
+            invalid_setup_err
+                .to_string()
+                .contains("invalid setup version range")
         );
     }
 
