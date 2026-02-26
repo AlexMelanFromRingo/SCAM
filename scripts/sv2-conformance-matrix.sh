@@ -14,6 +14,10 @@ SV2_CONFORMANCE_CONNECT_RETRY_DELAY_MS="${SV2_CONFORMANCE_CONNECT_RETRY_DELAY_MS
 SV2_CONFORMANCE_READ_TIMEOUT_SEC="${SV2_CONFORMANCE_READ_TIMEOUT_SEC:-3}"
 SV2_CONFORMANCE_MIN_JOB_MESSAGES="${SV2_CONFORMANCE_MIN_JOB_MESSAGES:-1}"
 SV2_CONFORMANCE_EXPECT_SET_TARGET="${SV2_CONFORMANCE_EXPECT_SET_TARGET:-true}"
+SV2_CONFORMANCE_SETUP_PROTOCOL="${SV2_CONFORMANCE_SETUP_PROTOCOL:-2}"
+SV2_CONFORMANCE_SETUP_MIN_VERSION="${SV2_CONFORMANCE_SETUP_MIN_VERSION:-2}"
+SV2_CONFORMANCE_SETUP_MAX_VERSION="${SV2_CONFORMANCE_SETUP_MAX_VERSION:-2}"
+SV2_CONFORMANCE_SETUP_FLAGS="${SV2_CONFORMANCE_SETUP_FLAGS:-0}"
 SV2_CONFORMANCE_REQUIRE_SETUP_VERSION="${SV2_CONFORMANCE_REQUIRE_SETUP_VERSION:-}"
 SV2_CONFORMANCE_REQUIRE_SETUP_FLAGS_MASK="${SV2_CONFORMANCE_REQUIRE_SETUP_FLAGS_MASK:-0}"
 SV2_CONFORMANCE_FORBID_SETUP_FLAGS_MASK="${SV2_CONFORMANCE_FORBID_SETUP_FLAGS_MASK:-0}"
@@ -48,6 +52,10 @@ run_conformance_target() {
   local require_setup_version="${21:-${SV2_CONFORMANCE_REQUIRE_SETUP_VERSION}}"
   local require_setup_flags_mask="${22:-${SV2_CONFORMANCE_REQUIRE_SETUP_FLAGS_MASK}}"
   local forbid_setup_flags_mask="${23:-${SV2_CONFORMANCE_FORBID_SETUP_FLAGS_MASK}}"
+  local setup_protocol="${24:-${SV2_CONFORMANCE_SETUP_PROTOCOL}}"
+  local setup_min_version="${25:-${SV2_CONFORMANCE_SETUP_MIN_VERSION}}"
+  local setup_max_version="${26:-${SV2_CONFORMANCE_SETUP_MAX_VERSION}}"
+  local setup_flags="${27:-${SV2_CONFORMANCE_SETUP_FLAGS}}"
 
   if [[ -z "${stack_name}" || -z "${endpoint}" ]]; then
     echo "[sv2-matrix] invalid target entry: missing stack_name or endpoint"
@@ -100,6 +108,23 @@ run_conformance_target() {
   if [[ -z "${min_job_messages}" ]]; then
     min_job_messages="${SV2_CONFORMANCE_MIN_JOB_MESSAGES}"
   fi
+  if [[ -z "${setup_protocol}" ]]; then
+    setup_protocol="${SV2_CONFORMANCE_SETUP_PROTOCOL}"
+  fi
+  if [[ -z "${setup_min_version}" ]]; then
+    setup_min_version="${SV2_CONFORMANCE_SETUP_MIN_VERSION}"
+  fi
+  if [[ -z "${setup_max_version}" ]]; then
+    setup_max_version="${SV2_CONFORMANCE_SETUP_MAX_VERSION}"
+  fi
+  if [[ -z "${setup_flags}" ]]; then
+    setup_flags="${SV2_CONFORMANCE_SETUP_FLAGS}"
+  fi
+  if (( setup_min_version > setup_max_version )); then
+    echo "[sv2-matrix] invalid setup version range for ${stack_name}: min=${setup_min_version} max=${setup_max_version}"
+    unexpected_external_failures=$((unexpected_external_failures + 1))
+    return
+  fi
   local effective_corpus="${corpus_override:-${CORPUS}}"
   if [[ -z "${effective_corpus}" ]]; then
     effective_corpus="docs/sv2-corpus/default.json"
@@ -109,6 +134,10 @@ run_conformance_target() {
     --pool "${endpoint}"
     --stack-name "${stack_name}"
     --user "matrix-${stack_name}"
+    --setup-protocol "${setup_protocol}"
+    --setup-min-version "${setup_min_version}"
+    --setup-max-version "${setup_max_version}"
+    --setup-flags "${setup_flags}"
     --read-timeout-sec "${read_timeout_sec}"
     --connect-timeout-sec "${connect_timeout_sec}"
     --connect-retries "${connect_retries}"
@@ -162,7 +191,7 @@ run_conformance_target() {
     rc=$?
   fi
 
-  python3 - <<'PY' "${EXTERNAL_RESULTS_JSONL}" "${stack_name}" "${endpoint}" "${secure}" "${mode}" "${expected}" "${vendor}" "${version}" "${role}" "${read_timeout_sec}" "${connect_timeout_sec}" "${connect_retries}" "${connect_retry_delay_ms}" "${expect_set_target}" "${min_job_messages}" "${workaround}" "${notes}" "${required_observed_kinds}" "${forbidden_observed_kinds}" "${require_setup_version}" "${require_setup_flags_mask}" "${forbid_setup_flags_mask}" "${result}" "${rc}"
+  python3 - <<'PY' "${EXTERNAL_RESULTS_JSONL}" "${stack_name}" "${endpoint}" "${secure}" "${mode}" "${expected}" "${vendor}" "${version}" "${role}" "${read_timeout_sec}" "${connect_timeout_sec}" "${connect_retries}" "${connect_retry_delay_ms}" "${expect_set_target}" "${min_job_messages}" "${workaround}" "${notes}" "${required_observed_kinds}" "${forbidden_observed_kinds}" "${require_setup_version}" "${require_setup_flags_mask}" "${forbid_setup_flags_mask}" "${setup_protocol}" "${setup_min_version}" "${setup_max_version}" "${setup_flags}" "${result}" "${rc}"
 import json
 import pathlib
 import sys
@@ -190,8 +219,12 @@ record = {
     "require_setup_version": int(sys.argv[20]) if sys.argv[20] else None,
     "require_setup_flags_mask": int(sys.argv[21], 0),
     "forbid_setup_flags_mask": int(sys.argv[22], 0),
-    "result": sys.argv[23],
-    "exit_code": int(sys.argv[24]),
+    "setup_protocol": int(sys.argv[23], 0),
+    "setup_min_version": int(sys.argv[24], 0),
+    "setup_max_version": int(sys.argv[25], 0),
+    "setup_flags": int(sys.argv[26], 0),
+    "result": sys.argv[27],
+    "exit_code": int(sys.argv[28]),
 }
 path.parent.mkdir(parents=True, exist_ok=True)
 with path.open("a", encoding="utf-8") as fh:
@@ -259,7 +292,8 @@ if [[ -n "${SV2_EXTERNAL_TARGETS:-}" ]]; then
   # "name,endpoint,secure,mode,secret,expected,vendor,version,role,corpus,read_timeout_sec,\
   #  connect_timeout_sec,connect_retries,connect_retry_delay_ms,expect_set_target,\
   #  min_job_messages,workaround,notes,required_observed_kinds,forbidden_observed_kinds,\
-  #  require_setup_version,require_setup_flags_mask,forbid_setup_flags_mask"
+  #  require_setup_version,require_setup_flags_mask,forbid_setup_flags_mask,setup_protocol,\
+  #  setup_min_version,setup_max_version,setup_flags"
   IFS=';' read -ra targets <<<"${SV2_EXTERNAL_TARGETS}"
   for target in "${targets[@]}"; do
     [[ -z "${target}" ]] && continue
@@ -286,7 +320,11 @@ if [[ -n "${SV2_EXTERNAL_TARGETS:-}" ]]; then
       forbidden_observed_kinds \
       require_setup_version \
       require_setup_flags_mask \
-      forbid_setup_flags_mask <<<"${target}"
+      forbid_setup_flags_mask \
+      setup_protocol \
+      setup_min_version \
+      setup_max_version \
+      setup_flags <<<"${target}"
     run_conformance_target \
       "${stack_name}" \
       "${endpoint}" \
@@ -310,7 +348,11 @@ if [[ -n "${SV2_EXTERNAL_TARGETS:-}" ]]; then
       "${forbidden_observed_kinds:-}" \
       "${require_setup_version:-}" \
       "${require_setup_flags_mask:-0}" \
-      "${forbid_setup_flags_mask:-0}"
+      "${forbid_setup_flags_mask:-0}" \
+      "${setup_protocol:-${SV2_CONFORMANCE_SETUP_PROTOCOL}}" \
+      "${setup_min_version:-${SV2_CONFORMANCE_SETUP_MIN_VERSION}}" \
+      "${setup_max_version:-${SV2_CONFORMANCE_SETUP_MAX_VERSION}}" \
+      "${setup_flags:-${SV2_CONFORMANCE_SETUP_FLAGS}}"
   done
 fi
 
@@ -338,7 +380,11 @@ if [[ -n "${SV2_EXTERNAL_TARGETS_FILE}" ]]; then
     forbidden_observed_kinds \
     require_setup_version \
     require_setup_flags_mask \
-    forbid_setup_flags_mask; do
+    forbid_setup_flags_mask \
+    setup_protocol \
+    setup_min_version \
+    setup_max_version \
+    setup_flags; do
     [[ -z "${stack_name}" ]] && continue
     run_conformance_target \
       "${stack_name}" \
@@ -363,7 +409,11 @@ if [[ -n "${SV2_EXTERNAL_TARGETS_FILE}" ]]; then
       "${forbidden_observed_kinds:-}" \
       "${require_setup_version:-}" \
       "${require_setup_flags_mask:-0}" \
-      "${forbid_setup_flags_mask:-0}"
+      "${forbid_setup_flags_mask:-0}" \
+      "${setup_protocol:-${SV2_CONFORMANCE_SETUP_PROTOCOL}}" \
+      "${setup_min_version:-${SV2_CONFORMANCE_SETUP_MIN_VERSION}}" \
+      "${setup_max_version:-${SV2_CONFORMANCE_SETUP_MAX_VERSION}}" \
+      "${setup_flags:-${SV2_CONFORMANCE_SETUP_FLAGS}}"
   done < <(python3 - <<'PY' "${SV2_EXTERNAL_TARGETS_FILE}"
 import json
 import pathlib
@@ -408,6 +458,10 @@ for target in targets:
                 str(target.get("require_setup_version", "")),
                 str(target.get("require_setup_flags_mask", "0")),
                 str(target.get("forbid_setup_flags_mask", "0")),
+                str(target.get("setup_protocol", "2")),
+                str(target.get("setup_min_version", "2")),
+                str(target.get("setup_max_version", "2")),
+                str(target.get("setup_flags", "0")),
             ]
         )
     )

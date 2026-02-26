@@ -120,18 +120,25 @@ def main() -> int:
         "",
         "## Built-in / Local Targets",
         "",
-        "| stack | endpoint | secure | mode | pass | setup | setup_version | setup_flags | req_version | req_flags | forbid_flags | channel | jobs | min_jobs | set_target | expect_set_target |",
-        "|---|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| stack | endpoint | secure | mode | pass | setup | setup_proto | setup_req_range | setup_req_flags | setup_version | setup_flags | req_version | req_flags | forbid_flags | channel | jobs | min_jobs | set_target | expect_set_target |",
+        "|---|---|---:|---|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for report in reports:
         lines.append(
-            "| {stack} | {endpoint} | {secure} | {mode} | {pass_} | {setup} | {setup_version} | {setup_flags} | {req_version} | {req_flags} | {forbid_flags} | {channel} | {jobs} | {min_jobs} | {target} | {expect_target} |".format(
+            "| {stack} | {endpoint} | {secure} | {mode} | {pass_} | {setup} | {setup_proto} | {setup_req_range} | {setup_req_flags} | {setup_version} | {setup_flags} | {req_version} | {req_flags} | {forbid_flags} | {channel} | {jobs} | {min_jobs} | {target} | {expect_target} |".format(
                 stack=markdown_cell(report.get("stack_name", "unknown")),
                 endpoint=markdown_cell(report.get("endpoint", "unknown")),
                 secure=str(bool(report.get("secure_transport"))).lower(),
                 mode=markdown_cell(report.get("secure_transport_mode", "unknown")),
                 pass_=str(bool(report.get("pass"))).lower(),
                 setup=str(bool(report.get("setup_success"))).lower(),
+                setup_proto=markdown_cell(report.get("setup_protocol", "")),
+                setup_req_range=markdown_cell(
+                    f"[{report.get('setup_min_version', '')},{report.get('setup_max_version', '')}]"
+                ),
+                setup_req_flags=markdown_cell(
+                    f"0x{int(report.get('setup_flags_requested', 0)):08x}"
+                ),
                 setup_version=markdown_cell(report.get("setup_used_version", "")),
                 setup_flags=markdown_cell(
                     f"0x{int(report.get('setup_flags', 0)):08x}"
@@ -195,14 +202,19 @@ def main() -> int:
                 or req_setup_version is not None
                 or req_setup_flags_mask != 0
                 or forbid_setup_flags_mask != 0
+                or int(record.get("setup_protocol", 0)) != 0
             ):
                 lines.append(
-                    "|  |  |  |  |  |  |  |  |  |  |  |  | require={required} forbid={forbidden}; req_setup_version={req_setup_version}; req_setup_flags=0x{req_setup_flags_mask:08x}; forbid_setup_flags=0x{forbid_setup_flags_mask:08x} |  |".format(
+                    "|  |  |  |  |  |  |  |  |  |  |  |  | require={required} forbid={forbidden}; req_setup_version={req_setup_version}; req_setup_flags=0x{req_setup_flags_mask:08x}; forbid_setup_flags=0x{forbid_setup_flags_mask:08x}; setup={{protocol={setup_protocol},min={setup_min},max={setup_max},flags=0x{setup_flags:08x}}} |  |".format(
                         required=markdown_cell(",".join(required)),
                         forbidden=markdown_cell(",".join(forbidden)),
                         req_setup_version=markdown_cell(req_setup_version),
                         req_setup_flags_mask=req_setup_flags_mask,
                         forbid_setup_flags_mask=forbid_setup_flags_mask,
+                        setup_protocol=int(record.get("setup_protocol", 0)),
+                        setup_min=int(record.get("setup_min_version", 0)),
+                        setup_max=int(record.get("setup_max_version", 0)),
+                        setup_flags=int(record.get("setup_flags", 0)),
                     )
                 )
         lines.extend(["", "## Vendor Quirks / Workarounds", ""])

@@ -12,10 +12,19 @@ if [[ -z "${POOL}" ]]; then
   exit 1
 fi
 
+if (( ${SETUP_MIN_VERSION:-2} > ${SETUP_MAX_VERSION:-2} )); then
+  echo "SETUP_MIN_VERSION must be <= SETUP_MAX_VERSION" >&2
+  exit 1
+fi
+
 args=(
   --pool "${POOL}"
   --stack-name "${STACK_NAME}"
   --user "${USER_NAME}"
+  --setup-protocol "${SETUP_PROTOCOL:-2}"
+  --setup-min-version "${SETUP_MIN_VERSION:-2}"
+  --setup-max-version "${SETUP_MAX_VERSION:-2}"
+  --setup-flags "${SETUP_FLAGS:-0}"
   --connect-timeout-sec "${CONNECT_TIMEOUT_SEC:-5}"
   --connect-retries "${CONNECT_RETRIES:-2}"
   --connect-retry-delay-ms "${CONNECT_RETRY_DELAY_MS:-250}"

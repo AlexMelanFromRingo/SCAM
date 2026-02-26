@@ -137,6 +137,10 @@ Strict full-spec style replay (submit-share path + observed-kind gates):
 ```bash
 POOL=203.0.113.20:3347 \
 CORPUS=docs/sv2-corpus/full-spec-submit.json \
+SETUP_PROTOCOL=2 \
+SETUP_MIN_VERSION=2 \
+SETUP_MAX_VERSION=2 \
+SETUP_FLAGS=0 \
 MIN_JOB_MESSAGES=1 \
 EXPECT_SET_TARGET=true \
 REQUIRE_SETUP_VERSION=2 \

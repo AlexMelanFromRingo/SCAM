@@ -29,7 +29,7 @@ where:
 Full tuple (for strict automation and per-vendor quirks capture):
 
 ```text
-name,endpoint,secure,mode,secret_hex,expected,vendor,version,role,corpus,read_timeout_sec,connect_timeout_sec,connect_retries,connect_retry_delay_ms,expect_set_target,min_job_messages,workaround,notes,required_observed_kinds,forbidden_observed_kinds,require_setup_version,require_setup_flags_mask,forbid_setup_flags_mask
+name,endpoint,secure,mode,secret_hex,expected,vendor,version,role,corpus,read_timeout_sec,connect_timeout_sec,connect_retries,connect_retry_delay_ms,expect_set_target,min_job_messages,workaround,notes,required_observed_kinds,forbidden_observed_kinds,require_setup_version,require_setup_flags_mask,forbid_setup_flags_mask,setup_protocol,setup_min_version,setup_max_version,setup_flags
 ```
 
 3. Optional JSON-driven target list (recommended for multi-vendor runs):
@@ -56,6 +56,10 @@ scripts/sv2-conformance-matrix.sh
 - `require_setup_version` (optional, strict `SetupConnectionSuccess.used_version` gate)
 - `require_setup_flags_mask` (optional bitmask, all bits must be present in `SetupConnectionSuccess.flags`)
 - `forbid_setup_flags_mask` (optional bitmask, no bits may be present in `SetupConnectionSuccess.flags`)
+- `setup_protocol` (default `2`)
+- `setup_min_version` (default `2`)
+- `setup_max_version` (default `2`)
+- `setup_flags` (default `0`)
 - `enabled` (optional; `false` skips the row)
 
 The harness writes per-target run status metadata to:
@@ -75,6 +79,10 @@ Connection-hardening knobs for flaky external endpoints:
 - `SV2_CONFORMANCE_REQUIRE_SETUP_VERSION` (optional)
 - `SV2_CONFORMANCE_REQUIRE_SETUP_FLAGS_MASK` (default `0`)
 - `SV2_CONFORMANCE_FORBID_SETUP_FLAGS_MASK` (default `0`)
+- `SV2_CONFORMANCE_SETUP_PROTOCOL` (default `2`)
+- `SV2_CONFORMANCE_SETUP_MIN_VERSION` (default `2`)
+- `SV2_CONFORMANCE_SETUP_MAX_VERSION` (default `2`)
+- `SV2_CONFORMANCE_SETUP_FLAGS` (default `0`)
 
 Target tuple validation is strict for `secure` (`true|false`), `mode` (`legacy|noise-xx`), and
 `expected` (`pass|fail`) to avoid false-positive matrix rows.
