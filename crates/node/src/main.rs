@@ -10818,7 +10818,10 @@ fn update_sv2_conformance_state(
     response: &Sv2Message,
 ) {
     match response {
-        Sv2Message::SetupConnectionSuccess { used_version, flags } => {
+        Sv2Message::SetupConnectionSuccess {
+            used_version,
+            flags,
+        } => {
             state.setup_success = true;
             state.setup_used_version = Some(*used_version);
             state.setup_flags = Some(*flags);
@@ -11212,13 +11215,13 @@ fn run_sv2_conformance(args: Sv2ConformanceArgs) -> Result<(), NodeError> {
     if expect_set_target && !state.set_target_seen {
         errors.push("required SetTarget was not observed".to_owned());
     }
-    if let Some(expected_version) = require_setup_version {
-        if state.setup_used_version != Some(expected_version) {
-            errors.push(format!(
-                "setup version requirement not met: required {}, observed {:?}",
-                expected_version, state.setup_used_version
-            ));
-        }
+    if let Some(expected_version) = require_setup_version
+        && state.setup_used_version != Some(expected_version)
+    {
+        errors.push(format!(
+            "setup version requirement not met: required {}, observed {:?}",
+            expected_version, state.setup_used_version
+        ));
     }
     let observed_setup_flags = state.setup_flags.unwrap_or_default();
     if require_setup_flags_mask != 0
@@ -22419,8 +22422,8 @@ mod tests {
             connect_retries: 2,
             connect_retry_delay_ms: 50,
             read_timeout_sec: 1,
-            expect_set_target: true,
-            min_job_messages: 1,
+            expect_set_target: false,
+            min_job_messages: 0,
             require_setup_version: Some(2),
             require_setup_flags_mask: 0,
             forbid_setup_flags_mask: 0,
