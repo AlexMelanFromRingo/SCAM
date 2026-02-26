@@ -661,16 +661,24 @@ mod tests {
                     .await
                     .expect("timed out waiting for header bytes")
                     .expect("read header");
-                header
+                let payload_len =
+                    u32::from_be_bytes([header[4], header[5], header[6], header[7]]) as usize;
+                let mut payload = vec![0u8; payload_len];
+                tokio::time::timeout(Duration::from_millis(500), rx.read_exact(&mut payload))
+                    .await
+                    .expect("timed out waiting for payload bytes")
+                    .expect("read payload");
+                (header, payload)
             });
 
             writer.await.expect("writer join");
-            let header = reader.await.expect("reader join");
+            let (header, payload) = reader.await.expect("reader join");
             let magic = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
             assert_eq!(magic, FramingConfig::default().magic);
             let payload_len =
                 u32::from_be_bytes([header[4], header[5], header[6], header[7]]) as usize;
             assert!(payload_len > 0);
+            assert_eq!(payload_len, payload.len());
         });
     }
 
