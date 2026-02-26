@@ -4,19 +4,71 @@
     "endpoint": "203.0.113.10:3347",
     "secure": false,
     "mode": "legacy",
+    "role": "translator",
+    "corpus": "docs/sv2-corpus/default.json",
+    "read_timeout_sec": 3,
+    "connect_timeout_sec": 5,
+    "connect_retries": 4,
+    "connect_retry_delay_ms": 300,
+    "expect_set_target": true,
+    "min_job_messages": 1,
+    "required_observed_kinds": [
+      "SetupConnectionSuccess",
+      "OpenStandardMiningChannelSuccess"
+    ],
+    "forbidden_observed_kinds": [
+      "SetupConnectionError",
+      "OpenStandardMiningChannelError"
+    ],
     "secret_hex": "",
     "expected": "pass",
     "vendor": "vendorA",
-    "version": "1.2.3"
+    "version": "1.2.3",
+    "workaround": "requires legacy mode for setup/open path",
+    "notes": "Validated against vendorA release build with strict read timeout."
   },
   {
     "name": "vendorB-noise-v2",
     "endpoint": "203.0.113.11:3347",
     "secure": true,
     "mode": "noise-xx",
+    "role": "mining_proxy",
+    "corpus": "docs/sv2-corpus/default.json",
+    "read_timeout_sec": 5,
+    "connect_timeout_sec": 8,
+    "connect_retries": 5,
+    "connect_retry_delay_ms": 500,
+    "expect_set_target": true,
+    "min_job_messages": 1,
+    "required_observed_kinds": [
+      "SetTarget"
+    ],
+    "forbidden_observed_kinds": [],
     "secret_hex": "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
     "expected": "pass",
     "vendor": "vendorB",
-    "version": "2.0.0"
+    "version": "2.0.0",
+    "workaround": "",
+    "notes": "Noise XX path validated with static key pinning."
+  },
+  {
+    "name": "vendorC-negotiation-regression",
+    "endpoint": "203.0.113.12:3347",
+    "secure": true,
+    "mode": "noise-xx",
+    "role": "proxy",
+    "expect_set_target": false,
+    "min_job_messages": 0,
+    "required_observed_kinds": [
+      "OpenStandardMiningChannelError"
+    ],
+    "forbidden_observed_kinds": [
+      "SetTarget"
+    ],
+    "expected": "fail",
+    "vendor": "vendorC",
+    "version": "0.9.1",
+    "workaround": "known issue: channel opens but does not publish SetTarget",
+    "notes": "Pinned as expected-fail until upstream fix is released."
   }
 ]

@@ -751,6 +751,14 @@ struct Sv2ConformanceArgs {
     #[arg(long, default_value_t = 3)]
     read_timeout_sec: u64,
     #[arg(long, default_value_t = false)]
+    expect_set_target: bool,
+    #[arg(long, default_value_t = 0)]
+    min_job_messages: u32,
+    #[arg(long = "require-observed-kind")]
+    require_observed_kind: Vec<String>,
+    #[arg(long = "forbid-observed-kind")]
+    forbid_observed_kind: Vec<String>,
+    #[arg(long, default_value_t = false)]
     secure_transport: bool,
     #[arg(long, value_enum)]
     secure_transport_mode: Option<SecureTransportModeArg>,
@@ -10727,6 +10735,16 @@ struct Sv2ConformanceReport {
     channel_opened: bool,
     job_messages_seen: u32,
     set_target_seen: bool,
+    submit_success_seen: bool,
+    submit_error_seen: bool,
+    discovered_channel_id: Option<u32>,
+    discovered_job_id: Option<u32>,
+    min_job_messages_required: u32,
+    expect_set_target: bool,
+    required_observed_kinds: Vec<String>,
+    forbidden_observed_kinds: Vec<String>,
+    missing_required_observed_kinds: Vec<String>,
+    forbidden_observed_kinds_seen: Vec<String>,
     pass: bool,
     observed_messages: Vec<String>,
     errors: Vec<String>,
@@ -10768,35 +10786,108 @@ fn default_sv2_conformance_corpus(user: &str) -> Vec<Sv2Message> {
     ]
 }
 
+#[derive(Debug, Clone, Default)]
+struct Sv2ConformanceState {
+    setup_success: bool,
+    channel_opened: bool,
+    job_messages_seen: u32,
+    set_target_seen: bool,
+    submit_success_seen: bool,
+    submit_error_seen: bool,
+    discovered_channel_id: Option<u32>,
+    discovered_job_id: Option<u32>,
+    discovered_job_ntime: Option<u64>,
+}
+
 fn update_sv2_conformance_state(
-    setup_success: &mut bool,
-    channel_opened: &mut bool,
-    job_messages_seen: &mut u32,
-    set_target_seen: &mut bool,
+    state: &mut Sv2ConformanceState,
     errors: &mut Vec<String>,
     response: &Sv2Message,
 ) {
     match response {
-        Sv2Message::SetupConnectionSuccess { .. } => *setup_success = true,
+        Sv2Message::SetupConnectionSuccess { .. } => state.setup_success = true,
         Sv2Message::SetupConnectionError { code, reason } => {
             errors.push(format!("setup error: code={code} reason={reason}"));
         }
-        Sv2Message::OpenStandardMiningChannelSuccess { .. } => *channel_opened = true,
+        Sv2Message::OpenStandardMiningChannelSuccess { channel_id, .. } => {
+            state.channel_opened = true;
+            state.discovered_channel_id = Some(*channel_id);
+        }
         Sv2Message::OpenStandardMiningChannelError { code, reason, .. } => {
             errors.push(format!("open channel error: code={code} reason={reason}"));
         }
-        Sv2Message::NewMiningJob { .. } | Sv2Message::SetNewPrevHash { .. } => {
-            *job_messages_seen = job_messages_seen.saturating_add(1);
+        Sv2Message::NewMiningJob { job_id, ntime, .. }
+        | Sv2Message::SetNewPrevHash { job_id, ntime, .. } => {
+            state.job_messages_seen = state.job_messages_seen.saturating_add(1);
+            state.discovered_job_id = Some(*job_id);
+            state.discovered_job_ntime = Some(*ntime);
         }
         Sv2Message::SetTarget { .. } => {
-            *set_target_seen = true;
+            state.set_target_seen = true;
+        }
+        Sv2Message::SubmitSharesSuccess { .. } => {
+            state.submit_success_seen = true;
+        }
+        Sv2Message::SubmitSharesError { .. } => {
+            state.submit_error_seen = true;
         }
         _ => {}
     }
 }
 
-fn sv2_conformance_pass(setup_success: bool, channel_opened: bool, errors: &[String]) -> bool {
-    setup_success && channel_opened && errors.is_empty()
+fn materialize_sv2_conformance_message(
+    message: Sv2Message,
+    discovered_channel_id: Option<u32>,
+    discovered_job_id: Option<u32>,
+    discovered_job_ntime: Option<u64>,
+) -> Sv2Message {
+    match message {
+        Sv2Message::SubmitSharesStandard {
+            channel_id,
+            job_id,
+            nonce,
+            ntime,
+        } => Sv2Message::SubmitSharesStandard {
+            channel_id: if channel_id == 0 {
+                discovered_channel_id.unwrap_or(0)
+            } else {
+                channel_id
+            },
+            job_id: if job_id == 0 {
+                discovered_job_id.unwrap_or(0)
+            } else {
+                job_id
+            },
+            nonce,
+            ntime: if ntime == 0 {
+                discovered_job_ntime.unwrap_or(0)
+            } else {
+                ntime
+            },
+        },
+        other => other,
+    }
+}
+
+fn sv2_conformance_pass(
+    setup_success: bool,
+    channel_opened: bool,
+    errors: &[String],
+    job_messages_seen: u32,
+    min_job_messages_required: u32,
+    set_target_seen: bool,
+    expect_set_target: bool,
+) -> bool {
+    if !setup_success || !channel_opened || !errors.is_empty() {
+        return false;
+    }
+    if job_messages_seen < min_job_messages_required {
+        return false;
+    }
+    if expect_set_target && !set_target_seen {
+        return false;
+    }
+    true
 }
 
 fn ensure_sv2_conformance_pass(pass: bool) -> Result<(), NodeError> {
@@ -11021,15 +11112,18 @@ fn run_sv2_conformance(args: Sv2ConformanceArgs) -> Result<(), NodeError> {
         )
     };
 
-    let mut setup_success = false;
-    let mut channel_opened = false;
-    let mut job_messages_seen = 0u32;
-    let mut set_target_seen = false;
+    let mut state = Sv2ConformanceState::default();
     let mut observed_messages = Vec::<String>::new();
     let mut errors = Vec::<String>::new();
     let mut steps = Vec::<Sv2ConformanceStep>::new();
 
     for message in corpus {
+        let message = materialize_sv2_conformance_message(
+            message,
+            state.discovered_channel_id,
+            state.discovered_job_id,
+            state.discovered_job_ntime,
+        );
         let sent = sv2_message_kind(&message).to_owned();
         send_sv2_sync!(&message);
         let received = match read_next_sv2_message_with(3, || {
@@ -11038,14 +11132,7 @@ fn run_sv2_conformance(args: Sv2ConformanceArgs) -> Result<(), NodeError> {
             Some(response) => {
                 let kind = sv2_message_kind(&response).to_owned();
                 observed_messages.push(kind.clone());
-                update_sv2_conformance_state(
-                    &mut setup_success,
-                    &mut channel_opened,
-                    &mut job_messages_seen,
-                    &mut set_target_seen,
-                    &mut errors,
-                    &response,
-                );
+                update_sv2_conformance_state(&mut state, &mut errors, &response);
                 Some(kind)
             }
             None => None,
@@ -11062,17 +11149,58 @@ fn run_sv2_conformance(args: Sv2ConformanceArgs) -> Result<(), NodeError> {
         };
         let kind = sv2_message_kind(&msg).to_owned();
         observed_messages.push(kind.clone());
-        update_sv2_conformance_state(
-            &mut setup_success,
-            &mut channel_opened,
-            &mut job_messages_seen,
-            &mut set_target_seen,
-            &mut errors,
-            &msg,
-        );
+        update_sv2_conformance_state(&mut state, &mut errors, &msg);
     }
 
-    let pass = sv2_conformance_pass(setup_success, channel_opened, &errors);
+    let min_job_messages_required = args.min_job_messages;
+    let expect_set_target = args.expect_set_target;
+    let required_observed_kinds = args
+        .require_observed_kind
+        .iter()
+        .map(|kind| kind.trim())
+        .filter(|kind| !kind.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    let forbidden_observed_kinds = args
+        .forbid_observed_kind
+        .iter()
+        .map(|kind| kind.trim())
+        .filter(|kind| !kind.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    let observed_kinds = observed_messages.iter().cloned().collect::<HashSet<_>>();
+    let mut missing_required_observed_kinds = Vec::<String>::new();
+    let mut forbidden_observed_kinds_seen = Vec::<String>::new();
+    for kind in &required_observed_kinds {
+        if !observed_kinds.contains(kind) {
+            missing_required_observed_kinds.push(kind.clone());
+            errors.push(format!("required observed message kind missing: {kind}"));
+        }
+    }
+    for kind in &forbidden_observed_kinds {
+        if observed_kinds.contains(kind) {
+            forbidden_observed_kinds_seen.push(kind.clone());
+            errors.push(format!("forbidden observed message kind present: {kind}"));
+        }
+    }
+    if state.job_messages_seen < min_job_messages_required {
+        errors.push(format!(
+            "job message requirement not met: required >= {}, observed {}",
+            min_job_messages_required, state.job_messages_seen
+        ));
+    }
+    if expect_set_target && !state.set_target_seen {
+        errors.push("required SetTarget was not observed".to_owned());
+    }
+    let pass = sv2_conformance_pass(
+        state.setup_success,
+        state.channel_opened,
+        &errors,
+        state.job_messages_seen,
+        min_job_messages_required,
+        state.set_target_seen,
+        expect_set_target,
+    );
     let report = Sv2ConformanceReport {
         timestamp_unix_sec: current_unix_sec()?,
         stack_name: args
@@ -11083,10 +11211,20 @@ fn run_sv2_conformance(args: Sv2ConformanceArgs) -> Result<(), NodeError> {
         secure_transport: args.secure_transport,
         secure_transport_mode: secure_transport_mode.as_str().to_owned(),
         corpus_source,
-        setup_success,
-        channel_opened,
-        job_messages_seen,
-        set_target_seen,
+        setup_success: state.setup_success,
+        channel_opened: state.channel_opened,
+        job_messages_seen: state.job_messages_seen,
+        set_target_seen: state.set_target_seen,
+        submit_success_seen: state.submit_success_seen,
+        submit_error_seen: state.submit_error_seen,
+        discovered_channel_id: state.discovered_channel_id,
+        discovered_job_id: state.discovered_job_id,
+        min_job_messages_required,
+        expect_set_target,
+        required_observed_kinds,
+        forbidden_observed_kinds,
+        missing_required_observed_kinds,
+        forbidden_observed_kinds_seen,
         pass,
         observed_messages,
         errors,
@@ -17367,17 +17505,11 @@ mod tests {
 
     #[test]
     fn sv2_conformance_state_helpers_track_messages_and_pass_gate() {
-        let mut setup_success = false;
-        let mut channel_opened = false;
-        let mut job_messages_seen = 0u32;
-        let mut set_target_seen = false;
+        let mut state = super::Sv2ConformanceState::default();
         let mut errors = Vec::<String>::new();
 
         super::update_sv2_conformance_state(
-            &mut setup_success,
-            &mut channel_opened,
-            &mut job_messages_seen,
-            &mut set_target_seen,
+            &mut state,
             &mut errors,
             &Sv2Message::SetupConnectionSuccess {
                 used_version: 2,
@@ -17385,10 +17517,7 @@ mod tests {
             },
         );
         super::update_sv2_conformance_state(
-            &mut setup_success,
-            &mut channel_opened,
-            &mut job_messages_seen,
-            &mut set_target_seen,
+            &mut state,
             &mut errors,
             &Sv2Message::OpenStandardMiningChannelSuccess {
                 request_id: 1,
@@ -17398,10 +17527,7 @@ mod tests {
             },
         );
         super::update_sv2_conformance_state(
-            &mut setup_success,
-            &mut channel_opened,
-            &mut job_messages_seen,
-            &mut set_target_seen,
+            &mut state,
             &mut errors,
             &Sv2Message::NewMiningJob {
                 channel_id: 2,
@@ -17414,32 +17540,51 @@ mod tests {
             },
         );
         super::update_sv2_conformance_state(
-            &mut setup_success,
-            &mut channel_opened,
-            &mut job_messages_seen,
-            &mut set_target_seen,
+            &mut state,
             &mut errors,
             &Sv2Message::SetTarget {
                 channel_id: 2,
                 maximum_target_hex: Target::MAX.to_hex(),
             },
         );
-        assert!(setup_success);
-        assert!(channel_opened);
-        assert_eq!(job_messages_seen, 1);
-        assert!(set_target_seen);
+        assert!(state.setup_success);
+        assert!(state.channel_opened);
+        assert_eq!(state.job_messages_seen, 1);
+        assert!(state.set_target_seen);
+        assert_eq!(state.discovered_channel_id, Some(2));
+        assert_eq!(state.discovered_job_id, Some(42));
+        assert_eq!(state.discovered_job_ntime, Some(1_800_000_000));
         assert!(errors.is_empty());
         assert!(super::sv2_conformance_pass(
-            setup_success,
-            channel_opened,
-            &errors
+            state.setup_success,
+            state.channel_opened,
+            &errors,
+            state.job_messages_seen,
+            1,
+            state.set_target_seen,
+            true
+        ));
+        assert!(!super::sv2_conformance_pass(
+            state.setup_success,
+            state.channel_opened,
+            &errors,
+            state.job_messages_seen,
+            2,
+            state.set_target_seen,
+            true
+        ));
+        assert!(!super::sv2_conformance_pass(
+            state.setup_success,
+            state.channel_opened,
+            &errors,
+            state.job_messages_seen,
+            1,
+            false,
+            true
         ));
 
         super::update_sv2_conformance_state(
-            &mut setup_success,
-            &mut channel_opened,
-            &mut job_messages_seen,
-            &mut set_target_seen,
+            &mut state,
             &mut errors,
             &Sv2Message::SetupConnectionError {
                 code: "bad".to_owned(),
@@ -17447,10 +17592,7 @@ mod tests {
             },
         );
         super::update_sv2_conformance_state(
-            &mut setup_success,
-            &mut channel_opened,
-            &mut job_messages_seen,
-            &mut set_target_seen,
+            &mut state,
             &mut errors,
             &Sv2Message::OpenStandardMiningChannelError {
                 request_id: 7,
@@ -17470,12 +17612,40 @@ mod tests {
             "open channel errors must be retained in report state"
         );
         assert!(!super::sv2_conformance_pass(
-            setup_success,
-            channel_opened,
-            &errors
+            state.setup_success,
+            state.channel_opened,
+            &errors,
+            state.job_messages_seen,
+            1,
+            state.set_target_seen,
+            true
         ));
         super::ensure_sv2_conformance_pass(false).expect_err("must fail on false pass flag");
         super::ensure_sv2_conformance_pass(true).expect("must pass on true flag");
+    }
+
+    #[test]
+    fn materialize_sv2_conformance_message_autofills_submit_context() {
+        let filled = super::materialize_sv2_conformance_message(
+            Sv2Message::SubmitSharesStandard {
+                channel_id: 0,
+                job_id: 0,
+                nonce: 7,
+                ntime: 0,
+            },
+            Some(11),
+            Some(22),
+            Some(1_900_000_000),
+        );
+        assert_eq!(
+            filled,
+            Sv2Message::SubmitSharesStandard {
+                channel_id: 11,
+                job_id: 22,
+                nonce: 7,
+                ntime: 1_900_000_000,
+            }
+        );
     }
 
     #[test]
@@ -22201,6 +22371,10 @@ mod tests {
             connect_retries: 2,
             connect_retry_delay_ms: 50,
             read_timeout_sec: 1,
+            expect_set_target: true,
+            min_job_messages: 1,
+            require_observed_kind: Vec::new(),
+            forbid_observed_kind: Vec::new(),
             secure_transport: false,
             secure_transport_mode: None,
             secure_rekey_interval_messages: 10_000,
@@ -22306,6 +22480,10 @@ mod tests {
             connect_retries: 2,
             connect_retry_delay_ms: 50,
             read_timeout_sec: 1,
+            expect_set_target: true,
+            min_job_messages: 1,
+            require_observed_kind: Vec::new(),
+            forbid_observed_kind: Vec::new(),
             secure_transport: false,
             secure_transport_mode: None,
             secure_rekey_interval_messages: 10_000,
@@ -22333,6 +22511,183 @@ mod tests {
                 .iter()
                 .any(|entry| { entry.as_str().unwrap_or_default().contains("setup error") }),
             "expected setup error entry"
+        );
+
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
+    fn sv2_conformance_submit_corpus_autofills_context_and_observes_submit_success() {
+        let _net_guard = network_test_guard();
+        let Some(addr) = allocate_local_addr() else {
+            return;
+        };
+        let listener = match TcpListener::bind(&addr) {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("bind failed: {err}"),
+        };
+        let work_dir = temp_dir("test-sv2-conformance-submit-autofill");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let report_path = work_dir.join("report.json");
+        let corpus_path = work_dir.join("corpus.json");
+        fs::write(
+            &corpus_path,
+            r#"{
+  "messages": [
+    {"SetupConnection":{"protocol":2,"min_version":2,"max_version":2,"flags":0,"user_agent":"scam-corpus/full-spec"}},
+    {"OpenStandardMiningChannel":{"request_id":1,"user":"corpus-miner"}},
+    "KeepAlive",
+    {"SubmitSharesStandard":{"channel_id":0,"job_id":0,"nonce":7,"ntime":0}},
+    "KeepAlive"
+  ]
+}"#,
+        )
+        .expect("write corpus");
+
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("set read timeout");
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .expect("set write timeout");
+
+            let setup = read_frame(&mut stream).expect("read setup").expect("setup");
+            assert!(matches!(setup, Sv2Message::SetupConnection { .. }));
+            write_frame(
+                &mut stream,
+                &Sv2Message::SetupConnectionSuccess {
+                    used_version: 2,
+                    flags: 0,
+                },
+            )
+            .expect("write setup success");
+
+            let open = read_frame(&mut stream).expect("read open").expect("open");
+            let request_id = match open {
+                Sv2Message::OpenStandardMiningChannel { request_id, .. } => request_id,
+                other => panic!("unexpected open message: {other:?}"),
+            };
+            write_frame(
+                &mut stream,
+                &Sv2Message::OpenStandardMiningChannelSuccess {
+                    request_id,
+                    channel_id: 9,
+                    target_hex: scam_core::Target::MAX.to_hex(),
+                    extranonce_prefix_hex: "00000009".to_owned(),
+                },
+            )
+            .expect("write open success");
+
+            let keepalive = read_frame(&mut stream)
+                .expect("read keepalive")
+                .expect("keepalive");
+            assert!(matches!(keepalive, Sv2Message::KeepAlive));
+            write_frame(
+                &mut stream,
+                &Sv2Message::NewMiningJob {
+                    channel_id: 9,
+                    job_id: 44,
+                    version: 1,
+                    prev_hash_hex: Hash256::ZERO.to_hex(),
+                    merkle_root_hex: Hash256::ZERO.to_hex(),
+                    ntime: 1_900_000_000,
+                    network_target_hex: scam_core::Target::MAX.to_hex(),
+                },
+            )
+            .expect("write mining job");
+
+            let submit = read_frame(&mut stream)
+                .expect("read submit")
+                .expect("submit");
+            match submit {
+                Sv2Message::SubmitSharesStandard {
+                    channel_id,
+                    job_id,
+                    nonce,
+                    ntime,
+                } => {
+                    assert_eq!(channel_id, 9);
+                    assert_eq!(job_id, 44);
+                    assert_eq!(nonce, 7);
+                    assert_eq!(ntime, 1_900_000_000);
+                }
+                other => panic!("unexpected submit message: {other:?}"),
+            }
+            write_frame(
+                &mut stream,
+                &Sv2Message::SubmitSharesSuccess {
+                    channel_id: 9,
+                    accepted: 1,
+                    is_block: false,
+                },
+            )
+            .expect("write submit success");
+
+            let keepalive2 = read_frame(&mut stream)
+                .expect("read keepalive2")
+                .expect("keepalive2");
+            assert!(matches!(keepalive2, Sv2Message::KeepAlive));
+            write_frame(
+                &mut stream,
+                &Sv2Message::SetTarget {
+                    channel_id: 9,
+                    maximum_target_hex: scam_core::Target::MAX.to_hex(),
+                },
+            )
+            .expect("write set target");
+        });
+
+        run_sv2_conformance(Sv2ConformanceArgs {
+            pool: addr,
+            user: "sv2-submit-autofill".to_owned(),
+            connect_timeout_sec: 2,
+            connect_retries: 2,
+            connect_retry_delay_ms: 50,
+            read_timeout_sec: 1,
+            expect_set_target: true,
+            min_job_messages: 1,
+            require_observed_kind: vec![
+                "SetupConnectionSuccess".to_owned(),
+                "OpenStandardMiningChannelSuccess".to_owned(),
+                "SubmitSharesSuccess".to_owned(),
+                "SetTarget".to_owned(),
+            ],
+            forbid_observed_kind: vec!["SubmitSharesError".to_owned()],
+            secure_transport: false,
+            secure_transport_mode: None,
+            secure_rekey_interval_messages: 10_000,
+            secure_static_secret_key_hex: None,
+            secure_expected_remote_static_pubkey_hex: None,
+            corpus: Some(corpus_path.clone()),
+            out: Some(report_path.clone()),
+            stack_name: Some("mock-submit-autofill".to_owned()),
+        })
+        .expect("conformance should pass with submit autofill");
+        join_with_timeout(
+            server,
+            Duration::from_secs(5),
+            "sv2 conformance submit autofill server",
+        );
+
+        let rendered = fs::read_to_string(&report_path).expect("read report");
+        let report: serde_json::Value = serde_json::from_str(&rendered).expect("parse report");
+        assert_eq!(report["pass"], serde_json::Value::Bool(true));
+        assert_eq!(report["submit_success_seen"], serde_json::Value::Bool(true));
+        assert_eq!(report["submit_error_seen"], serde_json::Value::Bool(false));
+        assert_eq!(
+            report["discovered_channel_id"],
+            serde_json::Value::from(9u64)
+        );
+        assert_eq!(report["discovered_job_id"], serde_json::Value::from(44u64));
+        assert_eq!(
+            report["missing_required_observed_kinds"]
+                .as_array()
+                .expect("missing kinds")
+                .len(),
+            0
         );
 
         let _ = fs::remove_dir_all(work_dir);
@@ -23635,6 +23990,10 @@ mod tests {
             connect_retries: 0,
             connect_retry_delay_ms: 10,
             read_timeout_sec: 1,
+            expect_set_target: false,
+            min_job_messages: 0,
+            require_observed_kind: Vec::new(),
+            forbid_observed_kind: Vec::new(),
             secure_transport: false,
             secure_transport_mode: None,
             secure_rekey_interval_messages: 10_000,

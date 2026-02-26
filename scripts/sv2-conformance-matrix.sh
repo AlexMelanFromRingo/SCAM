@@ -11,6 +11,11 @@ EXTERNAL_RESULTS_JSONL="${OUT_DIR}/external-target-results.jsonl"
 SV2_CONFORMANCE_CONNECT_TIMEOUT_SEC="${SV2_CONFORMANCE_CONNECT_TIMEOUT_SEC:-5}"
 SV2_CONFORMANCE_CONNECT_RETRIES="${SV2_CONFORMANCE_CONNECT_RETRIES:-4}"
 SV2_CONFORMANCE_CONNECT_RETRY_DELAY_MS="${SV2_CONFORMANCE_CONNECT_RETRY_DELAY_MS:-300}"
+SV2_CONFORMANCE_READ_TIMEOUT_SEC="${SV2_CONFORMANCE_READ_TIMEOUT_SEC:-3}"
+SV2_CONFORMANCE_MIN_JOB_MESSAGES="${SV2_CONFORMANCE_MIN_JOB_MESSAGES:-1}"
+SV2_CONFORMANCE_EXPECT_SET_TARGET="${SV2_CONFORMANCE_EXPECT_SET_TARGET:-true}"
+SV2_CONFORMANCE_REQUIRED_OBSERVED_KINDS="${SV2_CONFORMANCE_REQUIRED_OBSERVED_KINDS:-}"
+SV2_CONFORMANCE_FORBIDDEN_OBSERVED_KINDS="${SV2_CONFORMANCE_FORBIDDEN_OBSERVED_KINDS:-}"
 unexpected_external_failures=0
 
 mkdir -p "${OUT_DIR}"
@@ -25,6 +30,18 @@ run_conformance_target() {
   local expected="${6:-pass}"
   local vendor="${7:-}"
   local version="${8:-}"
+  local role="${9:-mining_proxy}"
+  local corpus_override="${10:-}"
+  local read_timeout_sec="${11:-${SV2_CONFORMANCE_READ_TIMEOUT_SEC}}"
+  local connect_timeout_sec="${12:-${SV2_CONFORMANCE_CONNECT_TIMEOUT_SEC}}"
+  local connect_retries="${13:-${SV2_CONFORMANCE_CONNECT_RETRIES}}"
+  local connect_retry_delay_ms="${14:-${SV2_CONFORMANCE_CONNECT_RETRY_DELAY_MS}}"
+  local expect_set_target="${15:-${SV2_CONFORMANCE_EXPECT_SET_TARGET}}"
+  local min_job_messages="${16:-${SV2_CONFORMANCE_MIN_JOB_MESSAGES}}"
+  local workaround="${17:-}"
+  local notes="${18:-}"
+  local required_observed_kinds="${19:-${SV2_CONFORMANCE_REQUIRED_OBSERVED_KINDS}}"
+  local forbidden_observed_kinds="${20:-${SV2_CONFORMANCE_FORBIDDEN_OBSERVED_KINDS}}"
 
   if [[ -z "${stack_name}" || -z "${endpoint}" ]]; then
     echo "[sv2-matrix] invalid target entry: missing stack_name or endpoint"
@@ -55,17 +72,62 @@ run_conformance_target() {
       expected="pass"
       ;;
   esac
+  case "${expect_set_target}" in
+    true|false) ;;
+    *)
+      echo "[sv2-matrix] warning: expect_set_target must be true|false for ${stack_name}; got '${expect_set_target}', forcing true"
+      expect_set_target="true"
+      ;;
+  esac
+  if [[ -z "${read_timeout_sec}" ]]; then
+    read_timeout_sec="${SV2_CONFORMANCE_READ_TIMEOUT_SEC}"
+  fi
+  if [[ -z "${connect_timeout_sec}" ]]; then
+    connect_timeout_sec="${SV2_CONFORMANCE_CONNECT_TIMEOUT_SEC}"
+  fi
+  if [[ -z "${connect_retries}" ]]; then
+    connect_retries="${SV2_CONFORMANCE_CONNECT_RETRIES}"
+  fi
+  if [[ -z "${connect_retry_delay_ms}" ]]; then
+    connect_retry_delay_ms="${SV2_CONFORMANCE_CONNECT_RETRY_DELAY_MS}"
+  fi
+  if [[ -z "${min_job_messages}" ]]; then
+    min_job_messages="${SV2_CONFORMANCE_MIN_JOB_MESSAGES}"
+  fi
+  local effective_corpus="${corpus_override:-${CORPUS}}"
+  if [[ -z "${effective_corpus}" ]]; then
+    effective_corpus="docs/sv2-corpus/default.json"
+  fi
 
   local args=(
     --pool "${endpoint}"
     --stack-name "${stack_name}"
     --user "matrix-${stack_name}"
-    --connect-timeout-sec "${SV2_CONFORMANCE_CONNECT_TIMEOUT_SEC}"
-    --connect-retries "${SV2_CONFORMANCE_CONNECT_RETRIES}"
-    --connect-retry-delay-ms "${SV2_CONFORMANCE_CONNECT_RETRY_DELAY_MS}"
-    --corpus "${CORPUS}"
+    --read-timeout-sec "${read_timeout_sec}"
+    --connect-timeout-sec "${connect_timeout_sec}"
+    --connect-retries "${connect_retries}"
+    --connect-retry-delay-ms "${connect_retry_delay_ms}"
+    --min-job-messages "${min_job_messages}"
+    --corpus "${effective_corpus}"
     --out "${OUT_DIR}/${stack_name}.json"
   )
+  if [[ "${expect_set_target}" == "true" ]]; then
+    args+=(--expect-set-target)
+  fi
+  if [[ -n "${required_observed_kinds}" ]]; then
+    IFS=';' read -ra required_kinds <<<"${required_observed_kinds}"
+    for kind in "${required_kinds[@]}"; do
+      [[ -z "${kind}" ]] && continue
+      args+=(--require-observed-kind "${kind}")
+    done
+  fi
+  if [[ -n "${forbidden_observed_kinds}" ]]; then
+    IFS=';' read -ra forbidden_kinds <<<"${forbidden_observed_kinds}"
+    for kind in "${forbidden_kinds[@]}"; do
+      [[ -z "${kind}" ]] && continue
+      args+=(--forbid-observed-kind "${kind}")
+    done
+  fi
   if [[ "${secure}" == "true" ]]; then
     args+=(--secure-transport)
   fi
@@ -85,7 +147,7 @@ run_conformance_target() {
     rc=$?
   fi
 
-  python3 - <<'PY' "${EXTERNAL_RESULTS_JSONL}" "${stack_name}" "${endpoint}" "${secure}" "${mode}" "${expected}" "${vendor}" "${version}" "${result}" "${rc}"
+  python3 - <<'PY' "${EXTERNAL_RESULTS_JSONL}" "${stack_name}" "${endpoint}" "${secure}" "${mode}" "${expected}" "${vendor}" "${version}" "${role}" "${read_timeout_sec}" "${connect_timeout_sec}" "${connect_retries}" "${connect_retry_delay_ms}" "${expect_set_target}" "${min_job_messages}" "${workaround}" "${notes}" "${required_observed_kinds}" "${forbidden_observed_kinds}" "${result}" "${rc}"
 import json
 import pathlib
 import sys
@@ -99,8 +161,19 @@ record = {
     "expected": sys.argv[6],
     "vendor": sys.argv[7] or None,
     "version": sys.argv[8] or None,
-    "result": sys.argv[9],
-    "exit_code": int(sys.argv[10]),
+    "role": sys.argv[9] or None,
+    "read_timeout_sec": int(sys.argv[10]),
+    "connect_timeout_sec": int(sys.argv[11]),
+    "connect_retries": int(sys.argv[12]),
+    "connect_retry_delay_ms": int(sys.argv[13]),
+    "expect_set_target": sys.argv[14] == "true",
+    "min_job_messages": int(sys.argv[15]),
+    "workaround": sys.argv[16] or None,
+    "notes": sys.argv[17] or None,
+    "required_observed_kinds": [k for k in sys.argv[18].split(";") if k],
+    "forbidden_observed_kinds": [k for k in sys.argv[19].split(";") if k],
+    "result": sys.argv[20],
+    "exit_code": int(sys.argv[21]),
 }
 path.parent.mkdir(parents=True, exist_ok=True)
 with path.open("a", encoding="utf-8") as fh:
@@ -163,11 +236,35 @@ run_conformance_target "scam-local-noise-xx" "${SECURE_POOL_BIND}" "true" "noise
 wait "${secure_pid}" || true
 
 if [[ -n "${SV2_EXTERNAL_TARGETS:-}" ]]; then
-  # Format: "name,host:port,secure,mode,secret_hex;name2,host:port,secure,mode,secret_hex"
+  # Legacy format: "name,host:port,secure,mode,secret_hex,expected,vendor,version"
+  # Extended format:
+  # "name,endpoint,secure,mode,secret,expected,vendor,version,role,corpus,read_timeout_sec,\
+  #  connect_timeout_sec,connect_retries,connect_retry_delay_ms,expect_set_target,\
+  #  min_job_messages,workaround,notes"
   IFS=';' read -ra targets <<<"${SV2_EXTERNAL_TARGETS}"
   for target in "${targets[@]}"; do
     [[ -z "${target}" ]] && continue
-    IFS=',' read -r stack_name endpoint secure mode secret expected vendor version <<<"${target}"
+    IFS=',' read -r \
+      stack_name \
+      endpoint \
+      secure \
+      mode \
+      secret \
+      expected \
+      vendor \
+      version \
+      role \
+      corpus_override \
+      read_timeout_sec \
+      connect_timeout_sec \
+      connect_retries \
+      connect_retry_delay_ms \
+      expect_set_target \
+      min_job_messages \
+      workaround \
+      notes \
+      required_observed_kinds \
+      forbidden_observed_kinds <<<"${target}"
     run_conformance_target \
       "${stack_name}" \
       "${endpoint}" \
@@ -176,12 +273,44 @@ if [[ -n "${SV2_EXTERNAL_TARGETS:-}" ]]; then
       "${secret:-}" \
       "${expected:-pass}" \
       "${vendor:-}" \
-      "${version:-}"
+      "${version:-}" \
+      "${role:-mining_proxy}" \
+      "${corpus_override:-}" \
+      "${read_timeout_sec:-${SV2_CONFORMANCE_READ_TIMEOUT_SEC}}" \
+      "${connect_timeout_sec:-${SV2_CONFORMANCE_CONNECT_TIMEOUT_SEC}}" \
+      "${connect_retries:-${SV2_CONFORMANCE_CONNECT_RETRIES}}" \
+      "${connect_retry_delay_ms:-${SV2_CONFORMANCE_CONNECT_RETRY_DELAY_MS}}" \
+      "${expect_set_target:-${SV2_CONFORMANCE_EXPECT_SET_TARGET}}" \
+      "${min_job_messages:-${SV2_CONFORMANCE_MIN_JOB_MESSAGES}}" \
+      "${workaround:-}" \
+      "${notes:-}" \
+      "${required_observed_kinds:-}" \
+      "${forbidden_observed_kinds:-}"
   done
 fi
 
 if [[ -n "${SV2_EXTERNAL_TARGETS_FILE}" ]]; then
-  while IFS=$'\t' read -r stack_name endpoint secure mode secret expected vendor version; do
+  while IFS=$'\t' read -r \
+    stack_name \
+    endpoint \
+    secure \
+    mode \
+    secret \
+    expected \
+    vendor \
+    version \
+    role \
+    corpus_override \
+    read_timeout_sec \
+    connect_timeout_sec \
+    connect_retries \
+    connect_retry_delay_ms \
+    expect_set_target \
+    min_job_messages \
+    workaround \
+    notes \
+    required_observed_kinds \
+    forbidden_observed_kinds; do
     [[ -z "${stack_name}" ]] && continue
     run_conformance_target \
       "${stack_name}" \
@@ -191,7 +320,19 @@ if [[ -n "${SV2_EXTERNAL_TARGETS_FILE}" ]]; then
       "${secret:-}" \
       "${expected:-pass}" \
       "${vendor:-}" \
-      "${version:-}"
+      "${version:-}" \
+      "${role:-mining_proxy}" \
+      "${corpus_override:-}" \
+      "${read_timeout_sec:-${SV2_CONFORMANCE_READ_TIMEOUT_SEC}}" \
+      "${connect_timeout_sec:-${SV2_CONFORMANCE_CONNECT_TIMEOUT_SEC}}" \
+      "${connect_retries:-${SV2_CONFORMANCE_CONNECT_RETRIES}}" \
+      "${connect_retry_delay_ms:-${SV2_CONFORMANCE_CONNECT_RETRY_DELAY_MS}}" \
+      "${expect_set_target:-${SV2_CONFORMANCE_EXPECT_SET_TARGET}}" \
+      "${min_job_messages:-${SV2_CONFORMANCE_MIN_JOB_MESSAGES}}" \
+      "${workaround:-}" \
+      "${notes:-}" \
+      "${required_observed_kinds:-}" \
+      "${forbidden_observed_kinds:-}"
   done < <(python3 - <<'PY' "${SV2_EXTERNAL_TARGETS_FILE}"
 import json
 import pathlib
@@ -199,7 +340,17 @@ import sys
 
 path = pathlib.Path(sys.argv[1])
 targets = json.loads(path.read_text(encoding="utf-8"))
+
+def join_kinds(value):
+    if isinstance(value, list):
+        return ";".join(str(item) for item in value if str(item))
+    if isinstance(value, str):
+        return value
+    return ""
+
 for target in targets:
+    if target.get("enabled", True) is False:
+        continue
     print(
         "\t".join(
             [
@@ -211,6 +362,18 @@ for target in targets:
                 str(target.get("expected", "pass")),
                 str(target.get("vendor", "")),
                 str(target.get("version", "")),
+                str(target.get("role", "mining_proxy")),
+                str(target.get("corpus", "")),
+                str(target.get("read_timeout_sec", "")),
+                str(target.get("connect_timeout_sec", "")),
+                str(target.get("connect_retries", "")),
+                str(target.get("connect_retry_delay_ms", "")),
+                "true" if bool(target.get("expect_set_target", True)) else "false",
+                str(target.get("min_job_messages", "")),
+                str(target.get("workaround", "")),
+                str(target.get("notes", "")),
+                join_kinds(target.get("required_observed_kinds", [])),
+                join_kinds(target.get("forbidden_observed_kinds", [])),
             ]
         )
     )

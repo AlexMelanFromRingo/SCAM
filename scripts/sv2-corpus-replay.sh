@@ -16,9 +16,31 @@ args=(
   --pool "${POOL}"
   --stack-name "${STACK_NAME}"
   --user "${USER_NAME}"
+  --connect-timeout-sec "${CONNECT_TIMEOUT_SEC:-5}"
+  --connect-retries "${CONNECT_RETRIES:-2}"
+  --connect-retry-delay-ms "${CONNECT_RETRY_DELAY_MS:-250}"
+  --min-job-messages "${MIN_JOB_MESSAGES:-0}"
   --corpus "${CORPUS}"
   --out "${OUT}"
 )
+
+if [[ "${EXPECT_SET_TARGET:-false}" == "true" ]]; then
+  args+=(--expect-set-target)
+fi
+if [[ -n "${REQUIRE_OBSERVED_KINDS:-}" ]]; then
+  IFS=';' read -ra kinds <<<"${REQUIRE_OBSERVED_KINDS}"
+  for kind in "${kinds[@]}"; do
+    [[ -z "${kind}" ]] && continue
+    args+=(--require-observed-kind "${kind}")
+  done
+fi
+if [[ -n "${FORBID_OBSERVED_KINDS:-}" ]]; then
+  IFS=';' read -ra kinds <<<"${FORBID_OBSERVED_KINDS}"
+  for kind in "${kinds[@]}"; do
+    [[ -z "${kind}" ]] && continue
+    args+=(--forbid-observed-kind "${kind}")
+  done
+fi
 
 if [[ "${SECURE_TRANSPORT:-false}" == "true" ]]; then
   args+=(--secure-transport)
@@ -35,4 +57,3 @@ fi
 
 cargo run -p scam-node -- sv2-conformance "${args[@]}"
 echo "[sv2-corpus] report=${OUT}"
-

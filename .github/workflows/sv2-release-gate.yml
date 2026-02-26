@@ -1,0 +1,46 @@
+name: SV2 Release Gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      require_external:
+        description: "Fail if no external target rows are executed"
+        required: true
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+jobs:
+  sv2-release-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: scam-rust-${{ runner.os }}
+          workspaces: |
+            . -> target
+      - name: Prepare optional external target manifest
+        env:
+          TARGETS_JSON: ${{ secrets.SV2_EXTERNAL_TARGETS_JSON }}
+        run: |
+          if [[ -n "${TARGETS_JSON}" ]]; then
+            mkdir -p target/sv2-release-gate
+            printf '%s\n' "${TARGETS_JSON}" > target/sv2-release-gate/external-targets.json
+            echo "SV2_EXTERNAL_TARGETS_FILE=target/sv2-release-gate/external-targets.json" >> "${GITHUB_ENV}"
+          fi
+      - name: Run release gate
+        env:
+          REQUIRE_EXTERNAL: ${{ inputs.require_external }}
+          OUT_DIR: target/sv2-release-gate
+        run: scripts/sv2-release-gate.sh
+      - name: Upload release gate artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sv2-release-gate
+          path: target/sv2-release-gate

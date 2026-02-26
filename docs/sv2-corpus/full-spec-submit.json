@@ -1,0 +1,29 @@
+{
+  "messages": [
+    {
+      "SetupConnection": {
+        "protocol": 2,
+        "min_version": 2,
+        "max_version": 2,
+        "flags": 0,
+        "user_agent": "scam-node/sv2-conformance-fullspec"
+      }
+    },
+    {
+      "OpenStandardMiningChannel": {
+        "request_id": 1,
+        "user": "sv2-fullspec"
+      }
+    },
+    "KeepAlive",
+    {
+      "SubmitSharesStandard": {
+        "channel_id": 0,
+        "job_id": 0,
+        "nonce": 0,
+        "ntime": 0
+      }
+    },
+    "KeepAlive"
+  ]
+}

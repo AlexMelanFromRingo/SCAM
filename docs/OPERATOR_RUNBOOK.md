@@ -132,6 +132,32 @@ Direct corpus replay to a target endpoint:
 POOL=203.0.113.20:3347 scripts/sv2-corpus-replay.sh
 ```
 
+Strict full-spec style replay (submit-share path + observed-kind gates):
+
+```bash
+POOL=203.0.113.20:3347 \
+CORPUS=docs/sv2-corpus/full-spec-submit.json \
+MIN_JOB_MESSAGES=1 \
+EXPECT_SET_TARGET=true \
+REQUIRE_OBSERVED_KINDS="SetupConnectionSuccess;OpenStandardMiningChannelSuccess;SubmitSharesSuccess;SetTarget" \
+FORBID_OBSERVED_KINDS="SetupConnectionError;OpenStandardMiningChannelError;SubmitSharesError" \
+scripts/sv2-corpus-replay.sh
+```
+
+Strict release gate (local + optional external matrix expectations):
+
+```bash
+scripts/sv2-release-gate.sh
+```
+
+Require external targets during go/no-go gate:
+
+```bash
+REQUIRE_EXTERNAL=true \
+SV2_EXTERNAL_TARGETS_FILE=docs/sv2-interop-targets.example.json \
+scripts/sv2-release-gate.sh
+```
+
 Public testnet dry run:
 
 ```bash

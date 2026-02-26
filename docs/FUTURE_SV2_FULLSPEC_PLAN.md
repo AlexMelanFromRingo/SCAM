@@ -15,9 +15,9 @@ Clarification: consensus is already functionally implemented; future items touch
 - [x] Verify remote integrity (`git log`, tags/branches if present, and repository visibility).
   - Verified branch mapping and visibility via GitHub CLI (`gh repo view`).
 - [ ] Continue post-publish hardening work:
-- mutation-gap closure in `core/consensus/node`,
-- expanded external SV2 interoperability matrix,
-- final launch hardening and operator runbook polish.
+- [ ] mutation-gap closure in `core/consensus/node`,
+- [x] expanded external SV2 interoperability matrix automation (`SV2_EXTERNAL_TARGETS_FILE` extended schema, per-target timeout/retry/gating knobs, quirks/workaround metadata artifacts),
+- [x] final launch hardening and operator runbook/release-gate polish (`scripts/sv2-release-gate.sh`, workflow `sv2-release-gate.yml`, runbook section updates).
 
 ## 1) Target Outcome
 
@@ -29,10 +29,14 @@ Clarification: consensus is already functionally implemented; future items touch
 
 ### A. Protocol Completeness
 
-- Build a strict spec map: each required message, state transition, and error path.
-- Implement all required channel types and lifecycle paths.
-- Add complete capability negotiation and version/feature compatibility handling.
-- Add full negative-path handling for malformed/unsupported/out-of-order messages.
+- [~] Build a strict spec map: each required message, state transition, and error path.
+  - Conformance harness now supports strict observed-kind gates (`--require-observed-kind`, `--forbid-observed-kind`)
+    and submit-share context autofill from discovered channel/job state.
+- [~] Implement all required channel types and lifecycle paths.
+  - Added corpus path `docs/sv2-corpus/full-spec-submit.json` to assert submit/share state-path behavior.
+- [ ] Add complete capability negotiation and version/feature compatibility handling.
+- [~] Add full negative-path handling for malformed/unsupported/out-of-order messages.
+  - External matrix now supports expected-fail rows with vendor-specific workaround/notes tracking.
 
 ### B. Transport and Security
 
@@ -43,14 +47,15 @@ Clarification: consensus is already functionally implemented; future items touch
 
 ### C. External Interoperability
 
-- Define external target matrix (vendor, version, mode, role, expected behavior).
-- Run automated compatibility scenarios against each target stack.
-- Maintain golden corpus of cross-stack captures and expected outcomes.
-- Track compatibility quirks by stack/version with explicit workarounds.
+- [x] Define external target matrix (vendor, version, mode, role, expected behavior).
+- [x] Run automated compatibility scenarios against each target stack.
+- [ ] Maintain golden corpus of cross-stack captures and expected outcomes.
+- [x] Track compatibility quirks by stack/version with explicit workarounds.
 - Baseline harness support is in place for structured target manifests (`SV2_EXTERNAL_TARGETS_FILE`)
   with per-target expected outcome + vendor/version metadata artifacts.
 - Added dedicated manual CI workflow for external stacks (`.github/workflows/sv2-external-interop.yml`)
   driven by secret manifest `SV2_EXTERNAL_TARGETS_JSON`.
+- Added dedicated release gate workflow (`.github/workflows/sv2-release-gate.yml`) with strict external-rows option.
 
 ### D. Scale and Reliability
 
@@ -106,8 +111,8 @@ Exit criteria:
 
 ## 4) Release Gate (Go / No-Go)
 
-- Full-spec checklist complete.
-- Interop matrix green for supported targets.
-- Security audit closed for blocking findings.
-- Long-run soak and chaos criteria met.
-- Operator runbook updated for all final flows.
+- [ ] Full-spec checklist complete.
+- [x] Interop matrix green for supported targets (local + external expected-result gate in `scripts/sv2-release-gate.sh`).
+- [ ] Security audit closed for blocking findings.
+- [ ] Long-run soak and chaos criteria met.
+- [x] Operator runbook updated for final conformance/release-gate flows.
