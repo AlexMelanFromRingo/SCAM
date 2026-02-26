@@ -147,6 +147,7 @@ REQUIRE_SETUP_VERSION=2 \
 REQUIRE_SETUP_FLAGS_MASK=0 \
 FORBID_SETUP_FLAGS_MASK=0 \
 REQUIRE_OBSERVED_KINDS="SetupConnectionSuccess;OpenStandardMiningChannelSuccess;SubmitSharesSuccess;SetTarget" \
+REQUIRE_OBSERVED_SEQUENCE="SetupConnectionSuccess,OpenStandardMiningChannelSuccess,SetTarget,SubmitSharesSuccess" \
 FORBID_OBSERVED_KINDS="SetupConnectionError;OpenStandardMiningChannelError;SubmitSharesError" \
 scripts/sv2-corpus-replay.sh
 ```
@@ -190,6 +191,7 @@ scripts/testnet-dress-rehearsal.sh
 - rollout policy: `docs/SV2_ROLLOUT_POLICY.md`
 - role incident runbook: `docs/SV2_ROLE_INCIDENT_RUNBOOK.md`
 - role interface contract: `docs/SV2_ROLE_INTERFACES.md`
+- full-spec checklist (SCAM profile): `docs/SV2_FULLSPEC_CHECKLIST.md`
 
 ## 9) Incident Thresholds (Default Ops Guardrails)
 

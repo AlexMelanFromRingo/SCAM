@@ -75,12 +75,16 @@ const MSG_SETUP_CONNECTION_ERROR: u8 = 0x02;
 const MSG_OPEN_STANDARD_MINING_CHANNEL: u8 = 0x10;
 const MSG_OPEN_STANDARD_MINING_CHANNEL_SUCCESS: u8 = 0x11;
 const MSG_OPEN_STANDARD_MINING_CHANNEL_ERROR: u8 = 0x12;
+const MSG_OPEN_EXTENDED_MINING_CHANNEL: u8 = 0x13;
+const MSG_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS: u8 = 0x14;
+const MSG_OPEN_EXTENDED_MINING_CHANNEL_ERROR: u8 = 0x15;
 const MSG_NEW_MINING_JOB: u8 = 0x20;
 const MSG_SET_NEW_PREV_HASH: u8 = 0x21;
 const MSG_SET_TARGET: u8 = 0x22;
 const MSG_SUBMIT_SHARES_STANDARD: u8 = 0x30;
 const MSG_SUBMIT_SHARES_SUCCESS: u8 = 0x31;
 const MSG_SUBMIT_SHARES_ERROR: u8 = 0x32;
+const MSG_SUBMIT_SHARES_EXTENDED: u8 = 0x33;
 const MSG_KEEP_ALIVE: u8 = 0x40;
 
 pub const SV2_MINING_PROTOCOL_ID: u16 = 2;
@@ -121,6 +125,22 @@ pub enum Sv2Message {
         code: String,
         reason: String,
     },
+    OpenExtendedMiningChannel {
+        request_id: u32,
+        user: String,
+        extranonce_size: u16,
+    },
+    OpenExtendedMiningChannelSuccess {
+        request_id: u32,
+        channel_id: u32,
+        target_hex: String,
+        extranonce_prefix_hex: String,
+    },
+    OpenExtendedMiningChannelError {
+        request_id: u32,
+        code: String,
+        reason: String,
+    },
     NewMiningJob {
         channel_id: u32,
         job_id: u32,
@@ -156,6 +176,14 @@ pub enum Sv2Message {
         channel_id: u32,
         code: String,
         reason: String,
+    },
+    SubmitSharesExtended {
+        channel_id: u32,
+        job_id: u32,
+        nonce: u64,
+        ntime: u64,
+        version: u32,
+        extranonce_hex: String,
     },
     KeepAlive,
 }
@@ -277,6 +305,16 @@ pub struct ShareSubmission {
     pub job_id: u32,
     pub nonce: u64,
     pub ntime: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExtendedShareSubmission {
+    pub channel_id: u32,
+    pub job_id: u32,
+    pub nonce: u64,
+    pub ntime: u64,
+    pub version: u32,
+    pub extranonce_hex: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -489,6 +527,11 @@ impl Sv2Session {
             Sv2Message::OpenStandardMiningChannel { request_id, user } => {
                 self.handle_open_channel(request_id, user)
             }
+            Sv2Message::OpenExtendedMiningChannel {
+                request_id,
+                user,
+                extranonce_size,
+            } => self.handle_open_extended_channel(request_id, user, extranonce_size),
             Sv2Message::SubmitSharesStandard {
                 channel_id,
                 job_id,
@@ -500,6 +543,24 @@ impl Sv2Session {
                     job_id,
                     nonce,
                     ntime,
+                },
+                now_unix_sec,
+            ),
+            Sv2Message::SubmitSharesExtended {
+                channel_id,
+                job_id,
+                nonce,
+                ntime,
+                version,
+                extranonce_hex,
+            } => self.handle_submit_share_extended(
+                ExtendedShareSubmission {
+                    channel_id,
+                    job_id,
+                    nonce,
+                    ntime,
+                    version,
+                    extranonce_hex,
                 },
                 now_unix_sec,
             ),
@@ -705,6 +766,27 @@ impl Sv2Session {
         })
     }
 
+    fn handle_open_extended_channel(
+        &mut self,
+        request_id: u32,
+        _user: String,
+        _extranonce_size: u16,
+    ) -> Result<SessionResponse, StratumError> {
+        if self.state != SessionState::AwaitOpenChannel {
+            return Err(StratumError::ProtocolState(
+                "open_extended_channel requires setup accepted and unopened channel".to_owned(),
+            ));
+        }
+        Ok(SessionResponse {
+            outbound: vec![Sv2Message::OpenExtendedMiningChannelError {
+                request_id,
+                code: "unsupported_channel_type".to_owned(),
+                reason: "only standard channels are supported by this server".to_owned(),
+            }],
+            events: Vec::new(),
+        })
+    }
+
     fn handle_submit_share(
         &mut self,
         submission: ShareSubmission,
@@ -765,6 +847,30 @@ impl Sv2Session {
                 Ok(self.reject_share(Some(submission.job_id), "low_difficulty", reason))
             }
         }
+    }
+
+    fn handle_submit_share_extended(
+        &mut self,
+        submission: ExtendedShareSubmission,
+        _now_unix_sec: u64,
+    ) -> Result<SessionResponse, StratumError> {
+        if self.state != SessionState::Active {
+            return Err(StratumError::ProtocolState(
+                "submit_share_extended requires active channel".to_owned(),
+            ));
+        }
+        Ok(SessionResponse {
+            outbound: vec![Sv2Message::SubmitSharesError {
+                channel_id: submission.channel_id,
+                code: "unsupported_submit_type".to_owned(),
+                reason: "SubmitSharesExtended is not supported by this server".to_owned(),
+            }],
+            events: vec![SessionEvent::ShareRejected {
+                channel_id: submission.channel_id,
+                job_id: Some(submission.job_id),
+                reason: "SubmitSharesExtended is not supported".to_owned(),
+            }],
+        })
     }
 
     fn reject_share(&mut self, job_id: Option<u32>, code: &str, reason: String) -> SessionResponse {
@@ -1955,12 +2061,18 @@ fn message_type(message: &Sv2Message) -> u8 {
             MSG_OPEN_STANDARD_MINING_CHANNEL_SUCCESS
         }
         Sv2Message::OpenStandardMiningChannelError { .. } => MSG_OPEN_STANDARD_MINING_CHANNEL_ERROR,
+        Sv2Message::OpenExtendedMiningChannel { .. } => MSG_OPEN_EXTENDED_MINING_CHANNEL,
+        Sv2Message::OpenExtendedMiningChannelSuccess { .. } => {
+            MSG_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS
+        }
+        Sv2Message::OpenExtendedMiningChannelError { .. } => MSG_OPEN_EXTENDED_MINING_CHANNEL_ERROR,
         Sv2Message::NewMiningJob { .. } => MSG_NEW_MINING_JOB,
         Sv2Message::SetNewPrevHash { .. } => MSG_SET_NEW_PREV_HASH,
         Sv2Message::SetTarget { .. } => MSG_SET_TARGET,
         Sv2Message::SubmitSharesStandard { .. } => MSG_SUBMIT_SHARES_STANDARD,
         Sv2Message::SubmitSharesSuccess { .. } => MSG_SUBMIT_SHARES_SUCCESS,
         Sv2Message::SubmitSharesError { .. } => MSG_SUBMIT_SHARES_ERROR,
+        Sv2Message::SubmitSharesExtended { .. } => MSG_SUBMIT_SHARES_EXTENDED,
         Sv2Message::KeepAlive => MSG_KEEP_ALIVE,
     }
 }
@@ -1974,12 +2086,16 @@ fn is_known_message_type(msg_type: u8) -> bool {
             | MSG_OPEN_STANDARD_MINING_CHANNEL
             | MSG_OPEN_STANDARD_MINING_CHANNEL_SUCCESS
             | MSG_OPEN_STANDARD_MINING_CHANNEL_ERROR
+            | MSG_OPEN_EXTENDED_MINING_CHANNEL
+            | MSG_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS
+            | MSG_OPEN_EXTENDED_MINING_CHANNEL_ERROR
             | MSG_NEW_MINING_JOB
             | MSG_SET_NEW_PREV_HASH
             | MSG_SET_TARGET
             | MSG_SUBMIT_SHARES_STANDARD
             | MSG_SUBMIT_SHARES_SUCCESS
             | MSG_SUBMIT_SHARES_ERROR
+            | MSG_SUBMIT_SHARES_EXTENDED
             | MSG_KEEP_ALIVE
     )
 }
@@ -2670,6 +2786,66 @@ mod tests {
         assert!(matches!(
             missing_required.outbound.as_slice(),
             [Sv2Message::SetupConnectionError { code, .. }] if code == "missing_required_feature_flags"
+        ));
+    }
+
+    #[test]
+    fn session_rejects_extended_channel_open_with_explicit_error_message() {
+        let mut session = Sv2Session::new(test_session_config()).expect("session");
+        let _setup = session
+            .handle_message(Sv2Message::SetupConnection {
+                protocol: 2,
+                min_version: 2,
+                max_version: 2,
+                flags: 0,
+                user_agent: "miner".to_owned(),
+            })
+            .expect("setup");
+        let response = session
+            .handle_message(Sv2Message::OpenExtendedMiningChannel {
+                request_id: 7,
+                user: "extended-miner".to_owned(),
+                extranonce_size: 16,
+            })
+            .expect("extended response");
+        assert!(matches!(
+            response.outbound.as_slice(),
+            [Sv2Message::OpenExtendedMiningChannelError {
+                request_id: 7,
+                code,
+                ..
+            }] if code == "unsupported_channel_type"
+        ));
+    }
+
+    #[test]
+    fn session_rejects_extended_share_submit_with_explicit_error_message() {
+        let mut session = activate_session(test_session_config());
+        let response = session
+            .handle_message(Sv2Message::SubmitSharesExtended {
+                channel_id: 7,
+                job_id: 1,
+                nonce: 9,
+                ntime: 1_770_763_333,
+                version: 1,
+                extranonce_hex: "00".to_owned(),
+            })
+            .expect("submit response");
+        assert!(matches!(
+            response.outbound.as_slice(),
+            [Sv2Message::SubmitSharesError {
+                channel_id: 7,
+                code,
+                ..
+            }] if code == "unsupported_submit_type"
+        ));
+        assert!(matches!(
+            response.events.as_slice(),
+            [SessionEvent::ShareRejected {
+                channel_id: 7,
+                job_id: Some(1),
+                ..
+            }]
         ));
     }
 
@@ -3512,6 +3688,26 @@ mod tests {
             .read_message(&mut Cursor::new(at_limit_wire))
             .expect_err("at-limit bogus ciphertext should fail decrypt, not length check");
         assert!(matches!(at_limit_err, StratumError::SecureTransport(_)));
+    }
+
+    #[test]
+    fn noise_transport_replay_ciphertext_is_rejected() {
+        let (mut client, mut server) = build_noise_transport_pair_for_tests();
+        let mut wire = Vec::new();
+        client
+            .write_message(&mut wire, &Sv2Message::KeepAlive)
+            .expect("write keepalive");
+
+        let first = server
+            .read_message(&mut Cursor::new(wire.clone()))
+            .expect("read first frame")
+            .expect("first frame present");
+        assert_eq!(first, Sv2Message::KeepAlive);
+
+        let replay_err = server
+            .read_message(&mut Cursor::new(wire))
+            .expect_err("replayed ciphertext must fail");
+        assert!(matches!(replay_err, StratumError::SecureTransport(_)));
     }
 
     #[test]

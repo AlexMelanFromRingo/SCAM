@@ -192,12 +192,14 @@ def main() -> int:
                 )
             )
             required = record.get("required_observed_kinds") or []
+            required_sequence = record.get("required_observed_sequence") or []
             forbidden = record.get("forbidden_observed_kinds") or []
             req_setup_version = record.get("require_setup_version")
             req_setup_flags_mask = int(record.get("require_setup_flags_mask", 0))
             forbid_setup_flags_mask = int(record.get("forbid_setup_flags_mask", 0))
             if (
                 required
+                or required_sequence
                 or forbidden
                 or req_setup_version is not None
                 or req_setup_flags_mask != 0
@@ -205,8 +207,9 @@ def main() -> int:
                 or int(record.get("setup_protocol", 0)) != 0
             ):
                 lines.append(
-                    "|  |  |  |  |  |  |  |  |  |  |  |  | require={required} forbid={forbidden}; req_setup_version={req_setup_version}; req_setup_flags=0x{req_setup_flags_mask:08x}; forbid_setup_flags=0x{forbid_setup_flags_mask:08x}; setup={{protocol={setup_protocol},min={setup_min},max={setup_max},flags=0x{setup_flags:08x}}} |  |".format(
+                    "|  |  |  |  |  |  |  |  |  |  |  |  | require={required} require_seq={required_sequence} forbid={forbidden}; req_setup_version={req_setup_version}; req_setup_flags=0x{req_setup_flags_mask:08x}; forbid_setup_flags=0x{forbid_setup_flags_mask:08x}; setup={{protocol={setup_protocol},min={setup_min},max={setup_max},flags=0x{setup_flags:08x}}} |  |".format(
                         required=markdown_cell(",".join(required)),
+                        required_sequence=markdown_cell(",".join(required_sequence)),
                         forbidden=markdown_cell(",".join(forbidden)),
                         req_setup_version=markdown_cell(req_setup_version),
                         req_setup_flags_mask=req_setup_flags_mask,

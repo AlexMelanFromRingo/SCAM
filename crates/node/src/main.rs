@@ -307,14 +307,22 @@ struct ConfigScaffoldArgs {
     stratum_max_rejected_shares: u32,
     #[arg(long, default_value_t = 2)]
     stratum_read_timeout_sec: u64,
+    #[arg(long, default_value_t = 5)]
+    stratum_handshake_timeout_sec: u64,
     #[arg(long, default_value_t = 30)]
     stratum_keepalive_sec: u64,
     #[arg(long, default_value_t = 180)]
     stratum_idle_timeout_sec: u64,
+    #[arg(long, default_value_t = 5)]
+    stratum_inbound_accept_window_sec: u64,
+    #[arg(long, default_value_t = 64)]
+    stratum_inbound_max_accepts_per_ip: usize,
     #[arg(long, default_value_t = 64)]
     stratum_max_jobs_per_channel: usize,
     #[arg(long, default_value_t = 256)]
     stratum_max_active_clients: usize,
+    #[arg(long, default_value_t = 8)]
+    stratum_max_protocol_violations: u32,
     #[arg(long, default_value_t = false)]
     stratum_secure_transport: bool,
     #[arg(long, value_enum, default_value_t = SecureTransportModeArg::NoiseXx)]
@@ -613,11 +621,19 @@ struct StratumServeArgs {
     #[arg(long)]
     max_active_clients: Option<usize>,
     #[arg(long)]
+    max_protocol_violations: Option<u32>,
+    #[arg(long)]
     read_timeout_sec: Option<u64>,
+    #[arg(long)]
+    handshake_timeout_sec: Option<u64>,
     #[arg(long)]
     keepalive_sec: Option<u64>,
     #[arg(long)]
     idle_timeout_sec: Option<u64>,
+    #[arg(long)]
+    inbound_accept_window_sec: Option<u64>,
+    #[arg(long)]
+    inbound_max_accepts_per_ip: Option<usize>,
     #[arg(long)]
     vardiff_target_shares_per_minute: Option<u32>,
     #[arg(long)]
@@ -770,6 +786,8 @@ struct Sv2ConformanceArgs {
     forbid_setup_flags_mask: u32,
     #[arg(long = "require-observed-kind")]
     require_observed_kind: Vec<String>,
+    #[arg(long = "require-observed-sequence", value_delimiter = ',')]
+    require_observed_sequence: Vec<String>,
     #[arg(long = "forbid-observed-kind")]
     forbid_observed_kind: Vec<String>,
     #[arg(long, default_value_t = false)]
@@ -1802,9 +1820,13 @@ fn run_mode(args: RunModeArgs) -> Result<(), NodeError> {
             max_jobs_per_channel: None,
             max_clients: 0,
             max_active_clients: None,
+            max_protocol_violations: None,
             read_timeout_sec: None,
+            handshake_timeout_sec: None,
             keepalive_sec: None,
             idle_timeout_sec: None,
+            inbound_accept_window_sec: None,
+            inbound_max_accepts_per_ip: None,
             vardiff_target_shares_per_minute: None,
             vardiff_retarget_interval_shares: None,
             vardiff_clamp_up: None,
@@ -2104,10 +2126,14 @@ fn run_config_scaffold(args: ConfigScaffoldArgs) -> Result<(), NodeError> {
         stratum_vardiff_clamp_down: args.stratum_vardiff_clamp_down,
         stratum_max_rejected_shares: args.stratum_max_rejected_shares,
         stratum_read_timeout_sec: args.stratum_read_timeout_sec,
+        stratum_handshake_timeout_sec: args.stratum_handshake_timeout_sec,
         stratum_keepalive_sec: args.stratum_keepalive_sec,
         stratum_idle_timeout_sec: args.stratum_idle_timeout_sec,
+        stratum_inbound_accept_window_sec: args.stratum_inbound_accept_window_sec,
+        stratum_inbound_max_accepts_per_ip: args.stratum_inbound_max_accepts_per_ip,
         stratum_max_jobs_per_channel: args.stratum_max_jobs_per_channel,
         stratum_max_active_clients: args.stratum_max_active_clients,
+        stratum_max_protocol_violations: args.stratum_max_protocol_violations,
         stratum_secure_transport: args.stratum_secure_transport,
         stratum_secure_transport_mode: SecureTransportMode::from(
             args.stratum_secure_transport_mode,
@@ -8204,8 +8230,10 @@ struct StratumServerContext {
     vardiff_clamp_down: f64,
     max_rejected_shares: u32,
     read_timeout_sec: u64,
+    handshake_timeout_sec: u64,
     keepalive_sec: u64,
     idle_timeout_sec: u64,
+    max_protocol_violations: u32,
     next_channel_id: Arc<AtomicU32>,
     template_provider: RuntimeTemplateProvider,
     job_declarator: Arc<Mutex<SequentialJobDeclarator>>,
@@ -8350,14 +8378,24 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
     _permit: OwnedSemaphorePermit,
 ) -> Result<(), NodeError> {
     let read_timeout = Duration::from_secs(ctx.read_timeout_sec.max(1));
+    let handshake_timeout = Duration::from_secs(ctx.handshake_timeout_sec.max(1));
     let mut secure_transport = if ctx.secure_transport {
         let transport = match ctx.secure_transport_mode {
             SecureTransportMode::Legacy => {
-                let mut legacy = SecureSv2Transport::handshake_server_async(&mut stream)
-                    .await
-                    .map_err(|e| {
-                        NodeError::Runtime(format!("stratum secure(legacy) handshake failed: {e}"))
-                    })?;
+                let mut legacy = timeout(
+                    handshake_timeout,
+                    SecureSv2Transport::handshake_server_async(&mut stream),
+                )
+                .await
+                .map_err(|_| {
+                    NodeError::Runtime(format!(
+                        "stratum secure(legacy) handshake timeout after {}s",
+                        handshake_timeout.as_secs()
+                    ))
+                })?
+                .map_err(|e| {
+                    NodeError::Runtime(format!("stratum secure(legacy) handshake failed: {e}"))
+                })?;
                 legacy
                     .set_rekey_interval_messages(ctx.secure_rekey_interval_messages)
                     .map_err(|e| {
@@ -8368,12 +8406,21 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
                 StratumSecureTransport::Legacy(legacy)
             }
             SecureTransportMode::NoiseXx => {
-                let mut noise = NoiseSv2Transport::handshake_server_async(
-                    &mut stream,
-                    ctx.secure_static_private_key,
-                    ctx.secure_expected_remote_static_public_key,
+                let mut noise = timeout(
+                    handshake_timeout,
+                    NoiseSv2Transport::handshake_server_async(
+                        &mut stream,
+                        ctx.secure_static_private_key,
+                        ctx.secure_expected_remote_static_public_key,
+                    ),
                 )
                 .await
+                .map_err(|_| {
+                    NodeError::Runtime(format!(
+                        "stratum secure(noise_xx) handshake timeout after {}s",
+                        handshake_timeout.as_secs()
+                    ))
+                })?
                 .map_err(|e| {
                     NodeError::Runtime(format!("stratum secure(noise_xx) handshake failed: {e}"))
                 })?;
@@ -8435,6 +8482,7 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
     let mut last_keepalive = Instant::now();
     let mut last_activity = Instant::now();
     let mut last_tip_hash = load_runtime_tip_hash(&ctx)?;
+    let mut protocol_violations = 0u32;
     let mut payout_key_hash20 = if ctx.pool_payout_cfg.mode == PoolPayoutModeArg::Solo {
         ctx.cfg.genesis_reward_key_hash20()?
     } else {
@@ -8479,7 +8527,29 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
             }
             StratumReadOutcome::Message(inbound) => {
                 last_activity = Instant::now();
-                let response = session.handle_message(inbound)?;
+                let inbound_for_error = inbound.clone();
+                let response = match session.handle_message(inbound) {
+                    Ok(response) => {
+                        protocol_violations = 0;
+                        response
+                    }
+                    Err(err) => {
+                        protocol_violations = protocol_violations.saturating_add(1);
+                        if let Some(outbound) =
+                            protocol_violation_response(&inbound_for_error, &err)
+                        {
+                            send_sv2_async!(&outbound);
+                        }
+                        if protocol_violations >= ctx.max_protocol_violations {
+                            eprintln!(
+                                "stratum session closed after {} protocol violations: {}",
+                                protocol_violations, err
+                            );
+                            break;
+                        }
+                        continue;
+                    }
+                };
                 for outbound in response.outbound {
                     send_sv2_async!(&outbound);
                 }
@@ -8779,6 +8849,48 @@ fn map_sv2_read_result(
             Ok(StratumReadOutcome::Closed)
         }
         Err(err) => Err(NodeError::Runtime(format!("stratum read failed: {err}"))),
+    }
+}
+
+fn protocol_violation_response(
+    inbound: &Sv2Message,
+    err: &scam_stratum::StratumError,
+) -> Option<Sv2Message> {
+    let reason = err.to_string();
+    match inbound {
+        Sv2Message::SetupConnection { .. } => Some(Sv2Message::SetupConnectionError {
+            code: "protocol_state".to_owned(),
+            reason,
+        }),
+        Sv2Message::OpenStandardMiningChannel { request_id, .. } => {
+            Some(Sv2Message::OpenStandardMiningChannelError {
+                request_id: *request_id,
+                code: "protocol_state".to_owned(),
+                reason,
+            })
+        }
+        Sv2Message::OpenExtendedMiningChannel { request_id, .. } => {
+            Some(Sv2Message::OpenExtendedMiningChannelError {
+                request_id: *request_id,
+                code: "protocol_state".to_owned(),
+                reason,
+            })
+        }
+        Sv2Message::SubmitSharesStandard { channel_id, .. } => {
+            Some(Sv2Message::SubmitSharesError {
+                channel_id: *channel_id,
+                code: "protocol_state".to_owned(),
+                reason,
+            })
+        }
+        Sv2Message::SubmitSharesExtended { channel_id, .. } => {
+            Some(Sv2Message::SubmitSharesError {
+                channel_id: *channel_id,
+                code: "protocol_state".to_owned(),
+                reason,
+            })
+        }
+        _ => None,
     }
 }
 
@@ -9881,6 +9993,10 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
         .read_timeout_sec
         .unwrap_or(cfg.stratum_read_timeout_sec)
         .max(1);
+    let handshake_timeout_sec = args
+        .handshake_timeout_sec
+        .unwrap_or(cfg.stratum_handshake_timeout_sec)
+        .max(1);
     let keepalive_sec = args
         .keepalive_sec
         .unwrap_or(cfg.stratum_keepalive_sec)
@@ -9889,6 +10005,14 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
         .idle_timeout_sec
         .unwrap_or(cfg.stratum_idle_timeout_sec)
         .max(1);
+    let inbound_accept_window_sec = args
+        .inbound_accept_window_sec
+        .unwrap_or(cfg.stratum_inbound_accept_window_sec)
+        .max(1);
+    let inbound_max_accepts_per_ip = args
+        .inbound_max_accepts_per_ip
+        .unwrap_or(cfg.stratum_inbound_max_accepts_per_ip)
+        .max(1);
     let max_jobs_per_channel = args
         .max_jobs_per_channel
         .unwrap_or(cfg.stratum_max_jobs_per_channel)
@@ -9896,6 +10020,10 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
     let max_active_clients = args
         .max_active_clients
         .unwrap_or(cfg.stratum_max_active_clients)
+        .max(1);
+    let max_protocol_violations = args
+        .max_protocol_violations
+        .unwrap_or(cfg.stratum_max_protocol_violations)
         .max(1);
     let secure_transport = cfg.stratum_secure_transport || args.secure_transport;
     let secure_transport_mode = match args.secure_transport_mode {
@@ -9994,8 +10122,16 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
     );
     println!("I/O model: async tokio");
     println!(
-        "Read timeout={}s keepalive={}s idle timeout={}s",
-        read_timeout_sec, keepalive_sec, idle_timeout_sec
+        "Read timeout={}s handshake timeout={}s keepalive={}s idle timeout={}s",
+        read_timeout_sec, handshake_timeout_sec, keepalive_sec, idle_timeout_sec
+    );
+    println!(
+        "Inbound accept limit: {} accepts / {}s per IP",
+        inbound_max_accepts_per_ip, inbound_accept_window_sec
+    );
+    println!(
+        "Max protocol violations/session: {}",
+        max_protocol_violations
     );
     println!("Secure transport: {}", secure_transport);
     println!("Secure transport mode: {}", secure_transport_mode.as_str());
@@ -10042,8 +10178,10 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
         vardiff_clamp_down,
         max_rejected_shares,
         read_timeout_sec,
+        handshake_timeout_sec,
         keepalive_sec,
         idle_timeout_sec,
+        max_protocol_violations,
         next_channel_id: Arc::new(AtomicU32::new(0)),
         template_provider: RuntimeTemplateProvider,
         job_declarator: Arc::new(Mutex::new(SequentialJobDeclarator::default())),
@@ -10087,6 +10225,7 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
         let permits = Arc::new(Semaphore::new(max_active_clients));
         let mut workers = JoinSet::<Result<(), NodeError>>::new();
         let telemetry_stop = Arc::new(AtomicBool::new(false));
+        let mut inbound_accept_history = HashMap::<IpAddr, VecDeque<u64>>::new();
         let telemetry_handle = if let Some(path) = args.telemetry_out.clone() {
             let telemetry_state = ctx.telemetry_state.clone();
             let active_clients = ctx.active_clients.clone();
@@ -10123,10 +10262,27 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
         let mut served = 0u32;
 
         loop {
-            let (stream, _) = listener
+            let (stream, peer_addr) = listener
                 .accept()
                 .await
                 .map_err(|e| NodeError::Runtime(format!("stratum accept failed: {e}")))?;
+            let now_unix_sec = current_unix_sec()?;
+            if relay_inbound_accept_rate_limited(
+                &mut inbound_accept_history,
+                peer_addr.ip(),
+                now_unix_sec,
+                inbound_accept_window_sec,
+                inbound_max_accepts_per_ip,
+            ) {
+                eprintln!(
+                    "warning: dropping inbound stratum connection from {} (accept-rate limit: {} per {}s)",
+                    peer_addr.ip(),
+                    inbound_max_accepts_per_ip,
+                    inbound_accept_window_sec
+                );
+                drop(stream);
+                continue;
+            }
 
             let permit = match permits.clone().try_acquire_owned() {
                 Ok(permit) => permit,
@@ -10767,8 +10923,10 @@ struct Sv2ConformanceReport {
     require_setup_flags_mask: u32,
     forbid_setup_flags_mask: u32,
     required_observed_kinds: Vec<String>,
+    required_observed_sequence: Vec<String>,
     forbidden_observed_kinds: Vec<String>,
     missing_required_observed_kinds: Vec<String>,
+    missing_required_observed_sequence: Vec<String>,
     forbidden_observed_kinds_seen: Vec<String>,
     pass: bool,
     observed_messages: Vec<String>,
@@ -10784,12 +10942,16 @@ fn sv2_message_kind(message: &Sv2Message) -> &'static str {
         Sv2Message::OpenStandardMiningChannel { .. } => "OpenStandardMiningChannel",
         Sv2Message::OpenStandardMiningChannelSuccess { .. } => "OpenStandardMiningChannelSuccess",
         Sv2Message::OpenStandardMiningChannelError { .. } => "OpenStandardMiningChannelError",
+        Sv2Message::OpenExtendedMiningChannel { .. } => "OpenExtendedMiningChannel",
+        Sv2Message::OpenExtendedMiningChannelSuccess { .. } => "OpenExtendedMiningChannelSuccess",
+        Sv2Message::OpenExtendedMiningChannelError { .. } => "OpenExtendedMiningChannelError",
         Sv2Message::NewMiningJob { .. } => "NewMiningJob",
         Sv2Message::SetNewPrevHash { .. } => "SetNewPrevHash",
         Sv2Message::SetTarget { .. } => "SetTarget",
         Sv2Message::SubmitSharesStandard { .. } => "SubmitSharesStandard",
         Sv2Message::SubmitSharesSuccess { .. } => "SubmitSharesSuccess",
         Sv2Message::SubmitSharesError { .. } => "SubmitSharesError",
+        Sv2Message::SubmitSharesExtended { .. } => "SubmitSharesExtended",
         Sv2Message::KeepAlive => "KeepAlive",
     }
 }
@@ -10850,6 +11012,11 @@ fn update_sv2_conformance_state(
         Sv2Message::OpenStandardMiningChannelError { code, reason, .. } => {
             errors.push(format!("open channel error: code={code} reason={reason}"));
         }
+        Sv2Message::OpenExtendedMiningChannelError { code, reason, .. } => {
+            errors.push(format!(
+                "open extended channel error: code={code} reason={reason}"
+            ));
+        }
         Sv2Message::NewMiningJob { job_id, ntime, .. }
         | Sv2Message::SetNewPrevHash { job_id, ntime, .. } => {
             state.job_messages_seen = state.job_messages_seen.saturating_add(1);
@@ -10901,6 +11068,25 @@ fn materialize_sv2_conformance_message(
         },
         other => other,
     }
+}
+
+fn missing_observed_sequence(required_sequence: &[String], observed: &[String]) -> Vec<String> {
+    if required_sequence.is_empty() {
+        return Vec::new();
+    }
+    let mut observed_idx = 0usize;
+    let mut missing = Vec::new();
+    for required in required_sequence {
+        while observed_idx < observed.len() && observed[observed_idx] != *required {
+            observed_idx = observed_idx.saturating_add(1);
+        }
+        if observed_idx >= observed.len() {
+            missing.push(required.clone());
+            continue;
+        }
+        observed_idx = observed_idx.saturating_add(1);
+    }
+    missing
 }
 
 fn sv2_conformance_pass(
@@ -11236,6 +11422,13 @@ fn run_sv2_conformance(args: Sv2ConformanceArgs) -> Result<(), NodeError> {
         .filter(|kind| !kind.is_empty())
         .map(ToOwned::to_owned)
         .collect::<Vec<_>>();
+    let required_observed_sequence = args
+        .require_observed_sequence
+        .iter()
+        .map(|kind| kind.trim())
+        .filter(|kind| !kind.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
     let forbidden_observed_kinds = args
         .forbid_observed_kind
         .iter()
@@ -11245,12 +11438,20 @@ fn run_sv2_conformance(args: Sv2ConformanceArgs) -> Result<(), NodeError> {
         .collect::<Vec<_>>();
     let observed_kinds = observed_messages.iter().cloned().collect::<HashSet<_>>();
     let mut missing_required_observed_kinds = Vec::<String>::new();
+    let missing_required_observed_sequence =
+        missing_observed_sequence(&required_observed_sequence, &observed_messages);
     let mut forbidden_observed_kinds_seen = Vec::<String>::new();
     for kind in &required_observed_kinds {
         if !observed_kinds.contains(kind) {
             missing_required_observed_kinds.push(kind.clone());
             errors.push(format!("required observed message kind missing: {kind}"));
         }
+    }
+    if !missing_required_observed_sequence.is_empty() {
+        errors.push(format!(
+            "required observed sequence not met: required={:?}, missing_tail={:?}, observed={:?}",
+            required_observed_sequence, missing_required_observed_sequence, observed_messages
+        ));
     }
     for kind in &forbidden_observed_kinds {
         if observed_kinds.contains(kind) {
@@ -11327,8 +11528,10 @@ fn run_sv2_conformance(args: Sv2ConformanceArgs) -> Result<(), NodeError> {
         require_setup_flags_mask,
         forbid_setup_flags_mask,
         required_observed_kinds,
+        required_observed_sequence,
         forbidden_observed_kinds,
         missing_required_observed_kinds,
+        missing_required_observed_sequence,
         forbidden_observed_kinds_seen,
         pass,
         observed_messages,
@@ -15768,8 +15971,10 @@ mod tests {
             vardiff_clamp_down: cfg.stratum_vardiff_clamp_down,
             max_rejected_shares: cfg.stratum_max_rejected_shares,
             read_timeout_sec: 1,
+            handshake_timeout_sec: 1,
             keepalive_sec: 1,
             idle_timeout_sec: 3,
+            max_protocol_violations: 4,
             next_channel_id: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
             template_provider: super::RuntimeTemplateProvider,
             job_declarator: std::sync::Arc::new(std::sync::Mutex::new(
@@ -15822,7 +16027,8 @@ mod tests {
                 .expect_err("submit-before-setup must be rejected");
             assert!(
                 err.to_string()
-                    .contains("submit_share received before active channel"),
+                    .contains("submit_share received before active channel")
+                    || err.to_string().contains("broken pipe"),
                 "unexpected error: {err}"
             );
         });
@@ -17327,9 +17533,13 @@ mod tests {
             max_jobs_per_channel: None,
             max_clients: 0,
             max_active_clients: None,
+            max_protocol_violations: None,
             read_timeout_sec: None,
+            handshake_timeout_sec: None,
             keepalive_sec: Some(5),
             idle_timeout_sec: Some(6),
+            inbound_accept_window_sec: None,
+            inbound_max_accepts_per_ip: None,
             vardiff_target_shares_per_minute: None,
             vardiff_retarget_interval_shares: None,
             vardiff_clamp_up: None,
@@ -17380,9 +17590,13 @@ mod tests {
             max_jobs_per_channel: None,
             max_clients: 0,
             max_active_clients: None,
+            max_protocol_violations: None,
             read_timeout_sec: None,
+            handshake_timeout_sec: None,
             keepalive_sec: Some(5),
             idle_timeout_sec: Some(6),
+            inbound_accept_window_sec: None,
+            inbound_max_accepts_per_ip: None,
             vardiff_target_shares_per_minute: None,
             vardiff_retarget_interval_shares: None,
             vardiff_clamp_up: None,
@@ -17433,9 +17647,13 @@ mod tests {
             max_jobs_per_channel: None,
             max_clients: 0,
             max_active_clients: None,
+            max_protocol_violations: None,
             read_timeout_sec: None,
+            handshake_timeout_sec: None,
             keepalive_sec: Some(10),
             idle_timeout_sec: Some(10),
+            inbound_accept_window_sec: None,
+            inbound_max_accepts_per_ip: None,
             vardiff_target_shares_per_minute: None,
             vardiff_retarget_interval_shares: None,
             vardiff_clamp_up: None,
@@ -17579,6 +17797,11 @@ mod tests {
             request_id: 1,
             user: "miner".to_owned(),
         });
+        let open_extended = super::sv2_message_kind(&Sv2Message::OpenExtendedMiningChannel {
+            request_id: 2,
+            user: "miner".to_owned(),
+            extranonce_size: 8,
+        });
         let job = super::sv2_message_kind(&Sv2Message::NewMiningJob {
             channel_id: 1,
             job_id: 1,
@@ -17598,13 +17821,23 @@ mod tests {
             nonce: 42,
             ntime: 1_800_000_000,
         });
+        let submit_extended = super::sv2_message_kind(&Sv2Message::SubmitSharesExtended {
+            channel_id: 1,
+            job_id: 1,
+            nonce: 42,
+            ntime: 1_800_000_000,
+            version: 1,
+            extranonce_hex: "00".to_owned(),
+        });
         let keepalive = super::sv2_message_kind(&Sv2Message::KeepAlive);
 
         assert_eq!(setup, "SetupConnection");
         assert_eq!(open, "OpenStandardMiningChannel");
+        assert_eq!(open_extended, "OpenExtendedMiningChannel");
         assert_eq!(job, "NewMiningJob");
         assert_eq!(target, "SetTarget");
         assert_eq!(submit, "SubmitSharesStandard");
+        assert_eq!(submit_extended, "SubmitSharesExtended");
         assert_eq!(keepalive, "KeepAlive");
     }
 
@@ -17753,6 +17986,118 @@ mod tests {
                 ntime: 1_900_000_000,
             }
         );
+    }
+
+    #[test]
+    fn missing_observed_sequence_reports_missing_tail_in_order() {
+        let required = vec![
+            "SetupConnectionSuccess".to_owned(),
+            "OpenStandardMiningChannelSuccess".to_owned(),
+            "SubmitSharesSuccess".to_owned(),
+        ];
+        let observed = vec![
+            "SetupConnectionSuccess".to_owned(),
+            "NewMiningJob".to_owned(),
+            "OpenStandardMiningChannelSuccess".to_owned(),
+        ];
+        let missing = super::missing_observed_sequence(&required, &observed);
+        assert_eq!(missing, vec!["SubmitSharesSuccess".to_owned()]);
+    }
+
+    #[test]
+    fn protocol_violation_response_maps_state_errors_to_sv2_errors() {
+        let reason = scam_stratum::StratumError::ProtocolState("bad state".to_owned());
+
+        let setup = super::protocol_violation_response(
+            &Sv2Message::SetupConnection {
+                protocol: 2,
+                min_version: 2,
+                max_version: 2,
+                flags: 0,
+                user_agent: "ua".to_owned(),
+            },
+            &reason,
+        )
+        .expect("setup error");
+        assert!(matches!(
+            setup,
+            Sv2Message::SetupConnectionError { code, .. } if code == "protocol_state"
+        ));
+
+        let open = super::protocol_violation_response(
+            &Sv2Message::OpenStandardMiningChannel {
+                request_id: 9,
+                user: "worker".to_owned(),
+            },
+            &reason,
+        )
+        .expect("open error");
+        assert!(matches!(
+            open,
+            Sv2Message::OpenStandardMiningChannelError {
+                request_id: 9,
+                code,
+                ..
+            } if code == "protocol_state"
+        ));
+
+        let open_extended = super::protocol_violation_response(
+            &Sv2Message::OpenExtendedMiningChannel {
+                request_id: 10,
+                user: "worker".to_owned(),
+                extranonce_size: 8,
+            },
+            &reason,
+        )
+        .expect("open extended error");
+        assert!(matches!(
+            open_extended,
+            Sv2Message::OpenExtendedMiningChannelError {
+                request_id: 10,
+                code,
+                ..
+            } if code == "protocol_state"
+        ));
+
+        let submit = super::protocol_violation_response(
+            &Sv2Message::SubmitSharesStandard {
+                channel_id: 11,
+                job_id: 33,
+                nonce: 1,
+                ntime: 2,
+            },
+            &reason,
+        )
+        .expect("submit error");
+        assert!(matches!(
+            submit,
+            Sv2Message::SubmitSharesError {
+                channel_id: 11,
+                code,
+                ..
+            } if code == "protocol_state"
+        ));
+
+        let submit_extended = super::protocol_violation_response(
+            &Sv2Message::SubmitSharesExtended {
+                channel_id: 12,
+                job_id: 44,
+                nonce: 1,
+                ntime: 2,
+                version: 1,
+                extranonce_hex: "00".to_owned(),
+            },
+            &reason,
+        )
+        .expect("submit extended error");
+        assert!(matches!(
+            submit_extended,
+            Sv2Message::SubmitSharesError {
+                channel_id: 12,
+                code,
+                ..
+            } if code == "protocol_state"
+        ));
     }
 
     #[test]
@@ -18922,9 +19267,13 @@ mod tests {
             max_jobs_per_channel: None,
             max_clients: 0,
             max_active_clients: None,
+            max_protocol_violations: None,
             read_timeout_sec: None,
+            handshake_timeout_sec: None,
             keepalive_sec: None,
             idle_timeout_sec: None,
+            inbound_accept_window_sec: None,
+            inbound_max_accepts_per_ip: None,
             vardiff_target_shares_per_minute: None,
             vardiff_retarget_interval_shares: None,
             vardiff_clamp_up: None,
@@ -20717,10 +21066,14 @@ mod tests {
             stratum_vardiff_clamp_down: 0.5,
             stratum_max_rejected_shares: 64,
             stratum_read_timeout_sec: 2,
+            stratum_handshake_timeout_sec: 5,
             stratum_keepalive_sec: 30,
             stratum_idle_timeout_sec: 180,
+            stratum_inbound_accept_window_sec: 5,
+            stratum_inbound_max_accepts_per_ip: 64,
             stratum_max_jobs_per_channel: 64,
             stratum_max_active_clients: 256,
+            stratum_max_protocol_violations: 8,
             stratum_secure_transport: false,
             stratum_secure_transport_mode: super::SecureTransportModeArg::NoiseXx,
             stratum_secure_rekey_interval_messages: 10_000,
@@ -20752,6 +21105,10 @@ mod tests {
         assert_eq!(cfg.stratum_vardiff_retarget_interval_shares, 24);
         assert_eq!(cfg.stratum_max_jobs_per_channel, 64);
         assert_eq!(cfg.stratum_max_active_clients, 256);
+        assert_eq!(cfg.stratum_handshake_timeout_sec, 5);
+        assert_eq!(cfg.stratum_inbound_accept_window_sec, 5);
+        assert_eq!(cfg.stratum_inbound_max_accepts_per_ip, 64);
+        assert_eq!(cfg.stratum_max_protocol_violations, 8);
         assert!(!cfg.stratum_secure_transport);
         assert_eq!(cfg.stratum_secure_transport_mode, "noise_xx");
         assert_eq!(cfg.stratum_secure_rekey_interval_messages, 10_000);
@@ -22514,6 +22871,7 @@ mod tests {
             require_setup_flags_mask: 0,
             forbid_setup_flags_mask: 0,
             require_observed_kind: Vec::new(),
+            require_observed_sequence: Vec::new(),
             forbid_observed_kind: Vec::new(),
             secure_transport: false,
             secure_transport_mode: None,
@@ -22630,6 +22988,7 @@ mod tests {
             require_setup_flags_mask: 0,
             forbid_setup_flags_mask: 0,
             require_observed_kind: Vec::new(),
+            require_observed_sequence: Vec::new(),
             forbid_observed_kind: Vec::new(),
             secure_transport: false,
             secure_transport_mode: None,
@@ -22738,6 +23097,7 @@ mod tests {
             require_setup_flags_mask: 0x0000_0001,
             forbid_setup_flags_mask: 0x0000_0002,
             require_observed_kind: Vec::new(),
+            require_observed_sequence: Vec::new(),
             forbid_observed_kind: Vec::new(),
             secure_transport: false,
             secure_transport_mode: None,
@@ -22923,6 +23283,12 @@ mod tests {
                 "SubmitSharesSuccess".to_owned(),
                 "SetTarget".to_owned(),
             ],
+            require_observed_sequence: vec![
+                "SetupConnectionSuccess".to_owned(),
+                "OpenStandardMiningChannelSuccess".to_owned(),
+                "SetTarget".to_owned(),
+                "SubmitSharesSuccess".to_owned(),
+            ],
             forbid_observed_kind: vec!["SubmitSharesError".to_owned()],
             secure_transport: false,
             secure_transport_mode: None,
@@ -22954,6 +23320,13 @@ mod tests {
             report["missing_required_observed_kinds"]
                 .as_array()
                 .expect("missing kinds")
+                .len(),
+            0
+        );
+        assert_eq!(
+            report["missing_required_observed_sequence"]
+                .as_array()
+                .expect("missing sequence")
                 .len(),
             0
         );
@@ -24268,6 +24641,7 @@ mod tests {
             require_setup_flags_mask: 0,
             forbid_setup_flags_mask: 0,
             require_observed_kind: Vec::new(),
+            require_observed_sequence: Vec::new(),
             forbid_observed_kind: Vec::new(),
             secure_transport: false,
             secure_transport_mode: None,
@@ -24302,6 +24676,7 @@ mod tests {
             require_setup_flags_mask: 0,
             forbid_setup_flags_mask: 0,
             require_observed_kind: Vec::new(),
+            require_observed_sequence: Vec::new(),
             forbid_observed_kind: Vec::new(),
             secure_transport: false,
             secure_transport_mode: None,

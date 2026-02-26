@@ -29,7 +29,7 @@ where:
 Full tuple (for strict automation and per-vendor quirks capture):
 
 ```text
-name,endpoint,secure,mode,secret_hex,expected,vendor,version,role,corpus,read_timeout_sec,connect_timeout_sec,connect_retries,connect_retry_delay_ms,expect_set_target,min_job_messages,workaround,notes,required_observed_kinds,forbidden_observed_kinds,require_setup_version,require_setup_flags_mask,forbid_setup_flags_mask,setup_protocol,setup_min_version,setup_max_version,setup_flags
+name,endpoint,secure,mode,secret_hex,expected,vendor,version,role,corpus,read_timeout_sec,connect_timeout_sec,connect_retries,connect_retry_delay_ms,expect_set_target,min_job_messages,workaround,notes,required_observed_kinds,required_observed_sequence,forbidden_observed_kinds,require_setup_version,require_setup_flags_mask,forbid_setup_flags_mask,setup_protocol,setup_min_version,setup_max_version,setup_flags
 ```
 
 3. Optional JSON-driven target list (recommended for multi-vendor runs):
@@ -52,6 +52,7 @@ scripts/sv2-conformance-matrix.sh
 - `workaround`
 - `notes`
 - `required_observed_kinds` (array of message kind strings)
+- `required_observed_sequence` (array/string of message kinds that must be observed in-order)
 - `forbidden_observed_kinds` (array of message kind strings)
 - `require_setup_version` (optional, strict `SetupConnectionSuccess.used_version` gate)
 - `require_setup_flags_mask` (optional bitmask, all bits must be present in `SetupConnectionSuccess.flags`)
@@ -75,6 +76,7 @@ Connection-hardening knobs for flaky external endpoints:
 - `SV2_CONFORMANCE_MIN_JOB_MESSAGES` (default `1`)
 - `SV2_CONFORMANCE_EXPECT_SET_TARGET` (default `true`)
 - `SV2_CONFORMANCE_REQUIRED_OBSERVED_KINDS` (semicolon-separated, optional)
+- `SV2_CONFORMANCE_REQUIRED_OBSERVED_SEQUENCE` (comma-separated ordered list, optional)
 - `SV2_CONFORMANCE_FORBIDDEN_OBSERVED_KINDS` (semicolon-separated, optional)
 - `SV2_CONFORMANCE_REQUIRE_SETUP_VERSION` (optional)
 - `SV2_CONFORMANCE_REQUIRE_SETUP_FLAGS_MASK` (default `0`)
@@ -154,6 +156,7 @@ CORPUS=docs/sv2-corpus/full-spec-submit.json \
 MIN_JOB_MESSAGES=1 \
 EXPECT_SET_TARGET=true \
 REQUIRE_OBSERVED_KINDS="SetupConnectionSuccess;OpenStandardMiningChannelSuccess;SetTarget" \
+REQUIRE_OBSERVED_SEQUENCE="SetupConnectionSuccess,OpenStandardMiningChannelSuccess,SetTarget" \
 FORBID_OBSERVED_KINDS="SetupConnectionError;OpenStandardMiningChannelError" \
 scripts/sv2-corpus-replay.sh
 ```

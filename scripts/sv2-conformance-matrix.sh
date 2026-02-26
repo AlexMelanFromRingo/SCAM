@@ -22,6 +22,7 @@ SV2_CONFORMANCE_REQUIRE_SETUP_VERSION="${SV2_CONFORMANCE_REQUIRE_SETUP_VERSION:-
 SV2_CONFORMANCE_REQUIRE_SETUP_FLAGS_MASK="${SV2_CONFORMANCE_REQUIRE_SETUP_FLAGS_MASK:-0}"
 SV2_CONFORMANCE_FORBID_SETUP_FLAGS_MASK="${SV2_CONFORMANCE_FORBID_SETUP_FLAGS_MASK:-0}"
 SV2_CONFORMANCE_REQUIRED_OBSERVED_KINDS="${SV2_CONFORMANCE_REQUIRED_OBSERVED_KINDS:-}"
+SV2_CONFORMANCE_REQUIRED_OBSERVED_SEQUENCE="${SV2_CONFORMANCE_REQUIRED_OBSERVED_SEQUENCE:-}"
 SV2_CONFORMANCE_FORBIDDEN_OBSERVED_KINDS="${SV2_CONFORMANCE_FORBIDDEN_OBSERVED_KINDS:-}"
 unexpected_external_failures=0
 
@@ -48,14 +49,15 @@ run_conformance_target() {
   local workaround="${17:-}"
   local notes="${18:-}"
   local required_observed_kinds="${19:-${SV2_CONFORMANCE_REQUIRED_OBSERVED_KINDS}}"
-  local forbidden_observed_kinds="${20:-${SV2_CONFORMANCE_FORBIDDEN_OBSERVED_KINDS}}"
-  local require_setup_version="${21:-${SV2_CONFORMANCE_REQUIRE_SETUP_VERSION}}"
-  local require_setup_flags_mask="${22:-${SV2_CONFORMANCE_REQUIRE_SETUP_FLAGS_MASK}}"
-  local forbid_setup_flags_mask="${23:-${SV2_CONFORMANCE_FORBID_SETUP_FLAGS_MASK}}"
-  local setup_protocol="${24:-${SV2_CONFORMANCE_SETUP_PROTOCOL}}"
-  local setup_min_version="${25:-${SV2_CONFORMANCE_SETUP_MIN_VERSION}}"
-  local setup_max_version="${26:-${SV2_CONFORMANCE_SETUP_MAX_VERSION}}"
-  local setup_flags="${27:-${SV2_CONFORMANCE_SETUP_FLAGS}}"
+  local required_observed_sequence="${20:-${SV2_CONFORMANCE_REQUIRED_OBSERVED_SEQUENCE}}"
+  local forbidden_observed_kinds="${21:-${SV2_CONFORMANCE_FORBIDDEN_OBSERVED_KINDS}}"
+  local require_setup_version="${22:-${SV2_CONFORMANCE_REQUIRE_SETUP_VERSION}}"
+  local require_setup_flags_mask="${23:-${SV2_CONFORMANCE_REQUIRE_SETUP_FLAGS_MASK}}"
+  local forbid_setup_flags_mask="${24:-${SV2_CONFORMANCE_FORBID_SETUP_FLAGS_MASK}}"
+  local setup_protocol="${25:-${SV2_CONFORMANCE_SETUP_PROTOCOL}}"
+  local setup_min_version="${26:-${SV2_CONFORMANCE_SETUP_MIN_VERSION}}"
+  local setup_max_version="${27:-${SV2_CONFORMANCE_SETUP_MAX_VERSION}}"
+  local setup_flags="${28:-${SV2_CONFORMANCE_SETUP_FLAGS}}"
 
   if [[ -z "${stack_name}" || -z "${endpoint}" ]]; then
     echo "[sv2-matrix] invalid target entry: missing stack_name or endpoint"
@@ -165,6 +167,9 @@ run_conformance_target() {
       args+=(--require-observed-kind "${kind}")
     done
   fi
+  if [[ -n "${required_observed_sequence}" ]]; then
+    args+=(--require-observed-sequence "${required_observed_sequence}")
+  fi
   if [[ -n "${forbidden_observed_kinds}" ]]; then
     IFS=';' read -ra forbidden_kinds <<<"${forbidden_observed_kinds}"
     for kind in "${forbidden_kinds[@]}"; do
@@ -191,7 +196,7 @@ run_conformance_target() {
     rc=$?
   fi
 
-  python3 - <<'PY' "${EXTERNAL_RESULTS_JSONL}" "${stack_name}" "${endpoint}" "${secure}" "${mode}" "${expected}" "${vendor}" "${version}" "${role}" "${read_timeout_sec}" "${connect_timeout_sec}" "${connect_retries}" "${connect_retry_delay_ms}" "${expect_set_target}" "${min_job_messages}" "${workaround}" "${notes}" "${required_observed_kinds}" "${forbidden_observed_kinds}" "${require_setup_version}" "${require_setup_flags_mask}" "${forbid_setup_flags_mask}" "${setup_protocol}" "${setup_min_version}" "${setup_max_version}" "${setup_flags}" "${result}" "${rc}"
+  python3 - <<'PY' "${EXTERNAL_RESULTS_JSONL}" "${stack_name}" "${endpoint}" "${secure}" "${mode}" "${expected}" "${vendor}" "${version}" "${role}" "${read_timeout_sec}" "${connect_timeout_sec}" "${connect_retries}" "${connect_retry_delay_ms}" "${expect_set_target}" "${min_job_messages}" "${workaround}" "${notes}" "${required_observed_kinds}" "${required_observed_sequence}" "${forbidden_observed_kinds}" "${require_setup_version}" "${require_setup_flags_mask}" "${forbid_setup_flags_mask}" "${setup_protocol}" "${setup_min_version}" "${setup_max_version}" "${setup_flags}" "${result}" "${rc}"
 import json
 import pathlib
 import sys
@@ -215,16 +220,17 @@ record = {
     "workaround": sys.argv[16] or None,
     "notes": sys.argv[17] or None,
     "required_observed_kinds": [k for k in sys.argv[18].split(";") if k],
-    "forbidden_observed_kinds": [k for k in sys.argv[19].split(";") if k],
-    "require_setup_version": int(sys.argv[20]) if sys.argv[20] else None,
-    "require_setup_flags_mask": int(sys.argv[21], 0),
-    "forbid_setup_flags_mask": int(sys.argv[22], 0),
-    "setup_protocol": int(sys.argv[23], 0),
-    "setup_min_version": int(sys.argv[24], 0),
-    "setup_max_version": int(sys.argv[25], 0),
-    "setup_flags": int(sys.argv[26], 0),
-    "result": sys.argv[27],
-    "exit_code": int(sys.argv[28]),
+    "required_observed_sequence": [k for k in sys.argv[19].split(",") if k],
+    "forbidden_observed_kinds": [k for k in sys.argv[20].split(";") if k],
+    "require_setup_version": int(sys.argv[21]) if sys.argv[21] else None,
+    "require_setup_flags_mask": int(sys.argv[22], 0),
+    "forbid_setup_flags_mask": int(sys.argv[23], 0),
+    "setup_protocol": int(sys.argv[24], 0),
+    "setup_min_version": int(sys.argv[25], 0),
+    "setup_max_version": int(sys.argv[26], 0),
+    "setup_flags": int(sys.argv[27], 0),
+    "result": sys.argv[28],
+    "exit_code": int(sys.argv[29]),
 }
 path.parent.mkdir(parents=True, exist_ok=True)
 with path.open("a", encoding="utf-8") as fh:
@@ -291,8 +297,8 @@ if [[ -n "${SV2_EXTERNAL_TARGETS:-}" ]]; then
   # Extended format:
   # "name,endpoint,secure,mode,secret,expected,vendor,version,role,corpus,read_timeout_sec,\
   #  connect_timeout_sec,connect_retries,connect_retry_delay_ms,expect_set_target,\
-  #  min_job_messages,workaround,notes,required_observed_kinds,forbidden_observed_kinds,\
-  #  require_setup_version,require_setup_flags_mask,forbid_setup_flags_mask,setup_protocol,\
+  #  min_job_messages,workaround,notes,required_observed_kinds,required_observed_sequence,\
+  #  forbidden_observed_kinds,require_setup_version,require_setup_flags_mask,forbid_setup_flags_mask,setup_protocol,\
   #  setup_min_version,setup_max_version,setup_flags"
   IFS=';' read -ra targets <<<"${SV2_EXTERNAL_TARGETS}"
   for target in "${targets[@]}"; do
@@ -317,6 +323,7 @@ if [[ -n "${SV2_EXTERNAL_TARGETS:-}" ]]; then
       workaround \
       notes \
       required_observed_kinds \
+      required_observed_sequence \
       forbidden_observed_kinds \
       require_setup_version \
       require_setup_flags_mask \
@@ -345,6 +352,7 @@ if [[ -n "${SV2_EXTERNAL_TARGETS:-}" ]]; then
       "${workaround:-}" \
       "${notes:-}" \
       "${required_observed_kinds:-}" \
+      "${required_observed_sequence:-}" \
       "${forbidden_observed_kinds:-}" \
       "${require_setup_version:-}" \
       "${require_setup_flags_mask:-0}" \
@@ -377,6 +385,7 @@ if [[ -n "${SV2_EXTERNAL_TARGETS_FILE}" ]]; then
     workaround \
     notes \
     required_observed_kinds \
+    required_observed_sequence \
     forbidden_observed_kinds \
     require_setup_version \
     require_setup_flags_mask \
@@ -406,6 +415,7 @@ if [[ -n "${SV2_EXTERNAL_TARGETS_FILE}" ]]; then
       "${workaround:-}" \
       "${notes:-}" \
       "${required_observed_kinds:-}" \
+      "${required_observed_sequence:-}" \
       "${forbidden_observed_kinds:-}" \
       "${require_setup_version:-}" \
       "${require_setup_flags_mask:-0}" \
@@ -425,6 +435,13 @@ targets = json.loads(path.read_text(encoding="utf-8"))
 def join_kinds(value):
     if isinstance(value, list):
         return ";".join(str(item) for item in value if str(item))
+    if isinstance(value, str):
+        return value
+    return ""
+
+def join_sequence(value):
+    if isinstance(value, list):
+        return ",".join(str(item) for item in value if str(item))
     if isinstance(value, str):
         return value
     return ""
@@ -454,6 +471,7 @@ for target in targets:
                 str(target.get("workaround", "")),
                 str(target.get("notes", "")),
                 join_kinds(target.get("required_observed_kinds", [])),
+                join_sequence(target.get("required_observed_sequence", [])),
                 join_kinds(target.get("forbidden_observed_kinds", [])),
                 str(target.get("require_setup_version", "")),
                 str(target.get("require_setup_flags_mask", "0")),

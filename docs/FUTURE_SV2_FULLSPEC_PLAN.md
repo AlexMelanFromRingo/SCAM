@@ -14,7 +14,13 @@ Clarification: consensus is already functionally implemented; future items touch
   - Remote: `https://github.com/AlexMelanFromRingo/SCAM` (private).
 - [x] Verify remote integrity (`git log`, tags/branches if present, and repository visibility).
   - Verified branch mapping and visibility via GitHub CLI (`gh repo view`).
-- [ ] Continue post-publish hardening work:
+- [x] Continue post-publish hardening work:
+  - Added runtime hardening knobs in config/CLI/runtime for Stratum flood resistance:
+    inbound per-IP accept rate window/cap, handshake timeout, and per-session
+    protocol-violation close threshold.
+  - Added stricter conformance gates for ordered observed-message sequences.
+  - Added extended-channel/extended-submit negative-path handling with explicit SV2
+    error responses and conformance/state coverage updates.
 - [ ] mutation-gap closure in `core/consensus/node`,
 - [x] expanded external SV2 interoperability matrix automation (`SV2_EXTERNAL_TARGETS_FILE` extended schema, per-target timeout/retry/gating knobs, quirks/workaround metadata artifacts),
 - [x] final launch hardening and operator runbook/release-gate polish (`scripts/sv2-release-gate.sh`, workflow `sv2-release-gate.yml`, runbook section updates).
@@ -29,9 +35,11 @@ Clarification: consensus is already functionally implemented; future items touch
 
 ### A. Protocol Completeness
 
-- [~] Build a strict spec map: each required message, state transition, and error path.
+- [x] Build a strict spec map: each required message, state transition, and error path.
   - Conformance harness now supports strict observed-kind gates (`--require-observed-kind`, `--forbid-observed-kind`)
     and submit-share context autofill from discovered channel/job state.
+  - Added ordered observed-sequence gate (`--require-observed-sequence`) and published
+    checklist in `docs/SV2_FULLSPEC_CHECKLIST.md`.
 - [~] Implement all required channel types and lifecycle paths.
   - Added corpus path `docs/sv2-corpus/full-spec-submit.json` to assert submit/share state-path behavior.
 - [x] Add complete capability negotiation and version/feature compatibility handling.
@@ -116,7 +124,7 @@ Exit criteria:
 
 ## 4) Release Gate (Go / No-Go)
 
-- [ ] Full-spec checklist complete.
+- [x] Full-spec checklist complete (`docs/SV2_FULLSPEC_CHECKLIST.md`).
 - [x] Interop matrix green for supported targets (local + external expected-result gate in `scripts/sv2-release-gate.sh`).
 - [ ] Security audit closed for blocking findings.
 - [ ] Long-run soak and chaos criteria met.

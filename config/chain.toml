@@ -18,10 +18,14 @@ stratum_vardiff_clamp_up = 2.0
 stratum_vardiff_clamp_down = 0.5
 stratum_max_rejected_shares = 64
 stratum_read_timeout_sec = 2
+stratum_handshake_timeout_sec = 5
 stratum_keepalive_sec = 30
 stratum_idle_timeout_sec = 180
+stratum_inbound_accept_window_sec = 5
+stratum_inbound_max_accepts_per_ip = 64
 stratum_max_jobs_per_channel = 64
 stratum_max_active_clients = 256
+stratum_max_protocol_violations = 8
 stratum_secure_transport = false
 stratum_secure_rekey_interval_messages = 10000
 

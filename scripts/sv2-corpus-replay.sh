@@ -53,6 +53,9 @@ if [[ -n "${REQUIRE_OBSERVED_KINDS:-}" ]]; then
     args+=(--require-observed-kind "${kind}")
   done
 fi
+if [[ -n "${REQUIRE_OBSERVED_SEQUENCE:-}" ]]; then
+  args+=(--require-observed-sequence "${REQUIRE_OBSERVED_SEQUENCE}")
+fi
 if [[ -n "${FORBID_OBSERVED_KINDS:-}" ]]; then
   IFS=';' read -ra kinds <<<"${FORBID_OBSERVED_KINDS}"
   for kind in "${kinds[@]}"; do

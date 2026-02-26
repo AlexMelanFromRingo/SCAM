@@ -23,6 +23,10 @@
       "SetupConnectionSuccess",
       "OpenStandardMiningChannelSuccess"
     ],
+    "required_observed_sequence": [
+      "SetupConnectionSuccess",
+      "OpenStandardMiningChannelSuccess"
+    ],
     "forbidden_observed_kinds": [
       "SetupConnectionError",
       "OpenStandardMiningChannelError"
@@ -57,6 +61,11 @@
     "required_observed_kinds": [
       "SetTarget"
     ],
+    "required_observed_sequence": [
+      "SetupConnectionSuccess",
+      "OpenStandardMiningChannelSuccess",
+      "SetTarget"
+    ],
     "forbidden_observed_kinds": [],
     "secret_hex": "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
     "expected": "pass",
@@ -81,6 +90,10 @@
     "require_setup_flags_mask": 0,
     "forbid_setup_flags_mask": 0,
     "required_observed_kinds": [
+      "OpenStandardMiningChannelError"
+    ],
+    "required_observed_sequence": [
+      "SetupConnectionSuccess",
       "OpenStandardMiningChannelError"
     ],
     "forbidden_observed_kinds": [

@@ -74,14 +74,22 @@ pub struct ChainConfig {
     pub stratum_max_rejected_shares: u32,
     #[serde(default = "default_stratum_read_timeout_sec")]
     pub stratum_read_timeout_sec: u64,
+    #[serde(default = "default_stratum_handshake_timeout_sec")]
+    pub stratum_handshake_timeout_sec: u64,
     #[serde(default = "default_stratum_keepalive_sec")]
     pub stratum_keepalive_sec: u64,
     #[serde(default = "default_stratum_idle_timeout_sec")]
     pub stratum_idle_timeout_sec: u64,
+    #[serde(default = "default_stratum_inbound_accept_window_sec")]
+    pub stratum_inbound_accept_window_sec: u64,
+    #[serde(default = "default_stratum_inbound_max_accepts_per_ip")]
+    pub stratum_inbound_max_accepts_per_ip: usize,
     #[serde(default = "default_stratum_max_jobs_per_channel")]
     pub stratum_max_jobs_per_channel: usize,
     #[serde(default = "default_stratum_max_active_clients")]
     pub stratum_max_active_clients: usize,
+    #[serde(default = "default_stratum_max_protocol_violations")]
+    pub stratum_max_protocol_violations: u32,
     #[serde(default = "default_stratum_secure_transport")]
     pub stratum_secure_transport: bool,
     #[serde(default = "default_stratum_secure_transport_mode")]
@@ -243,6 +251,11 @@ impl ChainConfig {
                 "stratum_read_timeout_sec must be > 0".to_owned(),
             ));
         }
+        if self.stratum_handshake_timeout_sec == 0 {
+            return Err(ChainConfigError::InvalidField(
+                "stratum_handshake_timeout_sec must be > 0".to_owned(),
+            ));
+        }
         if self.stratum_keepalive_sec == 0 {
             return Err(ChainConfigError::InvalidField(
                 "stratum_keepalive_sec must be > 0".to_owned(),
@@ -258,6 +271,16 @@ impl ChainConfig {
                 "stratum_idle_timeout_sec must be > stratum_keepalive_sec".to_owned(),
             ));
         }
+        if self.stratum_inbound_accept_window_sec == 0 {
+            return Err(ChainConfigError::InvalidField(
+                "stratum_inbound_accept_window_sec must be > 0".to_owned(),
+            ));
+        }
+        if self.stratum_inbound_max_accepts_per_ip == 0 {
+            return Err(ChainConfigError::InvalidField(
+                "stratum_inbound_max_accepts_per_ip must be > 0".to_owned(),
+            ));
+        }
         if self.stratum_max_jobs_per_channel == 0 {
             return Err(ChainConfigError::InvalidField(
                 "stratum_max_jobs_per_channel must be > 0".to_owned(),
@@ -266,6 +289,11 @@ impl ChainConfig {
         if self.stratum_max_active_clients == 0 {
             return Err(ChainConfigError::InvalidField(
                 "stratum_max_active_clients must be > 0".to_owned(),
+            ));
+        }
+        if self.stratum_max_protocol_violations == 0 {
+            return Err(ChainConfigError::InvalidField(
+                "stratum_max_protocol_violations must be > 0".to_owned(),
             ));
         }
         if self.stratum_secure_rekey_interval_messages == 0 {
@@ -445,6 +473,10 @@ const fn default_stratum_read_timeout_sec() -> u64 {
     2
 }
 
+const fn default_stratum_handshake_timeout_sec() -> u64 {
+    5
+}
+
 const fn default_stratum_keepalive_sec() -> u64 {
     30
 }
@@ -453,12 +485,24 @@ const fn default_stratum_idle_timeout_sec() -> u64 {
     180
 }
 
+const fn default_stratum_inbound_accept_window_sec() -> u64 {
+    5
+}
+
+const fn default_stratum_inbound_max_accepts_per_ip() -> usize {
+    64
+}
+
 const fn default_stratum_max_jobs_per_channel() -> usize {
     64
 }
 
 const fn default_stratum_max_active_clients() -> usize {
     256
+}
+
+const fn default_stratum_max_protocol_violations() -> u32 {
+    8
 }
 
 const fn default_stratum_secure_transport() -> bool {
@@ -527,10 +571,14 @@ mod tests {
             stratum_vardiff_clamp_down: 0.5,
             stratum_max_rejected_shares: 64,
             stratum_read_timeout_sec: 2,
+            stratum_handshake_timeout_sec: 5,
             stratum_keepalive_sec: 30,
             stratum_idle_timeout_sec: 180,
+            stratum_inbound_accept_window_sec: 5,
+            stratum_inbound_max_accepts_per_ip: 64,
             stratum_max_jobs_per_channel: 64,
             stratum_max_active_clients: 256,
+            stratum_max_protocol_violations: 8,
             stratum_secure_transport: false,
             stratum_secure_transport_mode: "noise_xx".to_owned(),
             stratum_secure_rekey_interval_messages: 10_000,
@@ -585,10 +633,14 @@ mod tests {
             stratum_vardiff_clamp_down: 0.5,
             stratum_max_rejected_shares: 64,
             stratum_read_timeout_sec: 2,
+            stratum_handshake_timeout_sec: 5,
             stratum_keepalive_sec: 30,
             stratum_idle_timeout_sec: 180,
+            stratum_inbound_accept_window_sec: 5,
+            stratum_inbound_max_accepts_per_ip: 64,
             stratum_max_jobs_per_channel: 64,
             stratum_max_active_clients: 256,
+            stratum_max_protocol_violations: 8,
             stratum_secure_transport: false,
             stratum_secure_transport_mode: "noise_xx".to_owned(),
             stratum_secure_rekey_interval_messages: 10_000,
@@ -655,10 +707,14 @@ genesis_reward_key_hash20 = "0000000000000000000000000000000000000000"
         assert_eq!(cfg.stratum_vardiff_clamp_down, 0.5);
         assert_eq!(cfg.stratum_max_rejected_shares, 64);
         assert_eq!(cfg.stratum_read_timeout_sec, 2);
+        assert_eq!(cfg.stratum_handshake_timeout_sec, 5);
         assert_eq!(cfg.stratum_keepalive_sec, 30);
         assert_eq!(cfg.stratum_idle_timeout_sec, 180);
+        assert_eq!(cfg.stratum_inbound_accept_window_sec, 5);
+        assert_eq!(cfg.stratum_inbound_max_accepts_per_ip, 64);
         assert_eq!(cfg.stratum_max_jobs_per_channel, 64);
         assert_eq!(cfg.stratum_max_active_clients, 256);
+        assert_eq!(cfg.stratum_max_protocol_violations, 8);
         assert!(!cfg.stratum_secure_transport);
         assert_eq!(cfg.stratum_secure_transport_mode, "noise_xx");
         assert_eq!(cfg.stratum_secure_rekey_interval_messages, 10_000);
@@ -710,6 +766,36 @@ genesis_reward_key_hash20 = "0000000000000000000000000000000000000000"
         assert!(
             err.to_string()
                 .contains("stratum_idle_timeout_sec must be > stratum_keepalive_sec")
+        );
+
+        let mut cfg = sample_config();
+        cfg.stratum_handshake_timeout_sec = 0;
+        let err = cfg
+            .validate()
+            .expect_err("zero handshake timeout must fail");
+        assert!(
+            err.to_string()
+                .contains("stratum_handshake_timeout_sec must be > 0")
+        );
+
+        let mut cfg = sample_config();
+        cfg.stratum_inbound_max_accepts_per_ip = 0;
+        let err = cfg
+            .validate()
+            .expect_err("zero inbound accept max must fail");
+        assert!(
+            err.to_string()
+                .contains("stratum_inbound_max_accepts_per_ip must be > 0")
+        );
+
+        let mut cfg = sample_config();
+        cfg.stratum_max_protocol_violations = 0;
+        let err = cfg
+            .validate()
+            .expect_err("zero protocol violation budget must fail");
+        assert!(
+            err.to_string()
+                .contains("stratum_max_protocol_violations must be > 0")
         );
     }
 
