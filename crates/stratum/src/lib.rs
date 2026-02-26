@@ -83,6 +83,12 @@ const MSG_SUBMIT_SHARES_SUCCESS: u8 = 0x31;
 const MSG_SUBMIT_SHARES_ERROR: u8 = 0x32;
 const MSG_KEEP_ALIVE: u8 = 0x40;
 
+pub const SV2_MINING_PROTOCOL_ID: u16 = 2;
+pub const SV2_SETUP_FLAG_STANDARD_CHANNEL: u32 = 1 << 0;
+pub const SV2_SETUP_FLAG_SET_TARGET: u32 = 1 << 1;
+pub const SV2_SETUP_FLAGS_KNOWN_MASK: u32 =
+    SV2_SETUP_FLAG_STANDARD_CHANNEL | SV2_SETUP_FLAG_SET_TARGET;
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Sv2Message {
     SetupConnection {
@@ -289,6 +295,8 @@ pub struct SessionConfig {
     pub max_share_target: Target,
     pub max_jobs: usize,
     pub supported_version: u16,
+    pub supported_setup_flags: u32,
+    pub required_setup_flags: u32,
     pub vardiff_target_shares_per_minute: u32,
     pub vardiff_retarget_interval_shares: usize,
     pub vardiff_clamp_up: f64,
@@ -356,6 +364,8 @@ pub struct Sv2Session {
     stats: SessionStats,
     current_share_target: Target,
     recent_share_timestamps: VecDeque<u64>,
+    negotiated_setup_version: Option<u16>,
+    negotiated_setup_flags: u32,
 }
 
 impl Sv2Session {
@@ -400,6 +410,16 @@ impl Sv2Session {
                 "share_target must be within [min_share_target, max_share_target]".to_owned(),
             ));
         }
+        if (cfg.required_setup_flags & !cfg.supported_setup_flags) != 0 {
+            return Err(StratumError::InvalidConfig(
+                "required_setup_flags must be a subset of supported_setup_flags".to_owned(),
+            ));
+        }
+        if (cfg.supported_setup_flags & !SV2_SETUP_FLAGS_KNOWN_MASK) != 0 {
+            return Err(StratumError::InvalidConfig(
+                "supported_setup_flags contains unknown bits".to_owned(),
+            ));
+        }
 
         Ok(Self {
             cfg,
@@ -410,6 +430,8 @@ impl Sv2Session {
             stats: SessionStats::default(),
             current_share_target: cfg.share_target,
             recent_share_timestamps: VecDeque::new(),
+            negotiated_setup_version: None,
+            negotiated_setup_flags: 0,
         })
     }
 
@@ -427,6 +449,14 @@ impl Sv2Session {
 
     pub fn share_target(&self) -> Target {
         self.current_share_target
+    }
+
+    pub fn negotiated_setup_version(&self) -> Option<u16> {
+        self.negotiated_setup_version
+    }
+
+    pub fn negotiated_setup_flags(&self) -> u32 {
+        self.negotiated_setup_flags
     }
 
     pub fn close(&mut self) {
@@ -559,10 +589,31 @@ impl Sv2Session {
             ));
         }
 
-        if protocol != 2
-            || self.cfg.supported_version < min_version
-            || self.cfg.supported_version > max_version
-        {
+        if min_version > max_version {
+            return Ok(SessionResponse {
+                outbound: vec![Sv2Message::SetupConnectionError {
+                    code: "invalid_version_range".to_owned(),
+                    reason: format!(
+                        "requested_range=[{}, {}] is invalid",
+                        min_version, max_version
+                    ),
+                }],
+                events: Vec::new(),
+            });
+        }
+        if protocol != SV2_MINING_PROTOCOL_ID {
+            return Ok(SessionResponse {
+                outbound: vec![Sv2Message::SetupConnectionError {
+                    code: "unsupported_protocol".to_owned(),
+                    reason: format!(
+                        "supported_protocol={}, got={}",
+                        SV2_MINING_PROTOCOL_ID, protocol
+                    ),
+                }],
+                events: Vec::new(),
+            });
+        }
+        if self.cfg.supported_version < min_version || self.cfg.supported_version > max_version {
             return Ok(SessionResponse {
                 outbound: vec![Sv2Message::SetupConnectionError {
                     code: "unsupported_version".to_owned(),
@@ -574,12 +625,41 @@ impl Sv2Session {
                 events: Vec::new(),
             });
         }
+        let unsupported_flags = flags & !self.cfg.supported_setup_flags;
+        if unsupported_flags != 0 {
+            return Ok(SessionResponse {
+                outbound: vec![Sv2Message::SetupConnectionError {
+                    code: "unsupported_feature_flags".to_owned(),
+                    reason: format!(
+                        "unsupported_flags=0x{unsupported_flags:08x}, supported=0x{:08x}",
+                        self.cfg.supported_setup_flags
+                    ),
+                }],
+                events: Vec::new(),
+            });
+        }
+        let missing_required_flags = self.cfg.required_setup_flags & !flags;
+        if missing_required_flags != 0 {
+            return Ok(SessionResponse {
+                outbound: vec![Sv2Message::SetupConnectionError {
+                    code: "missing_required_feature_flags".to_owned(),
+                    reason: format!(
+                        "required_flags=0x{:08x}, missing=0x{missing_required_flags:08x}",
+                        self.cfg.required_setup_flags
+                    ),
+                }],
+                events: Vec::new(),
+            });
+        }
 
+        let negotiated_flags = flags & self.cfg.supported_setup_flags;
+        self.negotiated_setup_version = Some(self.cfg.supported_version);
+        self.negotiated_setup_flags = negotiated_flags;
         self.state = SessionState::AwaitOpenChannel;
         Ok(SessionResponse {
             outbound: vec![Sv2Message::SetupConnectionSuccess {
                 used_version: self.cfg.supported_version,
-                flags,
+                flags: negotiated_flags,
             }],
             events: vec![SessionEvent::SetupAccepted],
         })
@@ -2000,7 +2080,8 @@ mod tests {
 
     use crate::{
         IdentityTranslator, JobDeclarator, MiningJob, MiningTemplate, NoiseSv2Transport,
-        SUPPORTED_SV2_VERSION, SecureRole, SecureSv2Transport, SecureTransportMode,
+        SUPPORTED_SV2_VERSION, SV2_SETUP_FLAG_SET_TARGET, SV2_SETUP_FLAG_STANDARD_CHANNEL,
+        SV2_SETUP_FLAGS_KNOWN_MASK, SecureRole, SecureSv2Transport, SecureTransportMode,
         SequentialJobDeclarator, SessionConfig, SessionEvent, ShareSubmission, ShareValidation,
         StratumError, Sv2Message, Sv2Session, Translator, decode_secure_handshake_packet,
         decode_single_frame_bytes, read_frame, read_frame_async, validate_share, write_frame,
@@ -2018,6 +2099,8 @@ mod tests {
             max_share_target: Target::MAX,
             max_jobs: 8,
             supported_version: SUPPORTED_SV2_VERSION,
+            supported_setup_flags: SV2_SETUP_FLAGS_KNOWN_MASK,
+            required_setup_flags: 0,
             vardiff_target_shares_per_minute: 6,
             vardiff_retarget_interval_shares: 3,
             vardiff_clamp_up: 4.0,
@@ -2481,7 +2564,7 @@ mod tests {
             .expect("response");
         assert!(matches!(
             wrong_protocol.outbound.as_slice(),
-            [Sv2Message::SetupConnectionError { code, .. }] if code == "unsupported_version"
+            [Sv2Message::SetupConnectionError { code, .. }] if code == "unsupported_protocol"
         ));
 
         let mut session = Sv2Session::new(test_session_config()).expect("session");
@@ -2512,6 +2595,81 @@ mod tests {
         assert!(matches!(
             unsupported_max.outbound.as_slice(),
             [Sv2Message::SetupConnectionError { code, .. }] if code == "unsupported_version"
+        ));
+
+        let mut session = Sv2Session::new(test_session_config()).expect("session");
+        let invalid_range = session
+            .handle_message(Sv2Message::SetupConnection {
+                protocol: 2,
+                min_version: 3,
+                max_version: 2,
+                flags: 0,
+                user_agent: "miner".to_owned(),
+            })
+            .expect("response");
+        assert!(matches!(
+            invalid_range.outbound.as_slice(),
+            [Sv2Message::SetupConnectionError { code, .. }] if code == "invalid_version_range"
+        ));
+    }
+
+    #[test]
+    fn session_setup_negotiates_feature_flags_and_rejects_unsupported_or_missing_flags() {
+        let mut cfg = test_session_config();
+        cfg.supported_setup_flags = SV2_SETUP_FLAG_STANDARD_CHANNEL | SV2_SETUP_FLAG_SET_TARGET;
+        cfg.required_setup_flags = SV2_SETUP_FLAG_STANDARD_CHANNEL;
+
+        let mut session = Sv2Session::new(cfg).expect("session");
+        let ok = session
+            .handle_message(Sv2Message::SetupConnection {
+                protocol: 2,
+                min_version: 2,
+                max_version: 2,
+                flags: SV2_SETUP_FLAG_STANDARD_CHANNEL,
+                user_agent: "miner".to_owned(),
+            })
+            .expect("response");
+        assert!(matches!(
+            ok.outbound.as_slice(),
+            [Sv2Message::SetupConnectionSuccess {
+                used_version: 2,
+                flags
+            }] if *flags == SV2_SETUP_FLAG_STANDARD_CHANNEL
+        ));
+        assert_eq!(session.negotiated_setup_version(), Some(2));
+        assert_eq!(
+            session.negotiated_setup_flags(),
+            SV2_SETUP_FLAG_STANDARD_CHANNEL
+        );
+
+        let mut session = Sv2Session::new(cfg).expect("session");
+        let unsupported = session
+            .handle_message(Sv2Message::SetupConnection {
+                protocol: 2,
+                min_version: 2,
+                max_version: 2,
+                flags: SV2_SETUP_FLAG_STANDARD_CHANNEL | (1 << 30),
+                user_agent: "miner".to_owned(),
+            })
+            .expect("response");
+        assert!(matches!(
+            unsupported.outbound.as_slice(),
+            [Sv2Message::SetupConnectionError { code, .. }] if code == "unsupported_feature_flags"
+        ));
+
+        let mut session = Sv2Session::new(cfg).expect("session");
+        let missing_required = session
+            .handle_message(Sv2Message::SetupConnection {
+                protocol: 2,
+                min_version: 2,
+                max_version: 2,
+                flags: 0,
+                user_agent: "miner".to_owned(),
+            })
+            .expect("response");
+        assert!(matches!(
+            missing_required.outbound.as_slice(),
+            [Sv2Message::SetupConnectionError { code, .. }] if code == "missing_required_feature_flags"
         ));
     }
 
