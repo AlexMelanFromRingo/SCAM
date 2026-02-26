@@ -115,10 +115,28 @@ SV2_EXTERNAL_TARGETS_FILE=docs/sv2-interop-targets.example.json \
 scripts/sv2-release-gate.sh
 ```
 
+Enable golden baseline verification in release gate:
+
+```bash
+VERIFY_GOLDEN=true \
+GOLDEN_EXPECTATIONS=docs/sv2-corpus/golden/expectations.json \
+scripts/sv2-release-gate.sh
+```
+
 Release gate artifacts:
 
 - `target/sv2-release-gate/matrix/*`
 - `target/sv2-release-gate/release-gate.json`
+- `target/sv2-release-gate/golden-verify.json` (when `VERIFY_GOLDEN=true`)
+
+Golden corpus maintenance:
+
+```bash
+scripts/sv2-golden-freeze.sh
+python3 scripts/sv2-golden-verify.py \
+  --input-dir target/sv2-conformance \
+  --golden docs/sv2-corpus/golden/expectations.json
+```
 
 7. Direct corpus replay with strict observed-kind gate:
 

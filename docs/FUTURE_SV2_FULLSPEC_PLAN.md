@@ -37,6 +37,7 @@ Clarification: consensus is already functionally implemented; future items touch
 - [ ] Add complete capability negotiation and version/feature compatibility handling.
 - [~] Add full negative-path handling for malformed/unsupported/out-of-order messages.
   - External matrix now supports expected-fail rows with vendor-specific workaround/notes tracking.
+  - Added setup version/flags strict gates and observed-kind allow/deny enforcement in conformance runner.
 
 ### B. Transport and Security
 
@@ -49,7 +50,9 @@ Clarification: consensus is already functionally implemented; future items touch
 
 - [x] Define external target matrix (vendor, version, mode, role, expected behavior).
 - [x] Run automated compatibility scenarios against each target stack.
-- [ ] Maintain golden corpus of cross-stack captures and expected outcomes.
+- [x] Maintain golden corpus of cross-stack captures and expected outcomes.
+  - Added `scripts/sv2-golden-freeze.sh`, `scripts/sv2-golden-verify.py`, and baseline
+    `docs/sv2-corpus/golden/expectations.json` wired into release gate (`VERIFY_GOLDEN=true`).
 - [x] Track compatibility quirks by stack/version with explicit workarounds.
 - Baseline harness support is in place for structured target manifests (`SV2_EXTERNAL_TARGETS_FILE`)
   with per-target expected outcome + vendor/version metadata artifacts.

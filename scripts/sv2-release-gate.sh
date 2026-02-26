@@ -6,13 +6,25 @@ MATRIX_OUT_DIR="${OUT_DIR}/matrix"
 REQUIRE_EXTERNAL="${REQUIRE_EXTERNAL:-false}"
 MIN_LOCAL_TARGETS="${MIN_LOCAL_TARGETS:-2}"
 MIN_SECURE_LOCAL_TARGETS="${MIN_SECURE_LOCAL_TARGETS:-1}"
+VERIFY_GOLDEN="${VERIFY_GOLDEN:-false}"
+GOLDEN_EXPECTATIONS="${GOLDEN_EXPECTATIONS:-docs/sv2-corpus/golden/expectations.json}"
 
 mkdir -p "${OUT_DIR}"
 
 echo "[sv2-release-gate] running matrix into ${MATRIX_OUT_DIR}"
 OUT_DIR="${MATRIX_OUT_DIR}" scripts/sv2-conformance-matrix.sh
 
-python3 - <<'PY' "${MATRIX_OUT_DIR}/summary.json" "${OUT_DIR}/release-gate.json" "${REQUIRE_EXTERNAL}" "${MIN_LOCAL_TARGETS}" "${MIN_SECURE_LOCAL_TARGETS}"
+golden_check_enabled=false
+golden_check_pass=true
+if [[ "${VERIFY_GOLDEN}" == "true" ]]; then
+  golden_check_enabled=true
+  python3 scripts/sv2-golden-verify.py \
+    --input-dir "${MATRIX_OUT_DIR}" \
+    --golden "${GOLDEN_EXPECTATIONS}" \
+    --out "${OUT_DIR}/golden-verify.json"
+fi
+
+python3 - <<'PY' "${MATRIX_OUT_DIR}/summary.json" "${OUT_DIR}/release-gate.json" "${REQUIRE_EXTERNAL}" "${MIN_LOCAL_TARGETS}" "${MIN_SECURE_LOCAL_TARGETS}" "${golden_check_enabled}" "${golden_check_pass}" "${GOLDEN_EXPECTATIONS}"
 import json
 import pathlib
 import sys
@@ -23,6 +35,9 @@ out_path = pathlib.Path(sys.argv[2])
 require_external = sys.argv[3].lower() == "true"
 min_local_targets = int(sys.argv[4])
 min_secure_local_targets = int(sys.argv[5])
+golden_check_enabled = sys.argv[6].lower() == "true"
+golden_check_pass = sys.argv[7].lower() == "true"
+golden_expectations = sys.argv[8]
 
 if not summary_path.exists():
     raise SystemExit(f"[sv2-release-gate] missing summary file: {summary_path}")
@@ -55,6 +70,7 @@ gate_pass = all(
         secure_local_floor_ok,
         external_expectation_ok,
         external_required_ok,
+        golden_check_pass,
     ]
 )
 
@@ -67,6 +83,8 @@ result = {
         "secure_local_floor_ok": secure_local_floor_ok,
         "external_expectation_ok": external_expectation_ok,
         "external_required_ok": external_required_ok,
+        "golden_check_enabled": golden_check_enabled,
+        "golden_check_pass": golden_check_pass,
     },
     "local": {
         "total": local_total,
@@ -80,6 +98,11 @@ result = {
         "total": external_total,
         "unexpected": external_unexpected,
         "parse_errors": external_parse_errors,
+    },
+    "golden": {
+        "enabled": golden_check_enabled,
+        "expectations": golden_expectations,
+        "pass": golden_check_pass,
     },
     "summary_path": str(summary_path),
 }

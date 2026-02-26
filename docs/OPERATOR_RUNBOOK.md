@@ -153,12 +153,26 @@ Strict release gate (local + optional external matrix expectations):
 scripts/sv2-release-gate.sh
 ```
 
+Release gate with golden baseline verification:
+
+```bash
+VERIFY_GOLDEN=true \
+GOLDEN_EXPECTATIONS=docs/sv2-corpus/golden/expectations.json \
+scripts/sv2-release-gate.sh
+```
+
 Require external targets during go/no-go gate:
 
 ```bash
 REQUIRE_EXTERNAL=true \
 SV2_EXTERNAL_TARGETS_FILE=docs/sv2-interop-targets.example.json \
 scripts/sv2-release-gate.sh
+```
+
+Refresh local golden expectations after intentional protocol changes:
+
+```bash
+scripts/sv2-golden-freeze.sh
 ```
 
 Public testnet dry run:

@@ -1,0 +1,44 @@
+{
+  "generated_at_unix_sec": 1771777777,
+  "source": "manual-bootstrap",
+  "targets": [
+    {
+      "stack_name": "scam-local-plain",
+      "require_pass": true,
+      "require_setup_success": true,
+      "require_channel_opened": true,
+      "require_set_target_seen": true,
+      "min_job_messages_seen": 1,
+      "require_setup_version": 2,
+      "required_observed_kinds": [
+        "SetupConnectionSuccess",
+        "OpenStandardMiningChannelSuccess",
+        "SetTarget"
+      ],
+      "forbidden_observed_kinds": [
+        "SetupConnectionError",
+        "OpenStandardMiningChannelError",
+        "SubmitSharesError"
+      ]
+    },
+    {
+      "stack_name": "scam-local-noise-xx",
+      "require_pass": true,
+      "require_setup_success": true,
+      "require_channel_opened": true,
+      "require_set_target_seen": true,
+      "min_job_messages_seen": 1,
+      "require_setup_version": 2,
+      "required_observed_kinds": [
+        "SetupConnectionSuccess",
+        "OpenStandardMiningChannelSuccess",
+        "SetTarget"
+      ],
+      "forbidden_observed_kinds": [
+        "SetupConnectionError",
+        "OpenStandardMiningChannelError",
+        "SubmitSharesError"
+      ]
+    }
+  ]
+}

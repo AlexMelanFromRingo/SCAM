@@ -11,6 +11,14 @@ on:
         options:
           - "false"
           - "true"
+      verify_golden:
+        description: "Verify local matrix reports against docs/sv2-corpus/golden/expectations.json"
+        required: true
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
 
 jobs:
   sv2-release-gate:
@@ -37,6 +45,7 @@ jobs:
       - name: Run release gate
         env:
           REQUIRE_EXTERNAL: ${{ inputs.require_external }}
+          VERIFY_GOLDEN: ${{ inputs.verify_golden }}
           OUT_DIR: target/sv2-release-gate
         run: scripts/sv2-release-gate.sh
       - name: Upload release gate artifacts
