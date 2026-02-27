@@ -4702,9 +4702,10 @@ impl StratumPoolLedgerState {
             is_block,
         });
         while self.shares.len() > self.max_share_records {
-            if let Some(front) = self.shares.pop_front() {
-                self.share_index.remove(&front.share_key);
-            }
+            let Some(front) = self.shares.pop_front() else {
+                break;
+            };
+            self.share_index.remove(&front.share_key);
         }
 
         let counters =
@@ -4800,7 +4801,9 @@ impl StratumPoolLedgerState {
             orphaned: false,
         });
         while self.rounds.len() > self.max_round_records {
-            self.rounds.pop_front();
+            if self.rounds.pop_front().is_none() {
+                break;
+            }
         }
     }
 
@@ -5518,6 +5521,14 @@ fn relay_messages_for_peer(
         }
     }
     out
+}
+
+fn relay_startup_send_failed(startup_sent: bool) -> bool {
+    !startup_sent
+}
+
+fn should_persist_peer_reputation(delta: RuntimePeerReputation) -> bool {
+    delta.replacement_rate_limited_total > 0
 }
 
 fn relay_known_peer_addresses(state: &RelayServerState, max_items: usize) -> Vec<PeerAddress> {
@@ -6536,7 +6547,7 @@ fn run_relay_peer_session<IO: Read + Write>(
                 },
             ];
             let startup_sent = relay_send_messages_until_closed(stream, &startup, &framing)?;
-            if !startup_sent {
+            if relay_startup_send_failed(startup_sent) {
                 return Ok(());
             }
         }
@@ -6665,7 +6676,7 @@ fn run_relay_peer_session<IO: Read + Write>(
         *active_guard = active_guard.saturating_sub(1);
     }
     if let (Some(store), Some(address)) = (peer_reputation_store, peer_address)
-        && peer_reputation_delta.replacement_rate_limited_total > 0
+        && should_persist_peer_reputation(peer_reputation_delta)
     {
         let now_unix_sec = current_unix_sec()
             .unwrap_or(peer_reputation_delta.last_replacement_rate_limited_unix_sec);
@@ -6913,7 +6924,7 @@ async fn run_relay_peer_session_async<S: AsyncRead + AsyncWrite + Unpin>(
         *active_guard = active_guard.saturating_sub(1);
     }
     if let (Some(store), Some(address)) = (peer_reputation_store, peer_address)
-        && peer_reputation_delta.replacement_rate_limited_total > 0
+        && should_persist_peer_reputation(peer_reputation_delta)
     {
         let now_unix_sec = current_unix_sec()
             .unwrap_or(peer_reputation_delta.last_replacement_rate_limited_unix_sec);
@@ -15934,6 +15945,570 @@ mod tests {
                 .paid_total_atomic,
             payout.amount_atomic
         );
+    }
+
+    #[test]
+    fn pool_mode_and_paths_helpers_are_strict() {
+        assert!(!super::PoolPayoutModeArg::Solo.uses_pplns());
+        assert!(super::PoolPayoutModeArg::Pplns.uses_pplns());
+        assert!(!super::PoolPayoutModeArg::Pps.uses_pplns());
+        assert!(super::PoolPayoutModeArg::Hybrid.uses_pplns());
+
+        let runtime_db = PathBuf::from("target/test-runtime.redb");
+        let pool_db = super::default_pool_ledger_db_path(&runtime_db);
+        assert!(
+            pool_db.ends_with("pool.ledger.redb"),
+            "pool ledger db path should be derived from runtime db sibling name"
+        );
+        assert!(
+            !pool_db.as_os_str().is_empty(),
+            "derived pool ledger db path must not be empty"
+        );
+    }
+
+    #[test]
+    fn pool_ledger_lock_conflict_matcher_is_exact() {
+        assert!(super::is_pool_ledger_db_lock_conflict(
+            &super::NodeError::Runtime("Database already open".to_owned())
+        ));
+        assert!(super::is_pool_ledger_db_lock_conflict(
+            &super::NodeError::Runtime("Cannot acquire lock".to_owned())
+        ));
+        assert!(!super::is_pool_ledger_db_lock_conflict(
+            &super::NodeError::Runtime("different storage error".to_owned())
+        ));
+    }
+
+    #[test]
+    fn pool_ledger_persist_and_load_enforce_network_and_retry_contract() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let work_dir = temp_dir("test-pool-ledger-load-persist");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let path = work_dir.join("pool.ledger.redb");
+
+        let state = super::StratumPoolLedgerState::new(
+            cfg.network_id.clone(),
+            runtime.tip_height(),
+            runtime.tip_hash(),
+            1_770_000_100,
+            64,
+            16,
+        );
+        super::persist_pool_ledger_db_with_retry(&path, &state, 2, 1).expect("persist with retry");
+        assert!(path.exists(), "persist should create pool ledger db file");
+
+        let loaded = super::load_pool_ledger_from_db_or_new(&cfg, &runtime, &path, 64, 16)
+            .expect("load from persisted db");
+        assert_eq!(loaded.network_id, cfg.network_id);
+
+        let mismatch_path = work_dir.join("pool.ledger.mismatch.redb");
+        super::save_pool_ledger_db(
+            &mismatch_path,
+            &super::PoolLedgerSnapshot {
+                network_id: "wrongnet".to_owned(),
+                current_round_id: 1,
+                shares: Vec::new(),
+                rounds: Vec::new(),
+                workers: Vec::new(),
+                pending_payouts: Vec::new(),
+                completed_payouts: Vec::new(),
+            },
+        )
+        .expect("persist mismatch snapshot");
+        let err = super::load_pool_ledger_from_db_or_new(&cfg, &runtime, &mismatch_path, 64, 16)
+            .expect_err("network mismatch must fail");
+        assert!(err.to_string().contains("pool ledger db network mismatch"));
+
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
+    fn reputation_failure_weight_obeys_decay_boundaries() {
+        let day = 24 * 60 * 60;
+        let week = 7 * day;
+        let now = 1_770_000_000u64;
+
+        assert_eq!(super::reputation_failure_weight(0, now, now), 0);
+        assert_eq!(super::reputation_failure_weight(9, now, now), 9);
+        assert_eq!(super::reputation_failure_weight(9, now - day, now), 9);
+        assert_eq!(super::reputation_failure_weight(9, now - day - 1, now), 5);
+        assert_eq!(super::reputation_failure_weight(9, now - week, now), 5);
+        assert_eq!(super::reputation_failure_weight(9, now - week - 1, now), 0);
+    }
+
+    #[test]
+    fn update_peer_reputation_store_guards_and_dedup_behave() {
+        let peers_dir = temp_dir("test-peer-reputation-guards");
+        fs::create_dir_all(&peers_dir).expect("mkdir peers");
+        let store = super::PeerReputationStore::from_peers_dir(&peers_dir, "devnet");
+        let now = 1_770_000_000u64;
+
+        super::update_peer_reputation_store(
+            &store,
+            "",
+            super::RuntimePeerReputation {
+                replacement_rate_limited_total: 5,
+                last_replacement_rate_limited_unix_sec: now,
+            },
+            now,
+        )
+        .expect("empty address should be ignored");
+        assert!(
+            !store.path.exists(),
+            "ignored update should not create reputation file"
+        );
+
+        super::update_peer_reputation_store(
+            &store,
+            "127.0.0.1:18444",
+            super::RuntimePeerReputation {
+                replacement_rate_limited_total: 0,
+                last_replacement_rate_limited_unix_sec: now,
+            },
+            now,
+        )
+        .expect("zero delta should be ignored");
+        assert!(
+            !store.path.exists(),
+            "zero-delta update should not create reputation file"
+        );
+
+        super::save_peer_reputation_book(
+            &store.path,
+            &super::PeerReputationBook {
+                network_id: "devnet".to_owned(),
+                peers: vec![
+                    super::PeerReputationRecord {
+                        address: "127.0.0.1:18444".to_owned(),
+                        replacement_rate_limited_total: 1,
+                        last_replacement_rate_limited_unix_sec: now,
+                        last_updated_unix_sec: now,
+                    },
+                    super::PeerReputationRecord {
+                        address: "127.0.0.1:18444".to_owned(),
+                        replacement_rate_limited_total: 2,
+                        last_replacement_rate_limited_unix_sec: now + 1,
+                        last_updated_unix_sec: now + 1,
+                    },
+                ],
+            },
+        )
+        .expect("seed duplicate reputation records");
+
+        super::update_peer_reputation_store(
+            &store,
+            "127.0.0.1:18444",
+            super::RuntimePeerReputation {
+                replacement_rate_limited_total: 3,
+                last_replacement_rate_limited_unix_sec: now + 5,
+            },
+            now + 5,
+        )
+        .expect("update deduped record");
+
+        let loaded = super::load_peer_reputation_book(&store.path, "devnet").expect("load");
+        assert_eq!(
+            loaded.peers.len(),
+            1,
+            "duplicate peers must be deduplicated"
+        );
+        assert_eq!(loaded.peers[0].address, "127.0.0.1:18444");
+        assert!(
+            loaded.peers[0].replacement_rate_limited_total >= 4,
+            "existing + delta must accumulate"
+        );
+
+        let _ = fs::remove_dir_all(peers_dir);
+    }
+
+    #[test]
+    fn pool_ledger_from_snapshot_and_math_paths_are_deterministic() {
+        let mut shares = Vec::new();
+        for idx in 0..4u64 {
+            shares.push(super::PoolShareRecord {
+                share_key: format!("k-{idx}"),
+                worker: format!("worker-{idx}"),
+                timestamp_unix_sec: 100 + idx,
+                channel_id: 1,
+                job_id: 1,
+                nonce: idx,
+                ntime: idx,
+                expected_hashes: 1.0 + idx as f64,
+                accepted: true,
+                is_block: false,
+            });
+        }
+        let rounds = vec![
+            super::PoolRoundRecord {
+                round_id: 1,
+                start_height: 1,
+                start_tip_hash: Hash256([1; 32]),
+                start_unix_sec: 100,
+                end_height: Some(2),
+                end_tip_hash: Some(Hash256([2; 32])),
+                end_unix_sec: Some(110),
+                closed_by_worker: Some("worker-1".to_owned()),
+                found_block_hash: Some(Hash256([9; 32])),
+                found_block_reward_atomic: 1_000,
+                orphaned: false,
+            },
+            super::PoolRoundRecord {
+                round_id: 2,
+                start_height: 2,
+                start_tip_hash: Hash256([2; 32]),
+                start_unix_sec: 111,
+                end_height: Some(3),
+                end_tip_hash: Some(Hash256([3; 32])),
+                end_unix_sec: Some(120),
+                closed_by_worker: Some("worker-2".to_owned()),
+                found_block_hash: Some(Hash256([10; 32])),
+                found_block_reward_atomic: 1_000,
+                orphaned: false,
+            },
+        ];
+        let state = super::StratumPoolLedgerState::from_snapshot(
+            super::PoolLedgerSnapshot {
+                network_id: "devnet".to_owned(),
+                current_round_id: 2,
+                shares,
+                rounds,
+                workers: Vec::new(),
+                pending_payouts: Vec::new(),
+                completed_payouts: Vec::new(),
+            },
+            10,
+            Hash256([10; 32]),
+            1_770_000_000,
+            2,
+            2,
+        );
+        assert_eq!(
+            state.shares.len(),
+            2,
+            "shares should be trimmed to retention"
+        );
+        assert_eq!(
+            state.rounds.len(),
+            2,
+            "rounds should be trimmed to retention"
+        );
+        assert!(
+            state
+                .rounds
+                .back()
+                .expect("last round")
+                .end_height
+                .is_none(),
+            "from_snapshot should ensure open tail round exists"
+        );
+
+        let mut reward_state = super::StratumPoolLedgerState::new(
+            "devnet".to_owned(),
+            0,
+            Hash256::ZERO,
+            1_770_000_000,
+            16,
+            8,
+        );
+        reward_state.set_payout_config(super::PoolPayoutConfig {
+            pool_fee_bps: 100,
+            ..super::PoolPayoutConfig::default()
+        });
+        assert_eq!(reward_state.reward_after_pool_fee(10_000), 9_900);
+        reward_state.set_payout_config(super::PoolPayoutConfig {
+            pool_fee_bps: 20_000,
+            ..super::PoolPayoutConfig::default()
+        });
+        assert_eq!(
+            reward_state.reward_after_pool_fee(10_000),
+            0,
+            "pool fee should clamp at 100%"
+        );
+    }
+
+    #[test]
+    fn pool_ledger_pps_and_pplns_boundaries_are_exact() {
+        let mut ledger = super::StratumPoolLedgerState::new(
+            "devnet".to_owned(),
+            0,
+            Hash256::ZERO,
+            1_770_000_000,
+            8,
+            8,
+        );
+        ledger.workers.insert(
+            "worker-x".to_owned(),
+            super::PoolWorkerAccrualRecord {
+                worker: "worker-x".to_owned(),
+                accepted_total: 0,
+                rejected_total: 0,
+                blocks_found_total: 0,
+                expected_hashes_accumulated: 0.0,
+                pplns_accrual_atomic: 0,
+                pps_accrual_atomic: 10,
+                paid_total_atomic: 0,
+                last_share_unix_sec: 0,
+            },
+        );
+        ledger.set_payout_config(super::PoolPayoutConfig {
+            mode: super::PoolPayoutModeArg::Pps,
+            pps_share_atomic: 10,
+            pps_max_liability_atomic: 20,
+            pps_reserve_floor_atomic: 0,
+            payout_threshold_atomic: 1,
+            payout_interval_sec: 10,
+            payout_tx_fee_atomic: 1,
+            ..super::PoolPayoutConfig::default()
+        });
+        assert!(!ledger.pps_liability_exceeds_cap(10));
+        assert!(ledger.pps_liability_exceeds_cap(11));
+        ledger.apply_pps_share_credit("worker-x", Some(1_000));
+        assert_eq!(
+            ledger
+                .workers
+                .get("worker-x")
+                .expect("worker")
+                .pps_accrual_atomic,
+            20,
+            "equal-to-cap credit should be allowed"
+        );
+        ledger.apply_pps_share_credit("worker-x", Some(1_000));
+        assert_eq!(
+            ledger
+                .workers
+                .get("worker-x")
+                .expect("worker")
+                .pps_accrual_atomic,
+            20,
+            "above-cap credit should be blocked"
+        );
+
+        let mut pplns = super::StratumPoolLedgerState::new(
+            "devnet".to_owned(),
+            0,
+            Hash256::ZERO,
+            1_770_000_000,
+            32,
+            8,
+        );
+        pplns.set_payout_config(super::PoolPayoutConfig {
+            mode: super::PoolPayoutModeArg::Pplns,
+            pool_fee_bps: 0,
+            pplns_window_shares: 2,
+            payout_threshold_atomic: 1,
+            payout_interval_sec: 1,
+            payout_tx_fee_atomic: 1,
+            ..super::PoolPayoutConfig::default()
+        });
+        assert!(pplns.register_share("a", 1, 1, 1, 1, 1.0, true, false, 10, None));
+        assert!(pplns.register_share("b", 1, 1, 2, 2, 3.0, true, false, 11, None));
+        assert!(pplns.register_share("c", 1, 1, 3, 3, 6.0, true, false, 12, None));
+        pplns.close_round_with_block("c", Hash256([9; 32]), 1_000, 1, Hash256([7; 32]), 13);
+        assert_eq!(
+            pplns.workers.get("a").expect("a").pplns_accrual_atomic,
+            0,
+            "window should include only the latest two shares"
+        );
+        assert_eq!(pplns.workers.get("b").expect("b").pplns_accrual_atomic, 333);
+        assert_eq!(pplns.workers.get("c").expect("c").pplns_accrual_atomic, 666);
+    }
+
+    #[test]
+    fn pool_ledger_queue_register_and_round_retention_contracts() {
+        let mnemonic = WalletMnemonic::parse(SOAK_FLOW_MNEMONIC).expect("mnemonic");
+        let seed = mnemonic.to_seed("");
+        let key = derive_wallet_key(&seed, 0, 0).expect("key");
+        let worker_address = scam_wallet::to_address("sd", key.pubkey_compressed()).expect("addr");
+
+        let mut ledger = super::StratumPoolLedgerState::new(
+            "devnet".to_owned(),
+            0,
+            Hash256::ZERO,
+            1_770_000_000,
+            2,
+            2,
+        );
+        ledger.set_payout_config(super::PoolPayoutConfig {
+            mode: super::PoolPayoutModeArg::Pps,
+            pps_share_atomic: 100,
+            pps_max_liability_atomic: 0,
+            pps_reserve_floor_atomic: 0,
+            payout_threshold_atomic: 100,
+            payout_interval_sec: 10,
+            payout_tx_fee_atomic: 1,
+            ..super::PoolPayoutConfig::default()
+        });
+
+        assert!(ledger.register_share(
+            &worker_address,
+            1,
+            1,
+            1,
+            1,
+            2.0,
+            true,
+            true,
+            10,
+            Some(1_000),
+        ));
+        assert!(ledger.register_share(
+            &worker_address,
+            1,
+            1,
+            2,
+            2,
+            5.0,
+            false,
+            true,
+            11,
+            Some(1_000),
+        ));
+        assert!(ledger.register_share(
+            &worker_address,
+            1,
+            1,
+            3,
+            3,
+            3.0,
+            true,
+            false,
+            12,
+            Some(1_000),
+        ));
+        assert_eq!(ledger.shares.len(), 2, "share retention must trim oldest");
+        assert!(
+            !ledger
+                .share_index
+                .contains(&super::StratumPoolLedgerState::share_key(1, 1, 1, 1)),
+            "trimmed oldest share key must be removed from index"
+        );
+        let worker = ledger.workers.get(&worker_address).expect("worker");
+        assert_eq!(worker.accepted_total, 2);
+        assert_eq!(worker.rejected_total, 1);
+        assert_eq!(
+            worker.blocks_found_total, 1,
+            "rejected block shares must not count as found blocks"
+        );
+        assert_eq!(worker.expected_hashes_accumulated, 5.0);
+
+        ledger.register_rejected_only(&worker_address, 13);
+        let worker = ledger.workers.get(&worker_address).expect("worker");
+        assert_eq!(worker.rejected_total, 2);
+        assert_eq!(worker.last_share_unix_sec, 13);
+
+        ledger.last_payout_run_unix_sec = 10;
+        assert!(
+            ledger.queue_due_payouts(19).is_empty(),
+            "interval boundary before elapsed should not queue payouts"
+        );
+        let created = ledger.queue_due_payouts(20);
+        assert_eq!(
+            created.len(),
+            1,
+            "equal threshold and interval should queue payout"
+        );
+        assert!(
+            ledger.queue_due_payouts(21).is_empty(),
+            "pending payout should suppress duplicate worker queueing"
+        );
+
+        ledger.open_next_round(1, Hash256([1; 32]), 30);
+        ledger.open_next_round(2, Hash256([2; 32]), 31);
+        assert_eq!(ledger.rounds.len(), 2, "round retention must be capped");
+        assert_eq!(
+            ledger.rounds.back().expect("latest round").round_id,
+            ledger.current_round_id
+        );
+    }
+
+    #[test]
+    fn pool_ledger_reconcile_and_telemetry_state_math_are_precise() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let runtime = ChainRuntime::from_config(cfg).expect("runtime");
+        let mut ledger = super::StratumPoolLedgerState::new(
+            "devnet".to_owned(),
+            runtime.tip_height(),
+            runtime.tip_hash(),
+            1_770_000_000,
+            8,
+            8,
+        );
+        assert!(
+            !ledger.reconcile_with_runtime(&runtime, 1_770_000_100),
+            "no chain change should keep reconcile result unchanged"
+        );
+
+        assert_eq!(
+            super::StratumPoolTelemetryState::sanitize_worker_label(""),
+            "default"
+        );
+        assert_eq!(
+            super::StratumPoolTelemetryState::sanitize_worker_label("miner.!@#_A"),
+            "miner._A"
+        );
+
+        let mut telemetry = super::StratumPoolTelemetryState::default();
+        telemetry.register_accepted_share("miner.alpha", 10, 120.0, false);
+        telemetry.register_accepted_share("miner.beta", 20, 60.0, true);
+        telemetry.register_rejected_share("miner.beta", 30);
+        let snap_130 = telemetry.snapshot(2, 130);
+        assert_eq!(snap_130.accepted_total, 2);
+        assert_eq!(snap_130.rejected_total, 1);
+        assert_eq!(snap_130.blocks_found_total, 1);
+        assert_eq!(snap_130.workers_tracked_total, 2);
+        assert_eq!(snap_130.workers_active, 2);
+        assert!(
+            (snap_130.pool_hashrate_hps - 1.5).abs() < 1e-9,
+            "pool hashrate must equal total expected hashes over fixed window"
+        );
+        assert_eq!(snap_130.top_workers[0].worker, "miner.alpha");
+
+        let snap_131 = telemetry.snapshot(2, 131);
+        assert!(
+            (snap_131.pool_hashrate_hps - 0.5).abs() < 1e-9,
+            "old sample outside window must be pruned"
+        );
+        assert_eq!(snap_131.top_workers[0].worker, "miner.beta");
+    }
+
+    #[test]
+    fn relay_reputation_helpers_require_positive_deltas() {
+        assert!(super::relay_startup_send_failed(false));
+        assert!(!super::relay_startup_send_failed(true));
+        assert!(!super::should_persist_peer_reputation(
+            super::RuntimePeerReputation {
+                replacement_rate_limited_total: 0,
+                last_replacement_rate_limited_unix_sec: 1,
+            }
+        ));
+        assert!(super::should_persist_peer_reputation(
+            super::RuntimePeerReputation {
+                replacement_rate_limited_total: 1,
+                last_replacement_rate_limited_unix_sec: 1,
+            }
+        ));
+
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let relay = RelayAdmissionState {
+            mempool: Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip: GossipEngine::new(16).expect("gossip"),
+        };
+        let mut state = RelayServerState::new(runtime, relay);
+        super::relay_mark_peer_replacement_rate_limited(&mut state, 7, 100);
+        super::relay_mark_peer_replacement_rate_limited(&mut state, 7, 110);
+        let delta = super::relay_take_peer_runtime_reputation(&mut state, 7);
+        assert_eq!(delta.replacement_rate_limited_total, 2);
+        assert_eq!(delta.last_replacement_rate_limited_unix_sec, 110);
+        let empty = super::relay_take_peer_runtime_reputation(&mut state, 7);
+        assert_eq!(empty.replacement_rate_limited_total, 0);
     }
 
     #[test]
