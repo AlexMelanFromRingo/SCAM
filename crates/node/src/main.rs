@@ -4228,6 +4228,11 @@ const RELAY_OUTBOUND_ROTATE_AFTER_SEC: u64 = 6 * 60 * 60;
 const RELAY_INBOUND_ACCEPT_WINDOW_SEC: u64 = 5;
 const RELAY_INBOUND_ACCEPT_MAX_PER_IP: usize = 64;
 const RELAY_MAX_CONSECUTIVE_READ_TIMEOUTS: u32 = 16;
+const RELAY_PROTOCOL_PENALTY: u32 = 25;
+const RELAY_MAX_ADDR_ITEMS: usize = 1_000;
+const RELAY_MAX_LOCATOR_ITEMS: usize = 101;
+const RELAY_MAX_HEADERS_PER_ANNOUNCEMENT: usize = 2_000;
+const RELAY_MAX_GETBLOCKTXN_INDEXES: usize = 1_024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RelayServerTelemetrySnapshot {
@@ -5563,6 +5568,9 @@ fn relay_merge_known_peer_addresses(state: &mut RelayServerState, incoming: &[Pe
         if entry.address.trim().is_empty() {
             continue;
         }
+        if entry.address.parse::<SocketAddr>().is_err() {
+            continue;
+        }
         by_addr
             .entry(entry.address.clone())
             .and_modify(|existing| {
@@ -5677,6 +5685,73 @@ fn process_relay_wire_message(
     process_relay_wire_message_with_archive(state, peer_id, message, now_unix_sec, None)
 }
 
+fn relay_mark_protocol_violation(state: &mut RelayServerState, peer_id: u64, _now_unix_sec: u64) {
+    let _ = state
+        .relay
+        .gossip
+        .penalize_peer(peer_id, RELAY_PROTOCOL_PENALTY);
+}
+
+fn relay_protocol_violation(
+    state: &mut RelayServerState,
+    peer_id: u64,
+    now_unix_sec: u64,
+    detail: impl Into<String>,
+) -> NodeError {
+    relay_mark_protocol_violation(state, peer_id, now_unix_sec);
+    NodeError::Runtime(detail.into())
+}
+
+fn relay_missing_blocks_from_headers(
+    state: &RelayServerState,
+    headers: &[scam_core::BlockHeader],
+) -> Result<Vec<InventoryItem>, NodeError> {
+    if headers.len() > RELAY_MAX_HEADERS_PER_ANNOUNCEMENT {
+        return Err(NodeError::Runtime(format!(
+            "headers announcement exceeds limit: got={}, limit={}",
+            headers.len(),
+            RELAY_MAX_HEADERS_PER_ANNOUNCEMENT
+        )));
+    }
+    if headers.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut seen = HashSet::<Hash256>::with_capacity(headers.len());
+    let mut announced = HashSet::<Hash256>::with_capacity(headers.len());
+    let mut missing = Vec::<InventoryItem>::new();
+
+    for (index, header) in headers.iter().enumerate() {
+        if !scam_core::header_meets_pow(header) {
+            return Err(NodeError::Runtime(format!(
+                "headers announcement contains invalid pow at index {}",
+                index
+            )));
+        }
+        let hash = header.block_hash();
+        if !seen.insert(hash) {
+            return Err(NodeError::Runtime(format!(
+                "headers announcement contains duplicate hash {}",
+                hash
+            )));
+        }
+        if state.runtime.header_by_hash(&header.prev_block).is_none()
+            && !announced.contains(&header.prev_block)
+        {
+            return Err(NodeError::Runtime(format!(
+                "headers announcement contains unknown parent {} at index {}",
+                header.prev_block, index
+            )));
+        }
+        announced.insert(hash);
+        if state.runtime.block_by_hash(&hash).is_none() {
+            missing.push(InventoryItem::Block(hash));
+        }
+    }
+
+    Ok(missing)
+}
+
 async fn process_relay_getdata_with_archive_async(
     state: &Arc<Mutex<RelayServerState>>,
     items: Vec<InventoryItem>,
@@ -5733,13 +5808,23 @@ fn process_relay_wire_message_inner(
             },
             WireMessage::GetAddr,
         ]),
-        WireMessage::Verack | WireMessage::Pong { .. } | WireMessage::Headers { .. } => {
-            Ok(Vec::new())
-        }
+        WireMessage::Verack | WireMessage::Pong { .. } => Ok(Vec::new()),
         WireMessage::GetAddr => Ok(vec![WireMessage::Addr {
             peers: relay_known_peer_addresses(state, 250),
         }]),
         WireMessage::Addr { peers } => {
+            if peers.len() > RELAY_MAX_ADDR_ITEMS {
+                return Err(relay_protocol_violation(
+                    state,
+                    peer_id,
+                    now_unix_sec,
+                    format!(
+                        "addr message exceeds limit: got={}, limit={}",
+                        peers.len(),
+                        RELAY_MAX_ADDR_ITEMS
+                    ),
+                ));
+            }
             relay_merge_known_peer_addresses(state, &peers);
             Ok(Vec::new())
         }
@@ -5752,6 +5837,18 @@ fn process_relay_wire_message_inner(
             Ok(Vec::new())
         }
         WireMessage::GetHeaders { locator, stop } => {
+            if locator.len() > RELAY_MAX_LOCATOR_ITEMS {
+                return Err(relay_protocol_violation(
+                    state,
+                    peer_id,
+                    now_unix_sec,
+                    format!(
+                        "getheaders locator exceeds limit: got={}, limit={}",
+                        locator.len(),
+                        RELAY_MAX_LOCATOR_ITEMS
+                    ),
+                ));
+            }
             let mut headers_by_hash = HashMap::new();
             for hash in state.runtime.block_hashes() {
                 if let Some(header) = state.runtime.header_by_hash(hash) {
@@ -5768,10 +5865,36 @@ fn process_relay_wire_message_inner(
             Ok(vec![WireMessage::Headers { headers }])
         }
         WireMessage::GetBlocks { locator, stop } => {
+            if locator.len() > RELAY_MAX_LOCATOR_ITEMS {
+                return Err(relay_protocol_violation(
+                    state,
+                    peer_id,
+                    now_unix_sec,
+                    format!(
+                        "getblocks locator exceeds limit: got={}, limit={}",
+                        locator.len(),
+                        RELAY_MAX_LOCATOR_ITEMS
+                    ),
+                ));
+            }
             let hashes =
                 select_block_hashes_for_peer(state.runtime.block_hashes(), &locator, stop, 2_000);
             let items = hashes.into_iter().map(InventoryItem::Block).collect();
             Ok(vec![WireMessage::Inv { items }])
+        }
+        WireMessage::Headers { headers } => {
+            let missing = relay_missing_blocks_from_headers(state, &headers).map_err(|err| {
+                relay_protocol_violation(
+                    state,
+                    peer_id,
+                    now_unix_sec,
+                    format!("invalid headers announcement: {err}"),
+                )
+            })?;
+            if missing.is_empty() {
+                return Ok(Vec::new());
+            }
+            Ok(vec![WireMessage::GetData { items: missing }])
         }
         WireMessage::GetData { items } => {
             let (mut out, missing_block_hashes, mut not_found) =
@@ -5855,6 +5978,18 @@ fn process_relay_wire_message_inner(
             block_hash,
             indexes,
         } => {
+            if indexes.len() > RELAY_MAX_GETBLOCKTXN_INDEXES {
+                return Err(relay_protocol_violation(
+                    state,
+                    peer_id,
+                    now_unix_sec,
+                    format!(
+                        "getblocktxn indexes exceed limit: got={}, limit={}",
+                        indexes.len(),
+                        RELAY_MAX_GETBLOCKTXN_INDEXES
+                    ),
+                ));
+            }
             let Some(block) = state.runtime.block_by_hash(&block_hash) else {
                 return Ok(vec![WireMessage::NotFound {
                     items: vec![InventoryItem::Block(block_hash)],
@@ -24344,6 +24479,136 @@ mod tests {
     }
 
     #[test]
+    fn relay_headers_announcement_requests_missing_unknown_blocks() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let reward_key = cfg.genesis_reward_key_hash20().expect("reward key");
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let relay = RelayAdmissionState {
+            mempool: Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip: GossipEngine::new(64).expect("gossip"),
+        };
+        let mut state = RelayServerState::new(runtime, relay);
+
+        let target = state
+            .runtime
+            .expected_target_for_next_block()
+            .expect("target");
+        let template = BlockTemplate {
+            version: 1,
+            prev_block: state.runtime.tip_hash(),
+            timestamp: state
+                .runtime
+                .tip_header()
+                .timestamp
+                .saturating_add(cfg.target_block_time_sec),
+            target,
+            transactions: vec![build_coinbase_tx(
+                "headers-announcement".to_owned(),
+                cfg.block_subsidy,
+                reward_key,
+            )],
+        };
+        let block = mine_block(&template, 500_000).expect("mine");
+        let block_hash = block.header.block_hash();
+
+        let out = process_relay_wire_message(
+            &mut state,
+            77,
+            WireMessage::Headers {
+                headers: vec![block.header.clone()],
+            },
+            1_000,
+        )
+        .expect("headers announcement");
+
+        assert_eq!(
+            out,
+            vec![WireMessage::GetData {
+                items: vec![InventoryItem::Block(block_hash)],
+            }]
+        );
+    }
+
+    #[test]
+    fn relay_headers_announcement_rejects_invalid_pow_and_penalizes_peer() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let relay = RelayAdmissionState {
+            mempool: Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip: GossipEngine::new(64).expect("gossip"),
+        };
+        let mut state = RelayServerState::new(runtime, relay);
+        let peer_id = 80;
+        state.relay.gossip.connect_peer(peer_id);
+
+        let impossible_target =
+            Target::from_hex("0000000000000000000000000000000000000000000000000000000000000001")
+                .expect("target parse");
+        let bad_header = scam_core::BlockHeader {
+            version: 1,
+            prev_block: state.runtime.tip_hash(),
+            merkle_root: Hash256::ZERO,
+            timestamp: state
+                .runtime
+                .tip_header()
+                .timestamp
+                .saturating_add(cfg.target_block_time_sec),
+            target: impossible_target,
+            nonce: 0,
+        };
+
+        let err = process_relay_wire_message(
+            &mut state,
+            peer_id,
+            WireMessage::Headers {
+                headers: vec![bad_header],
+            },
+            1_001,
+        )
+        .expect_err("invalid pow must fail");
+        assert!(err.to_string().contains("invalid headers announcement"));
+        assert_eq!(state.relay.gossip.peer_score(peer_id), Some(25));
+    }
+
+    #[test]
+    fn relay_rejects_oversized_addr_messages() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let relay = RelayAdmissionState {
+            mempool: Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip: GossipEngine::new(64).expect("gossip"),
+        };
+        let mut state = RelayServerState::new(runtime, relay);
+        let peer_id = 81;
+        state.relay.gossip.connect_peer(peer_id);
+
+        let peers = (0..=super::RELAY_MAX_ADDR_ITEMS)
+            .map(|idx| super::PeerAddress {
+                address: format!("127.0.0.1:{}", 20_000 + idx),
+                services: 1,
+                last_seen_unix_sec: idx as u64,
+            })
+            .collect::<Vec<_>>();
+        let err =
+            process_relay_wire_message(&mut state, peer_id, WireMessage::Addr { peers }, 1_002)
+                .expect_err("oversized addr must fail");
+        assert!(err.to_string().contains("addr message exceeds limit"));
+        assert_eq!(state.relay.gossip.peer_score(peer_id), Some(25));
+    }
+
+    #[test]
     fn relay_compact_block_roundtrip_requests_missing_tx_then_accepts_blocktxn() {
         let mut cfg: ChainConfig =
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
@@ -24640,6 +24905,11 @@ mod tests {
                     last_seen_unix_sec: 99,
                 },
                 super::PeerAddress {
+                    address: "not-a-socket-address".to_owned(),
+                    services: 0b111,
+                    last_seen_unix_sec: 100,
+                },
+                super::PeerAddress {
                     address: "127.0.0.1:2001".to_owned(),
                     services: 0b100,
                     last_seen_unix_sec: 15,
@@ -24652,6 +24922,12 @@ mod tests {
         assert_eq!(state.known_peer_addresses[0].services, 0b011);
         assert_eq!(state.known_peer_addresses[0].last_seen_unix_sec, 20);
         assert_eq!(state.known_peer_addresses[1].address, "127.0.0.1:2001");
+        assert!(
+            state
+                .known_peer_addresses
+                .iter()
+                .all(|entry| entry.address != "not-a-socket-address")
+        );
 
         let many = (0..2_100u32)
             .map(|idx| super::PeerAddress {
@@ -24688,6 +24964,7 @@ mod tests {
         };
         let mut state = RelayServerState::new(runtime, relay);
         let peer_id = 41;
+        state.relay.gossip.connect_peer(peer_id);
 
         process_relay_wire_message(
             &mut state,
@@ -24725,6 +25002,39 @@ mod tests {
         .expect("version gate");
         assert_eq!(state.peer_compact_pref.get(&peer_id).copied(), Some(false));
 
+        let oversized_locator = vec![state.runtime.tip_hash(); super::RELAY_MAX_LOCATOR_ITEMS + 1];
+        let headers_err = process_relay_wire_message(
+            &mut state,
+            peer_id,
+            WireMessage::GetHeaders {
+                locator: oversized_locator.clone(),
+                stop: None,
+            },
+            1_003,
+        )
+        .expect_err("oversized getheaders locator must fail");
+        assert!(
+            headers_err
+                .to_string()
+                .contains("getheaders locator exceeds limit")
+        );
+
+        let blocks_err = process_relay_wire_message(
+            &mut state,
+            peer_id,
+            WireMessage::GetBlocks {
+                locator: oversized_locator,
+                stop: None,
+            },
+            1_004,
+        )
+        .expect_err("oversized getblocks locator must fail");
+        assert!(
+            blocks_err
+                .to_string()
+                .contains("getblocks locator exceeds limit")
+        );
+
         let block_hash = state.runtime.tip_hash();
         let ok = process_relay_wire_message(
             &mut state,
@@ -24733,7 +25043,7 @@ mod tests {
                 block_hash,
                 indexes: vec![0],
             },
-            1_003,
+            1_005,
         )
         .expect("valid index");
         assert!(
@@ -24752,10 +25062,24 @@ mod tests {
                 block_hash,
                 indexes: vec![1],
             },
-            1_004,
+            1_006,
         )
         .expect_err("out-of-range index must fail");
         assert!(err.to_string().contains("out of bounds"));
+
+        let too_many_indexes =
+            (0..=super::RELAY_MAX_GETBLOCKTXN_INDEXES as u32).collect::<Vec<_>>();
+        let err = process_relay_wire_message(
+            &mut state,
+            peer_id,
+            WireMessage::GetBlockTxn {
+                block_hash,
+                indexes: too_many_indexes,
+            },
+            1_007,
+        )
+        .expect_err("oversized getblocktxn must fail");
+        assert!(err.to_string().contains("getblocktxn indexes exceed limit"));
     }
 
     #[test]

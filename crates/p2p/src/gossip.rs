@@ -152,6 +152,17 @@ impl GossipEngine {
         self.telemetry
     }
 
+    pub fn penalize_peer(&mut self, peer_id: PeerId, penalty: u32) -> Result<(), GossipError> {
+        if self.banned_peers.contains(&peer_id) {
+            return Err(GossipError::BannedPeer { peer_id });
+        }
+        if !self.peers.contains_key(&peer_id) {
+            return Err(GossipError::UnknownPeer { peer_id });
+        }
+        self.apply_penalty(peer_id, penalty);
+        Ok(())
+    }
+
     pub fn announce_tx(&mut self, tx: Transaction) -> Vec<OutboundMessage> {
         let txid = self.store_tx(tx);
         let item = InventoryItem::Tx(txid);
@@ -267,7 +278,7 @@ impl GossipEngine {
         items: Vec<InventoryItem>,
     ) -> Result<Vec<OutboundMessage>, GossipError> {
         if items.len() > self.max_inv_items {
-            self.penalize_peer(from_peer, 25);
+            self.apply_penalty(from_peer, 25);
             return Err(GossipError::TooManyInventoryItems {
                 limit: self.max_inv_items,
                 got: items.len(),
@@ -300,7 +311,7 @@ impl GossipEngine {
         items: Vec<InventoryItem>,
     ) -> Result<Vec<OutboundMessage>, GossipError> {
         if items.len() > self.max_inv_items {
-            self.penalize_peer(from_peer, 25);
+            self.apply_penalty(from_peer, 25);
             return Err(GossipError::TooManyInventoryItems {
                 limit: self.max_inv_items,
                 got: items.len(),
@@ -470,7 +481,7 @@ impl GossipEngine {
         }
     }
 
-    fn penalize_peer(&mut self, peer_id: PeerId, penalty: u32) {
+    fn apply_penalty(&mut self, peer_id: PeerId, penalty: u32) {
         if let Some(state) = self.peers.get_mut(&peer_id) {
             state.score = state.score.saturating_add(penalty);
             if state.score >= self.ban_threshold {
@@ -505,7 +516,7 @@ impl GossipEngine {
                 .telemetry
                 .replacement_rate_limited_total
                 .saturating_add(1);
-            self.penalize_peer(peer_id, penalty);
+            self.apply_penalty(peer_id, penalty);
             return Err(GossipError::ReplacementRateLimited {
                 peer_id,
                 max_replacements,
@@ -646,6 +657,33 @@ mod tests {
         engine.disconnect_peer(2);
         assert_eq!(engine.peer_count(), 1);
         assert_eq!(engine.peer_score(2), None);
+    }
+
+    #[test]
+    fn explicit_penalty_api_bans_peer_after_threshold() {
+        let mut engine = GossipEngine::with_limits(256, 50).expect("engine");
+        engine.connect_peer(9);
+        assert!(!engine.is_banned(9));
+
+        engine.penalize_peer(9, 25).expect("first penalty");
+        assert_eq!(engine.peer_score(9), Some(25));
+        assert!(!engine.is_banned(9));
+
+        engine.penalize_peer(9, 25).expect("second penalty");
+        assert!(engine.is_banned(9));
+        assert_eq!(engine.peer_score(9), None);
+    }
+
+    #[test]
+    fn explicit_penalty_api_rejects_unknown_peer() {
+        let mut engine = GossipEngine::new(32).expect("engine");
+        let err = engine
+            .penalize_peer(42, 10)
+            .expect_err("unknown peer must fail");
+        assert!(matches!(
+            err,
+            super::GossipError::UnknownPeer { peer_id: 42 }
+        ));
     }
 
     #[test]
