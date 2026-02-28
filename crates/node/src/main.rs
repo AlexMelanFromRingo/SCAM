@@ -2192,6 +2192,10 @@ fn peer_reputation_path(peers_dir: &Path, network_name: &str) -> PathBuf {
     peers_dir.join(format!("{network_name}.reputation.json"))
 }
 
+fn peer_anchor_path(peers_dir: &Path, network_name: &str) -> PathBuf {
+    peers_dir.join(format!("{network_name}.anchors.json"))
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
 struct PeerReputationRecord {
     address: String,
@@ -2231,6 +2235,51 @@ impl PeerReputationStore {
         Self {
             path: peer_reputation_path(peers_dir, network_id),
             network_id: network_id.to_owned(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+struct PeerAnchorRecord {
+    address: String,
+    #[serde(default)]
+    success_total: u64,
+    #[serde(default)]
+    failure_total: u64,
+    #[serde(default)]
+    last_success_unix_sec: u64,
+    #[serde(default)]
+    last_attempt_unix_sec: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+struct PeerAnchorBook {
+    network_id: String,
+    anchors: Vec<PeerAnchorRecord>,
+}
+
+#[derive(Clone, Debug)]
+struct PeerAnchorStore {
+    path: PathBuf,
+    network_id: String,
+}
+
+impl PeerAnchorStore {
+    fn from_peers_dir(peers_dir: &Path, network_id: &str) -> Self {
+        Self {
+            path: peer_anchor_path(peers_dir, network_id),
+            network_id: network_id.to_owned(),
+        }
+    }
+
+    fn from_reputation_store(store: &PeerReputationStore) -> Self {
+        let path = store.path.parent().map_or_else(
+            || peer_anchor_path(Path::new("."), &store.network_id),
+            |dir| peer_anchor_path(dir, &store.network_id),
+        );
+        Self {
+            path,
+            network_id: store.network_id.clone(),
         }
     }
 }
@@ -2299,6 +2348,128 @@ fn save_peer_reputation_book(path: &Path, book: &PeerReputationBook) -> Result<(
         ))
     })?;
     Ok(())
+}
+
+fn load_peer_anchor_book(path: &Path, network_id: &str) -> Result<PeerAnchorBook, NodeError> {
+    if !path.exists() {
+        return Ok(PeerAnchorBook {
+            network_id: network_id.to_owned(),
+            anchors: Vec::new(),
+        });
+    }
+    let raw = fs::read_to_string(path).map_err(|e| {
+        NodeError::Runtime(format!(
+            "failed to read peer anchor file {}: {e}",
+            path.display()
+        ))
+    })?;
+    let mut parsed = serde_json::from_str::<PeerAnchorBook>(&raw).map_err(|e| {
+        NodeError::Runtime(format!(
+            "failed to parse peer anchor file {}: {e}",
+            path.display()
+        ))
+    })?;
+    if parsed.network_id != network_id {
+        return Err(NodeError::Runtime(format!(
+            "peer anchor network mismatch in {}: expected '{}', got '{}'",
+            path.display(),
+            network_id,
+            parsed.network_id
+        )));
+    }
+    parsed.anchors.sort_by(|a, b| a.address.cmp(&b.address));
+    parsed.anchors.dedup_by(|a, b| a.address == b.address);
+    Ok(parsed)
+}
+
+fn save_peer_anchor_book(path: &Path, book: &PeerAnchorBook) -> Result<(), NodeError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| {
+            NodeError::Runtime(format!(
+                "failed to create peer anchor dir {}: {e}",
+                parent.display()
+            ))
+        })?;
+    }
+    let body = serde_json::to_string_pretty(book).map_err(|e| {
+        NodeError::Runtime(format!(
+            "failed to encode peer anchor file {}: {e}",
+            path.display()
+        ))
+    })?;
+    let tmp_path = path.with_extension("json.tmp");
+    fs::write(&tmp_path, format!("{body}\n")).map_err(|e| {
+        NodeError::Runtime(format!(
+            "failed to write peer anchor temp file {}: {e}",
+            tmp_path.display()
+        ))
+    })?;
+    fs::rename(&tmp_path, path).map_err(|e| {
+        NodeError::Runtime(format!(
+            "failed to finalize peer anchor file {}: {e}",
+            path.display()
+        ))
+    })?;
+    Ok(())
+}
+
+fn update_peer_anchor_store_attempt(
+    store: &PeerAnchorStore,
+    address: &str,
+    now_unix_sec: u64,
+    success: bool,
+) -> Result<(), NodeError> {
+    if address.trim().is_empty() {
+        return Ok(());
+    }
+    let mut book = load_peer_anchor_book(&store.path, &store.network_id)?;
+    let mut updated = false;
+    for anchor in &mut book.anchors {
+        if anchor.address == address {
+            anchor.last_attempt_unix_sec = anchor.last_attempt_unix_sec.max(now_unix_sec);
+            if success {
+                anchor.success_total = anchor.success_total.saturating_add(1);
+                anchor.last_success_unix_sec = anchor.last_success_unix_sec.max(now_unix_sec);
+            } else {
+                anchor.failure_total = anchor.failure_total.saturating_add(1);
+            }
+            updated = true;
+            break;
+        }
+    }
+    if !updated {
+        book.anchors.push(PeerAnchorRecord {
+            address: address.to_owned(),
+            success_total: if success { 1 } else { 0 },
+            failure_total: if success { 0 } else { 1 },
+            last_success_unix_sec: if success { now_unix_sec } else { 0 },
+            last_attempt_unix_sec: now_unix_sec,
+        });
+    }
+    book.anchors.sort_by(|a, b| a.address.cmp(&b.address));
+    book.anchors.dedup_by(|a, b| a.address == b.address);
+    save_peer_anchor_book(&store.path, &book)
+}
+
+fn load_peer_anchor_targets(
+    store: &PeerAnchorStore,
+    max_items: usize,
+) -> Result<Vec<String>, NodeError> {
+    if max_items == 0 {
+        return Ok(Vec::new());
+    }
+    let mut anchors = load_peer_anchor_book(&store.path, &store.network_id)?.anchors;
+    anchors.retain(|anchor| {
+        !anchor.address.trim().is_empty() && anchor.address.parse::<SocketAddr>().is_ok()
+    });
+    anchors.sort_unstable_by(|a, b| {
+        b.last_success_unix_sec
+            .cmp(&a.last_success_unix_sec)
+            .then_with(|| a.failure_total.cmp(&b.failure_total))
+            .then_with(|| a.address.cmp(&b.address))
+    });
+    anchors.truncate(max_items);
+    Ok(anchors.into_iter().map(|anchor| anchor.address).collect())
 }
 
 fn reputation_failure_weight(events: u64, last_unix_sec: u64, now_unix_sec: u64) -> u32 {
@@ -4213,6 +4384,7 @@ struct RelayServerState {
     last_parent_sync_request_sec: HashMap<Hash256, u64>,
     peer_compact_pref: HashMap<u64, bool>,
     peer_runtime_reputation: HashMap<u64, RuntimePeerReputation>,
+    pending_parent_tx_requests: HashMap<Hash256, u64>,
     pending_compact_blocks: HashMap<Hash256, PendingCompactBlock>,
     known_peer_addresses: Vec<PeerAddress>,
     outbound_worker_starts_total: u64,
@@ -4229,6 +4401,7 @@ impl RelayServerState {
             last_parent_sync_request_sec: HashMap::new(),
             peer_compact_pref: HashMap::new(),
             peer_runtime_reputation: HashMap::new(),
+            pending_parent_tx_requests: HashMap::new(),
             pending_compact_blocks: HashMap::new(),
             known_peer_addresses: Vec::new(),
             outbound_worker_starts_total: 0,
@@ -4257,6 +4430,11 @@ const RELAY_MAX_ADDR_ITEMS: usize = 1_000;
 const RELAY_MAX_LOCATOR_ITEMS: usize = 101;
 const RELAY_MAX_HEADERS_PER_ANNOUNCEMENT: usize = 2_000;
 const RELAY_MAX_GETBLOCKTXN_INDEXES: usize = 1_024;
+const RELAY_MAX_ORPHAN_PARENT_REQUESTS: usize = 64;
+const RELAY_PARENT_REQUEST_TTL_SEC: u64 = 90;
+const RELAY_OUTBOUND_ANCHOR_TARGETS: usize = 2;
+const RELAY_OUTBOUND_FEELER_INTERVAL_SEC: u64 = 60;
+const RELAY_OUTBOUND_FEELER_TIMEOUT_SEC: u64 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RelayServerTelemetrySnapshot {
@@ -5571,6 +5749,95 @@ fn should_persist_peer_reputation(delta: RuntimePeerReputation) -> bool {
     delta.replacement_rate_limited_total > 0 || delta.protocol_violation_total > 0
 }
 
+fn merge_outbound_targets(
+    anchor_targets: Vec<String>,
+    selected_targets: Vec<String>,
+) -> Vec<String> {
+    let mut merged = Vec::<String>::new();
+    let mut seen = HashSet::<String>::new();
+    for target in anchor_targets.into_iter().chain(selected_targets) {
+        if target.trim().is_empty() {
+            continue;
+        }
+        if seen.insert(target.clone()) {
+            merged.push(target);
+        }
+        if merged.len() >= RELAY_OUTBOUND_MAX_PEERS {
+            break;
+        }
+    }
+    merged
+}
+
+fn relay_parent_request_cache_cleanup(state: &mut RelayServerState, now_unix_sec: u64) {
+    state.pending_parent_tx_requests.retain(|_, requested_at| {
+        now_unix_sec.saturating_sub(*requested_at) < RELAY_PARENT_REQUEST_TTL_SEC
+    });
+}
+
+fn relay_parent_getdata_for_missing_outpoints(
+    state: &mut RelayServerState,
+    missing: &[OutPoint],
+    now_unix_sec: u64,
+) -> Result<Vec<InventoryItem>, NodeError> {
+    relay_parent_request_cache_cleanup(state, now_unix_sec);
+    let mut unique_txids = missing
+        .iter()
+        .map(|outpoint| outpoint.txid)
+        .collect::<Vec<_>>();
+    unique_txids.sort_unstable();
+    unique_txids.dedup();
+
+    if unique_txids.len() > RELAY_MAX_ORPHAN_PARENT_REQUESTS {
+        return Err(NodeError::Runtime(format!(
+            "orphan transaction references too many unknown parents: got={}, limit={}",
+            unique_txids.len(),
+            RELAY_MAX_ORPHAN_PARENT_REQUESTS
+        )));
+    }
+
+    let mut items = Vec::<InventoryItem>::new();
+    for txid in unique_txids {
+        if state.pending_parent_tx_requests.contains_key(&txid) {
+            continue;
+        }
+        state.pending_parent_tx_requests.insert(txid, now_unix_sec);
+        items.push(InventoryItem::Tx(txid));
+    }
+    Ok(items)
+}
+
+fn load_relay_outbound_feeler_target(
+    peers_dir: &Path,
+    cfg: &ChainConfig,
+    bind_addr: &str,
+    excluded_targets: &HashSet<String>,
+) -> Result<Option<String>, NodeError> {
+    let (peers_db_path, legacy_txt_path) = peer_book_paths(peers_dir, &cfg.network_id);
+    let mut peer_book = load_or_init_peer_book(&cfg.network_id, &peers_db_path, &legacy_txt_path)?;
+    sort_and_dedup_peer_book(&mut peer_book);
+    let mut candidates = peer_book
+        .peers
+        .into_iter()
+        .filter(|peer| !excluded_targets.contains(&peer.address))
+        .filter(|peer| !relay_target_matches_bind(bind_addr, &peer.address))
+        .filter_map(|peer| {
+            if peer.address.parse::<SocketAddr>().is_ok() {
+                Some(peer)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_unstable_by(|a, b| {
+        a.last_seen_unix_sec
+            .cmp(&b.last_seen_unix_sec)
+            .then_with(|| a.ban_score.cmp(&b.ban_score))
+            .then_with(|| a.address.cmp(&b.address))
+    });
+    Ok(candidates.into_iter().next().map(|peer| peer.address))
+}
+
 fn relay_known_peer_addresses(state: &RelayServerState, max_items: usize) -> Vec<PeerAddress> {
     state
         .known_peer_addresses
@@ -5952,7 +6219,11 @@ fn process_relay_wire_message_inner(
         }
         WireMessage::Tx { tx } => {
             let txid = tx.txid();
+            relay_parent_request_cache_cleanup(state, now_unix_sec);
+            state.pending_parent_tx_requests.remove(&txid);
             let fee_hint = relay_fee_hint(&tx);
+            let missing_outpoints =
+                detect_missing_outpoints(&state.runtime, &state.relay.mempool, &tx);
             match admit_peer_tx_into_relay(
                 &mut state.relay,
                 &state.runtime,
@@ -5961,9 +6232,30 @@ fn process_relay_wire_message_inner(
                 fee_hint,
                 now_unix_sec,
             ) {
-                Ok(()) => Ok(vec![WireMessage::Inv {
-                    items: vec![InventoryItem::Tx(txid)],
-                }]),
+                Ok(()) => {
+                    if !missing_outpoints.is_empty() {
+                        let parents = relay_parent_getdata_for_missing_outpoints(
+                            state,
+                            &missing_outpoints,
+                            now_unix_sec,
+                        )
+                        .map_err(|err| {
+                            relay_protocol_violation(
+                                state,
+                                peer_id,
+                                now_unix_sec,
+                                format!("invalid orphan parent set: {err}"),
+                            )
+                        })?;
+                        if parents.is_empty() {
+                            return Ok(Vec::new());
+                        }
+                        return Ok(vec![WireMessage::GetData { items: parents }]);
+                    }
+                    Ok(vec![WireMessage::Inv {
+                        items: vec![InventoryItem::Tx(txid)],
+                    }])
+                }
                 Err(NodeError::Gossip(GossipError::ReplacementRateLimited { .. })) => {
                     relay_mark_peer_replacement_rate_limited(state, peer_id, now_unix_sec);
                     Ok(vec![WireMessage::NotFound {
@@ -6312,6 +6604,9 @@ fn run_relay_outbound_worker(
     if target.trim().is_empty() {
         return;
     }
+    let anchor_store = peer_reputation_store
+        .as_ref()
+        .map(PeerAnchorStore::from_reputation_store);
     if relay_target_matches_bind(&bind_addr, &target) {
         return;
     }
@@ -6325,6 +6620,10 @@ fn run_relay_outbound_worker(
             Ok(stream) => stream,
             Err(err) => {
                 eprintln!("warning: outbound relay connect to {target} failed: {err}");
+                if let Some(store) = anchor_store.as_ref() {
+                    let now_unix_sec = current_unix_sec().unwrap_or(0);
+                    let _ = update_peer_anchor_store_attempt(store, &target, now_unix_sec, false);
+                }
                 thread::sleep(redial_delay);
                 continue;
             }
@@ -6364,6 +6663,10 @@ fn run_relay_outbound_worker(
                 "warning: outbound relay session with {target} ended: reason={} detail={err}",
                 relay_disconnect_reason(&err)
             );
+            if let Some(store) = anchor_store.as_ref() {
+                let now_unix_sec = current_unix_sec().unwrap_or(0);
+                let _ = update_peer_anchor_store_attempt(store, &target, now_unix_sec, false);
+            }
         }
         thread::sleep(redial_delay);
     }
@@ -6486,6 +6789,9 @@ async fn run_relay_outbound_worker_async(
     peer_reputation_store: Option<PeerReputationStore>,
 ) {
     relay_mark_outbound_worker_start(&state);
+    let anchor_store = peer_reputation_store
+        .as_ref()
+        .map(PeerAnchorStore::from_reputation_store);
     if target.trim().is_empty() {
         return;
     }
@@ -6501,6 +6807,10 @@ async fn run_relay_outbound_worker_async(
             Ok(stream) => stream,
             Err(err) => {
                 eprintln!("warning: outbound relay connect to {target} failed: {err}");
+                if let Some(store) = anchor_store.as_ref() {
+                    let now_unix_sec = current_unix_sec().unwrap_or(0);
+                    let _ = update_peer_anchor_store_attempt(store, &target, now_unix_sec, false);
+                }
                 sleep(redial_delay).await;
                 continue;
             }
@@ -6534,8 +6844,51 @@ async fn run_relay_outbound_worker_async(
                 "warning: outbound relay session with {target} ended: reason={} detail={err}",
                 relay_disconnect_reason(&err)
             );
+            if let Some(store) = anchor_store.as_ref() {
+                let now_unix_sec = current_unix_sec().unwrap_or(0);
+                let _ = update_peer_anchor_store_attempt(store, &target, now_unix_sec, false);
+            }
         }
         sleep(redial_delay).await;
+    }
+}
+
+async fn run_relay_outbound_feeler_probe_async(
+    target: String,
+    bind_addr: String,
+    cfg: ChainConfig,
+    timeout_sec: u64,
+    anchor_store: Option<PeerAnchorStore>,
+) {
+    if target.trim().is_empty() || relay_target_matches_bind(&bind_addr, &target) {
+        return;
+    }
+
+    let deadline = Duration::from_secs(timeout_sec.max(1));
+    let now_unix_sec = current_unix_sec().unwrap_or(0);
+    let connect_result = timeout(deadline, tokio::net::TcpStream::connect(&target)).await;
+    let Ok(Ok(mut stream)) = connect_result else {
+        if let Some(store) = anchor_store {
+            let _ = update_peer_anchor_store_attempt(&store, &target, now_unix_sec, false);
+        }
+        return;
+    };
+
+    let framing = FramingConfig::default();
+    let local_hello = LocalHandshake {
+        protocol_version: 1,
+        network_id: cfg.network_id.clone(),
+        user_agent: "scam-node/relay-feeler".to_owned(),
+        start_height: 0,
+    };
+    let handshake = timeout(
+        deadline,
+        client_handshake_async(&mut stream, &framing, &local_hello),
+    )
+    .await;
+    let success = matches!(handshake, Ok(Ok(remote)) if remote.network_id == cfg.network_id);
+    if let Some(store) = anchor_store {
+        let _ = update_peer_anchor_store_attempt(&store, &target, now_unix_sec, success);
     }
 }
 
@@ -6561,6 +6914,10 @@ async fn run_relay_outbound_supervisor_async(
     relay_mark_outbound_supervisor_start(&state);
     let mut workers = HashMap::<String, tokio::task::JoinHandle<()>>::new();
     let mut worker_targets = HashSet::<String>::new();
+    let anchor_store = peer_reputation_store
+        .as_ref()
+        .map(PeerAnchorStore::from_reputation_store);
+    let mut last_feeler_unix_sec = current_unix_sec().unwrap_or(0);
 
     loop {
         if stop_flag.load(Ordering::Relaxed) {
@@ -6583,7 +6940,7 @@ async fn run_relay_outbound_supervisor_async(
             }
         }
 
-        let targets = match load_relay_outbound_targets_selected(
+        let selected_targets = match load_relay_outbound_targets_selected(
             &peers_dir,
             &cfg,
             RELAY_OUTBOUND_MAX_PEERS,
@@ -6599,6 +6956,20 @@ async fn run_relay_outbound_supervisor_async(
                 continue;
             }
         };
+        let anchor_targets = match anchor_store.as_ref() {
+            Some(store) => match load_peer_anchor_targets(store, RELAY_OUTBOUND_ANCHOR_TARGETS) {
+                Ok(anchors) => anchors,
+                Err(err) => {
+                    eprintln!(
+                        "warning: outbound relay anchor load failed ({}): {err}",
+                        store.path.display()
+                    );
+                    Vec::new()
+                }
+            },
+            None => Vec::new(),
+        };
+        let targets = merge_outbound_targets(anchor_targets, selected_targets);
 
         for target in targets {
             if worker_targets.contains(&target) {
@@ -6640,6 +7011,37 @@ async fn run_relay_outbound_supervisor_async(
                     .await
                 }),
             );
+        }
+
+        let now_unix_sec = current_unix_sec().unwrap_or(0);
+        if now_unix_sec.saturating_sub(last_feeler_unix_sec) >= RELAY_OUTBOUND_FEELER_INTERVAL_SEC {
+            let mut excluded = worker_targets.clone();
+            excluded.insert(bind_addr.clone());
+            match load_relay_outbound_feeler_target(&peers_dir, &cfg, &bind_addr, &excluded) {
+                Ok(Some(feeler_target)) => {
+                    last_feeler_unix_sec = now_unix_sec;
+                    let bind_addr_clone = bind_addr.clone();
+                    let cfg_clone = cfg.clone();
+                    let anchor_store_clone = anchor_store.clone();
+                    tokio::spawn(async move {
+                        run_relay_outbound_feeler_probe_async(
+                            feeler_target,
+                            bind_addr_clone,
+                            cfg_clone,
+                            RELAY_OUTBOUND_FEELER_TIMEOUT_SEC,
+                            anchor_store_clone,
+                        )
+                        .await;
+                    });
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    eprintln!(
+                        "warning: outbound relay feeler candidate load failed ({}): {err}",
+                        peers_dir.display()
+                    );
+                }
+            }
         }
 
         sleep(redial_delay).await;
@@ -6685,6 +7087,7 @@ fn run_relay_peer_session<IO: Read + Write>(
     peer_address: Option<&str>,
     peer_reputation_store: Option<&PeerReputationStore>,
 ) -> Result<(), NodeError> {
+    let anchor_store = peer_reputation_store.map(PeerAnchorStore::from_reputation_store);
     let result = (|| -> Result<(), NodeError> {
         {
             let mut active_guard = active
@@ -6705,6 +7108,12 @@ fn run_relay_peer_session<IO: Read + Write>(
             RelayPeerSessionMode::Outbound => client_handshake(stream, &framing, &local_hello)?,
         };
         ensure_relay_peer_network(&cfg.network_id, &remote.network_id)?;
+        if matches!(mode, RelayPeerSessionMode::Outbound)
+            && let (Some(store), Some(address)) = (anchor_store.as_ref(), peer_address)
+        {
+            let now_unix_sec = current_unix_sec().unwrap_or(0);
+            let _ = update_peer_anchor_store_attempt(store, address, now_unix_sec, true);
+        }
         {
             let mut guard = state
                 .lock()
@@ -6869,6 +7278,13 @@ fn run_relay_peer_session<IO: Read + Write>(
     if let Ok(mut active_guard) = active.lock() {
         *active_guard = active_guard.saturating_sub(1);
     }
+    if result.is_err()
+        && matches!(mode, RelayPeerSessionMode::Outbound)
+        && let (Some(store), Some(address)) = (anchor_store.as_ref(), peer_address)
+    {
+        let now_unix_sec = current_unix_sec().unwrap_or(0);
+        let _ = update_peer_anchor_store_attempt(store, address, now_unix_sec, false);
+    }
     if let (Some(store), Some(address)) = (peer_reputation_store, peer_address)
         && should_persist_peer_reputation(peer_reputation_delta)
     {
@@ -6901,6 +7317,7 @@ async fn run_relay_peer_session_async<S: AsyncRead + AsyncWrite + Unpin>(
     peer_address: Option<&str>,
     peer_reputation_store: Option<&PeerReputationStore>,
 ) -> Result<(), NodeError> {
+    let anchor_store = peer_reputation_store.map(PeerAnchorStore::from_reputation_store);
     {
         let mut active_guard = active
             .lock()
@@ -6925,6 +7342,12 @@ async fn run_relay_peer_session_async<S: AsyncRead + AsyncWrite + Unpin>(
         )
         .await?;
         ensure_relay_peer_network(&cfg.network_id, &remote.network_id)?;
+        if matches!(mode, RelayPeerSessionMode::Outbound)
+            && let (Some(store), Some(address)) = (anchor_store.as_ref(), peer_address)
+        {
+            let now_unix_sec = current_unix_sec().unwrap_or(0);
+            let _ = update_peer_anchor_store_attempt(store, address, now_unix_sec, true);
+        }
         {
             let mut guard = state
                 .lock()
@@ -7125,6 +7548,13 @@ async fn run_relay_peer_session_async<S: AsyncRead + AsyncWrite + Unpin>(
     if let Ok(mut active_guard) = active.lock() {
         *active_guard = active_guard.saturating_sub(1);
     }
+    if session_result.is_err()
+        && matches!(mode, RelayPeerSessionMode::Outbound)
+        && let (Some(store), Some(address)) = (anchor_store.as_ref(), peer_address)
+    {
+        let now_unix_sec = current_unix_sec().unwrap_or(0);
+        let _ = update_peer_anchor_store_attempt(store, address, now_unix_sec, false);
+    }
     if let (Some(store), Some(address)) = (peer_reputation_store, peer_address)
         && should_persist_peer_reputation(peer_reputation_delta)
     {
@@ -7234,6 +7664,8 @@ fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
             .join(format!("{}.redb", cfg.network_id))
             .display()
     );
+    let peer_anchor_store = PeerAnchorStore::from_peers_dir(&args.peers_dir, &cfg.network_id);
+    println!("Peer anchors: {}", peer_anchor_store.path.display());
     println!(
         "Relay policy: max_inv_items={} ban_threshold={} replacement_window={}s replacement_max_per_peer={} replacement_penalty={}",
         max_inv_items,
@@ -14196,6 +14628,7 @@ fn main() {
 mod tests {
     use clap::Parser;
     use num_traits::ToPrimitive;
+    use std::collections::HashSet;
     use std::fs;
     use std::io::{Read, Write};
     use std::net::{Shutdown, TcpListener, TcpStream};
@@ -18240,6 +18673,89 @@ mod tests {
             !expired.contains_key("127.0.0.1:18444"),
             "old reputation should age out of selection penalties"
         );
+
+        let _ = std::fs::remove_dir_all(peers_dir);
+    }
+
+    #[test]
+    fn peer_anchor_store_roundtrip_and_target_ordering_are_stable() {
+        let peers_dir = temp_dir("test-peer-anchor-roundtrip");
+        std::fs::create_dir_all(&peers_dir).expect("mkdir peers");
+        let store = super::PeerAnchorStore::from_peers_dir(&peers_dir, "devnet");
+
+        super::update_peer_anchor_store_attempt(&store, "127.0.0.1:18444", 10, true)
+            .expect("anchor update 1");
+        super::update_peer_anchor_store_attempt(&store, "127.0.0.1:18445", 25, true)
+            .expect("anchor update 2");
+        super::update_peer_anchor_store_attempt(&store, "127.0.0.1:18446", 30, false)
+            .expect("anchor update 3");
+
+        let ordered = super::load_peer_anchor_targets(&store, 3).expect("load anchors");
+        assert_eq!(ordered.len(), 3);
+        assert_eq!(
+            ordered,
+            vec![
+                "127.0.0.1:18445".to_owned(),
+                "127.0.0.1:18444".to_owned(),
+                "127.0.0.1:18446".to_owned(),
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(peers_dir);
+    }
+
+    #[test]
+    fn merge_outbound_targets_prioritizes_anchors_and_dedups() {
+        let merged = super::merge_outbound_targets(
+            vec!["127.0.0.1:18444".to_owned(), "127.0.0.1:18445".to_owned()],
+            vec!["127.0.0.1:18445".to_owned(), "127.0.0.1:18446".to_owned()],
+        );
+        assert_eq!(
+            merged,
+            vec![
+                "127.0.0.1:18444".to_owned(),
+                "127.0.0.1:18445".to_owned(),
+                "127.0.0.1:18446".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn load_relay_outbound_feeler_target_skips_bind_and_excluded() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let peers_dir = temp_dir("test-relay-feeler-target-selection");
+        std::fs::create_dir_all(&peers_dir).expect("mkdir peers");
+        super::save_peer_book_db(
+            &peers_dir.join("devnet.redb"),
+            &PeerAddressBook {
+                network_id: "devnet".to_owned(),
+                peers: vec![
+                    PeerAddressRecord {
+                        address: "127.0.0.1:18444".to_owned(),
+                        last_seen_unix_sec: 0,
+                        ban_score: 0,
+                    },
+                    PeerAddressRecord {
+                        address: "127.0.0.1:18445".to_owned(),
+                        last_seen_unix_sec: 0,
+                        ban_score: 0,
+                    },
+                    PeerAddressRecord {
+                        address: "127.0.0.1:18446".to_owned(),
+                        last_seen_unix_sec: 0,
+                        ban_score: 0,
+                    },
+                ],
+            },
+        )
+        .expect("save peer book");
+        let mut excluded = HashSet::<String>::new();
+        excluded.insert("127.0.0.1:18445".to_owned());
+        let selected =
+            super::load_relay_outbound_feeler_target(&peers_dir, &cfg, "0.0.0.0:18444", &excluded)
+                .expect("feeler selection");
+        assert_eq!(selected, Some("127.0.0.1:18446".to_owned()));
 
         let _ = std::fs::remove_dir_all(peers_dir);
     }
@@ -25879,6 +26395,115 @@ mod tests {
             .expect("mempool");
         let missing_outpoints = super::detect_missing_outpoints(&runtime, &mempool, &tx);
         assert_eq!(missing_outpoints, vec![missing]);
+    }
+
+    #[test]
+    fn relay_tx_orphan_path_requests_missing_parent_once_until_cache_expires() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let relay = RelayAdmissionState {
+            mempool: Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip: GossipEngine::new(64).expect("gossip"),
+        };
+        let mut state = RelayServerState::new(runtime, relay);
+        let peer_id = 77;
+        state.relay.gossip.connect_peer(peer_id);
+
+        let missing = OutPoint {
+            txid: Hash256([0xAB; 32]),
+            vout: 0,
+        };
+        let tx_a = relay_tx(missing.clone(), 1, 11);
+        let first = super::process_relay_wire_message(
+            &mut state,
+            peer_id,
+            WireMessage::Tx { tx: tx_a },
+            1_000,
+        )
+        .expect("first orphan tx");
+        assert!(
+            matches!(&first[..], [WireMessage::GetData { items }]
+                if items == &vec![InventoryItem::Tx(missing.txid)]),
+            "first orphan tx should trigger parent getdata request"
+        );
+
+        let tx_b = relay_tx(missing.clone(), 2, 12);
+        let second = super::process_relay_wire_message(
+            &mut state,
+            peer_id,
+            WireMessage::Tx { tx: tx_b },
+            1_001,
+        )
+        .expect("second orphan tx");
+        assert!(
+            second.is_empty(),
+            "parent requests should be de-duplicated while request cache entry is fresh"
+        );
+
+        let tx_c = relay_tx(missing, 3, 13);
+        let after_ttl = super::process_relay_wire_message(
+            &mut state,
+            peer_id,
+            WireMessage::Tx { tx: tx_c },
+            1_000 + super::RELAY_PARENT_REQUEST_TTL_SEC + 1,
+        )
+        .expect("third orphan tx");
+        assert!(
+            matches!(&after_ttl[..], [WireMessage::GetData { items }]
+                if items == &vec![InventoryItem::Tx(Hash256([0xAB; 32]))]),
+            "expired cache entry must allow parent request refresh"
+        );
+    }
+
+    #[test]
+    fn relay_tx_orphan_path_rejects_excessive_parent_fanout_and_penalizes_peer() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let relay = RelayAdmissionState {
+            mempool: Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip: GossipEngine::new(64).expect("gossip"),
+        };
+        let mut state = RelayServerState::new(runtime, relay);
+        let peer_id = 78;
+        state.relay.gossip.connect_peer(peer_id);
+
+        let mut inputs = Vec::<TxIn>::new();
+        for idx in 0..=super::RELAY_MAX_ORPHAN_PARENT_REQUESTS {
+            inputs.push(TxIn {
+                prev_out: OutPoint {
+                    txid: Hash256([idx as u8; 32]),
+                    vout: 0,
+                },
+                signature: vec![1u8; 64],
+                pubkey_compressed: vec![0x02; 33],
+                sequence: 0,
+            });
+        }
+        let tx = Transaction {
+            version: 1,
+            inputs,
+            outputs: vec![TxOut {
+                value: 1,
+                key_hash20: [0x11; 20],
+            }],
+            lock_time: 0,
+        };
+        let err =
+            super::process_relay_wire_message(&mut state, peer_id, WireMessage::Tx { tx }, 2_000)
+                .expect_err("oversized orphan parent fanout must be rejected");
+        assert!(err.to_string().contains("invalid orphan parent set"));
+        assert_eq!(
+            state.relay.gossip.peer_score(peer_id),
+            Some(super::RELAY_PROTOCOL_PENALTY)
+        );
     }
 
     #[test]

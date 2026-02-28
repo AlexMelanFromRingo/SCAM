@@ -54,6 +54,8 @@ Status: v3 (hardening + SV2 pool-grade gap closure on 2026-02-13)
 - [x] Added long-lived socket relay runtime (`node relay-serve`) with peer-scoped mempool replacement quotas + relay telemetry snapshots.
 - [x] Migrated `relay-serve` runtime path to async tokio I/O with bounded concurrent session permits (removed runtime thread-per-connection model).
 - [x] Extended P2P wire/runtime with addr exchange (`getaddr/addr`) and compact-block flow (`sendcmpct/cmpctblock/getblocktxn/blocktxn`) plus outbound addrman-lite peer selection.
+- [x] Added outbound anchor/feeler hardening in relay dialer (persisted successful anchors + periodic short-lived feeler probes).
+- [x] Added orphan-parent recovery in relay tx path (`GetData` requests for missing parent txids) with TTL de-dup cache and oversized-parent-fanout penalties.
 - [x] Added external SV2 role services with network boundaries (`sv2-template-provider`, `sv2-job-declarator`, `sv2-translator`) and per-role telemetry output.
 - [x] Added Noise-spec secure transport mode (`noise_xx`) with configurable selection (`stratum_secure_transport_mode`, `--secure-transport-mode`).
 - [x] Added secure key lifecycle operations (`stratum-keygen`, `stratum-key-rotate`) for Noise static keys.
