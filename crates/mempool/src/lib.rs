@@ -267,8 +267,10 @@ impl Mempool {
                 });
             }
 
-            let replacement_set =
-                self.collect_replacement_set(existing_txid, self.max_replacement_descendants + 2);
+            let replacement_set = self.collect_replacement_set(
+                existing_txid,
+                Self::replacement_scan_limit(self.max_replacement_descendants),
+            );
             let descendant_count = replacement_set.len().saturating_sub(1);
             if descendant_count > self.max_replacement_descendants {
                 return Err(MempoolError::ReplacementTooManyDescendants {
@@ -372,6 +374,10 @@ impl Mempool {
         self.feerate_index
             .first()
             .map(|(rate, txid)| (txid.0, *rate))
+    }
+
+    fn replacement_scan_limit(max_replacement_descendants: usize) -> usize {
+        max_replacement_descendants.saturating_add(2)
     }
 
     fn collect_replacement_set(&self, root_txid: Hash256, max_size: usize) -> Vec<Hash256> {
@@ -1035,6 +1041,42 @@ mod tests {
         for txid in chain {
             assert!(!mempool.contains(&txid));
         }
+    }
+
+    #[test]
+    fn replacement_scan_limit_is_descendants_plus_two() {
+        assert_eq!(Mempool::replacement_scan_limit(1), 3);
+        assert_eq!(Mempool::replacement_scan_limit(25), 27);
+        assert_eq!(Mempool::replacement_scan_limit(usize::MAX), usize::MAX);
+    }
+
+    #[test]
+    fn collect_replacement_set_overflow_returns_after_exceeding_limit() {
+        let mut mempool =
+            Mempool::with_policy_and_replacement(100, 0, 1, 25).expect("mempool must initialize");
+        let root = [0xAB; 32];
+        let parent = mk_tx(root, 0, b"parent", 1);
+        let parent_id = parent.txid();
+        let child = mk_tx(parent_id.0, 0, b"child", 2);
+        let child_id = child.txid();
+        let grandchild = mk_tx(child_id.0, 0, b"grandchild", 3);
+        let grandchild_id = grandchild.txid();
+
+        mempool.insert_with_fee(parent, 10).expect("insert parent");
+        mempool.insert_with_fee(child, 10).expect("insert child");
+        mempool
+            .insert_with_fee(grandchild, 10)
+            .expect("insert grandchild");
+
+        let replacement_set = mempool.collect_replacement_set(parent_id, 2);
+        assert_eq!(
+            replacement_set.len(),
+            3,
+            "replacement set should include one element beyond max_size sentinel"
+        );
+        assert!(replacement_set.contains(&parent_id));
+        assert!(replacement_set.contains(&child_id));
+        assert!(replacement_set.contains(&grandchild_id));
     }
 
     #[test]

@@ -810,6 +810,75 @@ mod tests {
     }
 
     #[test]
+    fn forget_tx_and_block_keep_unrelated_entries_in_order_indexes() {
+        let mut engine = GossipEngine::new(32).expect("engine");
+        engine.connect_peer(1);
+        engine.connect_peer(2);
+
+        let tx_a = sample_tx(31);
+        let tx_b = sample_tx(32);
+        let txid_a = tx_a.txid();
+        let txid_b = tx_b.txid();
+        let _ = engine
+            .on_message(1, WireMessage::Tx { tx: tx_a })
+            .expect("insert tx a");
+        let _ = engine
+            .on_message(1, WireMessage::Tx { tx: tx_b })
+            .expect("insert tx b");
+        assert_eq!(engine.tx_store_order.len(), 2);
+        assert_eq!(engine.tx_store_order.front().copied(), Some(txid_a));
+        assert_eq!(engine.tx_store_order.back().copied(), Some(txid_b));
+
+        engine.forget_tx(txid_a);
+        assert!(!engine.tx_store.contains_key(&txid_a));
+        assert!(engine.tx_store.contains_key(&txid_b));
+        assert_eq!(engine.tx_store_order.len(), 1);
+        assert_eq!(engine.tx_store_order.front().copied(), Some(txid_b));
+
+        let block_a = scam_core::Block {
+            header: scam_core::BlockHeader {
+                version: 1,
+                prev_block: scam_core::Hash256::ZERO,
+                merkle_root: scam_core::hash::hash256(b"blk-a"),
+                timestamp: 1_770_763_300,
+                target: scam_core::Target::MAX,
+                nonce: 1,
+            },
+            transactions: Vec::new(),
+        };
+        let block_b = scam_core::Block {
+            header: scam_core::BlockHeader {
+                version: 1,
+                prev_block: scam_core::Hash256::ZERO,
+                merkle_root: scam_core::hash::hash256(b"blk-b"),
+                timestamp: 1_770_763_301,
+                target: scam_core::Target::MAX,
+                nonce: 2,
+            },
+            transactions: Vec::new(),
+        };
+        let block_hash_a = block_a.header.block_hash();
+        let block_hash_b = block_b.header.block_hash();
+        let _ = engine.announce_block(block_a);
+        let _ = engine.announce_block(block_b);
+        assert_eq!(engine.block_store_order.len(), 2);
+        assert_eq!(
+            engine.block_store_order.front().copied(),
+            Some(block_hash_a)
+        );
+        assert_eq!(engine.block_store_order.back().copied(), Some(block_hash_b));
+
+        engine.forget_block(block_hash_a);
+        assert!(!engine.block_store.contains_key(&block_hash_a));
+        assert!(engine.block_store.contains_key(&block_hash_b));
+        assert_eq!(engine.block_store_order.len(), 1);
+        assert_eq!(
+            engine.block_store_order.front().copied(),
+            Some(block_hash_b)
+        );
+    }
+
+    #[test]
     fn per_peer_replacement_rate_limit_penalizes_sender() {
         let mut engine = GossipEngine::with_limits_and_replacement(
             256,

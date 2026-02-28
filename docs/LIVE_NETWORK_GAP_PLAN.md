@@ -48,7 +48,8 @@
 
 ## P2 (launch confidence)
 - [ ] Soak test profile for 24h: 2-5 nodes + miner + tx spam profile.
-- [ ] Mutation stage2/3 rerun after live submit/realtime changes.
+- [x] Mutation stage2/3 rerun after live submit/realtime changes.
+  - Closure (`2026-02-28`): Stage 2 iterate closure (`0 missed/timeout`), Stage 3 full workspace (`0 missed/timeout`).
 - [x] Fuzz target for relay wire parsing and tx submit route.
 - [x] Operator runbook updates (incident handling, recovery, metrics thresholds).
 
@@ -63,4 +64,5 @@
 - [x] No dependence on periodic `sync-book` loop for normal block propagation.
 - [x] User tx can be created/submitted/propagated/mined/observed from another node.
 - [x] UI reflects chain/mempool updates automatically (realtime stream) with clear fallback.
-- [ ] Full workspace: `fmt`, `clippy -D warnings`, tests, mutation stages (agreed thresholds).
+- [x] Full workspace: `fmt`, `clippy -D warnings`, tests, mutation stages (agreed thresholds).
+  - Verified (`2026-02-28`): `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, staged mutation closure (`stage2/stage3`).

@@ -1257,5 +1257,18 @@ mod tests {
             1_000,
             500_000_010
         ));
+
+        let tx_threshold_locked = Transaction {
+            lock_time: super::LOCKTIME_THRESHOLD,
+            ..tx_height_locked
+        };
+        assert!(
+            !super::tx_is_final_for_block(
+                &tx_threshold_locked,
+                (super::LOCKTIME_THRESHOLD as u64).saturating_add(10_000),
+                (super::LOCKTIME_THRESHOLD as u64).saturating_sub(1)
+            ),
+            "lock_time at threshold must use time-based finality, not height-based"
+        );
     }
 }

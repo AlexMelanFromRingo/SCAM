@@ -69,6 +69,7 @@ Scope note:
 
 ## 8) Remaining Non-Code Gates
 
-- [ ] Mutation rerun/closure on latest commit set (`stage2/stage3`).
+- [x] Mutation rerun/closure on latest commit set (`stage2/stage3`).
+  - Latest results (`2026-02-28`): Stage 2 iterate closure (`1 tested, 1 caught, 0 missed, 0 timeout`), Stage 3 full workspace (`2358 tested, 2064 caught, 0 missed, 0 timeout, 294 unviable`).
 - [ ] Long-run soak and chaos acceptance.
 - [ ] External security audit for production blocking findings.

@@ -469,8 +469,21 @@ impl ChainRuntime {
         };
 
         let fork_height = self.find_fork_height(chain_hashes)?;
+        let mut disconnect_guard = self.main_chain.len().saturating_add(1);
         while self.main_chain.len().saturating_sub(1) > fork_height {
+            let len_before = self.main_chain.len();
             self.disconnect_tip_block()?;
+            if self.main_chain.len() >= len_before {
+                return Err(ChainError::InvalidRuntime(
+                    "disconnect_tip_block made no progress during reorg".to_owned(),
+                ));
+            }
+            disconnect_guard = disconnect_guard.saturating_sub(1);
+            if disconnect_guard == 0 {
+                return Err(ChainError::InvalidRuntime(
+                    "reorg disconnect guard exhausted".to_owned(),
+                ));
+            }
         }
         for hash in chain_hashes.iter().copied().skip(fork_height + 1) {
             self.connect_known_block(hash)?;
@@ -658,7 +671,7 @@ pub enum ChainError {
 
 #[cfg(test)]
 mod tests {
-    use scam_core::{OutPoint, Transaction, TxIn, TxOut};
+    use scam_core::{Hash256, OutPoint, Transaction, TxIn, TxOut};
     use scam_miner::{BlockTemplate, mine_block};
 
     use super::{asert_next, chainwork_for_target, lwma_next, retarget_next};
@@ -1066,6 +1079,69 @@ mod tests {
 
         assert!(saw_reorg, "expected at least one reorg event");
         assert_ne!(runtime.tip_hash(), old_tip);
+    }
+
+    #[test]
+    fn find_fork_height_tracks_deepest_matching_prefix() {
+        let config: scam_core::ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let mut runtime = ChainRuntime::from_config(config.clone()).expect("runtime");
+        let reward = config.genesis_reward_key_hash20().expect("key");
+
+        let mut timestamp = runtime.tip_header().timestamp + 30;
+        for i in 0..2 {
+            let template = BlockTemplate {
+                version: 1,
+                prev_block: runtime.tip_hash(),
+                timestamp,
+                target: runtime.expected_target_for_next_block().expect("target"),
+                transactions: vec![coinbase(
+                    config.block_subsidy,
+                    reward,
+                    format!("fork-height-{i}").as_bytes(),
+                )],
+            };
+            let block = mine_block(&template, 200_000).expect("mine");
+            runtime.apply_next_block(block).expect("apply");
+            timestamp += 30;
+        }
+
+        let local_chain = runtime.main_chain.clone();
+        let fork_height = runtime
+            .find_fork_height(&local_chain)
+            .expect("fork height on identical chain");
+        assert_eq!(fork_height, runtime.tip_height() as usize);
+
+        let mut no_shared_genesis = local_chain.clone();
+        no_shared_genesis[0] = Hash256([0xEE; 32]);
+        let err = runtime
+            .find_fork_height(&no_shared_genesis)
+            .expect_err("mismatched genesis must fail");
+        assert!(matches!(err, ChainError::InvalidRuntime(_)));
+    }
+
+    #[test]
+    fn disconnect_tip_block_must_reduce_height() {
+        let config: scam_core::ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let mut runtime = ChainRuntime::from_config(config.clone()).expect("runtime");
+        let reward = config.genesis_reward_key_hash20().expect("key");
+
+        let template = BlockTemplate {
+            version: 1,
+            prev_block: runtime.tip_hash(),
+            timestamp: runtime.tip_header().timestamp + 30,
+            target: runtime.expected_target_for_next_block().expect("target"),
+            transactions: vec![coinbase(config.block_subsidy, reward, b"disconnect-tip")],
+        };
+        let block = mine_block(&template, 200_000).expect("mine");
+        runtime.apply_next_block(block).expect("apply");
+
+        let tip_before = runtime.tip_hash();
+        let height_before = runtime.tip_height();
+        runtime.disconnect_tip_block().expect("disconnect");
+        assert_eq!(runtime.tip_height(), height_before.saturating_sub(1));
+        assert_ne!(runtime.tip_hash(), tip_before);
     }
 
     #[test]

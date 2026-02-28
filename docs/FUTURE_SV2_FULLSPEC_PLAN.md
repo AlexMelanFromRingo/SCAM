@@ -21,7 +21,8 @@ Clarification: consensus is already functionally implemented; future items touch
   - Added stricter conformance gates for ordered observed-message sequences.
   - Added extended-channel/extended-submit negative-path handling with explicit SV2
     error responses and conformance/state coverage updates.
-- [ ] mutation-gap closure in `core/consensus/node`,
+- [x] mutation-gap closure in `core/consensus/node`,
+  - Closed on latest commit set (`2026-02-28`): `stage2` iterate closure and `stage3` full workspace rerun both finished with `0 missed` / `0 timeout`.
 - [x] expanded external SV2 interoperability matrix automation (`SV2_EXTERNAL_TARGETS_FILE` extended schema, per-target timeout/retry/gating knobs, quirks/workaround metadata artifacts),
 - [x] final launch hardening and operator runbook/release-gate polish (`scripts/sv2-release-gate.sh`, workflow `sv2-release-gate.yml`, runbook section updates).
 

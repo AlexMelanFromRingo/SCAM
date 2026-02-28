@@ -2,10 +2,11 @@
 
 SCAM is a Rust 2024 implementation of a PoW L1 blockchain with a configurable, production-style baseline.
 
-Current repository status (2026-02-13):
-- `IMPLEMENTATION_TODO` checklist is fully closed.
-- `SV2_POOL_GRADE_GAP` checklist is fully closed.
-- workspace `fmt/check/test/clippy` gates are green.
+Current repository status (2026-02-28, `RC1`):
+- Release candidate baseline is marked as `RC1`.
+- Full mutation closure is green on current code (`stage2` closure + full `stage3` with `0 missed`, `0 timeout`).
+- Workspace quality gates are green: `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`.
+- Remaining deferred non-code gates: long-run soak, external audit, and the maximum-detail documentation pack.
 
 This README is written as an operator+developer manual: what the protocol does, how to build it, how to run node/wallet/mining, and how to validate deployments.
 
@@ -144,7 +145,7 @@ Config controls algorithm and parameters.
 
 ### 4.1 Prerequisites
 - Linux/macOS with `bash`.
-- Rust stable toolchain (workspace currently validated on Rust 1.91.x stable).
+- Rust stable toolchain (workspace currently validated on Rust 1.93.x stable).
 - For fuzzing: nightly toolchain.
 
 ### 4.2 Build (debug)
@@ -665,6 +666,8 @@ python3 scripts/sv2-conformance-report.py \
 ## 15) Documentation Index
 
 - `docs/IMPLEMENTATION_TODO.md`
+- `docs/RELEASE_STATUS.md`
+- `docs/METHODICAL_MANUAL.md`
 - `docs/USER_DEPLOYMENT_GUIDE.md`
 - `docs/OPERATOR_RUNBOOK.md`
 - `docs/STRATUM_SV2_NOTES.md`

@@ -88,10 +88,9 @@ const MSG_SUBMIT_SHARES_EXTENDED: u8 = 0x33;
 const MSG_KEEP_ALIVE: u8 = 0x40;
 
 pub const SV2_MINING_PROTOCOL_ID: u16 = 2;
-pub const SV2_SETUP_FLAG_STANDARD_CHANNEL: u32 = 1 << 0;
-pub const SV2_SETUP_FLAG_SET_TARGET: u32 = 1 << 1;
-pub const SV2_SETUP_FLAGS_KNOWN_MASK: u32 =
-    SV2_SETUP_FLAG_STANDARD_CHANNEL | SV2_SETUP_FLAG_SET_TARGET;
+pub const SV2_SETUP_FLAG_STANDARD_CHANNEL: u32 = 0x0000_0001;
+pub const SV2_SETUP_FLAG_SET_TARGET: u32 = 0x0000_0002;
+pub const SV2_SETUP_FLAGS_KNOWN_MASK: u32 = 0x0000_0003;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Sv2Message {
@@ -2437,6 +2436,13 @@ mod tests {
     }
 
     #[test]
+    fn setup_flag_constants_have_expected_bit_layout() {
+        assert_eq!(SV2_SETUP_FLAG_STANDARD_CHANNEL, 0x0000_0001);
+        assert_eq!(SV2_SETUP_FLAG_SET_TARGET, 0x0000_0002);
+        assert_eq!(SV2_SETUP_FLAGS_KNOWN_MASK, 0x0000_0003);
+    }
+
+    #[test]
     fn session_accessors_and_close_path_work() {
         let mut session = Sv2Session::new(test_session_config()).expect("session");
         assert_eq!(session.channel_id(), 7);
@@ -2787,6 +2793,27 @@ mod tests {
             missing_required.outbound.as_slice(),
             [Sv2Message::SetupConnectionError { code, .. }] if code == "missing_required_feature_flags"
         ));
+    }
+
+    #[test]
+    fn negotiated_setup_flags_accessor_tracks_non_default_bitsets() {
+        let mut cfg = test_session_config();
+        cfg.required_setup_flags = 0;
+        let mut session = Sv2Session::new(cfg).expect("session");
+        let response = session
+            .handle_message(Sv2Message::SetupConnection {
+                protocol: 2,
+                min_version: 2,
+                max_version: 2,
+                flags: SV2_SETUP_FLAG_SET_TARGET,
+                user_agent: "miner".to_owned(),
+            })
+            .expect("setup response");
+        assert!(matches!(
+            response.outbound.as_slice(),
+            [Sv2Message::SetupConnectionSuccess { flags, .. }] if *flags == SV2_SETUP_FLAG_SET_TARGET
+        ));
+        assert_eq!(session.negotiated_setup_flags(), SV2_SETUP_FLAG_SET_TARGET);
     }
 
     #[test]

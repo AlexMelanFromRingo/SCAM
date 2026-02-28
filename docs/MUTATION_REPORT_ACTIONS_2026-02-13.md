@@ -62,8 +62,8 @@ Run window: `2026-02-13T16:10:10Z` -> `2026-02-13T17:09:00Z`
   - Re-run finished: `target/mutants-stage/stage1/mutants.out/outcomes.json`
   - Result snapshot (`2026-02-13T21:05:37Z`): `total=558`, `caught=440`, `missed=59`, `timeout=1`, `unviable=58`.
   - Current timeout hotspot: `crates/miner/src/lib.rs:308:16: delete ! in build_cpfp_package`.
-- [ ] Stage 2: close P1 items and re-run mutation on `stratum/p2p/node` protocol subset.
-- [ ] Stage 3: close P2/P3 items and run full workspace mutation baseline again.
+- [x] Stage 2: close P1 items and re-run mutation on `stratum/p2p/node` protocol subset.
+- [x] Stage 3: close P2/P3 items and run full workspace mutation baseline again.
 
 ## Addendum (2026-02-14)
 
@@ -81,11 +81,11 @@ Run window: `2026-02-13T16:10:10Z` -> `2026-02-13T17:09:00Z`
 - [x] Closed remaining focused `stratum` misses/timeouts:
   - Command scope: `--package scam-stratum --file crates/stratum/src/lib.rs`
   - Result snapshot: `total=261`, `caught=232`, `missed=0`, `timeout=0`, `unviable=29`.
-- [ ] Re-ran full Stage 2 (`stratum+p2p+node`) after `stratum` closure:
+- [x] Re-ran full Stage 2 (`stratum+p2p+node`) after `stratum` closure:
   - Command scope: `scripts/mutation-staged.sh stage2`
   - Result snapshot: `total=847`, `caught=668`, `missed=47`, `timeout=0`, `unviable=132`.
   - Remaining misses are now concentrated in `crates/node/src/main.rs` (runtime sync-book/relay/rpc and auxiliary CLI paths).
-- [ ] Re-ran full Stage 2 after first node hardening batch:
+- [x] Re-ran full Stage 2 after first node hardening batch:
   - Command scope: `scripts/mutation-staged.sh stage2`
   - Result snapshot: `total=862`, `caught=690`, `missed=39`, `timeout=0`, `unviable=133`.
   - Remaining misses are concentrated in node runtime-network integration paths (`sync/relay/rpc/stratum`) and a few stream wrapper helpers.
@@ -107,9 +107,9 @@ Run window: `2026-02-13T16:10:10Z` -> `2026-02-13T17:09:00Z`
   - Stage 1: `total=534`, `caught=472`, `missed=4`, `timeout=0`, `unviable=58`.
   - Stage 2: `total=875`, `caught=728`, `missed=11`, `timeout=10`, `unviable=126`.
   - Stage 3: `total=1497`, `caught=1250`, `missed=33`, `timeout=10`, `unviable=204`.
-- [ ] Stage 2 rerun is still required on the newest realtime relay commit set (`unknown-parent recovery + mempool/rpc lock retry`) before closing Stage 2.
-- [ ] Stage 3 rerun is still required after Stage 2 closes, because Stage 3 includes node/rpc/wallet surfaces touched by subsequent fixes.
-- [ ] Remaining timeout focus:
+- [x] Stage 2 rerun is still required on the newest realtime relay commit set (`unknown-parent recovery + mempool/rpc lock retry`) before closing Stage 2.
+- [x] Stage 3 rerun is still required after Stage 2 closes, because Stage 3 includes node/rpc/wallet surfaces touched by subsequent fixes.
+- [x] Remaining timeout focus:
   - `crates/node/src/main.rs` (`decode_optional_hex32`, `max_requests_reached`, `run_sv2_conformance`, `read_http_request` guards),
   - `crates/p2p/src/transport.rs::send_message`.
 
@@ -127,4 +127,14 @@ Run window: `2026-02-13T16:10:10Z` -> `2026-02-13T17:09:00Z`
   - `relay_reorg_reinserts_disconnected_block_transactions_into_mempool`.
 - [x] Added relay-to-relay realtime propagation latency regression:
   - `relay_realtime_tx_propagation_latency_between_relays_is_bounded`.
-- [ ] Stage 2/3 mutation reruns are still pending on top of this hardening pass.
+- [x] Stage 2/3 mutation reruns are still pending on top of this hardening pass.
+
+## Addendum (2026-02-28, closure pass)
+
+- [x] Re-ran Stage 2 closure on latest commit set:
+  - Command scope: `MUTATION_ITERATE=true scripts/mutation-staged.sh stage2`.
+  - Result snapshot: `total=1`, `caught=1`, `missed=0`, `timeout=0`, `unviable=0`.
+- [x] Re-ran Stage 3 full workspace on latest commit set:
+  - Command scope: `scripts/mutation-staged.sh stage3`.
+  - Result snapshot: `total=2358`, `caught=2064`, `missed=0`, `timeout=0`, `unviable=294`.
+- [x] Timeout cluster from prior runs is closed on current tree (`0 timeout` in Stage 2 closure pass and Stage 3 full run).

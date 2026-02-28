@@ -342,6 +342,7 @@ Status: v3 (hardening + SV2 pool-grade gap closure on 2026-02-13)
 
 ## 20) Deferred Full Documentation Pack (Post-Feature-Freeze)
 
+- [x] Bootstrap manual scaffold and crate-level index in `docs/METHODICAL_MANUAL.md` (WIP starter published, function-level expansion pending).
 - [ ] Write a maximum-detail project manual split by crate (`core`, `consensus`, `chain`, `mempool`, `wallet`, `p2p`, `stratum`, `storage`, `rpc`, `node`, `miner`) with:
 - [ ] module-level architecture and data-flow maps,
 - [ ] per-function behavior/reference notes (inputs, outputs, invariants, side effects, error paths),
