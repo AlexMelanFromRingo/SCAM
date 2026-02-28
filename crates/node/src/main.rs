@@ -2195,8 +2195,14 @@ fn peer_reputation_path(peers_dir: &Path, network_name: &str) -> PathBuf {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
 struct PeerReputationRecord {
     address: String,
+    #[serde(default)]
     replacement_rate_limited_total: u64,
+    #[serde(default)]
     last_replacement_rate_limited_unix_sec: u64,
+    #[serde(default)]
+    protocol_violation_total: u64,
+    #[serde(default)]
+    last_protocol_violation_unix_sec: u64,
     last_updated_unix_sec: u64,
 }
 
@@ -2210,6 +2216,8 @@ struct PeerReputationBook {
 struct RuntimePeerReputation {
     replacement_rate_limited_total: u64,
     last_replacement_rate_limited_unix_sec: u64,
+    protocol_violation_total: u64,
+    last_protocol_violation_unix_sec: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -2318,11 +2326,17 @@ fn load_peer_reputation_weights(
         if peer.address.trim().is_empty() {
             continue;
         }
-        let weight = reputation_failure_weight(
+        let replacement_weight = reputation_failure_weight(
             peer.replacement_rate_limited_total,
             peer.last_replacement_rate_limited_unix_sec,
             now_unix_sec,
         );
+        let protocol_weight = reputation_failure_weight(
+            peer.protocol_violation_total,
+            peer.last_protocol_violation_unix_sec,
+            now_unix_sec,
+        );
+        let weight = replacement_weight.saturating_add(protocol_weight.saturating_mul(2));
         if weight > 0 {
             out.insert(peer.address, weight);
         }
@@ -2336,7 +2350,9 @@ fn update_peer_reputation_store(
     delta: RuntimePeerReputation,
     now_unix_sec: u64,
 ) -> Result<(), NodeError> {
-    if address.trim().is_empty() || delta.replacement_rate_limited_total == 0 {
+    if address.trim().is_empty()
+        || (delta.replacement_rate_limited_total == 0 && delta.protocol_violation_total == 0)
+    {
         return Ok(());
     }
     let mut book = load_peer_reputation_book(&store.path, &store.network_id)?;
@@ -2349,6 +2365,12 @@ fn update_peer_reputation_store(
             peer.last_replacement_rate_limited_unix_sec = peer
                 .last_replacement_rate_limited_unix_sec
                 .max(delta.last_replacement_rate_limited_unix_sec);
+            peer.protocol_violation_total = peer
+                .protocol_violation_total
+                .saturating_add(delta.protocol_violation_total);
+            peer.last_protocol_violation_unix_sec = peer
+                .last_protocol_violation_unix_sec
+                .max(delta.last_protocol_violation_unix_sec);
             peer.last_updated_unix_sec = now_unix_sec;
             updated = true;
             break;
@@ -2359,6 +2381,8 @@ fn update_peer_reputation_store(
             address: address.to_owned(),
             replacement_rate_limited_total: delta.replacement_rate_limited_total,
             last_replacement_rate_limited_unix_sec: delta.last_replacement_rate_limited_unix_sec,
+            protocol_violation_total: delta.protocol_violation_total,
+            last_protocol_violation_unix_sec: delta.last_protocol_violation_unix_sec,
             last_updated_unix_sec: now_unix_sec,
         });
     }
@@ -5544,7 +5568,7 @@ fn relay_startup_send_failed(startup_sent: bool) -> bool {
 }
 
 fn should_persist_peer_reputation(delta: RuntimePeerReputation) -> bool {
-    delta.replacement_rate_limited_total > 0
+    delta.replacement_rate_limited_total > 0 || delta.protocol_violation_total > 0
 }
 
 fn relay_known_peer_addresses(state: &RelayServerState, max_items: usize) -> Vec<PeerAddress> {
@@ -5690,6 +5714,9 @@ fn relay_mark_protocol_violation(state: &mut RelayServerState, peer_id: u64, _no
         .relay
         .gossip
         .penalize_peer(peer_id, RELAY_PROTOCOL_PENALTY);
+    let entry = state.peer_runtime_reputation.entry(peer_id).or_default();
+    entry.protocol_violation_total = entry.protocol_violation_total.saturating_add(1);
+    entry.last_protocol_violation_unix_sec = _now_unix_sec;
 }
 
 fn relay_protocol_violation(
@@ -6532,7 +6559,7 @@ async fn run_relay_outbound_supervisor_async(
 ) {
     let redial_delay = Duration::from_secs(redial_sec.max(1));
     relay_mark_outbound_supervisor_start(&state);
-    let mut workers = JoinSet::<()>::new();
+    let mut workers = HashMap::<String, tokio::task::JoinHandle<()>>::new();
     let mut worker_targets = HashSet::<String>::new();
 
     loop {
@@ -6540,12 +6567,19 @@ async fn run_relay_outbound_supervisor_async(
             break;
         }
 
-        while let Some(joined) = workers.try_join_next() {
-            match joined {
-                Ok(()) => {}
-                Err(err) => {
-                    eprintln!("warning: outbound relay worker task failed: {err}");
+        let mut finished = Vec::<String>::new();
+        for (target, handle) in &workers {
+            if handle.is_finished() {
+                finished.push(target.clone());
+            }
+        }
+        for target in finished {
+            if let Some(handle) = workers.remove(&target) {
+                match handle.await {
+                    Ok(()) => {}
+                    Err(err) => eprintln!("warning: outbound relay worker task failed: {err}"),
                 }
+                worker_targets.remove(&target);
             }
         }
 
@@ -6583,32 +6617,38 @@ async fn run_relay_outbound_supervisor_async(
             let mempool_db_path_clone = mempool_db_path.clone();
             let bind_addr_clone = bind_addr.clone();
             let reputation_store_clone = peer_reputation_store.clone();
-            workers.spawn(async move {
-                run_relay_outbound_worker_async(
-                    target,
-                    bind_addr_clone,
-                    stop_clone,
-                    next_peer_clone,
-                    state_clone,
-                    active_clone,
-                    cfg_clone,
-                    runtime_db_path_clone,
-                    mempool_db_path_clone,
-                    max_inv_items,
-                    read_limit,
-                    read_timeout_sec,
-                    write_timeout_sec,
-                    redial_sec,
-                    reputation_store_clone,
-                )
-                .await
-            });
+            workers.insert(
+                target.clone(),
+                tokio::spawn(async move {
+                    run_relay_outbound_worker_async(
+                        target,
+                        bind_addr_clone,
+                        stop_clone,
+                        next_peer_clone,
+                        state_clone,
+                        active_clone,
+                        cfg_clone,
+                        runtime_db_path_clone,
+                        mempool_db_path_clone,
+                        max_inv_items,
+                        read_limit,
+                        read_timeout_sec,
+                        write_timeout_sec,
+                        redial_sec,
+                        reputation_store_clone,
+                    )
+                    .await
+                }),
+            );
         }
 
         sleep(redial_delay).await;
     }
 
-    workers.shutdown().await;
+    for (_target, worker) in workers {
+        worker.abort();
+        let _ = worker.await;
+    }
 }
 
 fn relay_runtime_or_mempool_changed(
@@ -16605,6 +16645,8 @@ mod tests {
             super::RuntimePeerReputation {
                 replacement_rate_limited_total: 5,
                 last_replacement_rate_limited_unix_sec: now,
+                protocol_violation_total: 0,
+                last_protocol_violation_unix_sec: 0,
             },
             now,
         )
@@ -16620,6 +16662,8 @@ mod tests {
             super::RuntimePeerReputation {
                 replacement_rate_limited_total: 0,
                 last_replacement_rate_limited_unix_sec: now,
+                protocol_violation_total: 0,
+                last_protocol_violation_unix_sec: 0,
             },
             now,
         )
@@ -16639,12 +16683,16 @@ mod tests {
                         replacement_rate_limited_total: 1,
                         last_replacement_rate_limited_unix_sec: now,
                         last_updated_unix_sec: now,
+                        protocol_violation_total: 0,
+                        last_protocol_violation_unix_sec: 0,
                     },
                     super::PeerReputationRecord {
                         address: "127.0.0.1:18444".to_owned(),
                         replacement_rate_limited_total: 2,
                         last_replacement_rate_limited_unix_sec: now + 1,
                         last_updated_unix_sec: now + 1,
+                        protocol_violation_total: 0,
+                        last_protocol_violation_unix_sec: 0,
                     },
                 ],
             },
@@ -16657,6 +16705,8 @@ mod tests {
             super::RuntimePeerReputation {
                 replacement_rate_limited_total: 3,
                 last_replacement_rate_limited_unix_sec: now + 5,
+                protocol_violation_total: 0,
+                last_protocol_violation_unix_sec: 0,
             },
             now + 5,
         )
@@ -16693,18 +16743,24 @@ mod tests {
                         replacement_rate_limited_total: 1,
                         last_replacement_rate_limited_unix_sec: 10,
                         last_updated_unix_sec: 10,
+                        protocol_violation_total: 0,
+                        last_protocol_violation_unix_sec: 0,
                     },
                     super::PeerReputationRecord {
                         address: "127.0.0.1:18444".to_owned(),
                         replacement_rate_limited_total: 2,
                         last_replacement_rate_limited_unix_sec: 11,
                         last_updated_unix_sec: 11,
+                        protocol_violation_total: 0,
+                        last_protocol_violation_unix_sec: 0,
                     },
                     super::PeerReputationRecord {
                         address: "127.0.0.1:18445".to_owned(),
                         replacement_rate_limited_total: 3,
                         last_replacement_rate_limited_unix_sec: 12,
                         last_updated_unix_sec: 12,
+                        protocol_violation_total: 0,
+                        last_protocol_violation_unix_sec: 0,
                     },
                 ],
             },
@@ -16747,12 +16803,16 @@ mod tests {
                         replacement_rate_limited_total: 1,
                         last_replacement_rate_limited_unix_sec: now,
                         last_updated_unix_sec: now,
+                        protocol_violation_total: 0,
+                        last_protocol_violation_unix_sec: 0,
                     },
                     super::PeerReputationRecord {
                         address: "127.0.0.1:18445".to_owned(),
                         replacement_rate_limited_total: 2,
                         last_replacement_rate_limited_unix_sec: now,
                         last_updated_unix_sec: now,
+                        protocol_violation_total: 0,
+                        last_protocol_violation_unix_sec: 0,
                     },
                 ],
             },
@@ -16765,6 +16825,8 @@ mod tests {
             super::RuntimePeerReputation {
                 replacement_rate_limited_total: 5,
                 last_replacement_rate_limited_unix_sec: now + 1,
+                protocol_violation_total: 0,
+                last_protocol_violation_unix_sec: 0,
             },
             now + 1,
         )
@@ -17896,12 +17958,24 @@ mod tests {
             super::RuntimePeerReputation {
                 replacement_rate_limited_total: 0,
                 last_replacement_rate_limited_unix_sec: 1,
+                protocol_violation_total: 0,
+                last_protocol_violation_unix_sec: 0,
             }
         ));
         assert!(super::should_persist_peer_reputation(
             super::RuntimePeerReputation {
                 replacement_rate_limited_total: 1,
                 last_replacement_rate_limited_unix_sec: 1,
+                protocol_violation_total: 0,
+                last_protocol_violation_unix_sec: 0,
+            }
+        ));
+        assert!(super::should_persist_peer_reputation(
+            super::RuntimePeerReputation {
+                replacement_rate_limited_total: 0,
+                last_replacement_rate_limited_unix_sec: 0,
+                protocol_violation_total: 1,
+                last_protocol_violation_unix_sec: 1,
             }
         ));
 
@@ -17921,6 +17995,10 @@ mod tests {
         let delta = super::relay_take_peer_runtime_reputation(&mut state, 7);
         assert_eq!(delta.replacement_rate_limited_total, 2);
         assert_eq!(delta.last_replacement_rate_limited_unix_sec, 110);
+        super::relay_mark_protocol_violation(&mut state, 7, 120);
+        let protocol_delta = super::relay_take_peer_runtime_reputation(&mut state, 7);
+        assert_eq!(protocol_delta.protocol_violation_total, 1);
+        assert_eq!(protocol_delta.last_protocol_violation_unix_sec, 120);
         let empty = super::relay_take_peer_runtime_reputation(&mut state, 7);
         assert_eq!(empty.replacement_rate_limited_total, 0);
     }
@@ -18114,6 +18192,8 @@ mod tests {
             super::RuntimePeerReputation {
                 replacement_rate_limited_total: 3,
                 last_replacement_rate_limited_unix_sec: now,
+                protocol_violation_total: 0,
+                last_protocol_violation_unix_sec: 0,
             },
             now,
         )
@@ -18124,6 +18204,8 @@ mod tests {
             super::RuntimePeerReputation {
                 replacement_rate_limited_total: 2,
                 last_replacement_rate_limited_unix_sec: now + 10,
+                protocol_violation_total: 2,
+                last_protocol_violation_unix_sec: now + 10,
             },
             now + 10,
         )
@@ -18137,14 +18219,20 @@ mod tests {
             loaded.peers[0].last_replacement_rate_limited_unix_sec,
             now + 10
         );
+        assert_eq!(loaded.peers[0].protocol_violation_total, 2);
+        assert_eq!(loaded.peers[0].last_protocol_violation_unix_sec, now + 10);
 
         let immediate =
             super::load_peer_reputation_weights(&store, now + 10).expect("load immediate weights");
-        assert_eq!(immediate.get("127.0.0.1:18444").copied(), Some(5));
+        assert_eq!(
+            immediate.get("127.0.0.1:18444").copied(),
+            Some(9),
+            "protocol violations are weighted stronger than replacement-limit events"
+        );
 
         let decayed = super::load_peer_reputation_weights(&store, now + 2 * 24 * 60 * 60)
             .expect("load decayed weights");
-        assert_eq!(decayed.get("127.0.0.1:18444").copied(), Some(3));
+        assert_eq!(decayed.get("127.0.0.1:18444").copied(), Some(5));
 
         let expired = super::load_peer_reputation_weights(&store, now + 8 * 24 * 60 * 60)
             .expect("load expired weights");
@@ -18189,6 +18277,8 @@ mod tests {
             super::RuntimePeerReputation {
                 replacement_rate_limited_total: 20,
                 last_replacement_rate_limited_unix_sec: now,
+                protocol_violation_total: 0,
+                last_protocol_violation_unix_sec: 0,
             },
             now,
         )
