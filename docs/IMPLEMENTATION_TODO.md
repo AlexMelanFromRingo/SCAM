@@ -56,6 +56,10 @@ Status: v3 (hardening + SV2 pool-grade gap closure on 2026-02-13)
 - [x] Extended P2P wire/runtime with addr exchange (`getaddr/addr`) and compact-block flow (`sendcmpct/cmpctblock/getblocktxn/blocktxn`) plus outbound addrman-lite peer selection.
 - [x] Added outbound anchor/feeler hardening in relay dialer (persisted successful anchors + periodic short-lived feeler probes).
 - [x] Added orphan-parent recovery in relay tx path (`GetData` requests for missing parent txids) with TTL de-dup cache and oversized-parent-fanout penalties.
+- [x] Hardened outbound peer rotation with addrman-style `tried/new` bias + secret-salted diversity buckets persisted per network (`<network>.bucket.key`).
+- [x] Added anti-fingerprinting relay diffusion knobs for tx inventory fanout (`SCAM_RELAY_TX_DIFFUSION_BASE_MS` / `SCAM_RELAY_TX_DIFFUSION_MAX_MS`) on async relay runtime path.
+- [x] Added policy-gated anonymous-network outbound routing (Tor/I2P via SOCKS5 + CJDNS allowlist flags) for relay outbound workers/feelers.
+- [ ] Erlay/Minisketch set-reconciliation path is still pending (wire messages + sketch exchange + reconciliation logic).
 - [x] Added external SV2 role services with network boundaries (`sv2-template-provider`, `sv2-job-declarator`, `sv2-translator`) and per-role telemetry output.
 - [x] Added Noise-spec secure transport mode (`noise_xx`) with configurable selection (`stratum_secure_transport_mode`, `--secure-transport-mode`).
 - [x] Added secure key lifecycle operations (`stratum-keygen`, `stratum-key-rotate`) for Noise static keys.

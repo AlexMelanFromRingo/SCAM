@@ -7,7 +7,10 @@
 - Relay runtime model: async tokio accept/session loop with bounded concurrent permits (no runtime thread-per-connection growth in `relay-serve` path).
 - P2P protocol baseline: now includes `getaddr/addr` exchange and compact-block negotiation/recovery (`sendcmpct/cmpctblock/getblocktxn/blocktxn`) in addition to legacy `inv/getdata`.
 - Peer management hardening: outbound dialer now supports persisted anchor targets (`<network>.anchors.json`) and periodic feeler probes for liveness sampling without opening full long-lived sessions.
+- Peer management hardening: outbound selection now uses addrman-like `tried/new` quotas plus per-network secret-salted diversity buckets (`<network>.bucket.key`) to reduce predictable eclipse slot targeting.
 - Orphan tx hardening: relay now requests missing parent transactions from the source peer (`GetData`), de-duplicates parent requests with TTL, and penalizes oversized orphan-parent fanout.
+- Anti-fingerprinting hardening: async relay send path supports bounded tx inventory diffusion jitter (`SCAM_RELAY_TX_DIFFUSION_BASE_MS`, `SCAM_RELAY_TX_DIFFUSION_MAX_MS`).
+- Anonymity transport guards: outbound relay now supports policy-gated Tor/I2P SOCKS5 routing and CJDNS admission (`SCAM_P2P_ALLOW_ONION`, `SCAM_P2P_ALLOW_I2P`, `SCAM_P2P_ALLOW_CJDNS`, `SCAM_P2P_SOCKS5_PROXY`).
 - Wallet UX transfer pipeline: live submit path (`wallet/send`, `tx/submit`) is wired to mempool DB admission and mined confirmation flow.
 - UI: SSE push stream (`/events`) with polling fallback (5s) is active; dashboard now shows relay peers, relay mempool, sync lag, and last-block age.
 
@@ -47,6 +50,7 @@
 - [x] Remove runtime thread-per-connection in `relay-serve` by migrating to async tokio socket handling.
 - [x] Add compact-block fallback path (request missing txs by index and reconstruct block before apply).
 - [x] Add addr exchange path (`getaddr/addr`) for live peer discovery enrichment.
+- [ ] Add Erlay/Minisketch mempool set-reconciliation path to reduce inv/getdata overhead at high peer counts.
 
 ## P2 (launch confidence)
 - [ ] Soak test profile for 24h: 2-5 nodes + miner + tx spam profile.

@@ -61,7 +61,7 @@ use scam_wallet::{
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::runtime::Builder as TokioRuntimeBuilder;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
@@ -2196,6 +2196,71 @@ fn peer_anchor_path(peers_dir: &Path, network_name: &str) -> PathBuf {
     peers_dir.join(format!("{network_name}.anchors.json"))
 }
 
+fn peer_bucket_secret_path(peers_dir: &Path, network_name: &str) -> PathBuf {
+    peers_dir.join(format!("{network_name}.bucket.key"))
+}
+
+fn load_or_init_peer_bucket_secret(
+    peers_dir: &Path,
+    network_name: &str,
+) -> Result<[u8; 32], NodeError> {
+    let path = peer_bucket_secret_path(peers_dir, network_name);
+    if path.exists() {
+        let raw = fs::read_to_string(&path).map_err(|e| {
+            NodeError::Runtime(format!(
+                "failed to read peer bucket secret {}: {e}",
+                path.display()
+            ))
+        })?;
+        let decoded = hex::decode(raw.trim()).map_err(|e| {
+            NodeError::Runtime(format!(
+                "failed to decode peer bucket secret {}: {e}",
+                path.display()
+            ))
+        })?;
+        if decoded.len() != 32 {
+            return Err(NodeError::Runtime(format!(
+                "invalid peer bucket secret length in {}: expected 32 bytes, got {}",
+                path.display(),
+                decoded.len()
+            )));
+        }
+        let mut secret = [0u8; 32];
+        secret.copy_from_slice(&decoded);
+        return Ok(secret);
+    }
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| {
+            NodeError::Runtime(format!(
+                "failed to create peer bucket secret directory {}: {e}",
+                parent.display()
+            ))
+        })?;
+    }
+    let mut secret = [0u8; 32];
+    let mut urandom = fs::File::open("/dev/urandom")
+        .map_err(|e| NodeError::Runtime(format!("failed to open /dev/urandom: {e}")))?;
+    urandom
+        .read_exact(&mut secret)
+        .map_err(|e| NodeError::Runtime(format!("failed to read random bytes: {e}")))?;
+
+    let tmp_path = path.with_extension("tmp");
+    fs::write(&tmp_path, format!("{}\n", hex::encode(secret))).map_err(|e| {
+        NodeError::Runtime(format!(
+            "failed to write peer bucket secret temp file {}: {e}",
+            tmp_path.display()
+        ))
+    })?;
+    fs::rename(&tmp_path, &path).map_err(|e| {
+        NodeError::Runtime(format!(
+            "failed to finalize peer bucket secret file {}: {e}",
+            path.display()
+        ))
+    })?;
+    Ok(secret)
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
 struct PeerReputationRecord {
     address: String,
@@ -2615,6 +2680,122 @@ fn current_unix_sec() -> Result<u64, NodeError> {
     Ok(now.as_secs())
 }
 
+#[derive(Clone, Debug)]
+struct RelayNetworkPolicy {
+    allow_onion: bool,
+    allow_i2p: bool,
+    allow_cjdns: bool,
+    socks5_proxy: Option<String>,
+}
+
+impl RelayNetworkPolicy {
+    fn from_env() -> Self {
+        Self {
+            allow_onion: env_flag("SCAM_P2P_ALLOW_ONION"),
+            allow_i2p: env_flag("SCAM_P2P_ALLOW_I2P"),
+            allow_cjdns: env_flag("SCAM_P2P_ALLOW_CJDNS"),
+            socks5_proxy: env_opt("SCAM_P2P_SOCKS5_PROXY"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RelayTargetNetwork {
+    Clearnet,
+    Onion,
+    I2p,
+    Cjdns,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RelayTargetEndpoint {
+    host: String,
+    port: u16,
+}
+
+fn env_flag(key: &str) -> bool {
+    std::env::var(key)
+        .ok()
+        .map(|raw| {
+            let lowered = raw.trim().to_ascii_lowercase();
+            matches!(lowered.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
+}
+
+fn env_opt(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|raw| raw.trim().to_owned())
+        .filter(|raw| !raw.is_empty())
+}
+
+fn parse_relay_target_endpoint(target: &str) -> Option<RelayTargetEndpoint> {
+    let raw = target.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if let Ok(addr) = raw.parse::<SocketAddr>() {
+        return Some(RelayTargetEndpoint {
+            host: addr.ip().to_string(),
+            port: addr.port(),
+        });
+    }
+    if raw.starts_with('[') {
+        return None;
+    }
+    let (host, port_raw) = raw.rsplit_once(':')?;
+    if host.trim().is_empty() {
+        return None;
+    }
+    let port = port_raw.parse::<u16>().ok()?;
+    Some(RelayTargetEndpoint {
+        host: host.to_owned(),
+        port,
+    })
+}
+
+fn is_cjdns_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V6(v6) => {
+            let [high, ..] = v6.octets();
+            high == 0xFC
+        }
+        IpAddr::V4(_) => false,
+    }
+}
+
+fn relay_target_network(endpoint: &RelayTargetEndpoint) -> RelayTargetNetwork {
+    let host = endpoint.host.to_ascii_lowercase();
+    if host.ends_with(".onion") {
+        return RelayTargetNetwork::Onion;
+    }
+    if host.ends_with(".i2p") {
+        return RelayTargetNetwork::I2p;
+    }
+    if host.ends_with(".cjdns") {
+        return RelayTargetNetwork::Cjdns;
+    }
+    if let Ok(ip) = endpoint.host.parse::<IpAddr>()
+        && is_cjdns_ip(ip)
+    {
+        return RelayTargetNetwork::Cjdns;
+    }
+    RelayTargetNetwork::Clearnet
+}
+
+fn relay_target_allowed_by_policy(target: &str, policy: &RelayNetworkPolicy) -> bool {
+    let Some(endpoint) = parse_relay_target_endpoint(target) else {
+        return false;
+    };
+    match relay_target_network(&endpoint) {
+        RelayTargetNetwork::Clearnet => true,
+        RelayTargetNetwork::Onion => policy.allow_onion && policy.socks5_proxy.is_some(),
+        RelayTargetNetwork::I2p => policy.allow_i2p && policy.socks5_proxy.is_some(),
+        RelayTargetNetwork::Cjdns => policy.allow_cjdns,
+    }
+}
+
 fn resolve_dns_seed(seed: &str) -> Vec<SocketAddr> {
     let raw = seed.trim();
     if raw.is_empty() {
@@ -2634,6 +2815,7 @@ fn resolve_dns_seed(seed: &str) -> Vec<SocketAddr> {
         .unwrap_or_default()
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn peer_diversity_bucket(addr: SocketAddr) -> String {
     match addr.ip() {
         IpAddr::V4(v4) => {
@@ -2647,6 +2829,20 @@ fn peer_diversity_bucket(addr: SocketAddr) -> String {
     }
 }
 
+fn peer_diversity_bucket_with_secret(addr: SocketAddr, secret: &[u8; 32]) -> String {
+    let mut input = Vec::<u8>::with_capacity(64);
+    input.extend_from_slice(secret);
+    match addr.ip() {
+        IpAddr::V4(v4) => input.extend_from_slice(&v4.octets()),
+        IpAddr::V6(v6) => input.extend_from_slice(&v6.octets()),
+    }
+    let digest = scam_core::hash::hash256(&input);
+    // 12 bits keeps a compact bucket-space while preserving diversity.
+    let bucket = u16::from_be_bytes([digest.0[0], digest.0[1]]) & 0x0FFF;
+    format!("hs-{bucket:03x}")
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 fn apply_bucket_cap(addrs: Vec<SocketAddr>, max_per_bucket: u32) -> Vec<SocketAddr> {
     if max_per_bucket == 0 {
         return Vec::new();
@@ -2655,6 +2851,28 @@ fn apply_bucket_cap(addrs: Vec<SocketAddr>, max_per_bucket: u32) -> Vec<SocketAd
     let mut counts = HashMap::<String, u32>::new();
     for addr in addrs {
         let key = peer_diversity_bucket(addr);
+        let count = counts.entry(key).or_insert(0);
+        if *count >= max_per_bucket {
+            continue;
+        }
+        *count = count.saturating_add(1);
+        out.push(addr);
+    }
+    out
+}
+
+fn apply_bucket_cap_with_secret(
+    addrs: Vec<SocketAddr>,
+    max_per_bucket: u32,
+    secret: &[u8; 32],
+) -> Vec<SocketAddr> {
+    if max_per_bucket == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(addrs.len());
+    let mut counts = HashMap::<String, u32>::new();
+    for addr in addrs {
+        let key = peer_diversity_bucket_with_secret(addr, secret);
         let count = counts.entry(key).or_insert(0);
         if *count >= max_per_bucket {
             continue;
@@ -4297,7 +4515,16 @@ fn run_sync_book(args: SyncBookArgs) -> Result<(), NodeError> {
     sort_and_dedup_peer_book(&mut peer_book);
 
     let selected = select_outbound_peers(&candidates, args.max_peers, args.rotate_after_sec, now);
-    let selected = apply_bucket_cap(selected, cfg.p2p_max_outbound_per_bucket);
+    let bucket_secret = load_or_init_peer_bucket_secret(&args.peers_dir, &cfg.network_id)
+        .unwrap_or_else(|err| {
+            eprintln!(
+                "warning: failed to load peer bucket secret for {}: {err}; using deterministic fallback",
+                cfg.network_id
+            );
+            [0u8; 32]
+        });
+    let selected =
+        apply_bucket_cap_with_secret(selected, cfg.p2p_max_outbound_per_bucket, &bucket_secret);
     if selected.is_empty() {
         return Err(NodeError::Runtime(
             "peer selection produced zero candidates".to_owned(),
@@ -4435,6 +4662,9 @@ const RELAY_PARENT_REQUEST_TTL_SEC: u64 = 90;
 const RELAY_OUTBOUND_ANCHOR_TARGETS: usize = 2;
 const RELAY_OUTBOUND_FEELER_INTERVAL_SEC: u64 = 60;
 const RELAY_OUTBOUND_FEELER_TIMEOUT_SEC: u64 = 3;
+
+static RELAY_TX_DIFFUSION_BASE_MS: AtomicU64 = AtomicU64::new(0);
+static RELAY_TX_DIFFUSION_MAX_MS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RelayServerTelemetrySnapshot {
@@ -5816,18 +6046,13 @@ fn load_relay_outbound_feeler_target(
     let (peers_db_path, legacy_txt_path) = peer_book_paths(peers_dir, &cfg.network_id);
     let mut peer_book = load_or_init_peer_book(&cfg.network_id, &peers_db_path, &legacy_txt_path)?;
     sort_and_dedup_peer_book(&mut peer_book);
+    let network_policy = RelayNetworkPolicy::from_env();
     let mut candidates = peer_book
         .peers
         .into_iter()
         .filter(|peer| !excluded_targets.contains(&peer.address))
         .filter(|peer| !relay_target_matches_bind(bind_addr, &peer.address))
-        .filter_map(|peer| {
-            if peer.address.parse::<SocketAddr>().is_ok() {
-                Some(peer)
-            } else {
-                None
-            }
-        })
+        .filter(|peer| relay_target_allowed_by_policy(&peer.address, &network_policy))
         .collect::<Vec<_>>();
     candidates.sort_unstable_by(|a, b| {
         a.last_seen_unix_sec
@@ -5859,7 +6084,7 @@ fn relay_merge_known_peer_addresses(state: &mut RelayServerState, incoming: &[Pe
         if entry.address.trim().is_empty() {
             continue;
         }
-        if entry.address.parse::<SocketAddr>().is_err() {
+        if parse_relay_target_endpoint(&entry.address).is_none() {
             continue;
         }
         by_addr
@@ -6501,24 +6726,75 @@ fn load_relay_outbound_targets_selected(
             );
             HashMap::new()
         });
+    let network_policy = RelayNetworkPolicy::from_env();
     let mut candidates = Vec::<PeerCandidate>::new();
+    let mut domain_candidates = Vec::<(String, u64, u32)>::new();
     for peer in peer_book.peers {
-        let Ok(addr) = peer.address.parse::<SocketAddr>() else {
+        if !relay_target_allowed_by_policy(&peer.address, &network_policy) {
             continue;
-        };
+        }
         let reputation_penalty = reputation_weights.get(&peer.address).copied().unwrap_or(0);
-        candidates.push(PeerCandidate {
-            addr,
-            last_connected_unix_sec: peer.last_seen_unix_sec,
-            failure_count: peer.ban_score.saturating_add(reputation_penalty),
-        });
+        let failure_count = peer.ban_score.saturating_add(reputation_penalty);
+        if let Ok(addr) = peer.address.parse::<SocketAddr>() {
+            candidates.push(PeerCandidate {
+                addr,
+                last_connected_unix_sec: peer.last_seen_unix_sec,
+                failure_count,
+            });
+        } else {
+            domain_candidates.push((peer.address, peer.last_seen_unix_sec, failure_count));
+        }
     }
-    if candidates.is_empty() {
+    if candidates.is_empty() && domain_candidates.is_empty() {
         return Ok(Vec::new());
     }
-    let selected = select_outbound_peers(&candidates, max_peers, rotate_after_sec, now);
-    let selected = apply_bucket_cap(selected, cfg.p2p_max_outbound_per_bucket);
-    Ok(selected.into_iter().map(|addr| addr.to_string()).collect())
+    let mut selected = select_outbound_peers(&candidates, max_peers, rotate_after_sec, now)
+        .into_iter()
+        .map(|addr| addr.to_string())
+        .collect::<Vec<_>>();
+    let selected_socket = selected
+        .iter()
+        .filter_map(|value| value.parse::<SocketAddr>().ok())
+        .collect::<Vec<_>>();
+    let bucket_secret = load_or_init_peer_bucket_secret(peers_dir, &cfg.network_id).unwrap_or_else(|err| {
+        eprintln!(
+            "warning: failed to load peer bucket secret for {}: {err}; using deterministic fallback",
+            cfg.network_id
+        );
+        [0u8; 32]
+    });
+    selected = apply_bucket_cap_with_secret(
+        selected_socket,
+        cfg.p2p_max_outbound_per_bucket,
+        &bucket_secret,
+    )
+    .into_iter()
+    .map(|addr| addr.to_string())
+    .collect::<Vec<_>>();
+
+    domain_candidates.sort_unstable_by(|a, b| {
+        let a_age = now.saturating_sub(a.1);
+        let b_age = now.saturating_sub(b.1);
+        a.2.cmp(&b.2)
+            .then_with(|| {
+                let a_rotate = a_age >= rotate_after_sec;
+                let b_rotate = b_age >= rotate_after_sec;
+                b_rotate.cmp(&a_rotate)
+            })
+            .then_with(|| b.1.cmp(&a.1))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    let mut seen = selected.iter().cloned().collect::<HashSet<_>>();
+    for (target, _, _) in domain_candidates {
+        if selected.len() >= max_peers {
+            break;
+        }
+        if seen.insert(target.clone()) {
+            selected.push(target);
+        }
+    }
+
+    Ok(selected)
 }
 
 fn relay_target_matches_bind(bind_addr: &str, target: &str) -> bool {
@@ -6792,6 +7068,7 @@ async fn run_relay_outbound_worker_async(
     let anchor_store = peer_reputation_store
         .as_ref()
         .map(PeerAnchorStore::from_reputation_store);
+    let network_policy = RelayNetworkPolicy::from_env();
     if target.trim().is_empty() {
         return;
     }
@@ -6803,7 +7080,7 @@ async fn run_relay_outbound_worker_async(
         if stop_flag.load(Ordering::Relaxed) {
             break;
         }
-        let mut stream = match tokio::net::TcpStream::connect(&target).await {
+        let mut stream = match relay_connect_target_async(&target, &network_policy).await {
             Ok(stream) => stream,
             Err(err) => {
                 eprintln!("warning: outbound relay connect to {target} failed: {err}");
@@ -6853,6 +7130,233 @@ async fn run_relay_outbound_worker_async(
     }
 }
 
+fn relay_tx_diffusion_delay_for_message(message: &WireMessage) -> Duration {
+    let base_ms = RELAY_TX_DIFFUSION_BASE_MS.load(Ordering::Relaxed);
+    let max_ms = RELAY_TX_DIFFUSION_MAX_MS.load(Ordering::Relaxed);
+    if base_ms == 0 || max_ms == 0 || max_ms < base_ms {
+        return Duration::from_millis(0);
+    }
+    let Some(first_txid) = relay_first_tx_inv_txid(message) else {
+        return Duration::from_millis(0);
+    };
+    let now_nanos = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(0);
+    let mut seed = now_nanos ^ u64::from_be_bytes(first_txid.0[..8].try_into().unwrap_or([0; 8]));
+    // SplitMix64 mixing to derive a stable pseudorandom value.
+    seed = seed.wrapping_add(0x9E3779B97F4A7C15);
+    let mut z = seed;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+    z ^= z >> 31;
+    let unit = ((z >> 11) as f64) / ((1u64 << 53) as f64);
+    let u = (1.0 - unit).clamp(1e-9, 1.0);
+    let sampled = (-u.ln() * base_ms as f64).round() as u64;
+    Duration::from_millis(sampled.clamp(base_ms, max_ms))
+}
+
+fn relay_first_tx_inv_txid(message: &WireMessage) -> Option<Hash256> {
+    match message {
+        WireMessage::Inv { items } => items.iter().find_map(|item| match item {
+            InventoryItem::Tx(txid) => Some(*txid),
+            InventoryItem::Block(_) => None,
+        }),
+        _ => None,
+    }
+}
+
+fn relay_socks5_proxy_endpoint(policy: &RelayNetworkPolicy) -> Option<String> {
+    policy
+        .socks5_proxy
+        .as_ref()
+        .map(|proxy| proxy.trim().to_owned())
+        .filter(|proxy| !proxy.is_empty())
+}
+
+fn relay_target_is_anonymous_network(endpoint: &RelayTargetEndpoint) -> bool {
+    matches!(
+        relay_target_network(endpoint),
+        RelayTargetNetwork::Onion | RelayTargetNetwork::I2p
+    )
+}
+
+fn relay_socks5_connect_request(endpoint: &RelayTargetEndpoint) -> Result<Vec<u8>, NodeError> {
+    let mut request = Vec::<u8>::new();
+    request.extend_from_slice(&[0x05, 0x01, 0x00]);
+    if let Ok(ip) = endpoint.host.parse::<IpAddr>() {
+        match ip {
+            IpAddr::V4(v4) => {
+                request.push(0x01);
+                request.extend_from_slice(&v4.octets());
+            }
+            IpAddr::V6(v6) => {
+                request.push(0x04);
+                request.extend_from_slice(&v6.octets());
+            }
+        }
+    } else {
+        let host_bytes = endpoint.host.as_bytes();
+        if host_bytes.is_empty() || host_bytes.len() > 255 {
+            return Err(NodeError::Runtime(format!(
+                "invalid SOCKS5 host length for {}",
+                endpoint.host
+            )));
+        }
+        request.push(0x03);
+        request.push(host_bytes.len() as u8);
+        request.extend_from_slice(host_bytes);
+    }
+    request.extend_from_slice(&endpoint.port.to_be_bytes());
+    Ok(request)
+}
+
+fn relay_target_parse_or_err(target: &str) -> Result<RelayTargetEndpoint, NodeError> {
+    parse_relay_target_endpoint(target).ok_or_else(|| {
+        NodeError::Runtime(format!(
+            "invalid outbound relay target '{target}': expected <ip:port> or <host:port>"
+        ))
+    })
+}
+
+fn relay_validate_target_against_policy(
+    target: &RelayTargetEndpoint,
+    policy: &RelayNetworkPolicy,
+) -> Result<(), NodeError> {
+    match relay_target_network(target) {
+        RelayTargetNetwork::Clearnet => {}
+        RelayTargetNetwork::Onion => {
+            if !policy.allow_onion || policy.socks5_proxy.is_none() {
+                return Err(NodeError::Runtime(format!(
+                    "relay target {}:{} requires onion + SOCKS5 policy enablement",
+                    target.host, target.port
+                )));
+            }
+        }
+        RelayTargetNetwork::I2p => {
+            if !policy.allow_i2p || policy.socks5_proxy.is_none() {
+                return Err(NodeError::Runtime(format!(
+                    "relay target {}:{} requires i2p + SOCKS5 policy enablement",
+                    target.host, target.port
+                )));
+            }
+        }
+        RelayTargetNetwork::Cjdns => {
+            if !policy.allow_cjdns {
+                return Err(NodeError::Runtime(format!(
+                    "relay target {}:{} requires cjdns policy enablement",
+                    target.host, target.port
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn relay_connect_target_async(
+    target: &str,
+    policy: &RelayNetworkPolicy,
+) -> Result<tokio::net::TcpStream, NodeError> {
+    let endpoint = relay_target_parse_or_err(target)?;
+    relay_validate_target_against_policy(&endpoint, policy)?;
+    let proxy = relay_socks5_proxy_endpoint(policy);
+    if relay_target_is_anonymous_network(&endpoint) {
+        let Some(proxy_target) = proxy else {
+            return Err(NodeError::Runtime(format!(
+                "target {}:{} requires SOCKS5 proxy",
+                endpoint.host, endpoint.port
+            )));
+        };
+        return relay_connect_via_socks5_async(&proxy_target, &endpoint).await;
+    }
+    if relay_target_network(&endpoint) == RelayTargetNetwork::Cjdns
+        && relay_socks5_proxy_endpoint(policy).is_some()
+    {
+        // CJDNS addresses are expected to be directly reachable; keep direct dial semantics.
+        return tokio::net::TcpStream::connect(target).await.map_err(|e| {
+            NodeError::Runtime(format!("outbound cjdns connect to {target} failed: {e}"))
+        });
+    }
+    tokio::net::TcpStream::connect(target)
+        .await
+        .map_err(|e| NodeError::Runtime(format!("outbound relay connect to {target} failed: {e}")))
+}
+
+async fn relay_connect_via_socks5_async(
+    proxy_target: &str,
+    endpoint: &RelayTargetEndpoint,
+) -> Result<tokio::net::TcpStream, NodeError> {
+    let mut stream = tokio::net::TcpStream::connect(proxy_target)
+        .await
+        .map_err(|e| {
+            NodeError::Runtime(format!(
+                "outbound relay SOCKS5 connect to proxy {proxy_target} failed: {e}"
+            ))
+        })?;
+    stream
+        .write_all(&[0x05, 0x01, 0x00])
+        .await
+        .map_err(|e| NodeError::Runtime(format!("SOCKS5 hello write failed: {e}")))?;
+    let mut hello = [0u8; 2];
+    stream
+        .read_exact(&mut hello)
+        .await
+        .map_err(|e| NodeError::Runtime(format!("SOCKS5 hello read failed: {e}")))?;
+    if hello != [0x05, 0x00] {
+        return Err(NodeError::Runtime(format!(
+            "SOCKS5 proxy rejected no-auth handshake: response={:02x?}",
+            hello
+        )));
+    }
+
+    let request = relay_socks5_connect_request(endpoint)?;
+    stream
+        .write_all(&request)
+        .await
+        .map_err(|e| NodeError::Runtime(format!("SOCKS5 connect request write failed: {e}")))?;
+
+    let mut head = [0u8; 4];
+    stream
+        .read_exact(&mut head)
+        .await
+        .map_err(|e| NodeError::Runtime(format!("SOCKS5 connect response read failed: {e}")))?;
+    if head[0] != 0x05 {
+        return Err(NodeError::Runtime(format!(
+            "SOCKS5 invalid response version: {:02x}",
+            head[0]
+        )));
+    }
+    if head[1] != 0x00 {
+        return Err(NodeError::Runtime(format!(
+            "SOCKS5 proxy connect failed with code {:02x}",
+            head[1]
+        )));
+    }
+    let addr_len = match head[3] {
+        0x01 => 4,
+        0x04 => 16,
+        0x03 => {
+            let mut len = [0u8; 1];
+            stream.read_exact(&mut len).await.map_err(|e| {
+                NodeError::Runtime(format!("SOCKS5 domain length read failed: {e}"))
+            })?;
+            len[0] as usize
+        }
+        atyp => {
+            return Err(NodeError::Runtime(format!(
+                "SOCKS5 response contains unsupported atyp {:02x}",
+                atyp
+            )));
+        }
+    };
+    let mut discard = vec![0u8; addr_len + 2];
+    stream
+        .read_exact(&mut discard)
+        .await
+        .map_err(|e| NodeError::Runtime(format!("SOCKS5 response tail read failed: {e}")))?;
+    Ok(stream)
+}
+
 async fn run_relay_outbound_feeler_probe_async(
     target: String,
     bind_addr: String,
@@ -6866,7 +7370,12 @@ async fn run_relay_outbound_feeler_probe_async(
 
     let deadline = Duration::from_secs(timeout_sec.max(1));
     let now_unix_sec = current_unix_sec().unwrap_or(0);
-    let connect_result = timeout(deadline, tokio::net::TcpStream::connect(&target)).await;
+    let network_policy = RelayNetworkPolicy::from_env();
+    let connect_result = timeout(
+        deadline,
+        relay_connect_target_async(&target, &network_policy),
+    )
+    .await;
     let Ok(Ok(mut stream)) = connect_result else {
         if let Some(store) = anchor_store {
             let _ = update_peer_anchor_store_attempt(&store, &target, now_unix_sec, false);
@@ -7628,6 +8137,15 @@ fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
             .unwrap_or(cfg.p2p_replacement_penalty)
             .max(1),
     };
+    let tx_diffusion_base_ms = env_opt("SCAM_RELAY_TX_DIFFUSION_BASE_MS")
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(0);
+    let tx_diffusion_max_ms = env_opt("SCAM_RELAY_TX_DIFFUSION_MAX_MS")
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(0);
+    RELAY_TX_DIFFUSION_BASE_MS.store(tx_diffusion_base_ms, Ordering::Relaxed);
+    RELAY_TX_DIFFUSION_MAX_MS.store(tx_diffusion_max_ms, Ordering::Relaxed);
+    let network_policy = RelayNetworkPolicy::from_env();
     let relay = RelayAdmissionState {
         mempool: load_mempool_from_db_or_empty(&cfg, &mempool_db_path)?,
         orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)?,
@@ -7673,6 +8191,17 @@ fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
         replacement.window_sec,
         replacement.max_replacements,
         replacement.penalty
+    );
+    println!(
+        "Relay tx diffusion: base={}ms max={}ms",
+        tx_diffusion_base_ms, tx_diffusion_max_ms
+    );
+    println!(
+        "Relay anonymizing networks: onion={} i2p={} cjdns={} socks5_proxy={}",
+        network_policy.allow_onion,
+        network_policy.allow_i2p,
+        network_policy.allow_cjdns,
+        network_policy.socks5_proxy.as_deref().unwrap_or("disabled")
     );
     println!("I/O model: async tokio");
     {
@@ -9660,6 +10189,10 @@ async fn relay_send_message_or_closed_async<S: AsyncWrite + Unpin>(
     framing: &FramingConfig,
     write_timeout_sec: u64,
 ) -> Result<bool, NodeError> {
+    let diffusion_delay = relay_tx_diffusion_delay_for_message(message);
+    if !diffusion_delay.is_zero() {
+        sleep(diffusion_delay).await;
+    }
     match timeout(
         Duration::from_secs(write_timeout_sec.max(1)),
         send_message_async(stream, message, framing),
@@ -19802,6 +20335,144 @@ mod tests {
         assert_eq!(capped.len(), 2);
         assert!(super::apply_bucket_cap(capped.clone(), 0).is_empty());
         assert_eq!(super::apply_bucket_cap(capped.clone(), 10), capped);
+    }
+
+    #[test]
+    fn hashed_bucket_secret_roundtrip_and_capped_selection_are_stable() {
+        let peers_dir = temp_dir("test-peer-bucket-secret");
+        fs::create_dir_all(&peers_dir).expect("mkdir peers dir");
+        let secret_a =
+            super::load_or_init_peer_bucket_secret(&peers_dir, "devnet").expect("secret init");
+        let secret_b =
+            super::load_or_init_peer_bucket_secret(&peers_dir, "devnet").expect("secret reload");
+        assert_eq!(
+            secret_a, secret_b,
+            "bucket secret must persist across reloads"
+        );
+
+        let addrs = vec![
+            "203.0.113.1:8333".parse().expect("addr1"),
+            "203.0.113.2:8333".parse().expect("addr2"),
+            "203.0.113.3:8333".parse().expect("addr3"),
+            "198.51.100.1:8333".parse().expect("addr4"),
+            "198.51.100.2:8333".parse().expect("addr5"),
+        ];
+        let capped = super::apply_bucket_cap_with_secret(addrs, 1, &secret_a);
+        assert!(
+            capped.len() >= 2,
+            "secret buckets should preserve diversity"
+        );
+        let _ = fs::remove_dir_all(peers_dir);
+    }
+
+    #[test]
+    fn relay_target_policy_and_parsing_cover_anonymous_networks() {
+        let endpoint = super::parse_relay_target_endpoint("exampleabcdefghijklmnop.onion:9735")
+            .expect("onion parse");
+        assert_eq!(endpoint.host, "exampleabcdefghijklmnop.onion");
+        assert_eq!(endpoint.port, 9735);
+        assert_eq!(
+            super::relay_target_network(&endpoint),
+            super::RelayTargetNetwork::Onion
+        );
+
+        let i2p = super::parse_relay_target_endpoint("nodebase32.i2p:17444").expect("i2p parse");
+        assert_eq!(
+            super::relay_target_network(&i2p),
+            super::RelayTargetNetwork::I2p
+        );
+
+        let cjdns = super::parse_relay_target_endpoint("[fc00::1]:18444").expect("cjdns parse");
+        assert_eq!(
+            super::relay_target_network(&cjdns),
+            super::RelayTargetNetwork::Cjdns
+        );
+
+        let deny_all = super::RelayNetworkPolicy {
+            allow_onion: false,
+            allow_i2p: false,
+            allow_cjdns: false,
+            socks5_proxy: None,
+        };
+        assert!(!super::relay_target_allowed_by_policy(
+            "exampleabcdefghijklmnop.onion:9735",
+            &deny_all
+        ));
+        assert!(!super::relay_target_allowed_by_policy(
+            "nodebase32.i2p:17444",
+            &deny_all
+        ));
+        assert!(!super::relay_target_allowed_by_policy(
+            "[fc00::1]:18444",
+            &deny_all
+        ));
+
+        let allow_anonymous = super::RelayNetworkPolicy {
+            allow_onion: true,
+            allow_i2p: true,
+            allow_cjdns: true,
+            socks5_proxy: Some("127.0.0.1:9050".to_owned()),
+        };
+        assert!(super::relay_target_allowed_by_policy(
+            "exampleabcdefghijklmnop.onion:9735",
+            &allow_anonymous
+        ));
+        assert!(super::relay_target_allowed_by_policy(
+            "nodebase32.i2p:17444",
+            &allow_anonymous
+        ));
+        assert!(super::relay_target_allowed_by_policy(
+            "[fc00::1]:18444",
+            &allow_anonymous
+        ));
+    }
+
+    #[test]
+    fn relay_socks5_connect_request_encodes_domain_and_ip_targets() {
+        let domain = super::RelayTargetEndpoint {
+            host: "exampleabcdefghijklmnop.onion".to_owned(),
+            port: 9735,
+        };
+        let domain_req = super::relay_socks5_connect_request(&domain).expect("domain request");
+        assert_eq!(domain_req[0..3], [0x05, 0x01, 0x00]);
+        assert_eq!(domain_req[3], 0x03);
+        assert_eq!(domain_req[4] as usize, domain.host.len());
+        assert_eq!(
+            &domain_req[5..5 + domain.host.len()],
+            domain.host.as_bytes()
+        );
+
+        let ip = super::RelayTargetEndpoint {
+            host: "203.0.113.44".to_owned(),
+            port: 18444,
+        };
+        let ip_req = super::relay_socks5_connect_request(&ip).expect("ip request");
+        assert_eq!(ip_req[3], 0x01);
+        assert_eq!(&ip_req[4..8], &[203, 0, 113, 44]);
+    }
+
+    #[test]
+    fn relay_tx_diffusion_delay_applies_only_to_tx_inventory_and_respects_bounds() {
+        super::RELAY_TX_DIFFUSION_BASE_MS.store(20, std::sync::atomic::Ordering::Relaxed);
+        super::RELAY_TX_DIFFUSION_MAX_MS.store(80, std::sync::atomic::Ordering::Relaxed);
+
+        let txid = scam_core::hash::hash256(b"tx-diffusion");
+        let inv = WireMessage::Inv {
+            items: vec![InventoryItem::Tx(txid)],
+        };
+        let delay = super::relay_tx_diffusion_delay_for_message(&inv);
+        assert!(
+            delay >= Duration::from_millis(20) && delay <= Duration::from_millis(80),
+            "unexpected diffusion delay {:?}",
+            delay
+        );
+
+        let ping = WireMessage::Ping { nonce: 7 };
+        let ping_delay = super::relay_tx_diffusion_delay_for_message(&ping);
+        assert_eq!(ping_delay, Duration::from_millis(0));
+
+        super::RELAY_TX_DIFFUSION_BASE_MS.store(0, std::sync::atomic::Ordering::Relaxed);
+        super::RELAY_TX_DIFFUSION_MAX_MS.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[test]

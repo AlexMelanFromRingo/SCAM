@@ -14,55 +14,59 @@ pub fn select_outbound_peers(
     rotate_after_sec: u64,
     now_unix_sec: u64,
 ) -> Vec<SocketAddr> {
-    if candidates.is_empty() {
+    if candidates.is_empty() || max_outbound == 0 {
         return Vec::new();
     }
 
-    let mut sorted = candidates.to_vec();
-    sorted.sort_unstable_by(|a, b| {
-        a.failure_count
-            .cmp(&b.failure_count)
-            .then_with(|| {
-                let a_age = now_unix_sec.saturating_sub(a.last_connected_unix_sec);
-                let b_age = now_unix_sec.saturating_sub(b.last_connected_unix_sec);
-                // Prefer peers that have been disconnected longer than the rotation threshold.
-                let a_is_rotation_candidate = a_age >= rotate_after_sec;
-                let b_is_rotation_candidate = b_age >= rotate_after_sec;
-                b_is_rotation_candidate.cmp(&a_is_rotation_candidate)
-            })
-            // Within the same rotation bucket, prefer fresher peers first.
-            .then_with(|| b.last_connected_unix_sec.cmp(&a.last_connected_unix_sec))
-            .then_with(|| a.addr.cmp(&b.addr))
-    });
+    let mut dedup = candidates.to_vec();
+    dedup.sort_unstable_by(|a, b| a.addr.cmp(&b.addr));
+    dedup.dedup_by_key(|candidate| candidate.addr);
+
+    let mut tried = Vec::<PeerCandidate>::new();
+    let mut new = Vec::<PeerCandidate>::new();
+    for candidate in dedup {
+        if candidate.last_connected_unix_sec == 0 {
+            new.push(candidate);
+        } else {
+            tried.push(candidate);
+        }
+    }
+
+    sort_candidates(&mut tried, rotate_after_sec, now_unix_sec);
+    sort_candidates(&mut new, rotate_after_sec, now_unix_sec);
+
+    // Addrman-inspired quota: bias toward previously successful peers while always
+    // keeping room for "new" addresses to avoid eclipse lock-in.
+    let tried_quota = if tried.is_empty() {
+        0
+    } else {
+        ((max_outbound * 2) / 3).max(1)
+    };
+    let new_quota = max_outbound.saturating_sub(tried_quota);
 
     let mut selected = Vec::<SocketAddr>::new();
     let mut selected_addrs = HashSet::<SocketAddr>::new();
-    let mut seen_diversity = HashSet::<String>::new();
+    let mut seen_groups = HashSet::<String>::new();
 
-    for candidate in &sorted {
-        if selected.len() >= max_outbound {
-            break;
-        }
-        if !selected_addrs.insert(candidate.addr) {
-            continue;
-        }
-        let key = diversity_key(candidate.addr.ip());
-        if seen_diversity.insert(key) {
-            selected.push(candidate.addr);
-        } else {
-            selected_addrs.remove(&candidate.addr);
-        }
-    }
+    select_diverse(
+        &tried,
+        tried_quota,
+        &mut selected,
+        &mut selected_addrs,
+        &mut seen_groups,
+    );
+    select_diverse(
+        &new,
+        new_quota,
+        &mut selected,
+        &mut selected_addrs,
+        &mut seen_groups,
+    );
 
-    for candidate in &sorted {
-        if selected.len() >= max_outbound {
-            break;
-        }
-        if selected_addrs.insert(candidate.addr) {
-            selected.push(candidate.addr);
-        }
-    }
-
+    // Backfill in addrman-like priority order when one partition is exhausted.
+    backfill_candidates(&tried, max_outbound, &mut selected, &mut selected_addrs);
+    backfill_candidates(&new, max_outbound, &mut selected, &mut selected_addrs);
+    selected.truncate(max_outbound);
     selected
 }
 
@@ -79,9 +83,69 @@ fn diversity_key(ip: IpAddr) -> String {
     }
 }
 
+fn sort_candidates(candidates: &mut [PeerCandidate], rotate_after_sec: u64, now_unix_sec: u64) {
+    candidates.sort_unstable_by(|a, b| {
+        a.failure_count
+            .cmp(&b.failure_count)
+            .then_with(|| {
+                let a_age = now_unix_sec.saturating_sub(a.last_connected_unix_sec);
+                let b_age = now_unix_sec.saturating_sub(b.last_connected_unix_sec);
+                let a_stale = a_age >= rotate_after_sec;
+                let b_stale = b_age >= rotate_after_sec;
+                b_stale.cmp(&a_stale)
+            })
+            // Prefer peers that have not been selected recently.
+            .then_with(|| a.last_connected_unix_sec.cmp(&b.last_connected_unix_sec))
+            .then_with(|| a.addr.cmp(&b.addr))
+    });
+}
+
+fn select_diverse(
+    candidates: &[PeerCandidate],
+    quota: usize,
+    selected: &mut Vec<SocketAddr>,
+    selected_addrs: &mut HashSet<SocketAddr>,
+    seen_groups: &mut HashSet<String>,
+) {
+    if quota == 0 {
+        return;
+    }
+    let start_len = selected.len();
+    for candidate in candidates {
+        if selected.len().saturating_sub(start_len) >= quota {
+            break;
+        }
+        if !selected_addrs.insert(candidate.addr) {
+            continue;
+        }
+        let group = diversity_key(candidate.addr.ip());
+        if seen_groups.insert(group) {
+            selected.push(candidate.addr);
+        } else {
+            selected_addrs.remove(&candidate.addr);
+        }
+    }
+}
+
+fn backfill_candidates(
+    candidates: &[PeerCandidate],
+    max_outbound: usize,
+    selected: &mut Vec<SocketAddr>,
+    selected_addrs: &mut HashSet<SocketAddr>,
+) {
+    for candidate in candidates {
+        if selected.len() >= max_outbound {
+            break;
+        }
+        if selected_addrs.insert(candidate.addr) {
+            selected.push(candidate.addr);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::net::SocketAddr;
+    use std::net::{IpAddr, SocketAddr};
 
     use crate::discovery::{PeerCandidate, select_outbound_peers};
 
@@ -218,5 +282,69 @@ mod tests {
 
         let selected = select_outbound_peers(&candidates, 1, 60, 1_000);
         assert_eq!(selected, vec![addr("11.2.1.1:8333")]);
+    }
+
+    #[test]
+    fn addrman_bias_keeps_room_for_new_addresses() {
+        let candidates = vec![
+            PeerCandidate {
+                addr: addr("10.1.1.1:8333"),
+                last_connected_unix_sec: 100,
+                failure_count: 0,
+            },
+            PeerCandidate {
+                addr: addr("11.1.1.1:8333"),
+                last_connected_unix_sec: 120,
+                failure_count: 0,
+            },
+            PeerCandidate {
+                addr: addr("12.1.1.1:8333"),
+                last_connected_unix_sec: 140,
+                failure_count: 0,
+            },
+            PeerCandidate {
+                addr: addr("13.2.1.1:8333"),
+                last_connected_unix_sec: 0,
+                failure_count: 0,
+            },
+            PeerCandidate {
+                addr: addr("14.3.1.1:8333"),
+                last_connected_unix_sec: 0,
+                failure_count: 0,
+            },
+        ];
+
+        let selected = select_outbound_peers(&candidates, 3, 60, 1_000);
+        assert_eq!(selected.len(), 3);
+        assert!(selected.iter().any(|addr| matches!(addr.ip(), IpAddr::V4(v4) if v4.octets()[0] == 13 || v4.octets()[0] == 14)));
+    }
+
+    #[test]
+    fn select_outbound_peers_deduplicates_duplicates_from_candidate_list() {
+        let duplicate = addr("10.1.1.1:8333");
+        let candidates = vec![
+            PeerCandidate {
+                addr: duplicate,
+                last_connected_unix_sec: 100,
+                failure_count: 0,
+            },
+            PeerCandidate {
+                addr: duplicate,
+                last_connected_unix_sec: 0,
+                failure_count: 5,
+            },
+            PeerCandidate {
+                addr: addr("11.1.1.1:8333"),
+                last_connected_unix_sec: 0,
+                failure_count: 0,
+            },
+        ];
+
+        let selected = select_outbound_peers(&candidates, 2, 60, 1_000);
+        assert_eq!(selected.len(), 2);
+        assert_eq!(
+            selected.iter().filter(|addr| **addr == duplicate).count(),
+            1
+        );
     }
 }
