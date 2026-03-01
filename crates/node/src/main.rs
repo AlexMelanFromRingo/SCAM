@@ -1134,16 +1134,6 @@ enum PoolPayoutModeArg {
     Hybrid,
 }
 
-impl PoolPayoutModeArg {
-    fn uses_pplns(self) -> bool {
-        matches!(self, Self::Pplns | Self::Hybrid)
-    }
-
-    fn uses_pps(self) -> bool {
-        matches!(self, Self::Pps | Self::Hybrid)
-    }
-}
-
 impl From<DifficultyAlgoArg> for DifficultyAlgorithm {
     fn from(value: DifficultyAlgoArg) -> Self {
         match value {
@@ -4903,7 +4893,10 @@ impl StratumPoolLedgerState {
 
     fn set_payout_config(&mut self, payout_cfg: PoolPayoutConfig) {
         self.payout_cfg = payout_cfg;
-        if self.payout_cfg.mode.uses_pplns() {
+        if matches!(
+            self.payout_cfg.mode,
+            PoolPayoutModeArg::Pplns | PoolPayoutModeArg::Hybrid
+        ) {
             self.recompute_pplns_accruals();
         } else {
             for worker in self.workers.values_mut() {
@@ -4938,7 +4931,10 @@ impl StratumPoolLedgerState {
     }
 
     fn apply_pps_share_credit(&mut self, worker: &str, reserve_spendable_atomic: Option<u128>) {
-        if !self.payout_cfg.mode.uses_pps() {
+        if !matches!(
+            self.payout_cfg.mode,
+            PoolPayoutModeArg::Pps | PoolPayoutModeArg::Hybrid
+        ) {
             return;
         }
         let credit = self.payout_cfg.pps_share_atomic as u128;
@@ -4968,7 +4964,10 @@ impl StratumPoolLedgerState {
         for worker in self.workers.values_mut() {
             worker.pplns_accrual_atomic = 0;
         }
-        if !self.payout_cfg.mode.uses_pplns() {
+        if !matches!(
+            self.payout_cfg.mode,
+            PoolPayoutModeArg::Pplns | PoolPayoutModeArg::Hybrid
+        ) {
             return;
         }
         let mut accepted = self
@@ -5240,7 +5239,10 @@ impl StratumPoolLedgerState {
             current.found_block_reward_atomic = found_block_reward_atomic;
             current.orphaned = false;
         }
-        if self.payout_cfg.mode.uses_pplns() {
+        if matches!(
+            self.payout_cfg.mode,
+            PoolPayoutModeArg::Pplns | PoolPayoutModeArg::Hybrid
+        ) {
             self.recompute_pplns_accruals();
         }
         self.open_next_round(end_height, end_tip_hash, now_unix_sec);
@@ -5305,7 +5307,12 @@ impl StratumPoolLedgerState {
             }
         }
 
-        if changed && self.payout_cfg.mode.uses_pplns() {
+        if changed
+            && matches!(
+                self.payout_cfg.mode,
+                PoolPayoutModeArg::Pplns | PoolPayoutModeArg::Hybrid
+            )
+        {
             self.recompute_pplns_accruals();
         }
 
@@ -9876,7 +9883,10 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
                             is_block,
                             ..
                         } => {
-                            let reserve_spendable_atomic = if ctx.pool_payout_cfg.mode.uses_pps() {
+                            let reserve_spendable_atomic = if matches!(
+                                ctx.pool_payout_cfg.mode,
+                                PoolPayoutModeArg::Pps | PoolPayoutModeArg::Hybrid
+                            ) {
                                 lock_runtime(&ctx.runtime).ok().map(|runtime| {
                                     runtime_spendable_balance_for_key_hash(
                                         &runtime,
@@ -11222,7 +11232,11 @@ fn validate_pool_payout_config(payout_cfg: &PoolPayoutConfig) -> Result<(), Node
             "pool_fee_bps must be <= 10000".to_owned(),
         ));
     }
-    if payout_cfg.mode.uses_pps() && payout_cfg.pps_share_atomic == 0 {
+    if matches!(
+        payout_cfg.mode,
+        PoolPayoutModeArg::Pps | PoolPayoutModeArg::Hybrid
+    ) && payout_cfg.pps_share_atomic == 0
+    {
         return Err(NodeError::Runtime(
             "pps_share_atomic must be > 0 when payout mode includes pps".to_owned(),
         ));
@@ -18678,10 +18692,22 @@ mod tests {
             super::PoolPayoutModeArg::Hybrid,
             super::PoolPayoutModeArg::Solo
         );
-        assert!(!super::PoolPayoutModeArg::Solo.uses_pplns());
-        assert!(super::PoolPayoutModeArg::Pplns.uses_pplns());
-        assert!(!super::PoolPayoutModeArg::Pps.uses_pplns());
-        assert!(super::PoolPayoutModeArg::Hybrid.uses_pplns());
+        assert!(!matches!(
+            super::PoolPayoutModeArg::Solo,
+            super::PoolPayoutModeArg::Pplns | super::PoolPayoutModeArg::Hybrid
+        ));
+        assert!(matches!(
+            super::PoolPayoutModeArg::Pplns,
+            super::PoolPayoutModeArg::Pplns | super::PoolPayoutModeArg::Hybrid
+        ));
+        assert!(!matches!(
+            super::PoolPayoutModeArg::Pps,
+            super::PoolPayoutModeArg::Pplns | super::PoolPayoutModeArg::Hybrid
+        ));
+        assert!(matches!(
+            super::PoolPayoutModeArg::Hybrid,
+            super::PoolPayoutModeArg::Pplns | super::PoolPayoutModeArg::Hybrid
+        ));
 
         let runtime_db = PathBuf::from("target/test-runtime.redb");
         let pool_db = super::default_pool_ledger_db_path(&runtime_db);
