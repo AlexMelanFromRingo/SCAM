@@ -8501,7 +8501,7 @@ fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
             });
 
             served = served.saturating_add(1);
-            if max_requests_reached(max_clients, served) {
+            if max_requests_limit_hit(max_clients, served) {
                 break;
             }
         }
@@ -10077,7 +10077,7 @@ fn write_role_response<T: Serialize, W: Write>(
         .map_err(|e| NodeError::Runtime(format!("role response flush failed: {e}")))
 }
 
-fn max_requests_reached(max_requests: u32, served: u32) -> bool {
+fn max_requests_limit_hit(max_requests: u32, served: u32) -> bool {
     max_requests > 0 && served >= max_requests
 }
 
@@ -11080,7 +11080,7 @@ fn run_sv2_template_provider(args: Sv2TemplateProviderArgs) -> Result<(), NodeEr
         }
 
         served = served.saturating_add(1);
-        if max_requests_reached(args.max_requests, served) {
+        if max_requests_limit_hit(args.max_requests, served) {
             break;
         }
     }
@@ -11144,7 +11144,7 @@ fn run_sv2_job_declarator(args: Sv2JobDeclaratorArgs) -> Result<(), NodeError> {
         }
 
         served = served.saturating_add(1);
-        if max_requests_reached(args.max_requests, served) {
+        if max_requests_limit_hit(args.max_requests, served) {
             break;
         }
     }
@@ -11213,7 +11213,7 @@ fn run_sv2_translator(args: Sv2TranslatorArgs) -> Result<(), NodeError> {
         }
 
         served = served.saturating_add(1);
-        if max_requests_reached(args.max_requests, served) {
+        if max_requests_limit_hit(args.max_requests, served) {
             break;
         }
     }
@@ -11376,6 +11376,14 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
         "secure_expected_remote_static_pubkey_hex",
         &args.secure_expected_remote_static_pubkey_hex,
     )?;
+    if !secure_transport
+        && (secure_static_private_key.is_some()
+            || secure_expected_remote_static_public_key.is_some())
+    {
+        return Err(NodeError::Runtime(
+            "secure static key options require secure transport to be enabled".to_owned(),
+        ));
+    }
     if secure_transport
         && matches!(secure_transport_mode, SecureTransportMode::NoiseXx)
         && secure_static_private_key.is_none()
@@ -11644,7 +11652,7 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
             });
 
             served = served.saturating_add(1);
-            if max_requests_reached(max_clients, served) {
+            if max_requests_limit_hit(max_clients, served) {
                 break;
             }
         }
@@ -15130,7 +15138,7 @@ fn run_rpc_serve_inner_axum(
         println!("Stratum telemetry source: {}", path.display());
     }
     println!("Pool ledger source: {}", pool_ledger_db_path.display());
-    if max_requests_reached(max_requests, max_requests) {
+    if max_requests > 0 {
         println!("Max requests before exit: {}", max_requests);
     }
 
@@ -15154,7 +15162,7 @@ fn run_rpc_serve_inner_axum(
             let listener = tokio::net::TcpListener::bind(&listener_bind)
                 .await
                 .map_err(|e| {
-                    NodeError::Runtime(format!("rpc axum bind failed on {}: {e}", listener_bind))
+                    NodeError::Runtime(format!("rpc bind failed on {}: {e}", listener_bind))
                 })?;
 
             let app = Router::new()
@@ -15276,7 +15284,7 @@ fn run_rpc_serve_inner_legacy(
         println!("Stratum telemetry source: {}", path.display());
     }
     println!("Pool ledger source: {}", pool_ledger_db_path.display());
-    if max_requests_reached(max_requests, max_requests) {
+    if max_requests > 0 {
         println!("Max requests before exit: {}", max_requests);
     }
 
@@ -15321,7 +15329,7 @@ fn run_rpc_serve_inner_legacy(
 
         let method = request.method.as_str();
         let path = request.path.as_str();
-        if rpc_exact_route_matches(method, path, "GET", "/events") {
+        if method == "GET" && path == "/events" {
             let cfg_clone = cfg.clone();
             let runtime_db_path_clone = runtime_db_path.clone();
             let mempool_db_path_clone = mempool_db_path.clone();
@@ -15344,7 +15352,7 @@ fn run_rpc_serve_inner_legacy(
                 }
             }));
             served = served.saturating_add(1);
-            if max_requests_reached(max_requests, served) {
+            if max_requests_limit_hit(max_requests, served) {
                 break;
             }
             continue;
@@ -16232,7 +16240,7 @@ fn run_rpc_serve_inner_legacy(
             };
             if should_serve_ui_asset_for_route(method, ui_served) {
                 served = served.saturating_add(1);
-                if max_requests_reached(max_requests, served) {
+                if max_requests_limit_hit(max_requests, served) {
                     break;
                 }
                 continue;
@@ -16242,7 +16250,7 @@ fn run_rpc_serve_inner_legacy(
 
         write_http_json_response(&mut stream, status, &body)?;
         served = served.saturating_add(1);
-        if max_requests_reached(max_requests, served) {
+        if max_requests_limit_hit(max_requests, served) {
             break;
         }
     }
@@ -16540,10 +16548,10 @@ mod tests {
         for _attempt in 0..3 {
             let mut stream = connect_with_retry(addr);
             stream
-                .set_read_timeout(Some(Duration::from_secs(10)))
+                .set_read_timeout(Some(Duration::from_secs(2)))
                 .expect("set read timeout");
             stream
-                .set_write_timeout(Some(Duration::from_secs(10)))
+                .set_write_timeout(Some(Duration::from_secs(2)))
                 .expect("set write timeout");
             if let Err(err) = stream.write_all(request.as_bytes()) {
                 if super::http_io_error_is_closed_like(&err) {
@@ -16619,7 +16627,7 @@ mod tests {
             .set_read_timeout(Some(Duration::from_millis(250)))
             .expect("set read timeout");
         stream
-            .set_write_timeout(Some(Duration::from_secs(10)))
+            .set_write_timeout(Some(Duration::from_secs(2)))
             .expect("set write timeout");
         stream
             .write_all(request.as_bytes())
@@ -16808,12 +16816,12 @@ mod tests {
 
     #[test]
     fn max_requests_guard_logic_is_strict() {
-        assert!(!super::max_requests_reached(0, 0));
-        assert!(!super::max_requests_reached(0, 100));
-        assert!(!super::max_requests_reached(2, 0));
-        assert!(!super::max_requests_reached(2, 1));
-        assert!(super::max_requests_reached(2, 2));
-        assert!(super::max_requests_reached(2, 3));
+        assert!(!super::max_requests_limit_hit(0, 0));
+        assert!(!super::max_requests_limit_hit(0, 100));
+        assert!(!super::max_requests_limit_hit(2, 0));
+        assert!(!super::max_requests_limit_hit(2, 1));
+        assert!(super::max_requests_limit_hit(2, 2));
+        assert!(super::max_requests_limit_hit(2, 3));
     }
 
     #[test]
@@ -21767,7 +21775,7 @@ mod tests {
     }
 
     #[test]
-    fn rpc_http_backend_from_env_defaults_to_legacy_and_accepts_axum() {
+    fn rpc_http_backend_from_env_defaults_to_legacy_and_accepts_overrides() {
         const KEY: &str = "SCAM_RPC_HTTP_BACKEND";
         unsafe {
             std::env::remove_var(KEY);
@@ -25549,6 +25557,32 @@ mod tests {
             assert!(
                 !text.contains("invalid SOCKS5 host length"),
                 "255-byte host should pass length guard"
+            );
+        });
+    }
+
+    #[test]
+    fn relay_connect_via_socks5_async_accepts_sub_255_host_before_connect_attempt() {
+        let endpoint = super::RelayTargetEndpoint {
+            host: "z".repeat(254),
+            port: 9735,
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        rt.block_on(async {
+            let err = super::relay_connect_via_socks5_async("127.0.0.1:9", &endpoint)
+                .await
+                .expect_err("missing proxy listener should fail connect");
+            let text = err.to_string();
+            assert!(
+                text.contains("SOCKS5 connect"),
+                "expected connect path error, got: {text}"
+            );
+            assert!(
+                !text.contains("invalid SOCKS5 host length"),
+                "254-byte host should pass length guard"
             );
         });
     }
