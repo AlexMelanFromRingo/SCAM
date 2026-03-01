@@ -50,7 +50,8 @@
 - [x] Remove runtime thread-per-connection in `relay-serve` by migrating to async tokio socket handling.
 - [x] Add compact-block fallback path (request missing txs by index and reconstruct block before apply).
 - [x] Add addr exchange path (`getaddr/addr`) for live peer discovery enrichment.
-- [ ] Add Erlay/Minisketch mempool set-reconciliation path to reduce inv/getdata overhead at high peer counts.
+- [x] Add Erlay/Minisketch mempool set-reconciliation path to reduce inv/getdata overhead at high peer counts.
+  - Closure (`2026-03-01`): `SendRecon/ReqRecon/Sketch/ReqSketchExt/ReqTx/ReconcileDiff` wired through relay runtime; short-id reconciliation now uses negotiated capability (`version/bits/implementation/salt`) with `minisketch-rs`, collision fallback, and bounded per-peer round tracking.
 
 ## P2 (launch confidence)
 - [ ] Soak test profile for 24h: 2-5 nodes + miner + tx spam profile.

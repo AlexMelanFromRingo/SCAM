@@ -10,3 +10,5 @@ scam-core = { path = "../core" }
 serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+minisketch-rs.workspace = true
+siphasher.workspace = true

@@ -59,7 +59,7 @@ Status: v3 (hardening + SV2 pool-grade gap closure on 2026-02-13)
 - [x] Hardened outbound peer rotation with addrman-style `tried/new` bias + secret-salted diversity buckets persisted per network (`<network>.bucket.key`).
 - [x] Added anti-fingerprinting relay diffusion knobs for tx inventory fanout (`SCAM_RELAY_TX_DIFFUSION_BASE_MS` / `SCAM_RELAY_TX_DIFFUSION_MAX_MS`) on async relay runtime path.
 - [x] Added policy-gated anonymous-network outbound routing (Tor/I2P via SOCKS5 + CJDNS allowlist flags) for relay outbound workers/feelers.
-- [ ] Erlay/Minisketch set-reconciliation path is still pending (wire messages + sketch exchange + reconciliation logic).
+- [x] Erlay/Minisketch set-reconciliation path implemented (`SendRecon/ReqRecon/Sketch/ReqSketchExt/ReqTx/ReconcileDiff`) with negotiated short-id context (`bits/implementation/salt`) and collision fallback.
 - [x] Added external SV2 role services with network boundaries (`sv2-template-provider`, `sv2-job-declarator`, `sv2-translator`) and per-role telemetry output.
 - [x] Added Noise-spec secure transport mode (`noise_xx`) with configurable selection (`stratum_secure_transport_mode`, `--secure-transport-mode`).
 - [x] Added secure key lifecycle operations (`stratum-keygen`, `stratum-key-rotate`) for Noise static keys.

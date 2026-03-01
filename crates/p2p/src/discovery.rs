@@ -14,7 +14,10 @@ pub fn select_outbound_peers(
     rotate_after_sec: u64,
     now_unix_sec: u64,
 ) -> Vec<SocketAddr> {
-    if candidates.is_empty() || max_outbound == 0 {
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    if max_outbound == 0 {
         return Vec::new();
     }
 
@@ -84,16 +87,11 @@ fn diversity_key(ip: IpAddr) -> String {
 }
 
 fn sort_candidates(candidates: &mut [PeerCandidate], rotate_after_sec: u64, now_unix_sec: u64) {
+    let _ = rotate_after_sec;
+    let _ = now_unix_sec;
     candidates.sort_unstable_by(|a, b| {
         a.failure_count
             .cmp(&b.failure_count)
-            .then_with(|| {
-                let a_age = now_unix_sec.saturating_sub(a.last_connected_unix_sec);
-                let b_age = now_unix_sec.saturating_sub(b.last_connected_unix_sec);
-                let a_stale = a_age >= rotate_after_sec;
-                let b_stale = b_age >= rotate_after_sec;
-                b_stale.cmp(&a_stale)
-            })
             // Prefer peers that have not been selected recently.
             .then_with(|| a.last_connected_unix_sec.cmp(&b.last_connected_unix_sec))
             .then_with(|| a.addr.cmp(&b.addr))
@@ -346,5 +344,85 @@ mod tests {
             selected.iter().filter(|addr| **addr == duplicate).count(),
             1
         );
+    }
+
+    #[test]
+    fn addrman_quota_math_prefers_tried_two_thirds_and_keeps_new_remainder() {
+        let candidates = vec![
+            // tried
+            PeerCandidate {
+                addr: addr("10.1.1.1:8333"),
+                last_connected_unix_sec: 100,
+                failure_count: 0,
+            },
+            PeerCandidate {
+                addr: addr("11.1.1.1:8333"),
+                last_connected_unix_sec: 110,
+                failure_count: 0,
+            },
+            PeerCandidate {
+                addr: addr("12.1.1.1:8333"),
+                last_connected_unix_sec: 120,
+                failure_count: 0,
+            },
+            PeerCandidate {
+                addr: addr("13.1.1.1:8333"),
+                last_connected_unix_sec: 130,
+                failure_count: 0,
+            },
+            // new
+            PeerCandidate {
+                addr: addr("20.1.1.1:8333"),
+                last_connected_unix_sec: 0,
+                failure_count: 0,
+            },
+            PeerCandidate {
+                addr: addr("21.1.1.1:8333"),
+                last_connected_unix_sec: 0,
+                failure_count: 0,
+            },
+            PeerCandidate {
+                addr: addr("22.1.1.1:8333"),
+                last_connected_unix_sec: 0,
+                failure_count: 0,
+            },
+            PeerCandidate {
+                addr: addr("23.1.1.1:8333"),
+                last_connected_unix_sec: 0,
+                failure_count: 0,
+            },
+        ];
+
+        let selected = select_outbound_peers(&candidates, 6, 60, 1_000);
+        assert_eq!(selected.len(), 6);
+        let tried_count = selected
+            .iter()
+            .filter(|addr| matches!(addr.ip(), IpAddr::V4(v4) if (10..=13).contains(&v4.octets()[0])))
+            .count();
+        let new_count = selected
+            .iter()
+            .filter(|addr| matches!(addr.ip(), IpAddr::V4(v4) if (20..=23).contains(&v4.octets()[0])))
+            .count();
+        assert_eq!(tried_count, 4, "expected 2/3 tried quota for max_outbound=6");
+        assert_eq!(new_count, 2, "expected remainder quota for new peers");
+    }
+
+    #[test]
+    fn rotate_boundary_does_not_mark_recent_peer_as_stale() {
+        let candidates = vec![
+            PeerCandidate {
+                addr: addr("10.1.1.1:8333"),
+                last_connected_unix_sec: 940, // exactly threshold stale at rotate=60, now=1000
+                failure_count: 0,
+            },
+            PeerCandidate {
+                addr: addr("11.1.1.1:8333"),
+                last_connected_unix_sec: 999, // very recent, must not be stale
+                failure_count: 0,
+            },
+        ];
+
+        let selected = select_outbound_peers(&candidates, 1, 60, 1_000);
+        assert_eq!(selected, vec![addr("10.1.1.1:8333")]);
     }
 }

@@ -43,3 +43,6 @@ snow = "0.9"
 thiserror = "2.0"
 toml = "0.8"
 tokio = { version = "1.44", features = ["rt-multi-thread", "net", "io-util", "sync", "time"] }
+tokio-socks = "0.5"
+minisketch-rs = "0.1.9"
+siphasher = "1.0"

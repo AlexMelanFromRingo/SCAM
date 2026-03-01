@@ -53,6 +53,39 @@ pub enum WireMessage {
     Addr {
         peers: Vec<PeerAddress>,
     },
+    SendRecon {
+        enabled: bool,
+        version: u16,
+        short_id_bits: u8,
+        implementation: u32,
+        salt: u64,
+        max_sketch_items: u32,
+        max_diff_items: u32,
+    },
+    ReqRecon {
+        salt: u64,
+        set_size: u32,
+    },
+    Sketch {
+        salt: u64,
+        bits: u32,
+        capacity: u32,
+        implementation: u32,
+        bytes: Vec<u8>,
+    },
+    ReqSketchExt {
+        salt: u64,
+        capacity: u32,
+    },
+    ReqTx {
+        salt: u64,
+        short_ids: Vec<u64>,
+    },
+    ReconcileDiff {
+        salt: u64,
+        announce_txids: Vec<Hash256>,
+        request_txids: Vec<Hash256>,
+    },
     SendCmpct {
         high_bandwidth: bool,
         version: u64,
@@ -191,7 +224,19 @@ mod tests {
                 last_seen_unix_sec: 1,
             }],
         };
-        for msg in [compact, addr] {
+        let recon_sketch = WireMessage::Sketch {
+            salt: 42,
+            bits: 32,
+            capacity: 16,
+            implementation: 0,
+            bytes: vec![1, 2, 3],
+        };
+        let recon_diff = WireMessage::ReconcileDiff {
+            salt: 42,
+            announce_txids: vec![hash256(b"announce")],
+            request_txids: vec![hash256(b"request")],
+        };
+        for msg in [compact, addr, recon_sketch, recon_diff] {
             let encoded = encode_message(&msg).expect("encode");
             let decoded = decode_message(&encoded, 8 * 1024).expect("decode");
             assert_eq!(decoded, msg);
