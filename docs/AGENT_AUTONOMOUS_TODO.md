@@ -17,7 +17,9 @@
 
 ### Phase B: Battle-tested transport/protocol migration
 - [x] Migrate async SOCKS5 connect path to `tokio-socks` (remove hand-rolled async dial logic).
-- [ ] Migrate `rpc-serve` HTTP path to `hyper`/`axum` while preserving existing route contracts/tests.
+- [~] Migrate `rpc-serve` HTTP path to `hyper`/`axum` while preserving existing route contracts/tests.
+  - Added `axum` backend scaffold (`SCAM_RPC_HTTP_BACKEND=axum`) with `GET /health` + `GET /status`.
+  - Legacy backend remains default until full route parity is reached.
 - [x] Move wire framing onto battle-tested codec path (`tokio-util` codec) with strict size limits (async path).
 - [ ] Keep compatibility tests for version/handshake/frame boundary behavior.
 
