@@ -36,7 +36,8 @@ impl Encoder<WireMessage> for ScamWireCodec {
                 got: payload.len(),
             });
         }
-        dst.reserve(8 + payload.len());
+        dst.reserve(8);
+        dst.reserve(payload.len());
         dst.put_u32(self.cfg.magic);
         dst.put_u32(payload.len() as u32);
         dst.extend_from_slice(&payload);
@@ -49,7 +50,7 @@ impl Decoder for ScamWireCodec {
     type Error = TransportError;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        if src.len() < 8 {
+        if src.get(7).is_none() {
             return Ok(None);
         }
         let magic = u32::from_be_bytes([src[0], src[1], src[2], src[3]]);
@@ -67,7 +68,7 @@ impl Decoder for ScamWireCodec {
             });
         }
         let frame_len = 8usize.saturating_add(payload_len);
-        if src.len() < frame_len {
+        if src.get(frame_len.saturating_sub(1)).is_none() {
             return Ok(None);
         }
         src.advance(8);
@@ -474,16 +475,18 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
+    use bytes::BytesMut;
     use scam_core::{Hash256, Target, hash::hash256};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::runtime::Runtime;
+    use tokio_util::codec::{Decoder, Encoder};
 
     use crate::sync::{build_block_locator, select_block_hashes_for_peer, select_headers_for_peer};
     use crate::transport::{
-        FramingConfig, LocalHandshake, WireMessage, client_handshake, client_handshake_async,
-        read_message, read_message_async, request_blocks, request_blocks_async, request_headers,
-        request_headers_async, send_message, send_message_async, server_handshake,
-        server_handshake_async,
+        FramingConfig, LocalHandshake, ScamWireCodec, WireMessage, client_handshake,
+        client_handshake_async, read_message, read_message_async, request_blocks,
+        request_blocks_async, request_headers, request_headers_async, send_message,
+        send_message_async, server_handshake, server_handshake_async,
     };
 
     #[derive(Default)]
@@ -1087,6 +1090,66 @@ mod tests {
         assert!(matches!(first, WireMessage::GetHeaders { .. }));
         let second = read_message(&mut write_cursor, &cfg).expect("second request");
         assert!(matches!(second, WireMessage::GetBlocks { .. }));
+    }
+
+    #[test]
+    fn scam_wire_codec_decode_waits_for_complete_frame_and_roundtrips_message() {
+        let cfg = FramingConfig::default();
+        let mut codec = ScamWireCodec::new(cfg.clone());
+        let message = WireMessage::Ping {
+            nonce: 0xAABBCCDDEEFF0011,
+        };
+        let framed = encode_framed_message_bytes(&cfg, &message);
+        assert!(
+            framed.len() > 9,
+            "framed ping must include non-empty payload"
+        );
+
+        let mut partial_header = BytesMut::from(&framed[..7]);
+        let first = codec
+            .decode(&mut partial_header)
+            .expect("decode partial header");
+        assert!(first.is_none(), "partial header must not decode");
+
+        partial_header.extend_from_slice(&framed[7..9]);
+        let second = codec
+            .decode(&mut partial_header)
+            .expect("decode partial payload");
+        assert!(second.is_none(), "partial payload must not decode");
+
+        partial_header.extend_from_slice(&framed[9..]);
+        let decoded = codec
+            .decode(&mut partial_header)
+            .expect("decode full frame")
+            .expect("message present");
+        assert_eq!(decoded, message);
+        assert!(
+            partial_header.is_empty(),
+            "codec must consume full frame bytes"
+        );
+    }
+
+    #[test]
+    fn scam_wire_codec_encode_and_decode_handle_exact_size_limits() {
+        let message = WireMessage::Ping { nonce: 0x1122 };
+        let payload_len = crate::wire::encode_message(&message).expect("encode").len();
+        let cfg = FramingConfig {
+            max_message_size: payload_len,
+            ..FramingConfig::default()
+        };
+        let mut codec = ScamWireCodec::new(cfg.clone());
+        let mut encoded = BytesMut::new();
+        codec
+            .encode(message.clone(), &mut encoded)
+            .expect("encode at exact boundary");
+
+        let mut decode_codec = ScamWireCodec::new(cfg);
+        let decoded = decode_codec
+            .decode(&mut encoded)
+            .expect("decode at exact boundary")
+            .expect("message present");
+        assert_eq!(decoded, message);
+        assert!(encoded.is_empty());
     }
 
     fn chain_headers(

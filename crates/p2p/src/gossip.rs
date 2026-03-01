@@ -810,10 +810,16 @@ impl GossipEngine {
         }
         decoded.truncate(decoded_count);
 
-        let mut missing = decoded
-            .into_iter()
-            .filter(|short_id| *short_id != 0 && !local_set.contains(short_id))
-            .collect::<Vec<_>>();
+        let mut missing = Vec::<u64>::new();
+        for short_id in decoded {
+            if short_id == 0 {
+                continue;
+            }
+            if local_set.contains(&short_id) {
+                continue;
+            }
+            missing.push(short_id);
+        }
         missing.sort_unstable();
         missing.dedup();
         missing.truncate(self.max_inv_items);
@@ -2624,6 +2630,75 @@ mod tests {
                 .iter()
                 .any(|msg| matches!(msg.message, WireMessage::ReconcileDiff { .. }))
         );
+    }
+
+    #[test]
+    fn handle_sketch_ignores_zero_and_local_short_ids_in_missing_requests() {
+        let mut engine = GossipEngine::new(16).expect("engine");
+        engine.connect_peer(98);
+        engine
+            .on_message(
+                98,
+                WireMessage::SendRecon {
+                    enabled: true,
+                    version: 1,
+                    short_id_bits: super::RECON_BITS as u8,
+                    implementation: 0,
+                    salt: 98,
+                    max_sketch_items: 16,
+                    max_diff_items: 16,
+                },
+            )
+            .expect("enable");
+        let req = engine
+            .maybe_start_reconciliation(98, 1_000)
+            .expect("start recon");
+        let (salt, capacity) = match req[0].message {
+            WireMessage::ReqRecon { salt, set_size } => (salt, set_size as usize),
+            ref other => panic!("expected reqrecon, got {other:?}"),
+        };
+
+        let local_short = 42u64;
+        {
+            let round = engine
+                .peers
+                .get_mut(&98)
+                .and_then(|state| state.recon_rounds.get_mut(&salt))
+                .expect("round");
+            round.snapshot.unique_short_ids = vec![local_short];
+            round.snapshot.short_to_txids.clear();
+            round.snapshot.collision_txids.clear();
+            round.snapshot.txids.clear();
+        }
+
+        let mut remote = Minisketch::try_new(super::RECON_BITS, 0, capacity).expect("remote");
+        remote.set_seed(salt);
+        remote.add(0);
+        remote.add(local_short);
+        remote.add(77);
+        let mut payload = vec![0u8; remote.serialized_size()];
+        remote.serialize(&mut payload).expect("serialize");
+
+        let out = engine
+            .on_message(
+                98,
+                WireMessage::Sketch {
+                    salt,
+                    bits: super::RECON_BITS,
+                    capacity: capacity as u32,
+                    implementation: 0,
+                    bytes: payload,
+                },
+            )
+            .expect("handle sketch");
+        let req_tx = out
+            .iter()
+            .find_map(|msg| match &msg.message {
+                WireMessage::ReqTx { short_ids, .. } => Some(short_ids.clone()),
+                _ => None,
+            })
+            .expect("expected reqtx");
+        assert_eq!(req_tx, vec![77], "must ignore zero and local short IDs");
     }
 
     #[test]

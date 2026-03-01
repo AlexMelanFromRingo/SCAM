@@ -2791,8 +2791,18 @@ fn relay_target_allowed_by_policy(target: &str, policy: &RelayNetworkPolicy) -> 
     };
     match relay_target_network(&endpoint) {
         RelayTargetNetwork::Clearnet => true,
-        RelayTargetNetwork::Onion => policy.allow_onion && policy.socks5_proxy.is_some(),
-        RelayTargetNetwork::I2p => policy.allow_i2p && policy.socks5_proxy.is_some(),
+        RelayTargetNetwork::Onion => {
+            if !policy.allow_onion {
+                return false;
+            }
+            policy.socks5_proxy.is_some()
+        }
+        RelayTargetNetwork::I2p => {
+            if !policy.allow_i2p {
+                return false;
+            }
+            policy.socks5_proxy.is_some()
+        }
         RelayTargetNetwork::Cjdns => policy.allow_cjdns,
     }
 }
@@ -5993,6 +6003,13 @@ fn relay_startup_send_failed(startup_sent: bool) -> bool {
     !startup_sent
 }
 
+fn relay_should_abort_after_startup_send(mode: RelayPeerSessionMode, startup_sent: bool) -> bool {
+    match mode {
+        RelayPeerSessionMode::Outbound => relay_startup_send_failed(startup_sent),
+        RelayPeerSessionMode::Inbound => false,
+    }
+}
+
 fn should_persist_peer_reputation(delta: RuntimePeerReputation) -> bool {
     delta.replacement_rate_limited_total > 0 || delta.protocol_violation_total > 0
 }
@@ -6243,7 +6260,7 @@ fn relay_missing_blocks_from_headers(
     state: &RelayServerState,
     headers: &[scam_core::BlockHeader],
 ) -> Result<Vec<InventoryItem>, NodeError> {
-    if headers.len() > RELAY_MAX_HEADERS_PER_ANNOUNCEMENT {
+    if headers.get(RELAY_MAX_HEADERS_PER_ANNOUNCEMENT).is_some() {
         return Err(NodeError::Runtime(format!(
             "headers announcement exceeds limit: got={}, limit={}",
             headers.len(),
@@ -6613,7 +6630,7 @@ fn process_relay_wire_message_inner(
             block_hash,
             indexes,
         } => {
-            if indexes.len() > RELAY_MAX_GETBLOCKTXN_INDEXES {
+            if indexes.get(RELAY_MAX_GETBLOCKTXN_INDEXES).is_some() {
                 return Err(relay_protocol_violation(
                     state,
                     peer_id,
@@ -6864,20 +6881,13 @@ fn load_relay_outbound_targets_selected(
     .collect::<Vec<_>>();
 
     domain_candidates.sort_unstable_by(|a, b| {
-        let a_age = now.saturating_sub(a.1);
-        let b_age = now.saturating_sub(b.1);
         a.2.cmp(&b.2)
-            .then_with(|| {
-                let a_rotate = a_age >= rotate_after_sec;
-                let b_rotate = b_age >= rotate_after_sec;
-                b_rotate.cmp(&a_rotate)
-            })
             .then_with(|| b.1.cmp(&a.1))
             .then_with(|| a.0.cmp(&b.0))
     });
     let mut seen = selected.iter().cloned().collect::<HashSet<_>>();
     for (target, _, _) in domain_candidates {
-        if selected.len() >= max_peers {
+        if selected.len() == max_peers {
             break;
         }
         if seen.insert(target.clone()) {
@@ -7231,12 +7241,26 @@ fn relay_tx_diffusion_delay_for_message(message: &WireMessage) -> Duration {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_nanos() as u64)
         .unwrap_or(0);
-    let seed = now_nanos ^ u64::from_be_bytes(first_txid.0[..8].try_into().unwrap_or([0; 8]));
+    let seed = relay_tx_diffusion_seed(now_nanos, first_txid);
     Duration::from_millis(relay_tx_diffusion_delay_ms_from_seed(base_ms, max_ms, seed))
 }
 
+fn relay_tx_diffusion_seed(now_nanos: u64, txid: Hash256) -> u64 {
+    let mut input = [0u8; 40];
+    input[..8].copy_from_slice(&now_nanos.to_be_bytes());
+    input[8..].copy_from_slice(&txid.0);
+    let mixed = scam_core::hash::hash256(&input);
+    u64::from_be_bytes(mixed.0[..8].try_into().unwrap_or([0; 8]))
+}
+
 fn relay_tx_diffusion_delay_ms_from_seed(base_ms: u64, max_ms: u64, mut seed: u64) -> u64 {
-    if base_ms == 0 || max_ms == 0 || max_ms < base_ms {
+    if base_ms == 0 {
+        return 0;
+    }
+    if max_ms == 0 {
+        return 0;
+    }
+    if max_ms < base_ms {
         return 0;
     }
     // SplitMix64 mixing to derive a stable pseudorandom value.
@@ -7244,10 +7268,10 @@ fn relay_tx_diffusion_delay_ms_from_seed(base_ms: u64, max_ms: u64, mut seed: u6
     let mut z = seed;
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
-    z ^= z >> 31;
+    z = z ^ (z >> 31);
     let unit = ((z >> 11) as f64) / ((1u64 << 53) as f64);
     let u = (1.0 - unit).clamp(1e-9, 1.0);
-    let sampled = (-u.ln() * base_ms as f64).round() as u64;
+    let sampled = (-u.ln()).mul_add(base_ms as f64, 0.0).round() as u64;
     sampled.clamp(base_ms, max_ms)
 }
 
@@ -7411,7 +7435,10 @@ async fn run_relay_outbound_feeler_probe_async(
     timeout_sec: u64,
     anchor_store: Option<PeerAnchorStore>,
 ) {
-    if target.trim().is_empty() || relay_target_matches_bind(&bind_addr, &target) {
+    if target.trim().is_empty() {
+        return;
+    }
+    if relay_target_matches_bind(&bind_addr, &target) {
         return;
     }
 
@@ -7446,6 +7473,13 @@ async fn run_relay_outbound_feeler_probe_async(
     if let Some(store) = anchor_store {
         let _ = update_peer_anchor_store_attempt(&store, &target, now_unix_sec, success);
     }
+}
+
+fn relay_outbound_feeler_due(now_unix_sec: u64, last_feeler_unix_sec: u64) -> bool {
+    now_unix_sec
+        .saturating_sub(last_feeler_unix_sec)
+        .checked_sub(RELAY_OUTBOUND_FEELER_INTERVAL_SEC)
+        .is_some()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7570,7 +7604,7 @@ async fn run_relay_outbound_supervisor_async(
         }
 
         let now_unix_sec = current_unix_sec().unwrap_or(0);
-        if now_unix_sec.saturating_sub(last_feeler_unix_sec) >= RELAY_OUTBOUND_FEELER_INTERVAL_SEC {
+        if relay_outbound_feeler_due(now_unix_sec, last_feeler_unix_sec) {
             let mut excluded = worker_targets.clone();
             excluded.insert(bind_addr.clone());
             match load_relay_outbound_feeler_target(&peers_dir, &cfg, &bind_addr, &excluded) {
@@ -7701,8 +7735,7 @@ fn run_relay_peer_session<IO: Read + Write>(
             ]);
         }
         let startup_sent = relay_send_messages_until_closed(stream, &startup, &framing)?;
-        if relay_startup_send_failed(startup_sent) && matches!(mode, RelayPeerSessionMode::Outbound)
-        {
+        if relay_should_abort_after_startup_send(mode, startup_sent) {
             return Ok(());
         }
 
@@ -7943,10 +7976,14 @@ async fn run_relay_peer_session_async<S: AsyncRead + AsyncWrite + Unpin>(
                 },
             ]);
         }
-        if !relay_send_messages_until_closed_async(stream, &first_sync, &framing, write_timeout_sec)
-            .await?
-            && matches!(mode, RelayPeerSessionMode::Outbound)
-        {
+        let startup_sent = relay_send_messages_until_closed_async(
+            stream,
+            &first_sync,
+            &framing,
+            write_timeout_sec,
+        )
+        .await?;
+        if relay_should_abort_after_startup_send(mode, startup_sent) {
             return Ok(());
         }
 
@@ -19013,6 +19050,18 @@ mod tests {
     fn relay_reputation_helpers_require_positive_deltas() {
         assert!(super::relay_startup_send_failed(false));
         assert!(!super::relay_startup_send_failed(true));
+        assert!(super::relay_should_abort_after_startup_send(
+            super::RelayPeerSessionMode::Outbound,
+            false
+        ));
+        assert!(!super::relay_should_abort_after_startup_send(
+            super::RelayPeerSessionMode::Outbound,
+            true
+        ));
+        assert!(!super::relay_should_abort_after_startup_send(
+            super::RelayPeerSessionMode::Inbound,
+            false
+        ));
         assert!(!super::should_persist_peer_reputation(
             super::RuntimePeerReputation {
                 replacement_rate_limited_total: 0,
@@ -20535,6 +20584,21 @@ mod tests {
             "[fc00::1]:18444",
             &allow_anonymous
         ));
+
+        let no_proxy = super::RelayNetworkPolicy {
+            allow_onion: true,
+            allow_i2p: true,
+            allow_cjdns: true,
+            socks5_proxy: None,
+        };
+        assert!(!super::relay_target_allowed_by_policy(
+            "exampleabcdefghijklmnop.onion:9735",
+            &no_proxy
+        ));
+        assert!(!super::relay_target_allowed_by_policy(
+            "nodebase32.i2p:17444",
+            &no_proxy
+        ));
     }
 
     #[test]
@@ -20577,6 +20641,17 @@ mod tests {
         let err =
             super::relay_socks5_connect_request(&oversized).expect_err("oversized host must fail");
         assert!(err.to_string().contains("invalid SOCKS5 host length"));
+    }
+
+    #[test]
+    fn relay_socks5_connect_request_accepts_exact_255_byte_host() {
+        let endpoint = super::RelayTargetEndpoint {
+            host: "a".repeat(255),
+            port: 9735,
+        };
+        let req = super::relay_socks5_connect_request(&endpoint).expect("255-byte host accepted");
+        assert_eq!(req[3], 0x03, "domain request must use SOCKS5 domain atyp");
+        assert_eq!(req[4], 255u8);
     }
 
     #[test]
@@ -20731,6 +20806,29 @@ mod tests {
         assert_eq!(super::relay_tx_diffusion_delay_ms_from_seed(0, 80, 1), 0);
         assert_eq!(super::relay_tx_diffusion_delay_ms_from_seed(20, 0, 1), 0);
         assert_eq!(super::relay_tx_diffusion_delay_ms_from_seed(80, 20, 1), 0);
+        assert_eq!(
+            super::relay_tx_diffusion_delay_ms_from_seed(20, 800, 0x1112_1314_1516_1718),
+            87
+        );
+        assert_eq!(
+            super::relay_tx_diffusion_delay_ms_from_seed(50, 150, 0xFFFF_FFFF_FFFF_FFFF),
+            112
+        );
+    }
+
+    #[test]
+    fn relay_tx_diffusion_seed_changes_with_txid_and_timestamp() {
+        let tx_a = scam_core::hash::hash256(b"tx-a");
+        let tx_b = scam_core::hash::hash256(b"tx-b");
+        let seed_a = super::relay_tx_diffusion_seed(1_700_000_000_000_000_000, tx_a);
+        let seed_b = super::relay_tx_diffusion_seed(1_700_000_000_000_000_000, tx_b);
+        let seed_c = super::relay_tx_diffusion_seed(1_700_000_000_000_000_001, tx_a);
+        assert_ne!(seed_a, seed_b);
+        assert_ne!(seed_a, seed_c);
+        assert_eq!(
+            seed_a,
+            super::relay_tx_diffusion_seed(1_700_000_000_000_000_000, tx_a)
+        );
     }
 
     #[test]
@@ -23681,6 +23779,55 @@ mod tests {
     }
 
     #[test]
+    fn load_relay_outbound_targets_selected_respects_domain_fill_boundary() {
+        let peers_dir = temp_dir("test-relay-selected-targets-domain-fill");
+        fs::create_dir_all(&peers_dir).expect("mkdir");
+        let peers_db_path = peers_dir.join("devnet.redb");
+        super::save_peer_book_db(
+            &peers_db_path,
+            &PeerAddressBook {
+                network_id: "devnet".to_owned(),
+                peers: vec![
+                    PeerAddressRecord {
+                        address: "127.0.0.1:19444".to_owned(),
+                        last_seen_unix_sec: 0,
+                        ban_score: 0,
+                    },
+                    PeerAddressRecord {
+                        address: "relay.example.test:19444".to_owned(),
+                        last_seen_unix_sec: 1,
+                        ban_score: 0,
+                    },
+                ],
+            },
+        )
+        .expect("save peer book");
+
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let one = super::load_relay_outbound_targets_selected(&peers_dir, &cfg, 1, 60)
+            .expect("load selected targets (one)");
+        assert_eq!(
+            one,
+            vec!["127.0.0.1:19444".to_owned()],
+            "domain candidate must not exceed max_peers"
+        );
+
+        let two = super::load_relay_outbound_targets_selected(&peers_dir, &cfg, 2, 60)
+            .expect("load selected targets (two)");
+        assert_eq!(
+            two,
+            vec![
+                "127.0.0.1:19444".to_owned(),
+                "relay.example.test:19444".to_owned()
+            ],
+            "domain candidate should fill remaining capacity"
+        );
+
+        let _ = fs::remove_dir_all(peers_dir);
+    }
+
+    #[test]
     fn load_peer_anchor_targets_filters_invalid_and_empty_addresses() {
         let peers_dir = temp_dir("test-peer-anchor-load-filter");
         fs::create_dir_all(&peers_dir).expect("mkdir peers");
@@ -24275,6 +24422,32 @@ mod tests {
     }
 
     #[test]
+    fn relay_connect_via_socks5_async_accepts_255_byte_host_before_connect_attempt() {
+        let endpoint = super::RelayTargetEndpoint {
+            host: "z".repeat(255),
+            port: 9735,
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        rt.block_on(async {
+            let err = super::relay_connect_via_socks5_async("127.0.0.1:9", &endpoint)
+                .await
+                .expect_err("missing proxy listener should fail connect");
+            let text = err.to_string();
+            assert!(
+                text.contains("SOCKS5 connect"),
+                "expected connect path error, got: {text}"
+            );
+            assert!(
+                !text.contains("invalid SOCKS5 host length"),
+                "255-byte host should pass length guard"
+            );
+        });
+    }
+
+    #[test]
     fn run_relay_outbound_feeler_probe_async_records_failed_attempts() {
         let peers_dir = temp_dir("test-relay-feeler-record-failure");
         fs::create_dir_all(&peers_dir).expect("mkdir peers");
@@ -24304,6 +24477,63 @@ mod tests {
         assert_eq!(anchors.anchors[0].address, target);
         assert_eq!(anchors.anchors[0].failure_total, 1);
         let _ = fs::remove_dir_all(peers_dir);
+    }
+
+    #[test]
+    fn run_relay_outbound_feeler_probe_async_noops_for_empty_and_self_targets() {
+        let peers_dir = temp_dir("test-relay-feeler-guard-noop");
+        fs::create_dir_all(&peers_dir).expect("mkdir peers");
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let store = super::PeerAnchorStore::from_peers_dir(&peers_dir, &cfg.network_id);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        rt.block_on(async {
+            super::run_relay_outbound_feeler_probe_async(
+                "   ".to_owned(),
+                "0.0.0.0:18444".to_owned(),
+                cfg.clone(),
+                1,
+                Some(store.clone()),
+            )
+            .await;
+            super::run_relay_outbound_feeler_probe_async(
+                "127.0.0.1:18444".to_owned(),
+                "0.0.0.0:18444".to_owned(),
+                cfg.clone(),
+                1,
+                Some(store.clone()),
+            )
+            .await;
+        });
+
+        let anchors =
+            super::load_peer_anchor_book(&store.path, &cfg.network_id).expect("load anchors");
+        assert!(
+            anchors.anchors.is_empty(),
+            "guarded feeler probes must not persist anchor attempts"
+        );
+        let _ = fs::remove_dir_all(peers_dir);
+    }
+
+    #[test]
+    fn relay_outbound_feeler_due_enforces_strict_interval_boundary() {
+        assert!(!super::relay_outbound_feeler_due(10, 10));
+        assert!(!super::relay_outbound_feeler_due(
+            super::RELAY_OUTBOUND_FEELER_INTERVAL_SEC - 1,
+            0
+        ));
+        assert!(super::relay_outbound_feeler_due(
+            super::RELAY_OUTBOUND_FEELER_INTERVAL_SEC,
+            0
+        ));
+        assert!(super::relay_outbound_feeler_due(
+            super::RELAY_OUTBOUND_FEELER_INTERVAL_SEC + 1,
+            0
+        ));
     }
 
     #[test]
@@ -24437,7 +24667,7 @@ mod tests {
         )
         .expect("mine sender funds");
 
-        let fee = 500u64;
+        let fee = 50_000u64;
         let tx = build_signed_transfer_tx(
             &runtime,
             &cfg.network_id,
@@ -24525,13 +24755,39 @@ mod tests {
         };
         let _remote = client_handshake(&mut client, &framing, &local_hello).expect("handshake");
         send_message(&mut client, &WireMessage::Tx { tx }, &framing).expect("send tx");
+        let mut saw_tx_inv = false;
+        for _ in 0..3 {
+            let Ok(message) = read_message(&mut client, &framing) else {
+                break;
+            };
+            if let WireMessage::Inv { items } = message
+                && items
+                    .iter()
+                    .any(|item| matches!(item, InventoryItem::Tx(found) if *found == txid))
+            {
+                saw_tx_inv = true;
+                break;
+            }
+        }
         drop(client);
 
         join_with_timeout(server, Duration::from_secs(8), "relay peer session persist")
             .expect("session result");
-        let persisted = super::load_mempool_from_db_or_empty(&cfg, &mempool_db)
-            .expect("load persisted mempool");
-        assert!(persisted.contains(&txid));
+        let mut persisted_contains_txid = false;
+        for _ in 0..40 {
+            let persisted = super::load_mempool_from_db_or_empty(&cfg, &mempool_db)
+                .expect("load persisted mempool");
+            if persisted.contains(&txid) {
+                persisted_contains_txid = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            persisted_contains_txid,
+            "persisted mempool should contain submitted txid {txid}"
+        );
+        assert!(saw_tx_inv, "peer should observe tx inventory announcement");
 
         let _ = fs::remove_dir_all(work_dir);
     }
@@ -26237,6 +26493,50 @@ mod tests {
     }
 
     #[test]
+    fn relay_headers_announcement_limit_boundary_is_exact() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let relay = RelayAdmissionState {
+            mempool: Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip: GossipEngine::new(64).expect("gossip"),
+        };
+        let state = RelayServerState::new(runtime, relay);
+        let header = scam_core::BlockHeader {
+            version: 1,
+            prev_block: state.runtime.tip_hash(),
+            merkle_root: scam_core::hash::hash256(b"headers-limit"),
+            timestamp: state
+                .runtime
+                .tip_header()
+                .timestamp
+                .saturating_add(cfg.target_block_time_sec),
+            target: Target::MAX,
+            nonce: 0,
+        };
+        let at_limit = vec![header.clone(); super::RELAY_MAX_HEADERS_PER_ANNOUNCEMENT];
+        let boundary_err = super::relay_missing_blocks_from_headers(&state, &at_limit)
+            .expect_err("duplicate header content should fail after boundary gate");
+        assert!(
+            !boundary_err
+                .to_string()
+                .contains("headers announcement exceeds limit"),
+            "exact boundary must not fail due to count limit"
+        );
+
+        let over_limit = vec![header; super::RELAY_MAX_HEADERS_PER_ANNOUNCEMENT + 1];
+        let err = super::relay_missing_blocks_from_headers(&state, &over_limit)
+            .expect_err("over-limit header announcement must fail");
+        assert!(
+            err.to_string()
+                .contains("headers announcement exceeds limit")
+        );
+    }
+
+    #[test]
     fn relay_headers_announcement_rejects_invalid_pow_and_penalizes_peer() {
         let cfg: ChainConfig =
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
@@ -26936,6 +27236,28 @@ mod tests {
         .expect_err("out-of-range index must fail");
         assert!(err.to_string().contains("out of bounds"));
 
+        let max_indexes =
+            std::iter::repeat_n(0u32, super::RELAY_MAX_GETBLOCKTXN_INDEXES).collect::<Vec<_>>();
+        let at_limit = process_relay_wire_message(
+            &mut state,
+            peer_id,
+            WireMessage::GetBlockTxn {
+                block_hash,
+                indexes: max_indexes,
+            },
+            1_006,
+        )
+        .expect("exact getblocktxn limit must pass");
+        assert!(
+            matches!(
+                at_limit.as_slice(),
+                [WireMessage::BlockTxn { block_hash: got, transactions }]
+                    if *got == block_hash
+                        && transactions.len() == super::RELAY_MAX_GETBLOCKTXN_INDEXES
+            ),
+            "exact getblocktxn boundary must return blocktxn payload"
+        );
+
         let too_many_indexes =
             (0..=super::RELAY_MAX_GETBLOCKTXN_INDEXES as u32).collect::<Vec<_>>();
         let err = process_relay_wire_message(
@@ -26945,7 +27267,7 @@ mod tests {
                 block_hash,
                 indexes: too_many_indexes,
             },
-            1_007,
+            1_008,
         )
         .expect_err("oversized getblocktxn must fail");
         assert!(err.to_string().contains("getblocktxn indexes exceed limit"));
