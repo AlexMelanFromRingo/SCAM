@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::convert::Infallible;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
@@ -10,10 +11,14 @@ use std::time::{Duration, Instant, SystemTime};
 
 use axum::{
     Router,
+    body::{Body as AxumBody, Bytes as AxumBytes},
     extract::{Path as AxumPath, State as AxumState},
-    http::{HeaderValue, StatusCode, header},
-    response::{IntoResponse, Response as AxumResponse},
-    routing::get,
+    http::{HeaderValue, Method, StatusCode, Uri, header},
+    response::{
+        IntoResponse, Response as AxumResponse,
+        sse::{Event as AxumSseEvent, KeepAlive as AxumSseKeepAlive, Sse as AxumSse},
+    },
+    routing::{get, post},
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use num_traits::ToPrimitive;
@@ -74,6 +79,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::{sleep, timeout};
 use tokio_socks::tcp::Socks5Stream;
+use tokio_stream::{StreamExt, wrappers::IntervalStream};
 
 #[derive(Debug, Parser)]
 #[command(name = "scam-node")]
@@ -14173,10 +14179,14 @@ fn rpc_http_backend_from_env() -> RpcHttpBackend {
 
 #[derive(Clone)]
 struct AxumRpcState {
+    network: Network,
     cfg: ChainConfig,
     runtime_db_path: PathBuf,
     mempool_db_path: PathBuf,
+    relay_telemetry: Option<PathBuf>,
     stratum_telemetry: Option<PathBuf>,
+    pool_ledger_db_path: PathBuf,
+    ui_dir: PathBuf,
 }
 
 fn axum_json_response(status: StatusCode, body: String) -> AxumResponse {
@@ -14186,6 +14196,41 @@ fn axum_json_response(status: StatusCode, body: String) -> AxumResponse {
         HeaderValue::from_static("application/json"),
     );
     response
+}
+
+fn axum_binary_response(
+    status: StatusCode,
+    content_type: &'static str,
+    body: Vec<u8>,
+) -> AxumResponse {
+    let mut response = AxumResponse::new(AxumBody::from(body));
+    *response.status_mut() = status;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_str(content_type)
+            .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
+    );
+    response
+}
+
+fn axum_bad_request(err: impl ToString) -> AxumResponse {
+    axum_json_response(StatusCode::BAD_REQUEST, json_error_body(&err.to_string()))
+}
+
+fn axum_internal_error(err: impl ToString) -> AxumResponse {
+    axum_json_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        json_error_body(&err.to_string()),
+    )
+}
+
+fn axum_parse_json_body<T: DeserializeOwned>(body: AxumBytes) -> Result<T, NodeError> {
+    let request = HttpRequest {
+        method: "POST".to_owned(),
+        path: "/".to_owned(),
+        body: body.to_vec(),
+    };
+    parse_json_body::<T>(&request)
 }
 
 fn axum_status_payload(state: &AxumRpcState) -> Result<StatusResponse, NodeError> {
@@ -14237,6 +14282,297 @@ fn axum_runtime_for_query(state: &AxumRpcState) -> Result<ChainRuntime, NodeErro
     Ok(runtime)
 }
 
+fn axum_block_response(state: &AxumRpcState, height: u64) -> AxumResponse {
+    let runtime = match axum_runtime_for_query(state) {
+        Ok(runtime) => runtime,
+        Err(err) => return axum_internal_error(err),
+    };
+    let Some(hash) = runtime.block_hash_at_height(height) else {
+        return axum_json_response(
+            StatusCode::NOT_FOUND,
+            json_error_body(&format!("height {height} not found")),
+        );
+    };
+    let Some(block) = runtime.block_by_hash(&hash) else {
+        return axum_internal_error(format!("block for height {height} missing"));
+    };
+    match to_pretty_json(&block_lookup_response(height, block)) {
+        Ok(body) => axum_json_response(StatusCode::OK, body),
+        Err(err) => axum_internal_error(format!("block serialization failed: {err}")),
+    }
+}
+
+fn axum_tx_response(state: &AxumRpcState, height: u64, index: usize) -> AxumResponse {
+    let runtime = match axum_runtime_for_query(state) {
+        Ok(runtime) => runtime,
+        Err(err) => return axum_internal_error(err),
+    };
+    let Some(hash) = runtime.block_hash_at_height(height) else {
+        return axum_json_response(
+            StatusCode::NOT_FOUND,
+            json_error_body(&format!("height {height} not found")),
+        );
+    };
+    let Some(block) = runtime.block_by_hash(&hash) else {
+        return axum_internal_error(format!("block for height {height} missing"));
+    };
+    let Some(tx) = block.transactions.get(index) else {
+        return axum_json_response(
+            StatusCode::NOT_FOUND,
+            json_error_body(&format!(
+                "tx index {index} not found in block at height {height}"
+            )),
+        );
+    };
+    match to_pretty_json(&tx_lookup_response(height, index, tx)) {
+        Ok(body) => axum_json_response(StatusCode::OK, body),
+        Err(err) => axum_internal_error(format!("tx serialization failed: {err}")),
+    }
+}
+
+fn axum_txid_response(state: &AxumRpcState, txid_raw: &str) -> AxumResponse {
+    if rpc_txid_path_is_invalid(txid_raw) {
+        return axum_bad_request("txid path must be /txid/<hex-txid>");
+    }
+    let needle_txid = match Hash256::from_hex(txid_raw) {
+        Ok(hash) => hash,
+        Err(_) => return axum_bad_request("invalid txid hex, expected 32-byte hash"),
+    };
+    let runtime = match axum_runtime_for_query(state) {
+        Ok(runtime) => runtime,
+        Err(err) => return axum_internal_error(err),
+    };
+    let mut located = None::<(u64, usize, TxLookupRpcResponse)>;
+    for height in 0..=runtime.tip_height() {
+        let Some(hash) = runtime.block_hash_at_height(height) else {
+            continue;
+        };
+        let Some(block) = runtime.block_by_hash(&hash) else {
+            return axum_internal_error(format!("block for height {height} missing"));
+        };
+        if let Some((index, tx)) = find_tx_by_txid(block, needle_txid) {
+            located = Some((height, index, tx_lookup_response(height, index, tx)));
+            break;
+        }
+    }
+    match located {
+        Some((_height, _index, payload)) => match to_pretty_json(&payload) {
+            Ok(body) => axum_json_response(StatusCode::OK, body),
+            Err(err) => axum_internal_error(format!("tx serialization failed: {err}")),
+        },
+        None => axum_json_response(
+            StatusCode::NOT_FOUND,
+            json_error_body(&format!("txid {txid_raw} not found")),
+        ),
+    }
+}
+
+fn axum_pool_status_response(state: &AxumRpcState) -> Result<AxumResponse, NodeError> {
+    let telemetry = match state.stratum_telemetry.as_ref() {
+        Some(path) => load_latest_jsonl_record::<StratumServerTelemetrySnapshot>(path)?,
+        None => None,
+    };
+    let ledger_snapshot = load_pool_ledger_snapshot_with_retry(&state.pool_ledger_db_path)?;
+    let now_unix_sec = current_unix_sec().unwrap_or(0);
+    let ledger = ledger_snapshot
+        .as_ref()
+        .and_then(|snapshot| pool_ledger_status_from_snapshot(snapshot, now_unix_sec));
+    if pool_status_sources_missing(telemetry.is_some(), ledger.is_some()) {
+        return Ok(axum_json_response(
+            StatusCode::NOT_FOUND,
+            json_error_body("pool telemetry and ledger snapshots are not available"),
+        ));
+    }
+    let payload = PoolStatusRpcResponse { telemetry, ledger };
+    match to_pretty_json(&payload) {
+        Ok(body) => Ok(axum_json_response(StatusCode::OK, body)),
+        Err(err) => Ok(axum_internal_error(format!(
+            "pool status serialization failed: {err}"
+        ))),
+    }
+}
+
+fn axum_pool_worker_response(
+    state: &AxumRpcState,
+    worker_label: &str,
+) -> Result<AxumResponse, NodeError> {
+    let trimmed = worker_label.trim();
+    if trimmed.is_empty() {
+        return Ok(axum_bad_request("worker label must not be empty"));
+    }
+    let normalized = StratumPoolTelemetryState::sanitize_worker_label(trimmed);
+    let telemetry = match state.stratum_telemetry.as_ref() {
+        Some(path) => load_latest_jsonl_record::<StratumServerTelemetrySnapshot>(path)?,
+        None => None,
+    };
+    let telemetry_worker = telemetry.as_ref().and_then(|snapshot| {
+        snapshot
+            .top_workers
+            .iter()
+            .find(|entry| pool_worker_name_matches(&entry.worker, &normalized))
+            .cloned()
+    });
+    let ledger = load_pool_ledger_snapshot_with_retry(&state.pool_ledger_db_path)?;
+    let ledger_worker = ledger
+        .as_ref()
+        .and_then(|snapshot| pool_worker_status_from_snapshot(snapshot, &normalized));
+    if pool_worker_sources_missing(telemetry_worker.is_some(), ledger_worker.is_some()) {
+        return Ok(axum_json_response(
+            StatusCode::NOT_FOUND,
+            json_error_body(&format!(
+                "worker {normalized} not found in telemetry or pool ledger"
+            )),
+        ));
+    }
+    let payload = PoolWorkerRpcResponse {
+        worker: normalized,
+        telemetry: telemetry_worker,
+        ledger: ledger_worker,
+    };
+    match to_pretty_json(&payload) {
+        Ok(body) => Ok(axum_json_response(StatusCode::OK, body)),
+        Err(err) => Ok(axum_internal_error(format!(
+            "worker status serialization failed: {err}"
+        ))),
+    }
+}
+
+fn axum_pool_payouts_response(
+    state: &AxumRpcState,
+    completed: bool,
+) -> Result<AxumResponse, NodeError> {
+    match load_pool_ledger_snapshot_with_retry(&state.pool_ledger_db_path)? {
+        Some(snapshot) => {
+            let payouts = if completed {
+                snapshot.completed_payouts
+            } else {
+                snapshot.pending_payouts
+            };
+            let payload = PoolPayoutsRpcResponse {
+                network_id: snapshot.network_id.clone(),
+                source: state.pool_ledger_db_path.display().to_string(),
+                count: payouts.len(),
+                payouts,
+            };
+            match to_pretty_json(&payload) {
+                Ok(body) => Ok(axum_json_response(StatusCode::OK, body)),
+                Err(err) => Ok(axum_internal_error(format!(
+                    "pool payout serialization failed: {err}"
+                ))),
+            }
+        }
+        None => Ok(axum_json_response(
+            StatusCode::NOT_FOUND,
+            json_error_body("pool ledger snapshot not available"),
+        )),
+    }
+}
+
+fn axum_wallet_send_preview_payload(
+    state: &AxumRpcState,
+    req: WalletSendPreviewRpcRequest,
+) -> Result<WalletSendPreviewRpcResponse, NodeError> {
+    if wallet_send_preview_has_invalid_amount(req.amount) {
+        return Err(NodeError::Runtime("amount must be > 0".to_owned()));
+    }
+    let recipient = parse_address(&req.to)?;
+    let accepted_hrps = accepted_hrps_for_network(state.network, &state.cfg.hrp);
+    if should_reject_send_preview_hrp(&accepted_hrps, &recipient.hrp) {
+        return Err(NodeError::Runtime(format!(
+            "address hrp '{}' is not valid for network '{}' (accepted: {})",
+            recipient.hrp,
+            state.cfg.network_id,
+            accepted_hrps.join(", ")
+        )));
+    }
+    let mnemonic = WalletMnemonic::parse(&req.mnemonic)?;
+    let seed = mnemonic.to_seed(&req.passphrase);
+    let key = derive_wallet_key(&seed, req.account, req.index)?;
+    let runtime = axum_runtime_for_query(state)?;
+    let signed = build_signed_transfer_tx(
+        &runtime,
+        &state.cfg.network_id,
+        &key,
+        recipient.key_hash20,
+        req.amount,
+        req.fee,
+    )?;
+    let tx_bincode_hex = hex::encode(
+        bincode::serialize(&signed.tx)
+            .map_err(|err| NodeError::Runtime(format!("tx encode failed: {err}")))?,
+    );
+    Ok(WalletSendPreviewRpcResponse {
+        network_id: state.cfg.network_id.clone(),
+        txid: signed.tx.txid().to_hex(),
+        raw_tx_hex: hex::encode(signed.tx.encode_for_hash()),
+        tx_bincode_hex,
+        amount: req.amount,
+        fee: req.fee,
+        input_total: signed.input_total,
+        change: signed.change_value,
+        is_self_transfer: signed.is_self_transfer,
+        selected_inputs: signed
+            .selected_inputs
+            .into_iter()
+            .map(|item| WalletSendPreviewInput {
+                txid: item.outpoint.txid.to_hex(),
+                vout: item.outpoint.vout,
+                value: item.value,
+            })
+            .collect(),
+    })
+}
+
+fn axum_events_snapshot_payload(state: &AxumRpcState) -> Result<String, NodeError> {
+    let (runtime, _) = load_runtime_from_db_or_genesis(&state.cfg, &state.runtime_db_path)?;
+    let snapshot = build_rpc_event_snapshot(
+        &state.cfg,
+        &runtime,
+        &state.mempool_db_path,
+        state.relay_telemetry.as_deref(),
+        state.stratum_telemetry.as_deref(),
+    )?;
+    serde_json::to_string(&snapshot)
+        .map_err(|e| NodeError::Runtime(format!("events serialization failed: {e}")))
+}
+
+fn axum_try_serve_ui_asset(
+    ui_dir: &Path,
+    request_path: &str,
+) -> Result<Option<AxumResponse>, NodeError> {
+    if !ui_dir_is_servable(ui_dir) {
+        return Ok(None);
+    }
+    let Some(relative) = sanitize_ui_path(request_path) else {
+        return Ok(Some(axum_json_response(
+            StatusCode::BAD_REQUEST,
+            json_error_body("invalid asset path"),
+        )));
+    };
+    let candidate = ui_dir.join(relative);
+    let asset_path = if candidate.exists() && candidate.is_file() {
+        candidate
+    } else {
+        let index = ui_dir.join("index.html");
+        if index.exists() && index.is_file() {
+            index
+        } else {
+            return Ok(None);
+        }
+    };
+    let body = fs::read(&asset_path).map_err(|e| {
+        NodeError::Runtime(format!(
+            "cannot read ui asset {}: {e}",
+            asset_path.display()
+        ))
+    })?;
+    Ok(Some(axum_binary_response(
+        StatusCode::OK,
+        guess_content_type(&asset_path),
+        body,
+    )))
+}
+
 async fn axum_mempool_handler(AxumState(state): AxumState<AxumRpcState>) -> AxumResponse {
     let mut txids = Vec::<String>::new();
     let mut tx_count = None::<usize>;
@@ -14261,101 +14597,484 @@ async fn axum_mempool_handler(AxumState(state): AxumState<AxumRpcState>) -> Axum
             }
         }
     }
-    let payload = MempoolSummaryRpcResponse {
-        available: tx_count.is_some(),
-        source: format!("mempool db: {}", state.mempool_db_path.display()),
-        snapshot: None,
-        tx_count,
-        txids,
+    let summary = if let Some(telemetry_path) = state.relay_telemetry.as_ref() {
+        match load_latest_jsonl_record::<RelayServerTelemetrySnapshot>(telemetry_path) {
+            Ok(Some(snapshot)) => MempoolSummaryRpcResponse {
+                available: true,
+                source: telemetry_path.display().to_string(),
+                snapshot: Some(snapshot),
+                tx_count,
+                txids,
+            },
+            Ok(None) => MempoolSummaryRpcResponse {
+                available: tx_count.is_some(),
+                source: telemetry_path.display().to_string(),
+                snapshot: None,
+                tx_count,
+                txids,
+            },
+            Err(err) => return axum_internal_error(err),
+        }
+    } else {
+        MempoolSummaryRpcResponse {
+            available: tx_count.is_some(),
+            source: format!("mempool db: {}", state.mempool_db_path.display()),
+            snapshot: None,
+            tx_count,
+            txids,
+        }
     };
-    match to_pretty_json(&payload) {
+    match to_pretty_json(&summary) {
         Ok(body) => axum_json_response(StatusCode::OK, body),
-        Err(err) => axum_json_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            json_error_body(&format!("mempool serialization failed: {err}")),
-        ),
+        Err(err) => axum_internal_error(format!("mempool serialization failed: {err}")),
     }
 }
 
 async fn axum_block_handler(
-    AxumPath(height): AxumPath<u64>,
+    AxumPath(tail): AxumPath<String>,
     AxumState(state): AxumState<AxumRpcState>,
 ) -> AxumResponse {
-    let runtime = match axum_runtime_for_query(&state) {
-        Ok(runtime) => runtime,
-        Err(err) => {
-            return axum_json_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                json_error_body(&err.to_string()),
-            );
-        }
-    };
-    let Some(hash) = runtime.block_hash_at_height(height) else {
-        return axum_json_response(
-            StatusCode::NOT_FOUND,
-            json_error_body(&format!("height {height} not found")),
-        );
-    };
-    let Some(block) = runtime.block_by_hash(&hash) else {
-        return axum_json_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            json_error_body(&format!("block for height {height} missing")),
-        );
-    };
-    match to_pretty_json(&block_lookup_response(height, block)) {
-        Ok(body) => axum_json_response(StatusCode::OK, body),
-        Err(err) => axum_json_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            json_error_body(&format!("block serialization failed: {err}")),
-        ),
+    if tail.is_empty() || tail.contains('/') {
+        return axum_bad_request("invalid block height, expected unsigned integer");
+    }
+    match tail.parse::<u64>() {
+        Ok(height) => axum_block_response(&state, height),
+        Err(_) => axum_bad_request("invalid block height, expected unsigned integer"),
     }
 }
 
 async fn axum_tx_handler(
-    AxumPath((height, index)): AxumPath<(u64, usize)>,
+    AxumPath(tail): AxumPath<String>,
     AxumState(state): AxumState<AxumRpcState>,
 ) -> AxumResponse {
-    let runtime = match axum_runtime_for_query(&state) {
-        Ok(runtime) => runtime,
-        Err(err) => {
-            return axum_json_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                json_error_body(&err.to_string()),
-            );
-        }
-    };
-    let Some(hash) = runtime.block_hash_at_height(height) else {
-        return axum_json_response(
-            StatusCode::NOT_FOUND,
-            json_error_body(&format!("height {height} not found")),
-        );
-    };
-    let Some(block) = runtime.block_by_hash(&hash) else {
-        return axum_json_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            json_error_body(&format!("block for height {height} missing")),
-        );
-    };
-    let Some(tx) = block.transactions.get(index) else {
-        return axum_json_response(
-            StatusCode::NOT_FOUND,
-            json_error_body(&format!("tx index {index} not found in height {height}")),
-        );
-    };
-    match to_pretty_json(&tx_lookup_response(height, index, tx)) {
-        Ok(body) => axum_json_response(StatusCode::OK, body),
-        Err(err) => axum_json_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            json_error_body(&format!("tx serialization failed: {err}")),
-        ),
+    let mut parts = tail.split('/');
+    let height_raw = parts.next().unwrap_or_default();
+    let index_raw = parts.next().unwrap_or_default();
+    let has_extra = parts.next().is_some();
+    if rpc_tx_path_is_invalid(height_raw, index_raw, has_extra) {
+        return axum_bad_request("tx path must be /tx/<height>/<index>");
+    }
+    match parse_tx_height_and_index(height_raw, index_raw) {
+        Some((height, index)) => axum_tx_response(&state, height, index),
+        None => axum_bad_request("invalid tx path numbers, expected /tx/<height>/<index>"),
     }
 }
 
-async fn axum_not_implemented_handler() -> AxumResponse {
-    axum_json_response(
-        StatusCode::NOT_IMPLEMENTED,
-        json_error_body("axum backend currently supports only /health and /status"),
-    )
+async fn axum_txid_handler(
+    AxumPath(txid_raw): AxumPath<String>,
+    AxumState(state): AxumState<AxumRpcState>,
+) -> AxumResponse {
+    axum_txid_response(&state, &txid_raw)
+}
+
+async fn axum_events_handler(AxumState(state): AxumState<AxumRpcState>) -> AxumResponse {
+    let stream_state = state.clone();
+    let stream =
+        IntervalStream::new(tokio::time::interval(Duration::from_secs(1))).map(move |_| {
+            let data = match axum_events_snapshot_payload(&stream_state) {
+                Ok(payload) => payload,
+                Err(err) => json_error_body(&err.to_string()),
+            };
+            Ok::<AxumSseEvent, Infallible>(AxumSseEvent::default().event("snapshot").data(data))
+        });
+    AxumSse::new(stream)
+        .keep_alive(
+            AxumSseKeepAlive::new()
+                .interval(Duration::from_secs(1))
+                .text("heartbeat"),
+        )
+        .into_response()
+}
+
+async fn axum_pool_status_handler(AxumState(state): AxumState<AxumRpcState>) -> AxumResponse {
+    match axum_pool_status_response(&state) {
+        Ok(response) => response,
+        Err(err) => axum_internal_error(err),
+    }
+}
+
+async fn axum_pool_worker_handler(
+    AxumPath(label): AxumPath<String>,
+    AxumState(state): AxumState<AxumRpcState>,
+) -> AxumResponse {
+    match axum_pool_worker_response(&state, &label) {
+        Ok(response) => response,
+        Err(err) => axum_internal_error(err),
+    }
+}
+
+async fn axum_pool_payouts_pending_handler(
+    AxumState(state): AxumState<AxumRpcState>,
+) -> AxumResponse {
+    match axum_pool_payouts_response(&state, false) {
+        Ok(response) => response,
+        Err(err) => axum_internal_error(err),
+    }
+}
+
+async fn axum_pool_payouts_completed_handler(
+    AxumState(state): AxumState<AxumRpcState>,
+) -> AxumResponse {
+    match axum_pool_payouts_response(&state, true) {
+        Ok(response) => response,
+        Err(err) => axum_internal_error(err),
+    }
+}
+
+async fn axum_wallet_new_handler(
+    AxumState(state): AxumState<AxumRpcState>,
+    body: AxumBytes,
+) -> AxumResponse {
+    let req = match axum_parse_json_body::<WalletNewRpcRequest>(body) {
+        Ok(req) => req,
+        Err(err) => return axum_bad_request(err),
+    };
+    let mnemonic = match new_mnemonic(req.words) {
+        Ok(value) => value,
+        Err(err) => return axum_bad_request(err),
+    };
+    let seed = mnemonic.to_seed(&req.passphrase);
+    let key = match derive_wallet_key(&seed, req.account, req.index) {
+        Ok(value) => value,
+        Err(err) => return axum_bad_request(err),
+    };
+    let hrp = req.hrp.unwrap_or_else(|| state.cfg.hrp.clone());
+    let payload = match wallet_address_response(&state.cfg, req.account, req.index, &hrp, &key) {
+        Ok(value) => value,
+        Err(err) => return axum_bad_request(err),
+    };
+    let body = serde_json::json!({
+        "mnemonic": mnemonic.phrase(),
+        "network_id": payload.network_id,
+        "hrp": payload.hrp,
+        "account": payload.account,
+        "index": payload.index,
+        "address": payload.address,
+        "pubkey_compressed_hex": payload.pubkey_compressed_hex,
+        "key_hash20_hex": payload.key_hash20_hex
+    });
+    match serde_json::to_string_pretty(&body) {
+        Ok(rendered) => axum_json_response(StatusCode::OK, rendered),
+        Err(err) => axum_internal_error(format!("wallet new serialization failed: {err}")),
+    }
+}
+
+async fn axum_wallet_address_handler(
+    AxumState(state): AxumState<AxumRpcState>,
+    body: AxumBytes,
+) -> AxumResponse {
+    let req = match axum_parse_json_body::<WalletAddressRpcRequest>(body) {
+        Ok(req) => req,
+        Err(err) => return axum_bad_request(err),
+    };
+    let mnemonic = match WalletMnemonic::parse(&req.mnemonic) {
+        Ok(value) => value,
+        Err(err) => return axum_bad_request(err),
+    };
+    let seed = mnemonic.to_seed(&req.passphrase);
+    let key = match derive_wallet_key(&seed, req.account, req.index) {
+        Ok(value) => value,
+        Err(err) => return axum_bad_request(err),
+    };
+    let hrp = req.hrp.unwrap_or_else(|| state.cfg.hrp.clone());
+    let payload = match wallet_address_response(&state.cfg, req.account, req.index, &hrp, &key) {
+        Ok(value) => value,
+        Err(err) => return axum_bad_request(err),
+    };
+    match to_pretty_json(&payload) {
+        Ok(body) => axum_json_response(StatusCode::OK, body),
+        Err(err) => axum_internal_error(format!("wallet address serialization failed: {err}")),
+    }
+}
+
+async fn axum_wallet_decode_handler(
+    AxumState(_state): AxumState<AxumRpcState>,
+    body: AxumBytes,
+) -> AxumResponse {
+    let req = match axum_parse_json_body::<WalletDecodeRpcRequest>(body) {
+        Ok(req) => req,
+        Err(err) => return axum_bad_request(err),
+    };
+    let decoded = match parse_address(&req.address) {
+        Ok(decoded) => decoded,
+        Err(err) => return axum_bad_request(err),
+    };
+    let payload = WalletDecodeRpcResponse {
+        hrp: decoded.hrp,
+        key_hash20_hex: hex::encode(decoded.key_hash20),
+    };
+    match to_pretty_json(&payload) {
+        Ok(body) => axum_json_response(StatusCode::OK, body),
+        Err(err) => axum_internal_error(format!("wallet decode serialization failed: {err}")),
+    }
+}
+
+async fn axum_wallet_balance_handler(
+    AxumState(state): AxumState<AxumRpcState>,
+    body: AxumBytes,
+) -> AxumResponse {
+    let req = match axum_parse_json_body::<WalletBalanceRpcRequest>(body) {
+        Ok(req) => req,
+        Err(err) => return axum_bad_request(err),
+    };
+    let mnemonic = match WalletMnemonic::parse(&req.mnemonic) {
+        Ok(value) => value,
+        Err(err) => return axum_bad_request(err),
+    };
+    let seed = mnemonic.to_seed(&req.passphrase);
+    let key = match derive_wallet_key(&seed, req.account, req.index) {
+        Ok(value) => value,
+        Err(err) => return axum_bad_request(err),
+    };
+    let address_payload =
+        match wallet_address_response(&state.cfg, req.account, req.index, &state.cfg.hrp, &key) {
+            Ok(value) => value,
+            Err(err) => return axum_bad_request(err),
+        };
+    let runtime = match axum_runtime_for_query(&state) {
+        Ok(runtime) => runtime,
+        Err(err) => return axum_internal_error(err),
+    };
+    let key_hash20 = scam_core::hash160_blake3(&key.pubkey_compressed());
+    let payload = wallet_balance_response(
+        &runtime,
+        &state.cfg,
+        req.account,
+        req.index,
+        address_payload.address,
+        key_hash20,
+    );
+    match to_pretty_json(&payload) {
+        Ok(body) => axum_json_response(StatusCode::OK, body),
+        Err(err) => axum_internal_error(format!("wallet balance serialization failed: {err}")),
+    }
+}
+
+async fn axum_wallet_balance_by_address_handler(
+    AxumState(state): AxumState<AxumRpcState>,
+    body: AxumBytes,
+) -> AxumResponse {
+    let req = match axum_parse_json_body::<WalletBalanceByAddressRpcRequest>(body) {
+        Ok(req) => req,
+        Err(err) => return axum_bad_request(err),
+    };
+    let decoded = match parse_address(&req.address) {
+        Ok(value) => value,
+        Err(err) => return axum_bad_request(err),
+    };
+    let accepted_hrps = accepted_hrps_for_network(state.network, &state.cfg.hrp);
+    if should_reject_send_preview_hrp(&accepted_hrps, &decoded.hrp) {
+        return axum_bad_request(format!(
+            "address hrp '{}' is not valid for network '{}' (accepted: {})",
+            decoded.hrp,
+            state.cfg.network_id,
+            accepted_hrps.join(", ")
+        ));
+    }
+    let runtime = match axum_runtime_for_query(&state) {
+        Ok(runtime) => runtime,
+        Err(err) => return axum_internal_error(err),
+    };
+    let payload =
+        wallet_balance_response(&runtime, &state.cfg, 0, 0, req.address, decoded.key_hash20);
+    match to_pretty_json(&payload) {
+        Ok(body) => axum_json_response(StatusCode::OK, body),
+        Err(err) => axum_internal_error(format!(
+            "wallet balance-by-address serialization failed: {err}"
+        )),
+    }
+}
+
+async fn axum_wallet_balance_history_by_address_handler(
+    AxumState(state): AxumState<AxumRpcState>,
+    body: AxumBytes,
+) -> AxumResponse {
+    let req = match axum_parse_json_body::<WalletBalanceHistoryByAddressRpcRequest>(body) {
+        Ok(req) => req,
+        Err(err) => return axum_bad_request(err),
+    };
+    let decoded = match parse_address(&req.address) {
+        Ok(value) => value,
+        Err(err) => return axum_bad_request(err),
+    };
+    let accepted_hrps = accepted_hrps_for_network(state.network, &state.cfg.hrp);
+    if should_reject_send_preview_hrp(&accepted_hrps, &decoded.hrp) {
+        return axum_bad_request(format!(
+            "address hrp '{}' is not valid for network '{}' (accepted: {})",
+            decoded.hrp,
+            state.cfg.network_id,
+            accepted_hrps.join(", ")
+        ));
+    }
+    let runtime = match axum_runtime_for_query(&state) {
+        Ok(runtime) => runtime,
+        Err(err) => return axum_internal_error(err),
+    };
+    let balance =
+        wallet_balance_response(&runtime, &state.cfg, 0, 0, req.address, decoded.key_hash20);
+    let tx_history = wallet_tx_history_for_key_hash(&runtime, decoded.key_hash20, req.max_entries);
+    let payload = WalletBalanceHistoryRpcResponse {
+        balance,
+        tx_history,
+    };
+    match to_pretty_json(&payload) {
+        Ok(body) => axum_json_response(StatusCode::OK, body),
+        Err(err) => axum_internal_error(format!(
+            "wallet balance-history-by-address serialization failed: {err}"
+        )),
+    }
+}
+
+async fn axum_wallet_send_preview_handler(
+    AxumState(state): AxumState<AxumRpcState>,
+    body: AxumBytes,
+) -> AxumResponse {
+    let req = match axum_parse_json_body::<WalletSendPreviewRpcRequest>(body) {
+        Ok(req) => req,
+        Err(err) => return axum_bad_request(err),
+    };
+    let payload = match axum_wallet_send_preview_payload(&state, req) {
+        Ok(payload) => payload,
+        Err(err) => return axum_bad_request(err),
+    };
+    match to_pretty_json(&payload) {
+        Ok(body) => axum_json_response(StatusCode::OK, body),
+        Err(err) => axum_internal_error(format!("wallet send serialization failed: {err}")),
+    }
+}
+
+async fn axum_wallet_send_handler(
+    AxumState(state): AxumState<AxumRpcState>,
+    body: AxumBytes,
+) -> AxumResponse {
+    let req = match axum_parse_json_body::<WalletSendPreviewRpcRequest>(body) {
+        Ok(req) => req,
+        Err(err) => return axum_bad_request(err),
+    };
+    let preview_payload = match axum_wallet_send_preview_payload(&state, req) {
+        Ok(payload) => payload,
+        Err(err) => return axum_bad_request(err),
+    };
+    let tx_bytes = match hex::decode(&preview_payload.tx_bincode_hex) {
+        Ok(bytes) => bytes,
+        Err(err) => return axum_internal_error(format!("tx decode failed: {err}")),
+    };
+    let tx: Transaction = match bincode::deserialize(&tx_bytes) {
+        Ok(tx) => tx,
+        Err(err) => return axum_internal_error(format!("tx decode failed: {err}")),
+    };
+    let (txid, outcome, effective_fee) = match submit_tx_via_mempool_db(
+        &state.cfg,
+        &state.runtime_db_path,
+        &state.mempool_db_path,
+        tx,
+        preview_payload.fee,
+    ) {
+        Ok(value) => value,
+        Err(err) => return axum_bad_request(err),
+    };
+    let payload = WalletSendRpcResponse {
+        network_id: state.cfg.network_id.clone(),
+        txid: txid.to_hex(),
+        fee: effective_fee,
+        amount: preview_payload.amount,
+        input_total: preview_payload.input_total,
+        change: preview_payload.change,
+        is_self_transfer: preview_payload.is_self_transfer,
+        mempool_outcome: outcome,
+        selected_inputs: preview_payload.selected_inputs,
+    };
+    match to_pretty_json(&payload) {
+        Ok(body) => axum_json_response(StatusCode::OK, body),
+        Err(err) => axum_internal_error(format!("wallet send serialization failed: {err}")),
+    }
+}
+
+async fn axum_tx_submit_handler(
+    AxumState(state): AxumState<AxumRpcState>,
+    body: AxumBytes,
+) -> AxumResponse {
+    let req = match axum_parse_json_body::<TxSubmitRpcRequest>(body) {
+        Ok(req) => req,
+        Err(err) => return axum_bad_request(err),
+    };
+    let (tx, requested_fee) = match decode_tx_submit_request(&req) {
+        Ok(value) => value,
+        Err(err) => return axum_bad_request(err),
+    };
+    let (txid, outcome, effective_fee) = match submit_tx_via_mempool_db(
+        &state.cfg,
+        &state.runtime_db_path,
+        &state.mempool_db_path,
+        tx,
+        requested_fee,
+    ) {
+        Ok(value) => value,
+        Err(err) => return axum_bad_request(err),
+    };
+    let payload = TxSubmitRpcResponse {
+        network_id: state.cfg.network_id.clone(),
+        txid: txid.to_hex(),
+        fee: effective_fee,
+        mempool_outcome: outcome,
+    };
+    match to_pretty_json(&payload) {
+        Ok(body) => axum_json_response(StatusCode::OK, body),
+        Err(err) => axum_internal_error(format!("tx submit serialization failed: {err}")),
+    }
+}
+
+async fn axum_wallet_qr_handler(
+    AxumState(_state): AxumState<AxumRpcState>,
+    body: AxumBytes,
+) -> AxumResponse {
+    let req = match axum_parse_json_body::<WalletQrRpcRequest>(body) {
+        Ok(req) => req,
+        Err(err) => return axum_bad_request(err),
+    };
+    if req.address.trim().is_empty() {
+        return axum_bad_request("address must not be empty");
+    }
+    let ascii = match qr_for_payment_uri(&req.address, req.amount, req.label.as_deref()) {
+        Ok(value) => value,
+        Err(err) => return axum_bad_request(err),
+    };
+    let payload = WalletQrRpcResponse { ascii };
+    match to_pretty_json(&payload) {
+        Ok(body) => axum_json_response(StatusCode::OK, body),
+        Err(err) => axum_internal_error(format!("wallet qr serialization failed: {err}")),
+    }
+}
+
+async fn axum_fallback_handler(
+    AxumState(state): AxumState<AxumRpcState>,
+    method: Method,
+    uri: Uri,
+) -> AxumResponse {
+    let path = uri.path();
+
+    if method == Method::GET {
+        if path.starts_with("/txid/") {
+            let txid_raw = path.trim_start_matches("/txid/");
+            return axum_txid_response(&state, txid_raw);
+        }
+        if path.starts_with("/pool/worker/") {
+            let worker_label = path.trim_start_matches("/pool/worker/");
+            return match axum_pool_worker_response(&state, worker_label) {
+                Ok(response) => response,
+                Err(err) => axum_internal_error(err),
+            };
+        }
+        if should_attempt_ui_asset_serve(method.as_str()) {
+            match axum_try_serve_ui_asset(&state.ui_dir, path) {
+                Ok(Some(response)) => return response,
+                Ok(None) => {}
+                Err(err) => return axum_internal_error(err),
+            }
+        }
+    }
+
+    axum_json_response(StatusCode::NOT_FOUND, json_error_body("unknown endpoint"))
 }
 
 fn run_rpc_serve_inner_axum(
@@ -14367,19 +15086,22 @@ fn run_rpc_serve_inner_axum(
         config,
         runtime_db,
         bind,
-        ui_dir: _,
-        relay_telemetry: _,
+        ui_dir,
+        relay_telemetry,
         stratum_telemetry,
-        pool_ledger: _,
+        pool_ledger,
         mine_blocks,
         interval_sec,
         max_nonce,
-        max_requests: _,
+        max_requests,
     } = args;
     let runtime_db_path = runtime_db
         .clone()
         .unwrap_or_else(|| default_runtime_db_path(network));
     let mempool_db_path = default_mempool_db_path(&runtime_db_path);
+    let pool_ledger_db_path = pool_ledger
+        .clone()
+        .unwrap_or_else(|| default_pool_ledger_db_path(&runtime_db_path));
     let (cfg, runtime) = build_runtime_for_query(
         network,
         config,
@@ -14397,14 +15119,30 @@ fn run_rpc_serve_inner_axum(
         runtime.tip_hash()
     );
     println!(
-        "Endpoints (axum): GET /health, /status, /mempool, /block/<height>, /tx/<height>/<index> (other routes stay on legacy backend for now)"
+        "Endpoints (axum): GET /health, /status, /block/<height>, /tx/<height>/<index>, /txid/<txid>, /mempool, /events, /pool/status, /pool/worker/<label>, /pool/payouts/pending, /pool/payouts/completed; POST /wallet/new, /wallet/address, /wallet/decode, /wallet/balance, /wallet/balance-by-address, /wallet/balance-history-by-address, /wallet/send-preview, /wallet/send, /tx/submit, /wallet/qr"
     );
+    println!("UI assets directory: {}", ui_dir.display());
+    println!("Mempool DB source: {}", mempool_db_path.display());
+    if let Some(path) = relay_telemetry.as_ref() {
+        println!("Relay telemetry source: {}", path.display());
+    }
+    if let Some(path) = stratum_telemetry.as_ref() {
+        println!("Stratum telemetry source: {}", path.display());
+    }
+    println!("Pool ledger source: {}", pool_ledger_db_path.display());
+    if max_requests_reached(max_requests, max_requests) {
+        println!("Max requests before exit: {}", max_requests);
+    }
 
     let shared = AxumRpcState {
+        network,
         cfg,
         runtime_db_path,
         mempool_db_path,
+        relay_telemetry,
         stratum_telemetry,
+        pool_ledger_db_path,
+        ui_dir,
     };
     let listener_bind = bind.clone();
 
@@ -14423,9 +15161,40 @@ fn run_rpc_serve_inner_axum(
                 .route("/health", get(axum_health_handler))
                 .route("/status", get(axum_status_handler))
                 .route("/mempool", get(axum_mempool_handler))
-                .route("/block/{height}", get(axum_block_handler))
-                .route("/tx/{height}/{index}", get(axum_tx_handler))
-                .fallback(get(axum_not_implemented_handler))
+                .route("/events", get(axum_events_handler))
+                .route("/pool/status", get(axum_pool_status_handler))
+                .route("/pool/worker/{*label}", get(axum_pool_worker_handler))
+                .route(
+                    "/pool/payouts/pending",
+                    get(axum_pool_payouts_pending_handler),
+                )
+                .route(
+                    "/pool/payouts/completed",
+                    get(axum_pool_payouts_completed_handler),
+                )
+                .route("/block/{*tail}", get(axum_block_handler))
+                .route("/tx/{*tail}", get(axum_tx_handler))
+                .route("/txid/{*txid}", get(axum_txid_handler))
+                .route("/wallet/new", post(axum_wallet_new_handler))
+                .route("/wallet/address", post(axum_wallet_address_handler))
+                .route("/wallet/balance", post(axum_wallet_balance_handler))
+                .route("/wallet/decode", post(axum_wallet_decode_handler))
+                .route(
+                    "/wallet/balance-by-address",
+                    post(axum_wallet_balance_by_address_handler),
+                )
+                .route(
+                    "/wallet/balance-history-by-address",
+                    post(axum_wallet_balance_history_by_address_handler),
+                )
+                .route(
+                    "/wallet/send-preview",
+                    post(axum_wallet_send_preview_handler),
+                )
+                .route("/wallet/send", post(axum_wallet_send_handler))
+                .route("/wallet/qr", post(axum_wallet_qr_handler))
+                .route("/tx/submit", post(axum_tx_submit_handler))
+                .fallback(axum_fallback_handler)
                 .with_state(shared);
 
             let graceful_shutdown_flag = shutdown_flag.clone();
