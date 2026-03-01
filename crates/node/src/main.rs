@@ -10,7 +10,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use axum::{
     Router,
-    extract::State as AxumState,
+    extract::{Path as AxumPath, State as AxumState},
     http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response as AxumResponse},
     routing::get,
@@ -14175,6 +14175,7 @@ fn rpc_http_backend_from_env() -> RpcHttpBackend {
 struct AxumRpcState {
     cfg: ChainConfig,
     runtime_db_path: PathBuf,
+    mempool_db_path: PathBuf,
     stratum_telemetry: Option<PathBuf>,
 }
 
@@ -14231,6 +14232,125 @@ async fn axum_status_handler(AxumState(state): AxumState<AxumRpcState>) -> AxumR
     }
 }
 
+fn axum_runtime_for_query(state: &AxumRpcState) -> Result<ChainRuntime, NodeError> {
+    let (runtime, _) = load_runtime_from_db_or_genesis(&state.cfg, &state.runtime_db_path)?;
+    Ok(runtime)
+}
+
+async fn axum_mempool_handler(AxumState(state): AxumState<AxumRpcState>) -> AxumResponse {
+    let mut txids = Vec::<String>::new();
+    let mut tx_count = None::<usize>;
+    if state.mempool_db_path.exists() {
+        match load_mempool_from_db_or_empty_with_retry(&state.cfg, &state.mempool_db_path, 10, 15) {
+            Ok(mempool) => {
+                tx_count = Some(mempool.len());
+                txids = mempool
+                    .txids_by_feerate_desc()
+                    .into_iter()
+                    .map(|txid| txid.to_hex())
+                    .collect();
+            }
+            Err(err) => {
+                return axum_json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json_error_body(&format!(
+                        "mempool db load failed ({}): {err}",
+                        state.mempool_db_path.display()
+                    )),
+                );
+            }
+        }
+    }
+    let payload = MempoolSummaryRpcResponse {
+        available: tx_count.is_some(),
+        source: format!("mempool db: {}", state.mempool_db_path.display()),
+        snapshot: None,
+        tx_count,
+        txids,
+    };
+    match to_pretty_json(&payload) {
+        Ok(body) => axum_json_response(StatusCode::OK, body),
+        Err(err) => axum_json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json_error_body(&format!("mempool serialization failed: {err}")),
+        ),
+    }
+}
+
+async fn axum_block_handler(
+    AxumPath(height): AxumPath<u64>,
+    AxumState(state): AxumState<AxumRpcState>,
+) -> AxumResponse {
+    let runtime = match axum_runtime_for_query(&state) {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            return axum_json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json_error_body(&err.to_string()),
+            );
+        }
+    };
+    let Some(hash) = runtime.block_hash_at_height(height) else {
+        return axum_json_response(
+            StatusCode::NOT_FOUND,
+            json_error_body(&format!("height {height} not found")),
+        );
+    };
+    let Some(block) = runtime.block_by_hash(&hash) else {
+        return axum_json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json_error_body(&format!("block for height {height} missing")),
+        );
+    };
+    match to_pretty_json(&block_lookup_response(height, block)) {
+        Ok(body) => axum_json_response(StatusCode::OK, body),
+        Err(err) => axum_json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json_error_body(&format!("block serialization failed: {err}")),
+        ),
+    }
+}
+
+async fn axum_tx_handler(
+    AxumPath((height, index)): AxumPath<(u64, usize)>,
+    AxumState(state): AxumState<AxumRpcState>,
+) -> AxumResponse {
+    let runtime = match axum_runtime_for_query(&state) {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            return axum_json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json_error_body(&err.to_string()),
+            );
+        }
+    };
+    let Some(hash) = runtime.block_hash_at_height(height) else {
+        return axum_json_response(
+            StatusCode::NOT_FOUND,
+            json_error_body(&format!("height {height} not found")),
+        );
+    };
+    let Some(block) = runtime.block_by_hash(&hash) else {
+        return axum_json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json_error_body(&format!("block for height {height} missing")),
+        );
+    };
+    let Some(tx) = block.transactions.get(index) else {
+        return axum_json_response(
+            StatusCode::NOT_FOUND,
+            json_error_body(&format!("tx index {index} not found in height {height}")),
+        );
+    };
+    match to_pretty_json(&tx_lookup_response(height, index, tx)) {
+        Ok(body) => axum_json_response(StatusCode::OK, body),
+        Err(err) => axum_json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json_error_body(&format!("tx serialization failed: {err}")),
+        ),
+    }
+}
+
 async fn axum_not_implemented_handler() -> AxumResponse {
     axum_json_response(
         StatusCode::NOT_IMPLEMENTED,
@@ -14259,6 +14379,7 @@ fn run_rpc_serve_inner_axum(
     let runtime_db_path = runtime_db
         .clone()
         .unwrap_or_else(|| default_runtime_db_path(network));
+    let mempool_db_path = default_mempool_db_path(&runtime_db_path);
     let (cfg, runtime) = build_runtime_for_query(
         network,
         config,
@@ -14276,12 +14397,13 @@ fn run_rpc_serve_inner_axum(
         runtime.tip_hash()
     );
     println!(
-        "Endpoints (axum): GET /health, /status (other routes stay on legacy backend for now)"
+        "Endpoints (axum): GET /health, /status, /mempool, /block/<height>, /tx/<height>/<index> (other routes stay on legacy backend for now)"
     );
 
     let shared = AxumRpcState {
         cfg,
         runtime_db_path,
+        mempool_db_path,
         stratum_telemetry,
     };
     let listener_bind = bind.clone();
@@ -14300,6 +14422,9 @@ fn run_rpc_serve_inner_axum(
             let app = Router::new()
                 .route("/health", get(axum_health_handler))
                 .route("/status", get(axum_status_handler))
+                .route("/mempool", get(axum_mempool_handler))
+                .route("/block/{height}", get(axum_block_handler))
+                .route("/tx/{height}/{index}", get(axum_tx_handler))
                 .fallback(get(axum_not_implemented_handler))
                 .with_state(shared);
 
