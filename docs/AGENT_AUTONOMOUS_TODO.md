@@ -17,26 +17,27 @@
 
 ### Phase B: Battle-tested transport/protocol migration
 - [x] Migrate async SOCKS5 connect path to `tokio-socks` (remove hand-rolled async dial logic).
-- [~] Migrate `rpc-serve` HTTP path to `hyper`/`axum` while preserving existing route contracts/tests.
-  - Added `axum` backend scaffold (`SCAM_RPC_HTTP_BACKEND=axum`) with `GET /health`, `GET /status`, `GET /mempool`, `GET /block/<height>`, `GET /tx/<height>/<index>`.
-  - Legacy backend remains default until full route parity is reached.
+- [x] Migrate `rpc-serve` HTTP path to `hyper`/`axum` while preserving existing route contracts/tests.
+  - `axum` backend now implements full route parity for RPC GET/POST endpoints, SSE `/events`, pool routes, and UI asset fallback behavior.
+  - `SCAM_RPC_HTTP_BACKEND=axum` remains available for rollout control; legacy path is retained only as compatibility backend.
 - [x] Move wire framing onto battle-tested codec path (`tokio-util` codec) with strict size limits (async path).
 - [ ] Keep compatibility tests for version/handshake/frame boundary behavior.
 
 ### Phase C: Verification gates (mandatory after each sub-phase)
-- [ ] `cargo fmt --all`
-- [ ] `cargo check --workspace`
-- [ ] `cargo test --workspace`
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings`
+- [x] `cargo fmt --all`
+- [x] `cargo check --workspace`
+- [x] `cargo test --workspace`
+- [x] `cargo clippy --workspace --all-targets -- -D warnings`
 - [ ] Mutation gate re-check for stage2.
 
 ### Phase D: Local commit policy (no push)
 - [ ] Commit 1: Stage2 mutation fixes (`p2p/node`).
-- [ ] Commit 2: HTTP migration (`hyper`/`axum`) + route tests.
+- [x] Commit 2: HTTP migration (`hyper`/`axum`) + route tests.
 - [ ] Commit 3: wire/codec migration + framing tests.
 - [ ] Commit 4: final verification gate + docs status update.
 
 ## Current status snapshot
 - `p2p` targeted mutation loop for `discovery/gossip`: closed (0 misses in scoped run).
-- Full stage2 mutation: running now.
+- `rpc-serve` axum path: full route parity done, SSE and UI fallback included.
 - `p2p::transport` async frame path now uses `tokio-util` codec + strict magic/size checks.
+- Full stage2 mutation: pending final rerun after latest node/http changes.
