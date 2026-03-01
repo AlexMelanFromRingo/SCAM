@@ -18,7 +18,7 @@ use axum::{
         IntoResponse, Response as AxumResponse,
         sse::{Event as AxumSseEvent, KeepAlive as AxumSseKeepAlive, Sse as AxumSse},
     },
-    routing::{get, post},
+    routing::{any, get, post},
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use num_traits::ToPrimitive;
@@ -1135,10 +1135,6 @@ enum PoolPayoutModeArg {
 }
 
 impl PoolPayoutModeArg {
-    fn is_solo(self) -> bool {
-        matches!(self, Self::Solo)
-    }
-
     fn uses_pplns(self) -> bool {
         matches!(self, Self::Pplns | Self::Hybrid)
     }
@@ -9768,12 +9764,12 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
     let mut last_activity = Instant::now();
     let mut last_tip_hash = load_runtime_tip_hash(&ctx)?;
     let mut protocol_violations = 0u32;
-    let mut payout_key_hash20 = if ctx.pool_payout_cfg.mode.is_solo() {
+    let mut payout_key_hash20 = if ctx.pool_payout_cfg.mode == PoolPayoutModeArg::Solo {
         ctx.cfg.genesis_reward_key_hash20()?
     } else {
         ctx.pool_coinbase_key_hash20
     };
-    let mut payout_label = if ctx.pool_payout_cfg.mode.is_solo() {
+    let mut payout_label = if ctx.pool_payout_cfg.mode == PoolPayoutModeArg::Solo {
         stratum_coinbase_label(session.channel_id(), "default")
     } else {
         stratum_coinbase_label(session.channel_id(), "pool")
@@ -9847,7 +9843,7 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
                         SessionEvent::SetupAccepted => {}
                         SessionEvent::ChannelOpened { user, .. } => {
                             worker_label = StratumPoolTelemetryState::sanitize_worker_label(&user);
-                            if ctx.pool_payout_cfg.mode.is_solo() {
+                            if ctx.pool_payout_cfg.mode == PoolPayoutModeArg::Solo {
                                 if let Some(parsed) = stratum_user_payout_key_hash20(&user) {
                                     payout_key_hash20 = parsed;
                                     payout_label =
@@ -10554,7 +10550,7 @@ fn pool_payout_amount_from_atomic(amount_atomic: u128) -> Option<u64> {
 }
 
 fn maybe_process_pool_payouts(ctx: &StratumServerContext) -> Result<(), NodeError> {
-    if ctx.pool_payout_cfg.mode.is_solo() {
+    if ctx.pool_payout_cfg.mode == PoolPayoutModeArg::Solo {
         return Ok(());
     }
     let now_unix_sec = current_unix_sec()?;
@@ -11279,12 +11275,12 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
         }
         None => None,
     };
-    if !payout_cfg.mode.is_solo() && pool_payout_key.is_none() {
+    if payout_cfg.mode != PoolPayoutModeArg::Solo && pool_payout_key.is_none() {
         return Err(NodeError::Runtime(
             "pool payout mode requires --pool-payout-mnemonic".to_owned(),
         ));
     }
-    let pool_coinbase_key_hash20 = if payout_cfg.mode.is_solo() {
+    let pool_coinbase_key_hash20 = if payout_cfg.mode == PoolPayoutModeArg::Solo {
         cfg.genesis_reward_key_hash20()?
     } else {
         let key = pool_payout_key
@@ -14176,7 +14172,7 @@ enum RpcHttpBackend {
 
 fn rpc_http_backend_from_env() -> RpcHttpBackend {
     match env_opt("SCAM_RPC_HTTP_BACKEND")
-        .unwrap_or_else(|| "legacy".to_owned())
+        .unwrap_or_else(|| "axum".to_owned())
         .to_ascii_lowercase()
         .as_str()
     {
@@ -14677,7 +14673,10 @@ async fn axum_txid_handler(
 
 async fn axum_events_handler(AxumState(state): AxumState<AxumRpcState>) -> AxumResponse {
     let stream_state = state.clone();
-    let stream =
+    let initial = tokio_stream::once(Ok::<AxumSseEvent, Infallible>(
+        AxumSseEvent::default().comment("heartbeat"),
+    ));
+    let snapshots =
         IntervalStream::new(tokio::time::interval(Duration::from_secs(1))).map(move |_| {
             let data = match axum_events_snapshot_payload(&stream_state) {
                 Ok(payload) => payload,
@@ -14685,6 +14684,7 @@ async fn axum_events_handler(AxumState(state): AxumState<AxumRpcState>) -> AxumR
             };
             Ok::<AxumSseEvent, Infallible>(AxumSseEvent::default().event("snapshot").data(data))
         });
+    let stream = initial.chain(snapshots);
     AxumSse::new(stream)
         .keep_alive(
             AxumSseKeepAlive::new()
@@ -14709,6 +14709,17 @@ async fn axum_pool_worker_handler(
         Ok(response) => response,
         Err(err) => axum_internal_error(err),
     }
+}
+
+async fn axum_pool_worker_route_handler(
+    method: Method,
+    AxumPath(label): AxumPath<String>,
+    AxumState(state): AxumState<AxumRpcState>,
+) -> AxumResponse {
+    if method != Method::GET {
+        return axum_json_response(StatusCode::NOT_FOUND, json_error_body("unknown endpoint"));
+    }
+    axum_pool_worker_handler(AxumPath(label), AxumState(state)).await
 }
 
 async fn axum_pool_payouts_pending_handler(
@@ -15171,7 +15182,7 @@ fn run_rpc_serve_inner_axum(
                 .route("/mempool", get(axum_mempool_handler))
                 .route("/events", get(axum_events_handler))
                 .route("/pool/status", get(axum_pool_status_handler))
-                .route("/pool/worker/{*label}", get(axum_pool_worker_handler))
+                .route("/pool/worker/{*label}", any(axum_pool_worker_route_handler))
                 .route(
                     "/pool/payouts/pending",
                     get(axum_pool_payouts_pending_handler),
@@ -16560,17 +16571,21 @@ mod tests {
                 }
                 panic!("write request bytes: {err}");
             }
-            if let Err(err) = stream.shutdown(Shutdown::Write) {
-                if super::http_io_error_is_closed_like(&err) {
-                    last_closed_like_err = Some(err.to_string());
-                    continue;
-                }
-                panic!("shutdown write half: {err}");
-            }
             let mut response = String::new();
             match stream.read_to_string(&mut response) {
                 Ok(_) => return response,
                 Err(err) if super::http_io_error_is_closed_like(&err) => {
+                    if !response.is_empty() {
+                        return response;
+                    }
+                    last_closed_like_err = Some(err.to_string());
+                }
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
                     if !response.is_empty() {
                         return response;
                     }
@@ -16632,9 +16647,6 @@ mod tests {
         stream
             .write_all(request.as_bytes())
             .expect("write request bytes");
-        stream
-            .shutdown(Shutdown::Write)
-            .expect("shutdown write half");
         let start = Instant::now();
         let mut response = String::new();
         let mut buffer = [0u8; 1024];
@@ -18650,10 +18662,22 @@ mod tests {
 
     #[test]
     fn pool_mode_and_paths_helpers_are_strict() {
-        assert!(super::PoolPayoutModeArg::Solo.is_solo());
-        assert!(!super::PoolPayoutModeArg::Pplns.is_solo());
-        assert!(!super::PoolPayoutModeArg::Pps.is_solo());
-        assert!(!super::PoolPayoutModeArg::Hybrid.is_solo());
+        assert_eq!(
+            super::PoolPayoutModeArg::Solo,
+            super::PoolPayoutModeArg::Solo
+        );
+        assert_ne!(
+            super::PoolPayoutModeArg::Pplns,
+            super::PoolPayoutModeArg::Solo
+        );
+        assert_ne!(
+            super::PoolPayoutModeArg::Pps,
+            super::PoolPayoutModeArg::Solo
+        );
+        assert_ne!(
+            super::PoolPayoutModeArg::Hybrid,
+            super::PoolPayoutModeArg::Solo
+        );
         assert!(!super::PoolPayoutModeArg::Solo.uses_pplns());
         assert!(super::PoolPayoutModeArg::Pplns.uses_pplns());
         assert!(!super::PoolPayoutModeArg::Pps.uses_pplns());
@@ -21775,14 +21799,14 @@ mod tests {
     }
 
     #[test]
-    fn rpc_http_backend_from_env_defaults_to_legacy_and_accepts_overrides() {
+    fn rpc_http_backend_from_env_defaults_to_axum_and_accepts_overrides() {
         const KEY: &str = "SCAM_RPC_HTTP_BACKEND";
         unsafe {
             std::env::remove_var(KEY);
         }
         assert_eq!(
             super::rpc_http_backend_from_env(),
-            super::RpcHttpBackend::Legacy
+            super::RpcHttpBackend::Axum
         );
         unsafe {
             std::env::set_var(KEY, "axum");

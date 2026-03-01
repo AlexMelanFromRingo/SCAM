@@ -1,3 +1,4 @@
+use bincode::Options;
 use scam_core::{Block, BlockHeader, Hash256, Transaction};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -125,7 +126,9 @@ pub struct CompactBlock {
 }
 
 pub fn encode_message(message: &WireMessage) -> Result<Vec<u8>, WireError> {
-    bincode::serialize(message).map_err(WireError::Encode)
+    bincode::options()
+        .serialize(message)
+        .map_err(WireError::Encode)
 }
 
 pub fn decode_message(data: &[u8], max_message_size: usize) -> Result<WireMessage, WireError> {
@@ -135,7 +138,11 @@ pub fn decode_message(data: &[u8], max_message_size: usize) -> Result<WireMessag
             got: data.len(),
         });
     }
-    bincode::deserialize(data).map_err(WireError::Decode)
+    bincode::options()
+        .with_limit(max_message_size as u64)
+        .reject_trailing_bytes()
+        .deserialize(data)
+        .map_err(WireError::Decode)
 }
 
 #[derive(Debug, Error)]
@@ -180,6 +187,15 @@ mod tests {
         let err = decode_message(&encoded, encoded.len().saturating_sub(1))
             .expect_err("smaller limit must reject");
         assert!(matches!(err, super::WireError::MessageTooLarge { .. }));
+    }
+
+    #[test]
+    fn decode_message_rejects_trailing_bytes() {
+        let msg = WireMessage::Ping { nonce: 7 };
+        let mut encoded = encode_message(&msg).expect("encode");
+        encoded.push(0xAA);
+        let err = decode_message(&encoded, 1024).expect_err("trailing bytes must reject");
+        assert!(matches!(err, super::WireError::Decode(_)));
     }
 
     #[test]

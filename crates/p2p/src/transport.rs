@@ -122,6 +122,7 @@ pub fn send_message<W: Write>(
     header[4..].copy_from_slice(&(payload.len() as u32).to_be_bytes());
     stream.write_all(&header).map_err(TransportError::Io)?;
     stream.write_all(&payload).map_err(TransportError::Io)?;
+    stream.flush().map_err(TransportError::Io)?;
     Ok(())
 }
 
