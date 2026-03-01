@@ -765,26 +765,26 @@ impl GossipEngine {
         if decoded_count == capacity && round.role == ReconRoundRole::Initiator {
             let at_extension_limit = round.extension_requests >= RECON_MAX_EXTENSION_REQUESTS;
             let at_capacity_limit = capacity >= peer_max_sketch_items;
-            if !at_extension_limit {
-                if !at_capacity_limit {
-                    let next_capacity = (capacity.saturating_mul(2))
-                        .max(capacity.saturating_add(1))
-                        .min(peer_max_sketch_items);
-                    if let Some(peer_state) = self.peers.get_mut(&from_peer)
-                        && let Some(round_state) = peer_state.recon_rounds.get_mut(&salt)
-                    {
-                        round_state.capacity = round_state.capacity.max(next_capacity);
-                        round_state.extension_requests =
-                            round_state.extension_requests.saturating_add(1);
-                    }
-                    return Ok(vec![OutboundMessage {
-                        peer_id: from_peer,
-                        message: WireMessage::ReqSketchExt {
-                            salt,
-                            capacity: next_capacity as u32,
-                        },
-                    }]);
+            if at_extension_limit {
+                // Fall through to deterministic diff fallback below.
+            } else if !at_capacity_limit {
+                let next_capacity = (capacity.saturating_mul(2))
+                    .max(capacity.saturating_add(1))
+                    .min(peer_max_sketch_items);
+                if let Some(peer_state) = self.peers.get_mut(&from_peer)
+                    && let Some(round_state) = peer_state.recon_rounds.get_mut(&salt)
+                {
+                    round_state.capacity = round_state.capacity.max(next_capacity);
+                    round_state.extension_requests =
+                        round_state.extension_requests.saturating_add(1);
                 }
+                return Ok(vec![OutboundMessage {
+                    peer_id: from_peer,
+                    message: WireMessage::ReqSketchExt {
+                        salt,
+                        capacity: next_capacity as u32,
+                    },
+                }]);
             }
             self.remove_recon_round(from_peer, salt);
             if round.snapshot.txids.is_empty() {
@@ -812,15 +812,7 @@ impl GossipEngine {
 
         let mut missing = decoded
             .into_iter()
-            .filter_map(|short_id| {
-                if short_id == 0 {
-                    return None;
-                }
-                if local_set.contains(&short_id) {
-                    return None;
-                }
-                Some(short_id)
-            })
+            .filter(|short_id| *short_id != 0 && !local_set.contains(short_id))
             .collect::<Vec<_>>();
         missing.sort_unstable();
         missing.dedup();
@@ -2357,9 +2349,8 @@ mod tests {
             "extended sketch should be at least as large"
         );
         assert!(
-            !ext.iter().any(
-                |msg| matches!(msg.message, WireMessage::ReconcileDiff { .. })
-            ),
+            !ext.iter()
+                .any(|msg| matches!(msg.message, WireMessage::ReconcileDiff { .. })),
             "no collision diff should be emitted when snapshot has no short-id collisions"
         );
     }
@@ -2491,10 +2482,7 @@ mod tests {
             ref other => panic!("expected reqrecon, got {other:?}"),
         };
         let err = engine
-            .on_message(
-                95,
-                WireMessage::ReqSketchExt { salt, capacity: 16 },
-            )
+            .on_message(95, WireMessage::ReqSketchExt { salt, capacity: 16 })
             .expect_err("initiator round must reject reqsketchext");
         assert!(matches!(err, super::GossipError::Recon(_)));
     }
@@ -2524,7 +2512,8 @@ mod tests {
             WireMessage::ReqRecon { salt, set_size } => (salt, set_size as usize),
             ref other => panic!("expected reqrecon, got {other:?}"),
         };
-        let max_serialized_len = (((super::RECON_BITS as usize).saturating_mul(capacity)) / 8).max(1);
+        let max_serialized_len =
+            (((super::RECON_BITS as usize).saturating_mul(capacity)) / 8).max(1);
         let payload = vec![0u8; max_serialized_len.saturating_mul(2)];
         let out = engine
             .on_message(
@@ -2604,9 +2593,11 @@ mod tests {
                 },
             )
             .expect("first saturated sketch should request extension");
-        assert!(first
-            .iter()
-            .any(|msg| matches!(msg.message, WireMessage::ReqSketchExt { .. })));
+        assert!(
+            first
+                .iter()
+                .any(|msg| matches!(msg.message, WireMessage::ReqSketchExt { .. }))
+        );
 
         {
             let round = engine
@@ -2674,8 +2665,8 @@ mod tests {
             max_replacements: 5,
             penalty: 9,
         };
-        let engine = GossipEngine::with_limits_and_replacement(16, 33, replacement)
-            .expect("engine config");
+        let engine =
+            GossipEngine::with_limits_and_replacement(16, 33, replacement).expect("engine config");
 
         let expected_key0 = 0x7265_636f_6e5f_6b30u64 ^ 16u64 ^ ((33u64) << 32);
         let expected_key1 = 0x7265_636f_6e5f_6b31u64 ^ 7u64 ^ ((5u64) << 32);
@@ -2820,7 +2811,10 @@ mod tests {
         sketch.merge(&expected).expect("merge");
         let mut decoded = vec![0u64; 8];
         let count = sketch.decode(&mut decoded).expect("decode");
-        assert_eq!(count, 0, "identical sketches should reconcile to empty diff");
+        assert_eq!(
+            count, 0,
+            "identical sketches should reconcile to empty diff"
+        );
     }
 
     #[test]
@@ -2927,9 +2921,7 @@ mod tests {
         engine.announce_tx(sample_tx(1));
         engine.announce_tx(sample_tx(2));
         let salt = 0x7777_1111_2222_3333u64;
-        let snapshot = engine
-            .build_recon_snapshot(salt, 2, 0)
-            .expect("snapshot");
+        let snapshot = engine.build_recon_snapshot(salt, 2, 0).expect("snapshot");
         let short_ids = snapshot
             .unique_short_ids
             .iter()

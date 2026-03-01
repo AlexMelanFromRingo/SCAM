@@ -397,13 +397,20 @@ mod tests {
         assert_eq!(selected.len(), 6);
         let tried_count = selected
             .iter()
-            .filter(|addr| matches!(addr.ip(), IpAddr::V4(v4) if (10..=13).contains(&v4.octets()[0])))
+            .filter(
+                |addr| matches!(addr.ip(), IpAddr::V4(v4) if (10..=13).contains(&v4.octets()[0])),
+            )
             .count();
         let new_count = selected
             .iter()
-            .filter(|addr| matches!(addr.ip(), IpAddr::V4(v4) if (20..=23).contains(&v4.octets()[0])))
+            .filter(
+                |addr| matches!(addr.ip(), IpAddr::V4(v4) if (20..=23).contains(&v4.octets()[0])),
+            )
             .count();
-        assert_eq!(tried_count, 4, "expected 2/3 tried quota for max_outbound=6");
+        assert_eq!(
+            tried_count, 4,
+            "expected 2/3 tried quota for max_outbound=6"
+        );
         assert_eq!(new_count, 2, "expected remainder quota for new peers");
     }
 

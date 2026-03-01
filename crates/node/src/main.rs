@@ -7232,9 +7232,7 @@ fn relay_tx_diffusion_delay_for_message(message: &WireMessage) -> Duration {
         .map(|duration| duration.as_nanos() as u64)
         .unwrap_or(0);
     let seed = now_nanos ^ u64::from_be_bytes(first_txid.0[..8].try_into().unwrap_or([0; 8]));
-    Duration::from_millis(relay_tx_diffusion_delay_ms_from_seed(
-        base_ms, max_ms, seed,
-    ))
+    Duration::from_millis(relay_tx_diffusion_delay_ms_from_seed(base_ms, max_ms, seed))
 }
 
 fn relay_tx_diffusion_delay_ms_from_seed(base_ms: u64, max_ms: u64, mut seed: u64) -> u64 {
@@ -20604,10 +20602,7 @@ mod tests {
         unsafe {
             std::env::set_var(OPT_KEY, "  socks.local:9050  ");
         }
-        assert_eq!(
-            super::env_opt(OPT_KEY),
-            Some("socks.local:9050".to_owned())
-        );
+        assert_eq!(super::env_opt(OPT_KEY), Some("socks.local:9050".to_owned()));
         unsafe {
             std::env::set_var(OPT_KEY, "   ");
         }
@@ -20632,9 +20627,7 @@ mod tests {
             allow_cjdns: false,
             socks5_proxy: None,
         };
-        assert!(
-            super::relay_validate_target_against_policy(&endpoint_onion, &only_flags).is_err()
-        );
+        assert!(super::relay_validate_target_against_policy(&endpoint_onion, &only_flags).is_err());
         assert!(super::relay_validate_target_against_policy(&endpoint_i2p, &only_flags).is_err());
         assert!(
             super::relay_validate_target_against_policy(&endpoint_clearnet, &only_flags).is_ok()
@@ -20646,9 +20639,7 @@ mod tests {
             allow_cjdns: false,
             socks5_proxy: Some("127.0.0.1:9050".to_owned()),
         };
-        assert!(
-            super::relay_validate_target_against_policy(&endpoint_onion, &with_proxy).is_ok()
-        );
+        assert!(super::relay_validate_target_against_policy(&endpoint_onion, &with_proxy).is_ok());
         assert!(super::relay_validate_target_against_policy(&endpoint_i2p, &with_proxy).is_ok());
     }
 
@@ -20734,9 +20725,8 @@ mod tests {
         assert_eq!(fixed, 20);
         let same = super::relay_tx_diffusion_delay_ms_from_seed(20, 80, 0x0102_0304_0506_0708);
         assert_eq!(same, fixed);
-        let different =
-            super::relay_tx_diffusion_delay_ms_from_seed(20, 80, 0x1112_1314_1516_1718);
-        assert!(different >= 20 && different <= 80);
+        let different = super::relay_tx_diffusion_delay_ms_from_seed(20, 80, 0x1112_1314_1516_1718);
+        assert!((20..=80).contains(&different));
         assert_ne!(fixed, different);
         assert_eq!(super::relay_tx_diffusion_delay_ms_from_seed(0, 80, 1), 0);
         assert_eq!(super::relay_tx_diffusion_delay_ms_from_seed(20, 0, 1), 0);
@@ -26433,13 +26423,9 @@ mod tests {
                 last_seen_unix_sec: idx as u64,
             })
             .collect::<Vec<_>>();
-        let out = process_relay_wire_message(
-            &mut state,
-            peer_id,
-            WireMessage::Addr { peers },
-            2_000,
-        )
-        .expect("addr at exact limit must pass");
+        let out =
+            process_relay_wire_message(&mut state, peer_id, WireMessage::Addr { peers }, 2_000)
+                .expect("addr at exact limit must pass");
         assert!(out.is_empty());
     }
 
@@ -26468,7 +26454,11 @@ mod tests {
             2_001,
         )
         .expect("getheaders at exact locator boundary");
-        assert!(headers_out.iter().any(|msg| matches!(msg, WireMessage::Headers { .. })));
+        assert!(
+            headers_out
+                .iter()
+                .any(|msg| matches!(msg, WireMessage::Headers { .. }))
+        );
 
         let blocks_out = process_relay_wire_message(
             &mut state,
@@ -26480,7 +26470,11 @@ mod tests {
             2_002,
         )
         .expect("getblocks at exact locator boundary");
-        assert!(blocks_out.iter().any(|msg| matches!(msg, WireMessage::Inv { .. })));
+        assert!(
+            blocks_out
+                .iter()
+                .any(|msg| matches!(msg, WireMessage::Inv { .. }))
+        );
     }
 
     #[test]

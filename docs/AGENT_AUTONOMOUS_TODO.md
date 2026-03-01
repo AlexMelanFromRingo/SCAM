@@ -18,7 +18,7 @@
 ### Phase B: Battle-tested transport/protocol migration
 - [x] Migrate async SOCKS5 connect path to `tokio-socks` (remove hand-rolled async dial logic).
 - [ ] Migrate `rpc-serve` HTTP path to `hyper`/`axum` while preserving existing route contracts/tests.
-- [ ] Move wire framing onto battle-tested codec path (`tokio-util` codec) with strict size limits.
+- [x] Move wire framing onto battle-tested codec path (`tokio-util` codec) with strict size limits (async path).
 - [ ] Keep compatibility tests for version/handshake/frame boundary behavior.
 
 ### Phase C: Verification gates (mandatory after each sub-phase)
@@ -37,3 +37,4 @@
 ## Current status snapshot
 - `p2p` targeted mutation loop for `discovery/gossip`: closed (0 misses in scoped run).
 - Full stage2 mutation: running now.
+- `p2p::transport` async frame path now uses `tokio-util` codec + strict magic/size checks.

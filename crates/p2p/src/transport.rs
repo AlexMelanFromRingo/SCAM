@@ -1,8 +1,10 @@
 use std::io::{Read, Write};
 
+use bytes::{Buf, BufMut, BytesMut};
 use scam_core::{BlockHeader, Hash256};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio_util::codec::{Decoder, Encoder};
 
 use crate::wire::{InventoryItem, WireMessage, decode_message, encode_message};
 
@@ -10,6 +12,70 @@ use crate::wire::{InventoryItem, WireMessage, decode_message, encode_message};
 pub struct FramingConfig {
     pub magic: u32,
     pub max_message_size: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct ScamWireCodec {
+    cfg: FramingConfig,
+}
+
+impl ScamWireCodec {
+    pub fn new(cfg: FramingConfig) -> Self {
+        Self { cfg }
+    }
+}
+
+impl Encoder<WireMessage> for ScamWireCodec {
+    type Error = TransportError;
+
+    fn encode(&mut self, item: WireMessage, dst: &mut BytesMut) -> Result<(), Self::Error> {
+        let payload = encode_message(&item).map_err(TransportError::Wire)?;
+        if payload.len() > self.cfg.max_message_size {
+            return Err(TransportError::MessageTooLarge {
+                limit: self.cfg.max_message_size,
+                got: payload.len(),
+            });
+        }
+        dst.reserve(8 + payload.len());
+        dst.put_u32(self.cfg.magic);
+        dst.put_u32(payload.len() as u32);
+        dst.extend_from_slice(&payload);
+        Ok(())
+    }
+}
+
+impl Decoder for ScamWireCodec {
+    type Item = WireMessage;
+    type Error = TransportError;
+
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        if src.len() < 8 {
+            return Ok(None);
+        }
+        let magic = u32::from_be_bytes([src[0], src[1], src[2], src[3]]);
+        if magic != self.cfg.magic {
+            return Err(TransportError::InvalidMagic {
+                expected: self.cfg.magic,
+                got: magic,
+            });
+        }
+        let payload_len = u32::from_be_bytes([src[4], src[5], src[6], src[7]]) as usize;
+        if payload_len > self.cfg.max_message_size {
+            return Err(TransportError::MessageTooLarge {
+                limit: self.cfg.max_message_size,
+                got: payload_len,
+            });
+        }
+        let frame_len = 8usize.saturating_add(payload_len);
+        if src.len() < frame_len {
+            return Ok(None);
+        }
+        src.advance(8);
+        let payload = src.split_to(payload_len);
+        let message = decode_message(payload.as_ref(), self.cfg.max_message_size)
+            .map_err(TransportError::Wire)?;
+        Ok(Some(message))
+    }
 }
 
 impl Default for FramingConfig {
@@ -63,23 +129,11 @@ pub async fn send_message_async<S: AsyncWrite + Unpin>(
     message: &WireMessage,
     cfg: &FramingConfig,
 ) -> Result<(), TransportError> {
-    let payload = encode_message(message).map_err(TransportError::Wire)?;
-    if payload.len() > cfg.max_message_size {
-        return Err(TransportError::MessageTooLarge {
-            limit: cfg.max_message_size,
-            got: payload.len(),
-        });
-    }
-
-    let mut header = [0u8; 8];
-    header[..4].copy_from_slice(&cfg.magic.to_be_bytes());
-    header[4..].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+    let mut codec = ScamWireCodec::new(cfg.clone());
+    let mut buf = BytesMut::new();
+    codec.encode(message.clone(), &mut buf)?;
     stream
-        .write_all(&header)
-        .await
-        .map_err(TransportError::Io)?;
-    stream
-        .write_all(&payload)
+        .write_all(buf.as_ref())
         .await
         .map_err(TransportError::Io)?;
     stream.flush().await.map_err(TransportError::Io)?;
@@ -145,7 +199,18 @@ pub async fn read_message_async<S: AsyncRead + Unpin>(
         .read_exact(&mut payload)
         .await
         .map_err(TransportError::Io)?;
-    decode_message(&payload, cfg.max_message_size).map_err(TransportError::Wire)
+
+    let mut frame = BytesMut::with_capacity(8 + payload_len);
+    frame.extend_from_slice(&header);
+    frame.extend_from_slice(&payload);
+    let mut codec = ScamWireCodec::new(cfg.clone());
+    match codec.decode(&mut frame)? {
+        Some(message) => Ok(message),
+        None => Err(TransportError::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "failed to fill whole buffer",
+        ))),
+    }
 }
 
 pub fn client_handshake<IO: Read + Write>(
@@ -394,6 +459,12 @@ pub enum TransportError {
     UnexpectedMessage { expected: &'static str, got: String },
     #[error("unexpected inventory item: expected {expected}, got {got}")]
     UnexpectedInventoryItem { expected: &'static str, got: String },
+}
+
+impl From<std::io::Error> for TransportError {
+    fn from(value: std::io::Error) -> Self {
+        Self::Io(value)
+    }
 }
 
 #[cfg(test)]
