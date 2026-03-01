@@ -8,6 +8,13 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
+use axum::{
+    Router,
+    extract::State as AxumState,
+    http::{HeaderValue, StatusCode, header},
+    response::{IntoResponse, Response as AxumResponse},
+    routing::get,
+};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use num_traits::ToPrimitive;
 use scam_chain::{BlockSubmissionOutcome, ChainError, ChainRuntime};
@@ -14147,7 +14154,173 @@ fn run_rpc_events_worker(
     Ok(())
 }
 
-fn run_rpc_serve_inner(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RpcHttpBackend {
+    Legacy,
+    Axum,
+}
+
+fn rpc_http_backend_from_env() -> RpcHttpBackend {
+    match env_opt("SCAM_RPC_HTTP_BACKEND")
+        .unwrap_or_else(|| "legacy".to_owned())
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "axum" => RpcHttpBackend::Axum,
+        _ => RpcHttpBackend::Legacy,
+    }
+}
+
+#[derive(Clone)]
+struct AxumRpcState {
+    cfg: ChainConfig,
+    runtime_db_path: PathBuf,
+    stratum_telemetry: Option<PathBuf>,
+}
+
+fn axum_json_response(status: StatusCode, body: String) -> AxumResponse {
+    let mut response = (status, body).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    response
+}
+
+fn axum_status_payload(state: &AxumRpcState) -> Result<StatusResponse, NodeError> {
+    let (runtime, _) = load_runtime_from_db_or_genesis(&state.cfg, &state.runtime_db_path)?;
+    let (stratum_active_clients, stratum_workers_active, stratum_pool_hashrate_hps) =
+        match state.stratum_telemetry.as_ref() {
+            Some(path) => match load_latest_jsonl_record::<StratumServerTelemetrySnapshot>(path)? {
+                Some(snapshot) => (
+                    Some(snapshot.active_clients),
+                    Some(snapshot.workers_active),
+                    Some(snapshot.pool_hashrate_hps),
+                ),
+                None => (None, None, None),
+            },
+            None => (None, None, None),
+        };
+    Ok(StatusResponse {
+        network_id: state.cfg.network_id.clone(),
+        tip_height: runtime.tip_height(),
+        tip_hash: runtime.tip_hash().to_hex(),
+        utxo_count: runtime.utxo_len(),
+        cumulative_work: runtime.cumulative_work().to_str_radix(10),
+        network_hashrate_hps: estimate_network_hashrate_hps(&runtime),
+        stratum_active_clients,
+        stratum_workers_active,
+        stratum_pool_hashrate_hps,
+    })
+}
+
+async fn axum_health_handler() -> AxumResponse {
+    axum_json_response(StatusCode::OK, "{\"ok\":true}".to_owned())
+}
+
+async fn axum_status_handler(AxumState(state): AxumState<AxumRpcState>) -> AxumResponse {
+    match axum_status_payload(&state).and_then(|payload| {
+        to_pretty_json(&payload)
+            .map_err(|e| NodeError::Runtime(format!("status serialization failed: {e}")))
+    }) {
+        Ok(body) => axum_json_response(StatusCode::OK, body),
+        Err(err) => axum_json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json_error_body(&err.to_string()),
+        ),
+    }
+}
+
+async fn axum_not_implemented_handler() -> AxumResponse {
+    axum_json_response(
+        StatusCode::NOT_IMPLEMENTED,
+        json_error_body("axum backend currently supports only /health and /status"),
+    )
+}
+
+fn run_rpc_serve_inner_axum(
+    args: RpcServeArgs,
+    shutdown_flag: Option<Arc<AtomicBool>>,
+) -> Result<(), NodeError> {
+    let RpcServeArgs {
+        network,
+        config,
+        runtime_db,
+        bind,
+        ui_dir: _,
+        relay_telemetry: _,
+        stratum_telemetry,
+        pool_ledger: _,
+        mine_blocks,
+        interval_sec,
+        max_nonce,
+        max_requests: _,
+    } = args;
+    let runtime_db_path = runtime_db
+        .clone()
+        .unwrap_or_else(|| default_runtime_db_path(network));
+    let (cfg, runtime) = build_runtime_for_query(
+        network,
+        config,
+        Some(runtime_db_path.clone()),
+        mine_blocks,
+        interval_sec,
+        max_nonce,
+        "rpc-serve-axum",
+    )?;
+    println!(
+        "RPC(axum) listening on {} (network={} tip_h={} tip_hash={})",
+        bind,
+        cfg.network_id,
+        runtime.tip_height(),
+        runtime.tip_hash()
+    );
+    println!(
+        "Endpoints (axum): GET /health, /status (other routes stay on legacy backend for now)"
+    );
+
+    let shared = AxumRpcState {
+        cfg,
+        runtime_db_path,
+        stratum_telemetry,
+    };
+    let listener_bind = bind.clone();
+
+    TokioRuntimeBuilder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| NodeError::Runtime(format!("rpc axum runtime build failed: {e}")))?
+        .block_on(async move {
+            let listener = tokio::net::TcpListener::bind(&listener_bind)
+                .await
+                .map_err(|e| {
+                    NodeError::Runtime(format!("rpc axum bind failed on {}: {e}", listener_bind))
+                })?;
+
+            let app = Router::new()
+                .route("/health", get(axum_health_handler))
+                .route("/status", get(axum_status_handler))
+                .fallback(get(axum_not_implemented_handler))
+                .with_state(shared);
+
+            let graceful_shutdown_flag = shutdown_flag.clone();
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    loop {
+                        if let Some(flag) = graceful_shutdown_flag.as_ref()
+                            && flag.load(Ordering::Relaxed)
+                        {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .map_err(|e| NodeError::Runtime(format!("rpc axum serve failed: {e}")))
+        })
+}
+
+fn run_rpc_serve_inner_legacy(
     args: RpcServeArgs,
     shutdown_flag: Option<Arc<AtomicBool>>,
 ) -> Result<(), NodeError> {
@@ -15184,6 +15357,16 @@ fn run_rpc_serve_inner(
         let _ = handle.join();
     }
     Ok(())
+}
+
+fn run_rpc_serve_inner(
+    args: RpcServeArgs,
+    shutdown_flag: Option<Arc<AtomicBool>>,
+) -> Result<(), NodeError> {
+    match rpc_http_backend_from_env() {
+        RpcHttpBackend::Legacy => run_rpc_serve_inner_legacy(args, shutdown_flag),
+        RpcHttpBackend::Axum => run_rpc_serve_inner_axum(args, shutdown_flag),
+    }
 }
 
 fn run_rpc_serve(args: RpcServeArgs) -> Result<(), NodeError> {
@@ -20686,6 +20869,35 @@ mod tests {
         unsafe {
             std::env::remove_var(FLAG_KEY);
             std::env::remove_var(OPT_KEY);
+        }
+    }
+
+    #[test]
+    fn rpc_http_backend_from_env_defaults_to_legacy_and_accepts_axum() {
+        const KEY: &str = "SCAM_RPC_HTTP_BACKEND";
+        unsafe {
+            std::env::remove_var(KEY);
+        }
+        assert_eq!(
+            super::rpc_http_backend_from_env(),
+            super::RpcHttpBackend::Legacy
+        );
+        unsafe {
+            std::env::set_var(KEY, "axum");
+        }
+        assert_eq!(
+            super::rpc_http_backend_from_env(),
+            super::RpcHttpBackend::Axum
+        );
+        unsafe {
+            std::env::set_var(KEY, "unknown");
+        }
+        assert_eq!(
+            super::rpc_http_backend_from_env(),
+            super::RpcHttpBackend::Legacy
+        );
+        unsafe {
+            std::env::remove_var(KEY);
         }
     }
 

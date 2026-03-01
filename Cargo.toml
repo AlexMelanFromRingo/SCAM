@@ -20,6 +20,7 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
+axum = "0.8"
 argon2 = "0.5"
 blake3 = "1.8"
 bincode = "1.3"
