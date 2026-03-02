@@ -9371,6 +9371,7 @@ struct StratumTemplateWork {
 struct StratumWork {
     job: MiningJob,
     block_txs: Vec<Transaction>,
+    expected_coinbase_value: u64,
 }
 
 trait StratumTemplateProvider {
@@ -9550,6 +9551,82 @@ fn lock_runtime<'a>(
         .map_err(|_| NodeError::Runtime("stratum runtime mutex poisoned".to_owned()))
 }
 
+fn tx_outputs_value_sum_u64(tx: &Transaction) -> Option<u64> {
+    let total = tx.outputs.iter().fold(0u128, |acc, output| {
+        acc.saturating_add(output.value as u128)
+    });
+    u64::try_from(total).ok()
+}
+
+fn rewrite_coinbase_to_expected_value(
+    coinbase: &mut Transaction,
+    expected_value: u64,
+) -> Result<(), NodeError> {
+    if !coinbase.is_coinbase() {
+        return Err(NodeError::Runtime(
+            "stratum template first tx is not coinbase".to_owned(),
+        ));
+    }
+    if coinbase.outputs.is_empty() {
+        return Err(NodeError::Runtime(
+            "stratum template coinbase has no outputs".to_owned(),
+        ));
+    }
+    let expected = expected_value as u128;
+    let other_outputs_sum = coinbase.outputs.iter().skip(1).fold(0u128, |acc, output| {
+        acc.saturating_add(output.value as u128)
+    });
+    if expected < other_outputs_sum {
+        return Err(NodeError::Runtime(format!(
+            "stratum template coinbase outputs exceed expected reward: expected={expected_value}, non_primary_outputs={other_outputs_sum}"
+        )));
+    }
+    let primary = expected - other_outputs_sum;
+    let primary = u64::try_from(primary).map_err(|_| {
+        NodeError::Runtime("stratum template coinbase primary output overflow".to_owned())
+    })?;
+    coinbase.outputs[0].value = primary;
+    Ok(())
+}
+
+fn normalize_stratum_block_coinbase(
+    block_txs: &mut [Transaction],
+    expected_coinbase_value: u64,
+    channel_id: u32,
+    job_id: u32,
+) -> Result<(), NodeError> {
+    let Some(coinbase) = block_txs.first_mut() else {
+        return Err(NodeError::Runtime(
+            "stratum template produced empty block transaction list".to_owned(),
+        ));
+    };
+    if !coinbase.is_coinbase() {
+        return Err(NodeError::Runtime(
+            "stratum template first tx is not coinbase".to_owned(),
+        ));
+    }
+    let observed = tx_outputs_value_sum_u64(coinbase).ok_or_else(|| {
+        NodeError::Runtime("stratum template coinbase output sum overflow".to_owned())
+    })?;
+    if observed != expected_coinbase_value {
+        eprintln!(
+            "warning: stratum coinbase mismatch for channel={} job={}: expected={}, got={}; rewriting coinbase output",
+            channel_id, job_id, expected_coinbase_value, observed
+        );
+        rewrite_coinbase_to_expected_value(coinbase, expected_coinbase_value)?;
+    }
+    let final_total = tx_outputs_value_sum_u64(coinbase).ok_or_else(|| {
+        NodeError::Runtime("stratum template coinbase output sum overflow".to_owned())
+    })?;
+    if final_total != expected_coinbase_value {
+        return Err(NodeError::Runtime(format!(
+            "stratum coinbase normalization failed: expected {}, got {}",
+            expected_coinbase_value, final_total
+        )));
+    }
+    Ok(())
+}
+
 #[allow(dead_code)]
 async fn issue_new_stratum_job_async<S: AsyncRead + AsyncWrite + Unpin>(
     session: &mut Sv2Session,
@@ -9613,9 +9690,17 @@ async fn issue_new_stratum_job_async<S: AsyncRead + AsyncWrite + Unpin>(
         ntime: template.ntime,
         network_target: template.network_target,
     };
+    let expected_coinbase_value = template_work
+        .block_txs
+        .first()
+        .and_then(tx_outputs_value_sum_u64)
+        .ok_or_else(|| {
+            NodeError::Runtime("stratum template coinbase reward is invalid".to_owned())
+        })?;
     let work = StratumWork {
         job,
         block_txs: template_work.block_txs,
+        expected_coinbase_value,
     };
 
     let new_job = session.install_job(work.job.clone())?;
@@ -9918,8 +10003,14 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
                                 let Some(work) = jobs.get(&job_id).cloned() else {
                                     continue;
                                 };
-                                let included_txids = work
-                                    .block_txs
+                                let mut block_txs = work.block_txs;
+                                normalize_stratum_block_coinbase(
+                                    &mut block_txs,
+                                    work.expected_coinbase_value,
+                                    channel_id,
+                                    job_id,
+                                )?;
+                                let included_txids = block_txs
                                     .iter()
                                     .skip(1)
                                     .map(Transaction::txid)
@@ -9933,7 +10024,7 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
                                         target: work.job.network_target,
                                         nonce,
                                     },
-                                    transactions: work.block_txs,
+                                    transactions: block_txs,
                                 };
                                 let block_reward_atomic = block
                                     .transactions
@@ -9945,65 +10036,77 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
                                     })
                                     .unwrap_or(ctx.cfg.block_subsidy as u128);
                                 let mut tip_advanced = false;
+                                let mut submit_failed = false;
 
                                 {
                                     let mut runtime = lock_runtime(&ctx.runtime)?;
-                                    let submission = runtime.submit_block(block)?;
-                                    handle_runtime_persist_result(
-                                        persist_runtime_db_with_retry(
-                                            &runtime,
-                                            &ctx.runtime_db_path,
-                                            80,
-                                            25,
-                                        ),
-                                        runtime.tip_hash(),
-                                    )?;
-                                    match submission {
-                                        scam_chain::BlockSubmissionOutcome::ExtendedTip {
-                                            new_tip,
-                                            new_height,
+                                    match runtime.submit_block(block) {
+                                        Ok(submission) => {
+                                            handle_runtime_persist_result(
+                                                persist_runtime_db_with_retry(
+                                                    &runtime,
+                                                    &ctx.runtime_db_path,
+                                                    80,
+                                                    25,
+                                                ),
+                                                runtime.tip_hash(),
+                                            )?;
+                                            match submission {
+                                                scam_chain::BlockSubmissionOutcome::ExtendedTip {
+                                                    new_tip,
+                                                    new_height,
+                                                }
+                                                | scam_chain::BlockSubmissionOutcome::Reorged {
+                                                    new_tip,
+                                                    new_height,
+                                                    ..
+                                                } => {
+                                                    record_pool_round_closed(
+                                                        &ctx,
+                                                        &worker_label,
+                                                        new_tip,
+                                                        block_reward_atomic,
+                                                        new_height,
+                                                        new_tip,
+                                                        ntime,
+                                                    );
+                                                    last_tip_hash = new_tip;
+                                                    tip_advanced = true;
+                                                }
+                                                scam_chain::BlockSubmissionOutcome::AlreadyKnown {
+                                                    ..
+                                                }
+                                                | scam_chain::BlockSubmissionOutcome::StoredSideBranch {
+                                                    ..
+                                                } => {}
+                                            }
+                                            if tip_advanced
+                                                && let Err(err) =
+                                                    remove_confirmed_txids_from_mempool_db(
+                                                        &ctx.cfg,
+                                                        &ctx.mempool_db_path,
+                                                        &included_txids,
+                                                    )
+                                            {
+                                                eprintln!(
+                                                    "warning: failed to trim confirmed txids from mempool db: {err}"
+                                                );
+                                            }
                                         }
-                                        | scam_chain::BlockSubmissionOutcome::Reorged {
-                                            new_tip,
-                                            new_height,
-                                            ..
-                                        } => {
-                                            record_pool_round_closed(
-                                                &ctx,
-                                                &worker_label,
-                                                new_tip,
-                                                block_reward_atomic,
-                                                new_height,
-                                                new_tip,
-                                                ntime,
+                                        Err(err) => {
+                                            submit_failed = true;
+                                            eprintln!(
+                                                "warning: stratum block submit failed for channel={} job={}: {}",
+                                                channel_id, job_id, err
                                             );
-                                            last_tip_hash = new_tip;
-                                            tip_advanced = true;
                                         }
-                                        scam_chain::BlockSubmissionOutcome::AlreadyKnown {
-                                            ..
-                                        }
-                                        | scam_chain::BlockSubmissionOutcome::StoredSideBranch {
-                                            ..
-                                        } => {}
-                                    }
-                                    if tip_advanced
-                                        && let Err(err) = remove_confirmed_txids_from_mempool_db(
-                                            &ctx.cfg,
-                                            &ctx.mempool_db_path,
-                                            &included_txids,
-                                        )
-                                    {
-                                        eprintln!(
-                                            "warning: failed to trim confirmed txids from mempool db: {err}"
-                                        );
                                     }
                                 }
                                 if tip_advanced {
                                     reconcile_pool_ledger_with_runtime(&ctx, ntime);
                                 }
 
-                                if tip_advanced {
+                                if tip_advanced || submit_failed {
                                     jobs.clear();
                                     if should_reissue_job_for_channel(
                                         channel_id,
@@ -16929,6 +17032,65 @@ mod tests {
         assert!(!super::coinbase_prevout_is_immature(10, 0, 10));
         assert!(super::coinbase_prevout_is_immature(104, 100, 5));
         assert!(!super::coinbase_prevout_is_immature(105, 100, 5));
+    }
+
+    #[test]
+    fn tx_outputs_value_sum_u64_detects_overflow() {
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: OutPoint::coinbase(),
+                signature: b"overflow".to_vec(),
+                pubkey_compressed: vec![],
+                sequence: u32::MAX,
+            }],
+            outputs: vec![
+                TxOut {
+                    value: u64::MAX,
+                    key_hash20: [1u8; 20],
+                },
+                TxOut {
+                    value: 1,
+                    key_hash20: [2u8; 20],
+                },
+            ],
+            lock_time: 0,
+        };
+        assert!(super::tx_outputs_value_sum_u64(&tx).is_none());
+    }
+
+    #[test]
+    fn normalize_stratum_block_coinbase_rewrites_mismatched_reward() {
+        let mut block_txs = vec![super::build_coinbase_tx(
+            "test-coinbase".to_owned(),
+            123,
+            [0x11u8; 20],
+        )];
+        block_txs[0].outputs[0].value = 9_999;
+        super::normalize_stratum_block_coinbase(&mut block_txs, 123, 7, 99)
+            .expect("coinbase reward should be rewritten");
+        assert_eq!(block_txs[0].outputs[0].value, 123);
+    }
+
+    #[test]
+    fn normalize_stratum_block_coinbase_rejects_non_coinbase() {
+        let mut tx = super::build_coinbase_tx("cb".to_owned(), 10, [0x22u8; 20]);
+        tx.inputs.push(TxIn {
+            prev_out: OutPoint {
+                txid: Hash256([3u8; 32]),
+                vout: 0,
+            },
+            signature: vec![],
+            pubkey_compressed: vec![],
+            sequence: u32::MAX,
+        });
+        let mut block_txs = vec![tx];
+        let err = super::normalize_stratum_block_coinbase(&mut block_txs, 10, 1, 1)
+            .expect_err("non-coinbase first tx must fail");
+        assert!(
+            err.to_string()
+                .contains("stratum template first tx is not coinbase")
+        );
     }
 
     #[test]
