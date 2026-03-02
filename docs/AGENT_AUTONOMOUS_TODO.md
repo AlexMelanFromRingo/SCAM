@@ -21,7 +21,10 @@
   - `axum` backend now implements full route parity for RPC GET/POST endpoints, SSE `/events`, pool routes, and UI asset fallback behavior.
   - `SCAM_RPC_HTTP_BACKEND=axum` remains available for rollout control; legacy path is retained only as compatibility backend.
 - [x] Move wire framing onto battle-tested codec path (`tokio-util` codec) with strict size limits (async path).
-- [ ] Keep compatibility tests for version/handshake/frame boundary behavior.
+- [x] Keep compatibility tests for version/handshake/frame boundary behavior.
+  - Verified via `cargo test -p scam-p2p` (`transport::tests::*` frame/size/handshake boundaries)
+    and `cargo test -p scam-node --bin scam-node -- --test-threads=1`
+    (`sv2_conformance*`, relay handshake/timeouts, rpc route boundary paths).
 
 ### Phase C: Verification gates (mandatory after each sub-phase)
 - [x] `cargo fmt --all`
@@ -31,10 +34,17 @@
 - [ ] Mutation gate re-check for stage2.
 
 ### Phase D: Local commit policy (no push)
-- [ ] Commit 1: Stage2 mutation fixes (`p2p/node`).
+- [x] Commit 1: Stage2 mutation fixes (`p2p/node`).
+  - `7f37a2d Harden stage2 mutation guards for node and p2p`
 - [x] Commit 2: HTTP migration (`hyper`/`axum`) + route tests.
-- [ ] Commit 3: wire/codec migration + framing tests.
-- [ ] Commit 4: final verification gate + docs status update.
+- [x] Commit 3: wire/codec migration + framing tests.
+  - `db184e1 Finalize axum rpc backend parity and harden p2p wire codec`
+- [x] Commit 4: final verification gate + docs status update.
+  - Verification gate (non-mutation) completed on current HEAD:
+    `cargo fmt --all -- --check`,
+    `cargo check --workspace`,
+    `cargo test --workspace`,
+    `cargo clippy --workspace --all-targets -- -D warnings`.
 
 ## Current status snapshot
 - `p2p` targeted mutation loop for `discovery/gossip`: closed (0 misses in scoped run).

@@ -41,14 +41,20 @@ Clarification: consensus is already functionally implemented; future items touch
     and submit-share context autofill from discovered channel/job state.
   - Added ordered observed-sequence gate (`--require-observed-sequence`) and published
     checklist in `docs/SV2_FULLSPEC_CHECKLIST.md`.
-- [~] Implement all required channel types and lifecycle paths.
+- [x] Implement all required channel types and lifecycle paths.
   - Added corpus path `docs/sv2-corpus/full-spec-submit.json` to assert submit/share state-path behavior.
+  - SCAM full-spec profile now covers standard channel lifecycle and explicit extended-channel
+    reject paths with deterministic error codes (`unsupported_channel_type` / `unsupported_submit_type`)
+    plus conformance + unit coverage (`scam-stratum`, `scam-node`).
 - [x] Add complete capability negotiation and version/feature compatibility handling.
   - Session setup now validates protocol/version range semantics, rejects unsupported/missing feature
     flags, and exposes negotiated setup state (`version`/`flags`) in conformance reports.
-- [~] Add full negative-path handling for malformed/unsupported/out-of-order messages.
+- [x] Add full negative-path handling for malformed/unsupported/out-of-order messages.
   - External matrix now supports expected-fail rows with vendor-specific workaround/notes tracking.
   - Added setup version/flags strict gates and observed-kind allow/deny enforcement in conformance runner.
+  - Added deterministic protocol-violation mapping and thresholded session close behavior;
+    malformed frame/header, unsupported message, and out-of-state sequence paths are
+    covered in local unit/integration suites.
 
 ### B. Transport and Security
 
