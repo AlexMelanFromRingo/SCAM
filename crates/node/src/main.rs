@@ -9771,12 +9771,12 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
     let mut last_activity = Instant::now();
     let mut last_tip_hash = load_runtime_tip_hash(&ctx)?;
     let mut protocol_violations = 0u32;
-    let mut payout_key_hash20 = if ctx.pool_payout_cfg.mode == PoolPayoutModeArg::Solo {
+    let mut payout_key_hash20 = if matches!(ctx.pool_payout_cfg.mode, PoolPayoutModeArg::Solo) {
         ctx.cfg.genesis_reward_key_hash20()?
     } else {
         ctx.pool_coinbase_key_hash20
     };
-    let mut payout_label = if ctx.pool_payout_cfg.mode == PoolPayoutModeArg::Solo {
+    let mut payout_label = if matches!(ctx.pool_payout_cfg.mode, PoolPayoutModeArg::Solo) {
         stratum_coinbase_label(session.channel_id(), "default")
     } else {
         stratum_coinbase_label(session.channel_id(), "pool")
@@ -9850,7 +9850,7 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
                         SessionEvent::SetupAccepted => {}
                         SessionEvent::ChannelOpened { user, .. } => {
                             worker_label = StratumPoolTelemetryState::sanitize_worker_label(&user);
-                            if ctx.pool_payout_cfg.mode == PoolPayoutModeArg::Solo {
+                            if matches!(ctx.pool_payout_cfg.mode, PoolPayoutModeArg::Solo) {
                                 if let Some(parsed) = stratum_user_payout_key_hash20(&user) {
                                     payout_key_hash20 = parsed;
                                     payout_label =
@@ -10084,7 +10084,11 @@ fn write_role_response<T: Serialize, W: Write>(
 }
 
 fn max_requests_limit_hit(max_requests: u32, served: u32) -> bool {
-    max_requests > 0 && served >= max_requests
+    max_requests_limit_configured(max_requests) && served >= max_requests
+}
+
+fn max_requests_limit_configured(max_requests: u32) -> bool {
+    max_requests != 0
 }
 
 fn relay_inbound_accept_rate_limited(
@@ -14653,7 +14657,7 @@ async fn axum_block_handler(
     AxumState(state): AxumState<AxumRpcState>,
 ) -> AxumResponse {
     if tail.is_empty() || tail.contains('/') {
-        return axum_bad_request("invalid block height, expected unsigned integer");
+        return axum_bad_request("block path must be /block/<height>");
     }
     match tail.parse::<u64>() {
         Ok(height) => axum_block_response(&state, height),
@@ -15163,7 +15167,7 @@ fn run_rpc_serve_inner_axum(
         println!("Stratum telemetry source: {}", path.display());
     }
     println!("Pool ledger source: {}", pool_ledger_db_path.display());
-    if max_requests > 0 {
+    if max_requests_limit_configured(max_requests) {
         println!("Max requests before exit: {}", max_requests);
     }
 
@@ -15309,7 +15313,7 @@ fn run_rpc_serve_inner_legacy(
         println!("Stratum telemetry source: {}", path.display());
     }
     println!("Pool ledger source: {}", pool_ledger_db_path.display());
-    if max_requests > 0 {
+    if max_requests_limit_configured(max_requests) {
         println!("Max requests before exit: {}", max_requests);
     }
 
@@ -15354,7 +15358,7 @@ fn run_rpc_serve_inner_legacy(
 
         let method = request.method.as_str();
         let path = request.path.as_str();
-        if method == "GET" && path == "/events" {
+        if rpc_exact_route_matches(method, path, "GET", "/events") {
             let cfg_clone = cfg.clone();
             let runtime_db_path_clone = runtime_db_path.clone();
             let mempool_db_path_clone = mempool_db_path.clone();
@@ -16494,12 +16498,12 @@ mod tests {
 
     fn connect_with_retry(addr: &str) -> TcpStream {
         let mut last_err = None;
-        for _ in 0..200 {
+        for _ in 0..120 {
             match TcpStream::connect(addr) {
                 Ok(stream) => return stream,
                 Err(err) => {
                     last_err = Some(err);
-                    thread::sleep(Duration::from_millis(25));
+                    thread::sleep(Duration::from_millis(10));
                 }
             }
         }
@@ -16842,6 +16846,8 @@ mod tests {
 
     #[test]
     fn max_requests_guard_logic_is_strict() {
+        assert!(!super::max_requests_limit_configured(0));
+        assert!(super::max_requests_limit_configured(1));
         assert!(!super::max_requests_limit_hit(0, 0));
         assert!(!super::max_requests_limit_hit(0, 100));
         assert!(!super::max_requests_limit_hit(2, 0));
@@ -20966,7 +20972,7 @@ mod tests {
             network: Network::Devnet,
             config: Some(missing_cfg),
             runtime_db: None,
-            bind: "127.0.0.1:0".to_owned(),
+            bind: "not-an-addr".to_owned(),
             max_clients: 1,
             max_messages_per_peer: 1,
             read_timeout_sec: 1,
@@ -21971,12 +21977,24 @@ mod tests {
         assert_eq!(super::relay_tx_diffusion_delay_ms_from_seed(20, 0, 1), 0);
         assert_eq!(super::relay_tx_diffusion_delay_ms_from_seed(80, 20, 1), 0);
         assert_eq!(
+            super::relay_tx_diffusion_delay_ms_from_seed(42, 42, 0xA5A5_A5A5_A5A5_A5A5),
+            42
+        );
+        assert_eq!(
             super::relay_tx_diffusion_delay_ms_from_seed(20, 800, 0x1112_1314_1516_1718),
             87
         );
         assert_eq!(
             super::relay_tx_diffusion_delay_ms_from_seed(50, 150, 0xFFFF_FFFF_FFFF_FFFF),
             112
+        );
+        assert_eq!(
+            super::relay_tx_diffusion_delay_ms_from_seed(
+                10_000_000_000,
+                u64::MAX,
+                16_806_898_589_309_566_640,
+            ),
+            10_499_273_757
         );
     }
 
@@ -22304,6 +22322,7 @@ mod tests {
         let config_path = work_dir.join("devnet.toml");
         fs::write(&config_path, include_str!("../../../config/devnet.toml")).expect("write cfg");
         let runtime_db = work_dir.join("runtime.redb");
+        let valid_noise_secret = Some("11".repeat(32));
 
         let min_target = format!("00{}", "ff".repeat(31));
         let below_min_target = "00".repeat(32);
@@ -22333,10 +22352,10 @@ mod tests {
             max_rejected_shares: None,
             min_share_target_hex: Some(min_target.clone()),
             max_share_target_hex: Some(scam_core::Target::MAX.to_hex()),
-            secure_transport: false,
+            secure_transport: true,
             secure_transport_mode: None,
             secure_rekey_interval_messages: None,
-            secure_static_secret_key_hex: None,
+            secure_static_secret_key_hex: valid_noise_secret.clone(),
             secure_expected_remote_static_pubkey_hex: None,
             template_provider_addr: None,
             job_declarator_addr: None,
@@ -22390,10 +22409,10 @@ mod tests {
             max_rejected_shares: None,
             min_share_target_hex: Some(min_target.clone()),
             max_share_target_hex: Some(max_target.clone()),
-            secure_transport: false,
+            secure_transport: true,
             secure_transport_mode: None,
             secure_rekey_interval_messages: None,
-            secure_static_secret_key_hex: None,
+            secure_static_secret_key_hex: valid_noise_secret.clone(),
             secure_expected_remote_static_pubkey_hex: None,
             template_provider_addr: None,
             job_declarator_addr: None,
@@ -22447,10 +22466,10 @@ mod tests {
             max_rejected_shares: None,
             min_share_target_hex: Some(min_target.clone()),
             max_share_target_hex: Some(max_target),
-            secure_transport: false,
+            secure_transport: true,
             secure_transport_mode: None,
             secure_rekey_interval_messages: None,
-            secure_static_secret_key_hex: None,
+            secure_static_secret_key_hex: valid_noise_secret,
             secure_expected_remote_static_pubkey_hex: None,
             template_provider_addr: None,
             job_declarator_addr: None,
@@ -23601,6 +23620,359 @@ mod tests {
     }
 
     #[test]
+    fn axum_helper_responses_return_expected_error_statuses() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let work_dir = temp_dir("test-axum-helper-responses");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let state = super::AxumRpcState {
+            network: Network::Devnet,
+            cfg: cfg.clone(),
+            runtime_db_path: work_dir.join("runtime.redb"),
+            mempool_db_path: work_dir.join("mempool.redb"),
+            relay_telemetry: None,
+            stratum_telemetry: None,
+            pool_ledger_db_path: work_dir.join("pool-ledger.redb"),
+            ui_dir: work_dir.join("ui"),
+        };
+
+        let internal = super::axum_internal_error("boom");
+        assert_eq!(
+            internal.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+
+        let tx_not_found = super::axum_tx_response(&state, 0, 99);
+        assert_eq!(tx_not_found.status(), axum::http::StatusCode::NOT_FOUND);
+
+        let payouts_pending = super::axum_pool_payouts_response(&state, false)
+            .expect("pool payouts response should not error");
+        assert_eq!(payouts_pending.status(), axum::http::StatusCode::NOT_FOUND);
+
+        let payouts_completed = super::axum_pool_payouts_response(&state, true)
+            .expect("pool payouts response should not error");
+        assert_eq!(
+            payouts_completed.status(),
+            axum::http::StatusCode::NOT_FOUND
+        );
+
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
+    fn axum_ui_asset_helpers_reject_directories_without_index_files() {
+        let ui_dir = temp_dir("test-axum-ui-assets");
+        fs::create_dir_all(&ui_dir).expect("mkdir");
+        fs::create_dir_all(ui_dir.join("folder")).expect("mkdir folder");
+
+        let directory_candidate = super::axum_try_serve_ui_asset(&ui_dir, "/folder")
+            .expect("asset lookup should not error");
+        assert!(
+            directory_candidate.is_none(),
+            "directory candidates must not be served as files"
+        );
+
+        fs::create_dir_all(ui_dir.join("index.html")).expect("mkdir fake index dir");
+        let fallback_to_directory = super::axum_try_serve_ui_asset(&ui_dir, "/missing")
+            .expect("asset lookup should not error");
+        assert!(
+            fallback_to_directory.is_none(),
+            "index directory must not be treated as an index file"
+        );
+
+        fs::remove_dir_all(ui_dir.join("index.html")).expect("remove fake index dir");
+        fs::write(ui_dir.join("index.html"), "<html>ok</html>").expect("write index");
+        let fallback_to_file = super::axum_try_serve_ui_asset(&ui_dir, "/missing")
+            .expect("asset lookup should not error");
+        let fallback_to_file = fallback_to_file.expect("missing asset must fallback to index file");
+        assert_eq!(fallback_to_file.status(), axum::http::StatusCode::OK);
+
+        let _ = fs::remove_dir_all(ui_dir);
+    }
+
+    #[test]
+    fn axum_block_handler_rejects_segmented_paths_with_explicit_message() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let work_dir = temp_dir("test-axum-block-handler-invalid-tail");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let state = super::AxumRpcState {
+            network: Network::Devnet,
+            cfg: cfg.clone(),
+            runtime_db_path: work_dir.join("runtime.redb"),
+            mempool_db_path: work_dir.join("mempool.redb"),
+            relay_telemetry: None,
+            stratum_telemetry: None,
+            pool_ledger_db_path: work_dir.join("pool-ledger.redb"),
+            ui_dir: work_dir.join("ui"),
+        };
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let body = rt.block_on(async {
+            let response = super::axum_block_handler(
+                super::AxumPath("0/1".to_owned()),
+                super::AxumState(state),
+            )
+            .await;
+            assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("read body bytes");
+            String::from_utf8(body.to_vec()).expect("utf8 body")
+        });
+        assert!(
+            body.contains("block path must be /block/<height>"),
+            "unexpected body: {body}"
+        );
+
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
+    fn mutation_guard_stage2_regressions() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+
+        assert_eq!(
+            super::relay_tx_diffusion_delay_ms_from_seed(
+                10_000_000_000,
+                u64::MAX,
+                16_806_898_589_309_566_640,
+            ),
+            10_499_273_757
+        );
+        assert!(!super::max_requests_limit_configured(0));
+        assert!(super::max_requests_limit_configured(1));
+        assert!(super::max_requests_limit_hit(2, 2));
+
+        let none = super::decode_optional_hex32("guard", &None).expect("none decode");
+        assert!(none.is_none());
+        let full_hex = Some("11".repeat(32));
+        let some = super::decode_optional_hex32("guard", &full_hex).expect("some decode");
+        assert_eq!(some, Some([0x11u8; 32]));
+
+        let work_dir = temp_dir("test-mutation-guard-stage2");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let state = super::AxumRpcState {
+            network: Network::Devnet,
+            cfg: cfg.clone(),
+            runtime_db_path: work_dir.join("runtime.redb"),
+            mempool_db_path: work_dir.join("mempool.redb"),
+            relay_telemetry: None,
+            stratum_telemetry: None,
+            pool_ledger_db_path: work_dir.join("pool-ledger.redb"),
+            ui_dir: work_dir.join("ui"),
+        };
+        assert_eq!(
+            super::axum_internal_error("guard").status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            super::axum_tx_response(&state, 0, 999).status(),
+            axum::http::StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            super::axum_pool_payouts_response(&state, false)
+                .expect("pool payouts")
+                .status(),
+            axum::http::StatusCode::NOT_FOUND
+        );
+
+        fs::create_dir_all(&state.ui_dir).expect("mkdir ui");
+        fs::create_dir_all(state.ui_dir.join("folder")).expect("mkdir folder");
+        assert!(
+            super::axum_try_serve_ui_asset(&state.ui_dir, "/folder")
+                .expect("asset check")
+                .is_none()
+        );
+        fs::create_dir_all(state.ui_dir.join("index.html")).expect("mkdir fake index");
+        assert!(
+            super::axum_try_serve_ui_asset(&state.ui_dir, "/missing")
+                .expect("fallback check")
+                .is_none()
+        );
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let block_body = rt.block_on(async {
+            let response = super::axum_block_handler(
+                super::AxumPath("0/1".to_owned()),
+                super::AxumState(state.clone()),
+            )
+            .await;
+            assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("read body");
+            String::from_utf8(body.to_vec()).expect("utf8")
+        });
+        assert!(block_body.contains("block path must be /block/<height>"));
+
+        let config_path = work_dir.join("devnet.toml");
+        fs::write(&config_path, include_str!("../../../config/devnet.toml")).expect("write cfg");
+        let runtime_db = work_dir.join("stratum-runtime.redb");
+        let secure_key_err = run_stratum_serve(StratumServeArgs {
+            network: Network::Devnet,
+            config: Some(config_path.clone()),
+            runtime_db: Some(runtime_db.clone()),
+            bind: "not-an-addr".to_owned(),
+            share_target_hex: None,
+            max_jobs_per_channel: None,
+            max_clients: 0,
+            max_active_clients: None,
+            max_protocol_violations: None,
+            read_timeout_sec: None,
+            handshake_timeout_sec: None,
+            keepalive_sec: None,
+            idle_timeout_sec: None,
+            inbound_accept_window_sec: None,
+            inbound_max_accepts_per_ip: None,
+            vardiff_target_shares_per_minute: None,
+            vardiff_retarget_interval_shares: None,
+            vardiff_clamp_up: None,
+            vardiff_clamp_down: None,
+            max_rejected_shares: None,
+            min_share_target_hex: None,
+            max_share_target_hex: None,
+            secure_transport: false,
+            secure_transport_mode: None,
+            secure_rekey_interval_messages: None,
+            secure_static_secret_key_hex: Some("11".repeat(32)),
+            secure_expected_remote_static_pubkey_hex: None,
+            template_provider_addr: None,
+            job_declarator_addr: None,
+            telemetry_out: None,
+            telemetry_every_sec: 1,
+            pool_ledger_db: None,
+            pool_share_retention: super::POOL_DEFAULT_SHARE_RETENTION,
+            pool_round_retention: super::POOL_DEFAULT_ROUND_RETENTION,
+            pool_payout_mode: super::PoolPayoutModeArg::Solo,
+            pool_fee_bps: 100,
+            pplns_window_shares: 300,
+            pps_share_atomic: 0,
+            pps_max_liability_atomic: 0,
+            pps_reserve_floor_atomic: 0,
+            pool_payout_threshold_atomic: 100_000_000,
+            pool_payout_interval_sec: 120,
+            pool_payout_tx_fee_atomic: 500,
+            pool_payout_mnemonic: None,
+            pool_payout_passphrase: String::new(),
+            pool_payout_account: 0,
+            pool_payout_index: 0,
+        })
+        .expect_err("secure key must require secure transport");
+        assert!(
+            secure_key_err
+                .to_string()
+                .contains("secure static key options require secure transport")
+        );
+
+        let secure_mode_err = run_stratum_serve(StratumServeArgs {
+            network: Network::Devnet,
+            config: Some(config_path),
+            runtime_db: Some(runtime_db),
+            bind: "not-an-addr".to_owned(),
+            share_target_hex: None,
+            max_jobs_per_channel: None,
+            max_clients: 0,
+            max_active_clients: None,
+            max_protocol_violations: None,
+            read_timeout_sec: None,
+            handshake_timeout_sec: None,
+            keepalive_sec: None,
+            idle_timeout_sec: None,
+            inbound_accept_window_sec: None,
+            inbound_max_accepts_per_ip: None,
+            vardiff_target_shares_per_minute: None,
+            vardiff_retarget_interval_shares: None,
+            vardiff_clamp_up: None,
+            vardiff_clamp_down: None,
+            max_rejected_shares: None,
+            min_share_target_hex: None,
+            max_share_target_hex: None,
+            secure_transport: true,
+            secure_transport_mode: Some(super::SecureTransportModeArg::NoiseXx),
+            secure_rekey_interval_messages: Some(1_000),
+            secure_static_secret_key_hex: None,
+            secure_expected_remote_static_pubkey_hex: None,
+            template_provider_addr: None,
+            job_declarator_addr: None,
+            telemetry_out: None,
+            telemetry_every_sec: 1,
+            pool_ledger_db: None,
+            pool_share_retention: super::POOL_DEFAULT_SHARE_RETENTION,
+            pool_round_retention: super::POOL_DEFAULT_ROUND_RETENTION,
+            pool_payout_mode: super::PoolPayoutModeArg::Solo,
+            pool_fee_bps: 100,
+            pplns_window_shares: 300,
+            pps_share_atomic: 0,
+            pps_max_liability_atomic: 0,
+            pps_reserve_floor_atomic: 0,
+            pool_payout_threshold_atomic: 100_000_000,
+            pool_payout_interval_sec: 120,
+            pool_payout_tx_fee_atomic: 500,
+            pool_payout_mnemonic: None,
+            pool_payout_passphrase: String::new(),
+            pool_payout_account: 0,
+            pool_payout_index: 0,
+        })
+        .expect_err("noise mode must require static key");
+        assert!(
+            secure_mode_err
+                .to_string()
+                .contains("requires --secure-static-secret-key-hex")
+        );
+
+        const KEY: &str = "SCAM_RPC_HTTP_BACKEND";
+        let _net_guard = network_test_guard();
+        if let Some(addr) = allocate_local_addr() {
+            let rpc_dir = temp_dir("test-mutation-guard-rpc-legacy");
+            fs::create_dir_all(&rpc_dir).expect("mkdir rpc");
+            let rpc_cfg = rpc_dir.join("devnet.toml");
+            fs::write(&rpc_cfg, include_str!("../../../config/devnet.toml"))
+                .expect("write rpc cfg");
+            let rpc_runtime = rpc_dir.join("runtime.redb");
+            let ui_dir = rpc_dir.join("ui");
+            fs::create_dir_all(&ui_dir).expect("mkdir rpc ui");
+            fs::write(ui_dir.join("index.html"), "<html>ui</html>").expect("write rpc ui");
+            unsafe {
+                std::env::set_var(KEY, "legacy");
+            }
+            let (shutdown, handle) = spawn_rpc_server_for_test(RpcServeArgs {
+                network: Network::Devnet,
+                config: Some(rpc_cfg),
+                runtime_db: Some(rpc_runtime),
+                bind: addr.clone(),
+                ui_dir,
+                relay_telemetry: None,
+                stratum_telemetry: None,
+                pool_ledger: None,
+                mine_blocks: 0,
+                interval_sec: 120,
+                max_nonce: 500_000,
+                max_requests: 0,
+            });
+            let post_events = send_http_request(
+                &addr,
+                "POST /events HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+            );
+            assert!(post_events.starts_with("HTTP/1.1 404 Not Found"));
+            stop_rpc_server_for_test(shutdown, handle, "mutation guard legacy rpc");
+            unsafe {
+                std::env::remove_var(KEY);
+            }
+            let _ = fs::remove_dir_all(rpc_dir);
+        }
+
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
     fn ui_dir_is_servable_requires_existing_directory() {
         let work_dir = temp_dir("test-ui-dir-servable");
         fs::create_dir_all(&work_dir).expect("mkdir");
@@ -23661,6 +24033,57 @@ mod tests {
         assert!(unknown_response.contains("<html>ui</html>"));
 
         stop_rpc_server_for_test(server_shutdown, server, "rpc health routes server");
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
+    fn run_rpc_serve_legacy_backend_routes_are_strict_when_selected() {
+        const KEY: &str = "SCAM_RPC_HTTP_BACKEND";
+        let _net_guard = network_test_guard();
+        let Some(addr) = allocate_local_addr() else {
+            return;
+        };
+        let work_dir = temp_dir("test-rpc-serve-legacy-routes");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let config_path = work_dir.join("devnet.toml");
+        fs::write(&config_path, include_str!("../../../config/devnet.toml")).expect("write cfg");
+        let runtime_db = work_dir.join("runtime.redb");
+        let ui_dir = work_dir.join("ui");
+        fs::create_dir_all(&ui_dir).expect("mkdir ui");
+        fs::write(ui_dir.join("index.html"), "<html>ui</html>").expect("write ui");
+
+        unsafe {
+            std::env::set_var(KEY, "legacy");
+        }
+        let (server_shutdown, server) = spawn_rpc_server_for_test(RpcServeArgs {
+            network: Network::Devnet,
+            config: Some(config_path),
+            runtime_db: Some(runtime_db),
+            bind: addr.clone(),
+            ui_dir,
+            relay_telemetry: None,
+            stratum_telemetry: None,
+            pool_ledger: None,
+            mine_blocks: 0,
+            interval_sec: 120,
+            max_nonce: 500_000,
+            max_requests: 0,
+        });
+
+        let health = send_http_request(&addr, "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        assert!(health.starts_with("HTTP/1.1 200 OK"));
+
+        let post_events = send_http_request(
+            &addr,
+            "POST /events HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+        );
+        assert!(post_events.starts_with("HTTP/1.1 404 Not Found"));
+        assert!(post_events.contains("\"unknown endpoint\""));
+
+        stop_rpc_server_for_test(server_shutdown, server, "rpc legacy routes server");
+        unsafe {
+            std::env::remove_var(KEY);
+        }
         let _ = fs::remove_dir_all(work_dir);
     }
 
@@ -23739,6 +24162,18 @@ mod tests {
             pool_status.contains("snapshot not available")
                 || pool_status.contains("pool telemetry and ledger snapshots are not available")
         );
+        let pool_pending = send_http_request(
+            &addr,
+            "GET /pool/payouts/pending HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(pool_pending.starts_with("HTTP/1.1 404 Not Found"));
+        assert!(pool_pending.contains("pool ledger snapshot not available"));
+        let pool_completed = send_http_request(
+            &addr,
+            "GET /pool/payouts/completed HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(pool_completed.starts_with("HTTP/1.1 404 Not Found"));
+        assert!(pool_completed.contains("pool ledger snapshot not available"));
 
         stop_rpc_server_for_test(server_shutdown, server, "rpc core routes server");
         let _ = fs::remove_dir_all(work_dir);
@@ -24295,7 +24730,7 @@ mod tests {
             network: Network::Devnet,
             config: Some(config_path.clone()),
             runtime_db: Some(runtime_db.clone()),
-            bind: "127.0.0.1:0".to_owned(),
+            bind: "not-an-addr".to_owned(),
             share_target_hex: None,
             max_jobs_per_channel: None,
             max_clients: 0,
@@ -24346,6 +24781,120 @@ mod tests {
                 .to_string()
                 .contains("requires --secure-static-secret-key-hex"),
             "unexpected serve error: {serve_err}"
+        );
+
+        let insecure_secret_err = run_stratum_serve(StratumServeArgs {
+            network: Network::Devnet,
+            config: Some(config_path.clone()),
+            runtime_db: Some(runtime_db.clone()),
+            bind: "not-an-addr".to_owned(),
+            share_target_hex: None,
+            max_jobs_per_channel: None,
+            max_clients: 0,
+            max_active_clients: None,
+            max_protocol_violations: None,
+            read_timeout_sec: None,
+            handshake_timeout_sec: None,
+            keepalive_sec: None,
+            idle_timeout_sec: None,
+            inbound_accept_window_sec: None,
+            inbound_max_accepts_per_ip: None,
+            vardiff_target_shares_per_minute: None,
+            vardiff_retarget_interval_shares: None,
+            vardiff_clamp_up: None,
+            vardiff_clamp_down: None,
+            max_rejected_shares: None,
+            min_share_target_hex: None,
+            max_share_target_hex: None,
+            secure_transport: false,
+            secure_transport_mode: None,
+            secure_rekey_interval_messages: None,
+            secure_static_secret_key_hex: Some("11".repeat(32)),
+            secure_expected_remote_static_pubkey_hex: None,
+            template_provider_addr: None,
+            job_declarator_addr: None,
+            telemetry_out: None,
+            telemetry_every_sec: 1,
+            pool_ledger_db: None,
+            pool_share_retention: super::POOL_DEFAULT_SHARE_RETENTION,
+            pool_round_retention: super::POOL_DEFAULT_ROUND_RETENTION,
+            pool_payout_mode: super::PoolPayoutModeArg::Solo,
+            pool_fee_bps: 100,
+            pplns_window_shares: 300,
+            pps_share_atomic: 0,
+            pps_max_liability_atomic: 0,
+            pps_reserve_floor_atomic: 0,
+            pool_payout_threshold_atomic: 100_000_000,
+            pool_payout_interval_sec: 120,
+            pool_payout_tx_fee_atomic: 500,
+            pool_payout_mnemonic: None,
+            pool_payout_passphrase: String::new(),
+            pool_payout_account: 0,
+            pool_payout_index: 0,
+        })
+        .expect_err("secure secret key must require secure transport");
+        assert!(
+            insecure_secret_err
+                .to_string()
+                .contains("secure static key options require secure transport"),
+            "unexpected insecure secret error: {insecure_secret_err}"
+        );
+
+        let insecure_remote_key_err = run_stratum_serve(StratumServeArgs {
+            network: Network::Devnet,
+            config: Some(config_path.clone()),
+            runtime_db: Some(runtime_db.clone()),
+            bind: "not-an-addr".to_owned(),
+            share_target_hex: None,
+            max_jobs_per_channel: None,
+            max_clients: 0,
+            max_active_clients: None,
+            max_protocol_violations: None,
+            read_timeout_sec: None,
+            handshake_timeout_sec: None,
+            keepalive_sec: None,
+            idle_timeout_sec: None,
+            inbound_accept_window_sec: None,
+            inbound_max_accepts_per_ip: None,
+            vardiff_target_shares_per_minute: None,
+            vardiff_retarget_interval_shares: None,
+            vardiff_clamp_up: None,
+            vardiff_clamp_down: None,
+            max_rejected_shares: None,
+            min_share_target_hex: None,
+            max_share_target_hex: None,
+            secure_transport: false,
+            secure_transport_mode: None,
+            secure_rekey_interval_messages: None,
+            secure_static_secret_key_hex: None,
+            secure_expected_remote_static_pubkey_hex: Some("22".repeat(32)),
+            template_provider_addr: None,
+            job_declarator_addr: None,
+            telemetry_out: None,
+            telemetry_every_sec: 1,
+            pool_ledger_db: None,
+            pool_share_retention: super::POOL_DEFAULT_SHARE_RETENTION,
+            pool_round_retention: super::POOL_DEFAULT_ROUND_RETENTION,
+            pool_payout_mode: super::PoolPayoutModeArg::Solo,
+            pool_fee_bps: 100,
+            pplns_window_shares: 300,
+            pps_share_atomic: 0,
+            pps_max_liability_atomic: 0,
+            pps_reserve_floor_atomic: 0,
+            pool_payout_threshold_atomic: 100_000_000,
+            pool_payout_interval_sec: 120,
+            pool_payout_tx_fee_atomic: 500,
+            pool_payout_mnemonic: None,
+            pool_payout_passphrase: String::new(),
+            pool_payout_account: 0,
+            pool_payout_index: 0,
+        })
+        .expect_err("secure expected remote key must require secure transport");
+        assert!(
+            insecure_remote_key_err
+                .to_string()
+                .contains("secure static key options require secure transport"),
+            "unexpected insecure remote key error: {insecure_remote_key_err}"
         );
 
         let mine_err = run_stratum_mine(StratumMineArgs {
@@ -30410,9 +30959,9 @@ mod tests {
             thread::sleep(Duration::from_millis(40));
         }
 
-        join_with_timeout(server_a, Duration::from_secs(60), "relay latency server A")
+        join_with_timeout(server_a, Duration::from_secs(25), "relay latency server A")
             .expect("relay A should exit");
-        join_with_timeout(server_b, Duration::from_secs(60), "relay latency server B")
+        join_with_timeout(server_b, Duration::from_secs(25), "relay latency server B")
             .expect("relay B should exit");
         let _ = fs::remove_dir_all(work_dir);
     }

@@ -984,6 +984,12 @@ mod tests {
 
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .expect("set read timeout");
+            stream
+                .set_write_timeout(Some(Duration::from_secs(1)))
+                .expect("set write timeout");
             let _ = read_message(&mut stream, &cfg).expect("first request");
             send_message(&mut stream, &WireMessage::Ping { nonce: 1 }, &cfg)
                 .expect("send unexpected headers response");
@@ -995,6 +1001,12 @@ mod tests {
         });
 
         let mut stream = TcpStream::connect(addr).expect("connect");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("set read timeout");
+        stream
+            .set_write_timeout(Some(Duration::from_secs(1)))
+            .expect("set write timeout");
         let err = request_headers(&mut stream, &FramingConfig::default(), Vec::new(), None)
             .expect_err("unexpected response must fail");
         assert!(matches!(
