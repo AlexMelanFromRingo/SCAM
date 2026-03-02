@@ -14204,11 +14204,17 @@ struct AxumRpcState {
     network: Network,
     cfg: ChainConfig,
     runtime_db_path: PathBuf,
+    runtime_cache: Arc<Mutex<AxumRuntimeCache>>,
     mempool_db_path: PathBuf,
     relay_telemetry: Option<PathBuf>,
     stratum_telemetry: Option<PathBuf>,
     pool_ledger_db_path: PathBuf,
     ui_dir: PathBuf,
+}
+
+struct AxumRuntimeCache {
+    runtime: ChainRuntime,
+    last_seen_mtime: Option<SystemTime>,
 }
 
 fn axum_json_response(status: StatusCode, body: String) -> AxumResponse {
@@ -14255,8 +14261,42 @@ fn axum_parse_json_body<T: DeserializeOwned>(body: AxumBytes) -> Result<T, NodeE
     parse_json_body::<T>(&request)
 }
 
+fn axum_runtime_for_query<T, F>(state: &AxumRpcState, query: F) -> Result<T, NodeError>
+where
+    F: FnOnce(&ChainRuntime) -> Result<T, NodeError>,
+{
+    let mut cache = state
+        .runtime_cache
+        .lock()
+        .map_err(|_| NodeError::Runtime("axum runtime cache mutex poisoned".to_owned()))?;
+    let AxumRuntimeCache {
+        runtime,
+        last_seen_mtime,
+    } = &mut *cache;
+    match refresh_runtime_from_db_if_changed(
+        &state.cfg,
+        runtime,
+        &state.runtime_db_path,
+        last_seen_mtime,
+    ) {
+        Ok(()) => {}
+        Err(err) if is_runtime_db_lock_conflict(&err) => {}
+        Err(err) => return Err(err),
+    }
+    query(&cache.runtime)
+}
+
 fn axum_status_payload(state: &AxumRpcState) -> Result<StatusResponse, NodeError> {
-    let (runtime, _) = load_runtime_from_db_or_genesis(&state.cfg, &state.runtime_db_path)?;
+    let (tip_height, tip_hash, utxo_count, cumulative_work, network_hashrate_hps) =
+        axum_runtime_for_query(state, |runtime| {
+            Ok((
+                runtime.tip_height(),
+                runtime.tip_hash(),
+                runtime.utxo_len(),
+                runtime.cumulative_work().to_str_radix(10),
+                estimate_network_hashrate_hps(runtime),
+            ))
+        })?;
     let (stratum_active_clients, stratum_workers_active, stratum_pool_hashrate_hps) =
         match state.stratum_telemetry.as_ref() {
             Some(path) => match load_latest_jsonl_record::<StratumServerTelemetrySnapshot>(path)? {
@@ -14271,11 +14311,11 @@ fn axum_status_payload(state: &AxumRpcState) -> Result<StatusResponse, NodeError
         };
     Ok(StatusResponse {
         network_id: state.cfg.network_id.clone(),
-        tip_height: runtime.tip_height(),
-        tip_hash: runtime.tip_hash().to_hex(),
-        utxo_count: runtime.utxo_len(),
-        cumulative_work: runtime.cumulative_work().to_str_radix(10),
-        network_hashrate_hps: estimate_network_hashrate_hps(&runtime),
+        tip_height,
+        tip_hash: tip_hash.to_hex(),
+        utxo_count,
+        cumulative_work,
+        network_hashrate_hps,
         stratum_active_clients,
         stratum_workers_active,
         stratum_pool_hashrate_hps,
@@ -14299,56 +14339,55 @@ async fn axum_status_handler(AxumState(state): AxumState<AxumRpcState>) -> AxumR
     }
 }
 
-fn axum_runtime_for_query(state: &AxumRpcState) -> Result<ChainRuntime, NodeError> {
-    let (runtime, _) = load_runtime_from_db_or_genesis(&state.cfg, &state.runtime_db_path)?;
-    Ok(runtime)
-}
-
 fn axum_block_response(state: &AxumRpcState, height: u64) -> AxumResponse {
-    let runtime = match axum_runtime_for_query(state) {
-        Ok(runtime) => runtime,
-        Err(err) => return axum_internal_error(err),
-    };
-    let Some(hash) = runtime.block_hash_at_height(height) else {
-        return axum_json_response(
-            StatusCode::NOT_FOUND,
-            json_error_body(&format!("height {height} not found")),
-        );
-    };
-    let Some(block) = runtime.block_by_hash(&hash) else {
-        return axum_internal_error(format!("block for height {height} missing"));
-    };
-    match to_pretty_json(&block_lookup_response(height, block)) {
-        Ok(body) => axum_json_response(StatusCode::OK, body),
-        Err(err) => axum_internal_error(format!("block serialization failed: {err}")),
+    match axum_runtime_for_query(state, |runtime| {
+        let Some(hash) = runtime.block_hash_at_height(height) else {
+            return Ok(axum_json_response(
+                StatusCode::NOT_FOUND,
+                json_error_body(&format!("height {height} not found")),
+            ));
+        };
+        let Some(block) = runtime.block_by_hash(&hash) else {
+            return Ok(axum_internal_error(format!(
+                "block for height {height} missing"
+            )));
+        };
+        let body = to_pretty_json(&block_lookup_response(height, block))
+            .map_err(|err| NodeError::Runtime(format!("block serialization failed: {err}")))?;
+        Ok(axum_json_response(StatusCode::OK, body))
+    }) {
+        Ok(payload) => payload,
+        Err(err) => axum_internal_error(err),
     }
 }
 
 fn axum_tx_response(state: &AxumRpcState, height: u64, index: usize) -> AxumResponse {
-    let runtime = match axum_runtime_for_query(state) {
-        Ok(runtime) => runtime,
-        Err(err) => return axum_internal_error(err),
-    };
-    let Some(hash) = runtime.block_hash_at_height(height) else {
-        return axum_json_response(
-            StatusCode::NOT_FOUND,
-            json_error_body(&format!("height {height} not found")),
-        );
-    };
-    let Some(block) = runtime.block_by_hash(&hash) else {
-        return axum_internal_error(format!("block for height {height} missing"));
-    };
-    let Some(tx) = block.transactions.get(index) else {
-        return axum_json_response(
-            StatusCode::NOT_FOUND,
-            json_error_body(&format!(
-                "tx index {index} not found in block at height {height}"
-            )),
-        );
-    };
-    match to_pretty_json(&tx_lookup_response(height, index, tx)) {
-        Ok(body) => axum_json_response(StatusCode::OK, body),
-        Err(err) => axum_internal_error(format!("tx serialization failed: {err}")),
+    match axum_runtime_for_query(state, |runtime| {
+        let Some(hash) = runtime.block_hash_at_height(height) else {
+            return Ok(axum_json_response(
+                StatusCode::NOT_FOUND,
+                json_error_body(&format!("height {height} not found")),
+            ));
+        };
+        let Some(block) = runtime.block_by_hash(&hash) else {
+            return Ok(axum_internal_error(format!(
+                "block for height {height} missing"
+            )));
+        };
+        let Some(tx) = block.transactions.get(index) else {
+            return Ok(axum_json_response(
+                StatusCode::NOT_FOUND,
+                json_error_body(&format!(
+                    "tx index {index} not found in block at height {height}"
+                )),
+            ));
+        };
+        let body = to_pretty_json(&tx_lookup_response(height, index, tx))
+            .map_err(|err| NodeError::Runtime(format!("tx serialization failed: {err}")))?;
+        Ok(axum_json_response(StatusCode::OK, body))
+    }) {
+        Ok(payload) => payload,
+        Err(err) => axum_internal_error(err),
     }
 }
 
@@ -14360,32 +14399,36 @@ fn axum_txid_response(state: &AxumRpcState, txid_raw: &str) -> AxumResponse {
         Ok(hash) => hash,
         Err(_) => return axum_bad_request("invalid txid hex, expected 32-byte hash"),
     };
-    let runtime = match axum_runtime_for_query(state) {
-        Ok(runtime) => runtime,
-        Err(err) => return axum_internal_error(err),
-    };
-    let mut located = None::<(u64, usize, TxLookupRpcResponse)>;
-    for height in 0..=runtime.tip_height() {
-        let Some(hash) = runtime.block_hash_at_height(height) else {
-            continue;
-        };
-        let Some(block) = runtime.block_by_hash(&hash) else {
-            return axum_internal_error(format!("block for height {height} missing"));
-        };
-        if let Some((index, tx)) = find_tx_by_txid(block, needle_txid) {
-            located = Some((height, index, tx_lookup_response(height, index, tx)));
-            break;
+    match axum_runtime_for_query(state, |runtime| {
+        let mut located = None::<TxLookupRpcResponse>;
+        for height in 0..=runtime.tip_height() {
+            let Some(hash) = runtime.block_hash_at_height(height) else {
+                continue;
+            };
+            let Some(block) = runtime.block_by_hash(&hash) else {
+                return Ok(axum_internal_error(format!(
+                    "block for height {height} missing"
+                )));
+            };
+            if let Some((index, tx)) = find_tx_by_txid(block, needle_txid) {
+                located = Some(tx_lookup_response(height, index, tx));
+                break;
+            }
         }
-    }
-    match located {
-        Some((_height, _index, payload)) => match to_pretty_json(&payload) {
-            Ok(body) => axum_json_response(StatusCode::OK, body),
-            Err(err) => axum_internal_error(format!("tx serialization failed: {err}")),
-        },
-        None => axum_json_response(
-            StatusCode::NOT_FOUND,
-            json_error_body(&format!("txid {txid_raw} not found")),
-        ),
+        match located {
+            Some(payload) => {
+                let body = to_pretty_json(&payload)
+                    .map_err(|err| NodeError::Runtime(format!("tx serialization failed: {err}")))?;
+                Ok(axum_json_response(StatusCode::OK, body))
+            }
+            None => Ok(axum_json_response(
+                StatusCode::NOT_FOUND,
+                json_error_body(&format!("txid {txid_raw} not found")),
+            )),
+        }
+    }) {
+        Ok(payload) => payload,
+        Err(err) => axum_internal_error(err),
     }
 }
 
@@ -14510,15 +14553,16 @@ fn axum_wallet_send_preview_payload(
     let mnemonic = WalletMnemonic::parse(&req.mnemonic)?;
     let seed = mnemonic.to_seed(&req.passphrase);
     let key = derive_wallet_key(&seed, req.account, req.index)?;
-    let runtime = axum_runtime_for_query(state)?;
-    let signed = build_signed_transfer_tx(
-        &runtime,
-        &state.cfg.network_id,
-        &key,
-        recipient.key_hash20,
-        req.amount,
-        req.fee,
-    )?;
+    let signed = axum_runtime_for_query(state, |runtime| {
+        build_signed_transfer_tx(
+            runtime,
+            &state.cfg.network_id,
+            &key,
+            recipient.key_hash20,
+            req.amount,
+            req.fee,
+        )
+    })?;
     let tx_bincode_hex = hex::encode(
         bincode::serialize(&signed.tx)
             .map_err(|err| NodeError::Runtime(format!("tx encode failed: {err}")))?,
@@ -14546,14 +14590,15 @@ fn axum_wallet_send_preview_payload(
 }
 
 fn axum_events_snapshot_payload(state: &AxumRpcState) -> Result<String, NodeError> {
-    let (runtime, _) = load_runtime_from_db_or_genesis(&state.cfg, &state.runtime_db_path)?;
-    let snapshot = build_rpc_event_snapshot(
-        &state.cfg,
-        &runtime,
-        &state.mempool_db_path,
-        state.relay_telemetry.as_deref(),
-        state.stratum_telemetry.as_deref(),
-    )?;
+    let snapshot = axum_runtime_for_query(state, |runtime| {
+        build_rpc_event_snapshot(
+            &state.cfg,
+            runtime,
+            &state.mempool_db_path,
+            state.relay_telemetry.as_deref(),
+            state.stratum_telemetry.as_deref(),
+        )
+    })?;
     serde_json::to_string(&snapshot)
         .map_err(|e| NodeError::Runtime(format!("events serialization failed: {e}")))
 }
@@ -14868,19 +14913,20 @@ async fn axum_wallet_balance_handler(
             Ok(value) => value,
             Err(err) => return axum_bad_request(err),
         };
-    let runtime = match axum_runtime_for_query(&state) {
-        Ok(runtime) => runtime,
+    let key_hash20 = scam_core::hash160_blake3(&key.pubkey_compressed());
+    let payload = match axum_runtime_for_query(&state, |runtime| {
+        Ok(wallet_balance_response(
+            runtime,
+            &state.cfg,
+            req.account,
+            req.index,
+            address_payload.address.clone(),
+            key_hash20,
+        ))
+    }) {
+        Ok(payload) => payload,
         Err(err) => return axum_internal_error(err),
     };
-    let key_hash20 = scam_core::hash160_blake3(&key.pubkey_compressed());
-    let payload = wallet_balance_response(
-        &runtime,
-        &state.cfg,
-        req.account,
-        req.index,
-        address_payload.address,
-        key_hash20,
-    );
     match to_pretty_json(&payload) {
         Ok(body) => axum_json_response(StatusCode::OK, body),
         Err(err) => axum_internal_error(format!("wallet balance serialization failed: {err}")),
@@ -14908,12 +14954,19 @@ async fn axum_wallet_balance_by_address_handler(
             accepted_hrps.join(", ")
         ));
     }
-    let runtime = match axum_runtime_for_query(&state) {
-        Ok(runtime) => runtime,
+    let payload = match axum_runtime_for_query(&state, |runtime| {
+        Ok(wallet_balance_response(
+            runtime,
+            &state.cfg,
+            0,
+            0,
+            req.address.clone(),
+            decoded.key_hash20,
+        ))
+    }) {
+        Ok(payload) => payload,
         Err(err) => return axum_internal_error(err),
     };
-    let payload =
-        wallet_balance_response(&runtime, &state.cfg, 0, 0, req.address, decoded.key_hash20);
     match to_pretty_json(&payload) {
         Ok(body) => axum_json_response(StatusCode::OK, body),
         Err(err) => axum_internal_error(format!(
@@ -14943,13 +14996,22 @@ async fn axum_wallet_balance_history_by_address_handler(
             accepted_hrps.join(", ")
         ));
     }
-    let runtime = match axum_runtime_for_query(&state) {
-        Ok(runtime) => runtime,
+    let (balance, tx_history) = match axum_runtime_for_query(&state, |runtime| {
+        Ok((
+            wallet_balance_response(
+                runtime,
+                &state.cfg,
+                0,
+                0,
+                req.address.clone(),
+                decoded.key_hash20,
+            ),
+            wallet_tx_history_for_key_hash(runtime, decoded.key_hash20, req.max_entries),
+        ))
+    }) {
+        Ok(values) => values,
         Err(err) => return axum_internal_error(err),
     };
-    let balance =
-        wallet_balance_response(&runtime, &state.cfg, 0, 0, req.address, decoded.key_hash20);
-    let tx_history = wallet_tx_history_for_key_hash(&runtime, decoded.key_hash20, req.max_entries);
     let payload = WalletBalanceHistoryRpcResponse {
         balance,
         tx_history,
@@ -15170,11 +15232,16 @@ fn run_rpc_serve_inner_axum(
     if max_requests_limit_configured(max_requests) {
         println!("Max requests before exit: {}", max_requests);
     }
+    let runtime_last_seen_mtime = runtime_db_mtime(&runtime_db_path);
 
     let shared = AxumRpcState {
         network,
         cfg,
         runtime_db_path,
+        runtime_cache: Arc::new(Mutex::new(AxumRuntimeCache {
+            runtime,
+            last_seen_mtime: runtime_last_seen_mtime,
+        })),
         mempool_db_path,
         relay_telemetry,
         stratum_telemetry,
@@ -23629,6 +23696,10 @@ mod tests {
             network: Network::Devnet,
             cfg: cfg.clone(),
             runtime_db_path: work_dir.join("runtime.redb"),
+            runtime_cache: Arc::new(std::sync::Mutex::new(super::AxumRuntimeCache {
+                runtime: ChainRuntime::from_config(cfg.clone()).expect("runtime"),
+                last_seen_mtime: None,
+            })),
             mempool_db_path: work_dir.join("mempool.redb"),
             relay_telemetry: None,
             stratum_telemetry: None,
@@ -23700,6 +23771,10 @@ mod tests {
             network: Network::Devnet,
             cfg: cfg.clone(),
             runtime_db_path: work_dir.join("runtime.redb"),
+            runtime_cache: Arc::new(std::sync::Mutex::new(super::AxumRuntimeCache {
+                runtime: ChainRuntime::from_config(cfg.clone()).expect("runtime"),
+                last_seen_mtime: None,
+            })),
             mempool_db_path: work_dir.join("mempool.redb"),
             relay_telemetry: None,
             stratum_telemetry: None,
@@ -23760,6 +23835,10 @@ mod tests {
             network: Network::Devnet,
             cfg: cfg.clone(),
             runtime_db_path: work_dir.join("runtime.redb"),
+            runtime_cache: Arc::new(std::sync::Mutex::new(super::AxumRuntimeCache {
+                runtime: ChainRuntime::from_config(cfg.clone()).expect("runtime"),
+                last_seen_mtime: None,
+            })),
             mempool_db_path: work_dir.join("mempool.redb"),
             relay_telemetry: None,
             stratum_telemetry: None,
