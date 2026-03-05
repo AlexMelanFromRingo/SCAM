@@ -92,6 +92,7 @@ impl Default for FramingConfig {
 pub struct LocalHandshake {
     pub protocol_version: u32,
     pub network_id: String,
+    pub consensus_fingerprint: String,
     pub user_agent: String,
     pub start_height: u64,
 }
@@ -100,6 +101,7 @@ pub struct LocalHandshake {
 pub struct RemoteHandshake {
     pub protocol_version: u32,
     pub network_id: String,
+    pub consensus_fingerprint: String,
     pub user_agent: String,
     pub start_height: u64,
 }
@@ -225,6 +227,7 @@ pub fn client_handshake<IO: Read + Write>(
         &WireMessage::Version {
             protocol_version: local.protocol_version,
             network_id: local.network_id.clone(),
+            consensus_fingerprint: local.consensus_fingerprint.clone(),
             user_agent: local.user_agent.clone(),
             start_height: local.start_height,
         },
@@ -254,6 +257,7 @@ pub async fn client_handshake_async<S: AsyncRead + AsyncWrite + Unpin>(
         &WireMessage::Version {
             protocol_version: local.protocol_version,
             network_id: local.network_id.clone(),
+            consensus_fingerprint: local.consensus_fingerprint.clone(),
             user_agent: local.user_agent.clone(),
             start_height: local.start_height,
         },
@@ -286,6 +290,7 @@ pub fn server_handshake<IO: Read + Write>(
         &WireMessage::Version {
             protocol_version: local.protocol_version,
             network_id: local.network_id.clone(),
+            consensus_fingerprint: local.consensus_fingerprint.clone(),
             user_agent: local.user_agent.clone(),
             start_height: local.start_height,
         },
@@ -314,6 +319,7 @@ pub async fn server_handshake_async<S: AsyncRead + AsyncWrite + Unpin>(
         &WireMessage::Version {
             protocol_version: local.protocol_version,
             network_id: local.network_id.clone(),
+            consensus_fingerprint: local.consensus_fingerprint.clone(),
             user_agent: local.user_agent.clone(),
             start_height: local.start_height,
         },
@@ -432,11 +438,13 @@ fn parse_version(message: WireMessage) -> Result<RemoteHandshake, TransportError
         WireMessage::Version {
             protocol_version,
             network_id,
+            consensus_fingerprint,
             user_agent,
             start_height,
         } => Ok(RemoteHandshake {
             protocol_version,
             network_id,
+            consensus_fingerprint,
             user_agent,
             start_height,
         }),
@@ -535,6 +543,7 @@ mod tests {
         LocalHandshake {
             protocol_version: 1,
             network_id: "devnet".to_owned(),
+            consensus_fingerprint: "consensus-devnet-v1".to_owned(),
             user_agent: "scam-test".to_owned(),
             start_height: 0,
         }
@@ -1031,6 +1040,7 @@ mod tests {
         let remote_version = WireMessage::Version {
             protocol_version: 1,
             network_id: "devnet".to_owned(),
+            consensus_fingerprint: "consensus-devnet-v1".to_owned(),
             user_agent: "remote".to_owned(),
             start_height: 7,
         };

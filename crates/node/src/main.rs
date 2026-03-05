@@ -379,6 +379,8 @@ struct HashVisualArgs {
 
 #[derive(Debug, Args)]
 struct WalletArgs {
+    #[arg(long, value_enum)]
+    seed_mode: Option<WalletSeedModeArg>,
     #[command(subcommand)]
     command: WalletCommand,
 }
@@ -1135,6 +1137,12 @@ enum PoolPayoutModeArg {
     Hybrid,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
+enum WalletSeedModeArg {
+    Bip39,
+    ScamBlake,
+}
+
 impl From<DifficultyAlgoArg> for DifficultyAlgorithm {
     fn from(value: DifficultyAlgoArg) -> Self {
         match value {
@@ -1150,6 +1158,15 @@ impl From<SecureTransportModeArg> for SecureTransportMode {
         match value {
             SecureTransportModeArg::Legacy => SecureTransportMode::Legacy,
             SecureTransportModeArg::NoiseXx => SecureTransportMode::NoiseXx,
+        }
+    }
+}
+
+impl From<WalletSeedModeArg> for WalletSeedMode {
+    fn from(value: WalletSeedModeArg) -> Self {
+        match value {
+            WalletSeedModeArg::Bip39 => WalletSeedMode::Bip39,
+            WalletSeedModeArg::ScamBlake => WalletSeedMode::ScamBlake,
         }
     }
 }
@@ -2964,8 +2981,17 @@ fn run_hash_visual(args: HashVisualArgs) -> Result<(), NodeError> {
     Ok(())
 }
 
+#[cfg(test)]
 fn run_wallet(command: WalletCommand) -> Result<(), NodeError> {
+    run_wallet_with_seed_mode(command, None)
+}
+
+fn run_wallet_with_seed_mode(
+    command: WalletCommand,
+    cli_seed_mode: Option<WalletSeedMode>,
+) -> Result<(), NodeError> {
     let seed_mode = wallet_seed_mode_from_env()?;
+    let seed_mode = cli_seed_mode.unwrap_or(seed_mode);
 
     fn derive_and_print_address(
         mnemonic_phrase: &str,
@@ -4041,6 +4067,48 @@ fn ensure_network_id_match(expected: &str, got: &str, context: &str) -> Result<(
     )))
 }
 
+fn consensus_fingerprint(cfg: &ChainConfig) -> String {
+    let mut payload = Vec::with_capacity(256);
+    payload.extend_from_slice(b"scam-consensus-fingerprint-v1");
+    payload.extend_from_slice(cfg.network_id.as_bytes());
+    payload.push(0);
+    payload.extend_from_slice(&cfg.target_block_time_sec.to_le_bytes());
+    payload.extend_from_slice(&cfg.difficulty_adjustment_window.to_le_bytes());
+    payload.push(match cfg.difficulty_algorithm {
+        DifficultyAlgorithm::Windowed => 0,
+        DifficultyAlgorithm::Lwma => 1,
+        DifficultyAlgorithm::Asert => 2,
+    });
+    payload.extend_from_slice(&cfg.asert_half_life_sec.to_le_bytes());
+    payload.extend_from_slice(&cfg.difficulty_clamp_up.to_le_bytes());
+    payload.extend_from_slice(&cfg.difficulty_clamp_down.to_le_bytes());
+    payload.extend_from_slice(&cfg.max_block_size.to_le_bytes());
+    payload.extend_from_slice(&cfg.max_tx_size.to_le_bytes());
+    payload.extend_from_slice(&cfg.coinbase_maturity.to_le_bytes());
+    payload.extend_from_slice(&cfg.block_subsidy.to_le_bytes());
+    payload.extend_from_slice(cfg.genesis_message.as_bytes());
+    payload.push(0);
+    payload.extend_from_slice(&cfg.genesis_timestamp.to_le_bytes());
+    payload.extend_from_slice(cfg.genesis_target.as_bytes());
+    payload.push(0);
+    payload.extend_from_slice(&cfg.genesis_nonce.to_le_bytes());
+    payload.extend_from_slice(cfg.genesis_reward_key_hash20.as_bytes());
+    scam_core::hash::hash256(&payload).to_hex()
+}
+
+fn ensure_consensus_fingerprint_match(
+    expected: &str,
+    got: &str,
+    context: &str,
+) -> Result<(), NodeError> {
+    if expected == got {
+        return Ok(());
+    }
+    Err(NodeError::Runtime(format!(
+        "{context}: expected consensus {expected}, got {got}"
+    )))
+}
+
 fn ensure_expected_hash(expected: Hash256, got: Hash256, context: &str) -> Result<(), NodeError> {
     if expected == got {
         return Ok(());
@@ -4092,6 +4160,7 @@ fn run_net_demo(args: NetDemoArgs) -> Result<(), NodeError> {
         .map_err(|e| NodeError::Runtime(format!("local_addr failed: {e}")))?;
 
     let network_id = cfg.network_id.clone();
+    let consensus_id = consensus_fingerprint(&cfg);
     let remote_tip = remote.tip_height();
     let remote_chain = remote.block_hashes().to_vec();
     let mut remote_headers = HashMap::new();
@@ -4106,6 +4175,7 @@ fn run_net_demo(args: NetDemoArgs) -> Result<(), NodeError> {
     }
     let max_headers = args.max_headers;
     let framing_server = framing.clone();
+    let consensus_id_server = consensus_id.clone();
     let server = thread::spawn(move || -> Result<(), String> {
         let (mut stream, _peer) = listener.accept().map_err(|e| e.to_string())?;
         configure_stream_timeouts_with_ops(
@@ -4119,6 +4189,7 @@ fn run_net_demo(args: NetDemoArgs) -> Result<(), NodeError> {
         let server_hello = LocalHandshake {
             protocol_version: 1,
             network_id: network_id.clone(),
+            consensus_fingerprint: consensus_id_server.clone(),
             user_agent: "scam-node/server".to_owned(),
             start_height: remote_tip,
         };
@@ -4128,6 +4199,12 @@ fn run_net_demo(args: NetDemoArgs) -> Result<(), NodeError> {
             &network_id,
             &remote_peer.network_id,
             "network mismatch from client",
+        )
+        .map_err(|e| e.to_string())?;
+        ensure_consensus_fingerprint_match(
+            &consensus_id_server,
+            &remote_peer.consensus_fingerprint,
+            "consensus mismatch from client",
         )
         .map_err(|e| e.to_string())?;
 
@@ -4236,6 +4313,7 @@ fn run_net_demo(args: NetDemoArgs) -> Result<(), NodeError> {
     let client_hello = LocalHandshake {
         protocol_version: 1,
         network_id: cfg.network_id.clone(),
+        consensus_fingerprint: consensus_id.clone(),
         user_agent: "scam-node/client".to_owned(),
         start_height: local.tip_height(),
     };
@@ -4244,6 +4322,11 @@ fn run_net_demo(args: NetDemoArgs) -> Result<(), NodeError> {
         &cfg.network_id,
         &remote_info.network_id,
         "network mismatch from server",
+    )?;
+    ensure_consensus_fingerprint_match(
+        &consensus_id,
+        &remote_info.consensus_fingerprint,
+        "consensus mismatch from server",
     )?;
 
     send_message(&mut client, &WireMessage::Ping { nonce: 7 }, &framing)?;
@@ -4376,9 +4459,11 @@ fn sync_runtime_with_peer(
         DEFAULT_STREAM_TIMEOUT,
     )?;
     let framing = FramingConfig::default();
+    let consensus_id = consensus_fingerprint(cfg);
     let local_hello = LocalHandshake {
         protocol_version: 1,
         network_id: cfg.network_id.clone(),
+        consensus_fingerprint: consensus_id.clone(),
         user_agent: user_agent.to_owned(),
         start_height: runtime.tip_height(),
     };
@@ -4387,6 +4472,11 @@ fn sync_runtime_with_peer(
         &cfg.network_id,
         &remote.network_id,
         "network mismatch from peer",
+    )?;
+    ensure_consensus_fingerprint_match(
+        &consensus_id,
+        &remote.consensus_fingerprint,
+        "consensus mismatch from peer",
     )?;
 
     let mut stats = PeerSyncStats::default();
@@ -7516,9 +7606,11 @@ async fn run_relay_outbound_feeler_probe_async(
     };
 
     let framing = FramingConfig::default();
+    let consensus_id = consensus_fingerprint(&cfg);
     let local_hello = LocalHandshake {
         protocol_version: 1,
         network_id: cfg.network_id.clone(),
+        consensus_fingerprint: consensus_id.clone(),
         user_agent: "scam-node/relay-feeler".to_owned(),
         start_height: 0,
     };
@@ -7527,7 +7619,12 @@ async fn run_relay_outbound_feeler_probe_async(
         client_handshake_async(&mut stream, &framing, &local_hello),
     )
     .await;
-    let success = matches!(handshake, Ok(Ok(remote)) if remote.network_id == cfg.network_id);
+    let success = matches!(
+        handshake,
+        Ok(Ok(remote))
+            if remote.network_id == cfg.network_id
+                && remote.consensus_fingerprint == consensus_id
+    );
     if let Some(store) = anchor_store {
         let _ = update_peer_anchor_store_attempt(&store, &target, now_unix_sec, success);
     }
@@ -7745,9 +7842,11 @@ fn run_relay_peer_session<IO: Read + Write>(
         }
 
         let framing = FramingConfig::default();
+        let consensus_id = consensus_fingerprint(cfg);
         let local_hello = LocalHandshake {
             protocol_version: 1,
             network_id: cfg.network_id.clone(),
+            consensus_fingerprint: consensus_id.clone(),
             user_agent: "scam-node/relay-serve".to_owned(),
             start_height: 0,
         };
@@ -7756,6 +7855,7 @@ fn run_relay_peer_session<IO: Read + Write>(
             RelayPeerSessionMode::Outbound => client_handshake(stream, &framing, &local_hello)?,
         };
         ensure_relay_peer_network(&cfg.network_id, &remote.network_id)?;
+        ensure_relay_peer_consensus(&consensus_id, &remote.consensus_fingerprint)?;
         if matches!(mode, RelayPeerSessionMode::Outbound)
             && let (Some(store), Some(address)) = (anchor_store.as_ref(), peer_address)
         {
@@ -7983,9 +8083,11 @@ async fn run_relay_peer_session_async<S: AsyncRead + AsyncWrite + Unpin>(
 
     let session_result = async {
         let framing = FramingConfig::default();
+        let consensus_id = consensus_fingerprint(cfg);
         let local_hello = LocalHandshake {
             protocol_version: 1,
             network_id: cfg.network_id.clone(),
+            consensus_fingerprint: consensus_id.clone(),
             user_agent: "scam-node/relay-serve".to_owned(),
             start_height: 0,
         };
@@ -7998,6 +8100,7 @@ async fn run_relay_peer_session_async<S: AsyncRead + AsyncWrite + Unpin>(
         )
         .await?;
         ensure_relay_peer_network(&cfg.network_id, &remote.network_id)?;
+        ensure_relay_peer_consensus(&consensus_id, &remote.consensus_fingerprint)?;
         if matches!(mode, RelayPeerSessionMode::Outbound)
             && let (Some(store), Some(address)) = (anchor_store.as_ref(), peer_address)
         {
@@ -10430,6 +10533,20 @@ fn ensure_relay_peer_network(
         Err(NodeError::Runtime(format!(
             "relay peer network mismatch: expected {}, got {}",
             expected_network_id, actual_network_id
+        )))
+    }
+}
+
+fn ensure_relay_peer_consensus(
+    expected_consensus_fingerprint: &str,
+    actual_consensus_fingerprint: &str,
+) -> Result<(), NodeError> {
+    if actual_consensus_fingerprint == expected_consensus_fingerprint {
+        Ok(())
+    } else {
+        Err(NodeError::Runtime(format!(
+            "relay peer consensus mismatch: expected {}, got {}",
+            expected_consensus_fingerprint, actual_consensus_fingerprint
         )))
     }
 }
@@ -16635,7 +16752,9 @@ fn run_command(cli: Cli) -> Result<(), NodeError> {
         Some(Command::ConfigScaffold(args)) => run_config_scaffold(args),
         Some(Command::AddPeer(args)) => run_add_peer(args),
         Some(Command::HashVisual(args)) => run_hash_visual(args),
-        Some(Command::Wallet(args)) => run_wallet(args.command),
+        Some(Command::Wallet(args)) => {
+            run_wallet_with_seed_mode(args.command, args.seed_mode.map(Into::into))
+        }
         Some(Command::MineOnce(args)) => run_mine_once(args),
         Some(Command::ChainDemo(args)) => run_chain_demo(args),
         Some(Command::SyncDemo(args)) => run_sync_demo(args),
@@ -17056,6 +17175,7 @@ mod tests {
         let remote_tip = remote.tip_height();
         let remote_chain = remote.block_hashes().to_vec();
         let network_id = cfg.network_id.clone();
+        let consensus_id = super::consensus_fingerprint(cfg);
         let mut remote_headers =
             std::collections::HashMap::<Hash256, scam_core::BlockHeader>::new();
         let mut remote_blocks_by_hash =
@@ -17082,6 +17202,7 @@ mod tests {
             let local_hello = LocalHandshake {
                 protocol_version: 1,
                 network_id: network_id.clone(),
+                consensus_fingerprint: consensus_id.clone(),
                 user_agent: "scam-node/test-sync-peer".to_owned(),
                 start_height: remote_tip,
             };
@@ -17091,6 +17212,12 @@ mod tests {
                 return Err(format!(
                     "network mismatch: expected {network_id}, got {}",
                     remote_peer.network_id
+                ));
+            }
+            if remote_peer.consensus_fingerprint != consensus_id {
+                return Err(format!(
+                    "consensus mismatch: expected {consensus_id}, got {}",
+                    remote_peer.consensus_fingerprint
                 ));
             }
 
@@ -21535,6 +21662,7 @@ mod tests {
         let local_hello = LocalHandshake {
             protocol_version: 1,
             network_id: "wrongnet".to_owned(),
+            consensus_fingerprint: "consensus-devnet-v1".to_owned(),
             user_agent: "test-client".to_owned(),
             start_height: 0,
         };
@@ -21544,6 +21672,67 @@ mod tests {
         let result = join_with_timeout(server, Duration::from_secs(5), "relay mismatch server");
         let err = result.expect_err("relay must fail on network mismatch");
         assert!(err.to_string().contains("network mismatch"));
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
+    fn relay_serve_rejects_consensus_mismatch_after_handshake() {
+        let _net_guard = network_test_guard();
+        let work_dir = temp_dir("test-relay-consensus-mismatch");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let config_path = work_dir.join("devnet.toml");
+        fs::write(&config_path, include_str!("../../../config/devnet.toml")).expect("write cfg");
+        let runtime_db = work_dir.join("runtime.redb");
+        let peers_dir = work_dir.join("peers");
+
+        let Some(bind) = allocate_local_addr() else {
+            return;
+        };
+        let server_bind = bind.clone();
+        let server = thread::spawn(move || {
+            super::run_relay_serve(super::RelayServeArgs {
+                network: Network::Devnet,
+                config: Some(config_path),
+                runtime_db: Some(runtime_db),
+                bind: server_bind,
+                max_clients: 1,
+                max_messages_per_peer: 1,
+                read_timeout_sec: 1,
+                write_timeout_sec: 1,
+                max_inv_items: None,
+                ban_threshold: None,
+                replacement_window_sec: None,
+                replacement_max_per_peer: None,
+                replacement_penalty: None,
+                telemetry_out: None,
+                telemetry_every_sec: 1,
+                peers_dir,
+                outbound_connect: false,
+                outbound_redial_sec: 1,
+            })
+        });
+
+        let mut stream = connect_with_retry(&bind);
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("timeout");
+        stream
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .expect("timeout");
+        let framing = FramingConfig::default();
+        let local_hello = LocalHandshake {
+            protocol_version: 1,
+            network_id: "devnet".to_owned(),
+            consensus_fingerprint: "consensus-wrong-v1".to_owned(),
+            user_agent: "test-client".to_owned(),
+            start_height: 0,
+        };
+        let _ = client_handshake(&mut stream, &framing, &local_hello);
+        drop(stream);
+
+        let result = join_with_timeout(server, Duration::from_secs(5), "relay consensus mismatch");
+        let err = result.expect_err("relay must fail on consensus mismatch");
+        assert!(err.to_string().contains("consensus mismatch"));
         let _ = fs::remove_dir_all(work_dir);
     }
 
@@ -21595,6 +21784,7 @@ mod tests {
         let local_hello = LocalHandshake {
             protocol_version: 1,
             network_id: "devnet".to_owned(),
+            consensus_fingerprint: "consensus-devnet-v1".to_owned(),
             user_agent: "test-client".to_owned(),
             start_height: 0,
         };
@@ -21685,6 +21875,7 @@ mod tests {
         let local_hello = LocalHandshake {
             protocol_version: 1,
             network_id: "devnet".to_owned(),
+            consensus_fingerprint: "consensus-devnet-v1".to_owned(),
             user_agent: "test-client".to_owned(),
             start_height: 0,
         };
@@ -21753,6 +21944,7 @@ mod tests {
             let local_hello = LocalHandshake {
                 protocol_version: 1,
                 network_id: "devnet".to_owned(),
+                consensus_fingerprint: "consensus-devnet-v1".to_owned(),
                 user_agent: format!("test-short-client-{idx}"),
                 start_height: 0,
             };
@@ -21866,6 +22058,7 @@ mod tests {
                 let local_hello = LocalHandshake {
                     protocol_version: 1,
                     network_id: "devnet".to_owned(),
+                    consensus_fingerprint: "consensus-devnet-v1".to_owned(),
                     user_agent: "test-restart-client".to_owned(),
                     start_height: 0,
                 };
@@ -26288,6 +26481,7 @@ mod tests {
             let local_hello = LocalHandshake {
                 protocol_version: 1,
                 network_id: "devnet".to_owned(),
+                consensus_fingerprint: "consensus-devnet-v1".to_owned(),
                 user_agent: "test-outbound-peer".to_owned(),
                 start_height: 0,
             };
@@ -26378,6 +26572,7 @@ mod tests {
             let local_hello = LocalHandshake {
                 protocol_version: 1,
                 network_id: "devnet".to_owned(),
+                consensus_fingerprint: "consensus-devnet-v1".to_owned(),
                 user_agent: "test-outbound-supervisor-peer".to_owned(),
                 start_height: 0,
             };
@@ -26463,6 +26658,7 @@ mod tests {
             let local_hello = LocalHandshake {
                 protocol_version: 1,
                 network_id: "devnet".to_owned(),
+                consensus_fingerprint: "consensus-devnet-v1".to_owned(),
                 user_agent: "test-async-outbound-peer".to_owned(),
                 start_height: 0,
             };
@@ -26554,6 +26750,7 @@ mod tests {
             let local_hello = LocalHandshake {
                 protocol_version: 1,
                 network_id: "devnet".to_owned(),
+                consensus_fingerprint: "consensus-devnet-v1".to_owned(),
                 user_agent: "test-async-supervisor-peer".to_owned(),
                 start_height: 0,
             };
@@ -26994,6 +27191,7 @@ mod tests {
         let local_hello = LocalHandshake {
             protocol_version: 1,
             network_id: "devnet".to_owned(),
+            consensus_fingerprint: "consensus-devnet-v1".to_owned(),
             user_agent: "test-relay-client".to_owned(),
             start_height: 0,
         };
@@ -27146,6 +27344,7 @@ mod tests {
         let local_hello = LocalHandshake {
             protocol_version: 1,
             network_id: "devnet".to_owned(),
+            consensus_fingerprint: "consensus-devnet-v1".to_owned(),
             user_agent: "test-relay-unix-client".to_owned(),
             start_height: 0,
         };
@@ -27256,6 +27455,7 @@ mod tests {
         let local_hello = LocalHandshake {
             protocol_version: 1,
             network_id: "devnet".to_owned(),
+            consensus_fingerprint: "consensus-devnet-v1".to_owned(),
             user_agent: "relay-outbound-test-remote".to_owned(),
             start_height: 0,
         };
@@ -27368,6 +27568,7 @@ mod tests {
             let local_hello = LocalHandshake {
                 protocol_version: 1,
                 network_id: "devnet".to_owned(),
+                consensus_fingerprint: "consensus-devnet-v1".to_owned(),
                 user_agent: "relay-async-outbound-test-remote".to_owned(),
                 start_height: 0,
             };
@@ -31366,6 +31567,7 @@ mod tests {
         let ready_hello = LocalHandshake {
             protocol_version: 1,
             network_id: "devnet".to_owned(),
+            consensus_fingerprint: "consensus-devnet-v1".to_owned(),
             user_agent: "relay-latency-ready-probe".to_owned(),
             start_height: 0,
         };
@@ -31414,6 +31616,7 @@ mod tests {
         let local_hello = LocalHandshake {
             protocol_version: 1,
             network_id: "devnet".to_owned(),
+            consensus_fingerprint: "consensus-devnet-v1".to_owned(),
             user_agent: "relay-latency-sender".to_owned(),
             start_height: 0,
         };

@@ -88,6 +88,44 @@ function setResult(el, data, isError = false) {
   el.classList.toggle("error", isError);
 }
 
+function formatAtomicScam(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return `${value}`;
+  return `${(n / 1e8).toFixed(8)} SCAM (${n} atomic)`;
+}
+
+function isWalletBalancePayload(data) {
+  return (
+    data &&
+    typeof data === "object" &&
+    "address" in data &&
+    "tip_height" in data &&
+    "spendable" in data &&
+    "immature" in data
+  );
+}
+
+function formatWalletBalanceSummary(data) {
+  return [
+    "Wallet Balance",
+    `Network: ${data.network_id ?? "-"}`,
+    `Address: ${data.address ?? "-"}`,
+    `Tip Height: ${data.tip_height ?? "-"}`,
+    `UTXOs: total=${data.utxo_count ?? 0}, spendable=${data.spendable_utxo_count ?? 0}, immature=${data.immature_utxo_count ?? 0}`,
+    `Total: ${formatAtomicScam(data.total)}`,
+    `Spendable: ${formatAtomicScam(data.spendable)}`,
+    `Immature: ${formatAtomicScam(data.immature)}`,
+  ].join("\n");
+}
+
+function setWalletResult(data, isError = false) {
+  if (!isError && isWalletBalancePayload(data)) {
+    setResult(walletOut, `${formatWalletBalanceSummary(data)}\n\nRaw JSON:\n${formatJson(data)}`);
+    return;
+  }
+  setResult(walletOut, data, isError);
+}
+
 function endpoint(path) {
   const base = state.apiBase.replace(/\/$/, "");
   return `${base}${path}`;
@@ -116,7 +154,25 @@ async function request(path, { method = "GET", body } = {}) {
     opts.headers["Content-Type"] = "application/json";
     opts.body = JSON.stringify(body);
   }
-  const response = await fetch(endpoint(path), opts);
+  const url = endpoint(path);
+  let response;
+  let lastError = null;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      response = await fetch(url, opts);
+      lastError = null;
+      break;
+    } catch (error) {
+      lastError = error;
+      if (attempt === 0) {
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      }
+    }
+  }
+  if (!response) {
+    const detail = lastError?.message || "network error";
+    throw new Error(`Failed to fetch ${url}: ${detail}`);
+  }
   const text = await response.text();
   let payload = text;
   try {
@@ -189,17 +245,25 @@ async function loadLatestBlocks(tipHeight, count = 12) {
   }
 
   const requests = heights.map(async (height) => {
-    const block = await request(`/block/${height}`);
-    return {
-      height,
-      hash: block.hash,
-      tx_count: block.tx_count,
-      timestamp: block.timestamp,
-      target: block.target,
-    };
+    try {
+      const block = await request(`/block/${height}`);
+      return {
+        height,
+        hash: block.hash,
+        tx_count: block.tx_count,
+        timestamp: block.timestamp,
+        target: block.target,
+      };
+    } catch (error) {
+      const msg = String(error?.message || "");
+      if (msg.includes("not found")) {
+        return null;
+      }
+      throw error;
+    }
   });
 
-  const blocks = await Promise.all(requests);
+  const blocks = (await Promise.all(requests)).filter(Boolean);
   renderLatestBlocks(blocks, tipHeight);
 }
 
@@ -249,7 +313,7 @@ async function refreshDashboard() {
     state.lastTipHeight = Number.isFinite(Number(status.tip_height))
       ? Number(status.tip_height)
       : state.lastTipHeight;
-    await Promise.all([
+    await Promise.allSettled([
       loadLatestBlocks(status.tip_height),
       loadMempool(),
       loadPoolStatus(),
@@ -440,9 +504,9 @@ function initWalletActions() {
     };
     try {
       const data = await request("/wallet/new", { method: "POST", body: payload });
-      setResult(walletOut, data);
+      setWalletResult(data);
     } catch (error) {
-      setResult(walletOut, error.message, true);
+      setWalletResult(error.message, true);
     }
   });
 
@@ -461,9 +525,9 @@ function initWalletActions() {
       };
       try {
         const data = await request("/wallet/address", { method: "POST", body: payload });
-        setResult(walletOut, data);
+        setWalletResult(data);
       } catch (error) {
-        setResult(walletOut, error.message, true);
+        setWalletResult(error.message, true);
       }
     });
 
@@ -481,9 +545,9 @@ function initWalletActions() {
       };
       try {
         const data = await request("/wallet/balance", { method: "POST", body: payload });
-        setResult(walletOut, data);
+        setWalletResult(data);
       } catch (error) {
-        setResult(walletOut, error.message, true);
+        setWalletResult(error.message, true);
       }
     });
 
@@ -497,9 +561,9 @@ function initWalletActions() {
       };
       try {
         const data = await request("/wallet/balance-by-address", { method: "POST", body: payload });
-        setResult(walletOut, data);
+        setWalletResult(data);
       } catch (error) {
-        setResult(walletOut, error.message, true);
+        setWalletResult(error.message, true);
       }
     });
 
@@ -518,10 +582,10 @@ function initWalletActions() {
     };
     try {
       const data = await request("/wallet/send", { method: "POST", body: payload });
-      setResult(walletOut, data);
+      setWalletResult(data);
       await refreshDashboard();
     } catch (error) {
-      setResult(walletOut, error.message, true);
+      setWalletResult(error.message, true);
     }
   });
 
@@ -533,9 +597,9 @@ function initWalletActions() {
         method: "POST",
         body: { address: raw.address },
       });
-      setResult(walletOut, data);
+      setWalletResult(data);
     } catch (error) {
-      setResult(walletOut, error.message, true);
+      setWalletResult(error.message, true);
     }
   });
 
@@ -549,9 +613,9 @@ function initWalletActions() {
     };
     try {
       const data = await request("/wallet/qr", { method: "POST", body: payload });
-      setResult(walletOut, data);
+      setWalletResult(data);
     } catch (error) {
-      setResult(walletOut, error.message, true);
+      setWalletResult(error.message, true);
     }
   });
 }

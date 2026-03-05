@@ -14,6 +14,7 @@ pub enum WireMessage {
     Version {
         protocol_version: u32,
         network_id: String,
+        consensus_fingerprint: String,
         user_agent: String,
         start_height: u64,
     },
