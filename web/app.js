@@ -91,7 +91,10 @@ function setResult(el, data, isError = false) {
 function formatAtomicScam(value) {
   const n = Number(value);
   if (!Number.isFinite(n)) return `${value}`;
-  return `${(n / 1e8).toFixed(8)} SCAM (${n} atomic)`;
+  return `${(n / 1e8).toLocaleString(undefined, {
+    minimumFractionDigits: 8,
+    maximumFractionDigits: 8,
+  })} SCAM (${n.toLocaleString()} atomic)`;
 }
 
 function isWalletBalancePayload(data) {
@@ -106,21 +109,43 @@ function isWalletBalancePayload(data) {
 }
 
 function formatWalletBalanceSummary(data) {
+  const total = Number(data.total) || 0;
+  const spendable = Number(data.spendable) || 0;
+  const immature = Number(data.immature) || 0;
+  const spendablePct = total > 0 ? ((spendable / total) * 100).toFixed(2) : "0.00";
+  const immaturePct = total > 0 ? ((immature / total) * 100).toFixed(2) : "0.00";
+  let status = "Status: no funds detected";
+  if (total > 0 && spendable === 0 && immature > 0) {
+    status = "Status: funds are immature (coinbase maturity not reached yet)";
+  } else if (spendable > 0 && immature > 0) {
+    status = "Status: partially spendable";
+  } else if (spendable > 0 && immature === 0) {
+    status = "Status: fully spendable";
+  }
   return [
-    "Wallet Balance",
-    `Network: ${data.network_id ?? "-"}`,
-    `Address: ${data.address ?? "-"}`,
-    `Tip Height: ${data.tip_height ?? "-"}`,
-    `UTXOs: total=${data.utxo_count ?? 0}, spendable=${data.spendable_utxo_count ?? 0}, immature=${data.immature_utxo_count ?? 0}`,
-    `Total: ${formatAtomicScam(data.total)}`,
-    `Spendable: ${formatAtomicScam(data.spendable)}`,
-    `Immature: ${formatAtomicScam(data.immature)}`,
+    "Wallet Balance Summary",
+    "======================",
+    `Network      : ${data.network_id ?? "-"}`,
+    `Address      : ${data.address ?? "-"}`,
+    `Tip Height   : ${data.tip_height ?? "-"}`,
+    "",
+    "Balances",
+    `  Total      : ${formatAtomicScam(total)}`,
+    `  Spendable  : ${formatAtomicScam(spendable)} (${spendablePct}%)`,
+    `  Immature   : ${formatAtomicScam(immature)} (${immaturePct}%)`,
+    "",
+    "UTXO counts",
+    `  Total      : ${(data.utxo_count ?? 0).toLocaleString()}`,
+    `  Spendable  : ${(data.spendable_utxo_count ?? 0).toLocaleString()}`,
+    `  Immature   : ${(data.immature_utxo_count ?? 0).toLocaleString()}`,
+    "",
+    status,
   ].join("\n");
 }
 
 function setWalletResult(data, isError = false) {
   if (!isError && isWalletBalancePayload(data)) {
-    setResult(walletOut, `${formatWalletBalanceSummary(data)}\n\nRaw JSON:\n${formatJson(data)}`);
+    setResult(walletOut, formatWalletBalanceSummary(data));
     return;
   }
   setResult(walletOut, data, isError);

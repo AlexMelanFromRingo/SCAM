@@ -1,7 +1,7 @@
 network_id = "devnet"
-target_block_time_sec = 120
+target_block_time_sec = 60
 difficulty_adjustment_window = 20
-difficulty_algorithm = "windowed"
+difficulty_algorithm = "lwma"
 asert_half_life_sec = 3_600
 difficulty_clamp_up = 4.0
 difficulty_clamp_down = 0.25
