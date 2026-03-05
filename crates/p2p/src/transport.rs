@@ -344,14 +344,23 @@ pub fn request_headers<IO: Read + Write>(
     stop: Option<Hash256>,
 ) -> Result<Vec<BlockHeader>, TransportError> {
     send_message(stream, &WireMessage::GetHeaders { locator, stop }, cfg)?;
-    let response = read_message(stream, cfg)?;
-    match response {
-        WireMessage::Headers { headers } => Ok(headers),
-        other => Err(TransportError::UnexpectedMessage {
-            expected: "headers",
-            got: format!("{other:?}"),
-        }),
+    for _ in 0..16 {
+        let response = read_message(stream, cfg)?;
+        match response {
+            WireMessage::Headers { headers } => return Ok(headers),
+            WireMessage::SendRecon { .. } => continue,
+            other => {
+                return Err(TransportError::UnexpectedMessage {
+                    expected: "headers",
+                    got: format!("{other:?}"),
+                });
+            }
+        }
     }
+    Err(TransportError::UnexpectedMessage {
+        expected: "headers",
+        got: "too many SendRecon preface messages".to_owned(),
+    })
 }
 
 pub async fn request_headers_async<S: AsyncRead + AsyncWrite + Unpin>(
@@ -361,14 +370,23 @@ pub async fn request_headers_async<S: AsyncRead + AsyncWrite + Unpin>(
     stop: Option<Hash256>,
 ) -> Result<Vec<BlockHeader>, TransportError> {
     send_message_async(stream, &WireMessage::GetHeaders { locator, stop }, cfg).await?;
-    let response = read_message_async(stream, cfg).await?;
-    match response {
-        WireMessage::Headers { headers } => Ok(headers),
-        other => Err(TransportError::UnexpectedMessage {
-            expected: "headers",
-            got: format!("{other:?}"),
-        }),
+    for _ in 0..16 {
+        let response = read_message_async(stream, cfg).await?;
+        match response {
+            WireMessage::Headers { headers } => return Ok(headers),
+            WireMessage::SendRecon { .. } => continue,
+            other => {
+                return Err(TransportError::UnexpectedMessage {
+                    expected: "headers",
+                    got: format!("{other:?}"),
+                });
+            }
+        }
     }
+    Err(TransportError::UnexpectedMessage {
+        expected: "headers",
+        got: "too many SendRecon preface messages".to_owned(),
+    })
 }
 
 pub fn request_blocks<IO: Read + Write>(
@@ -378,28 +396,37 @@ pub fn request_blocks<IO: Read + Write>(
     stop: Option<Hash256>,
 ) -> Result<Vec<Hash256>, TransportError> {
     send_message(stream, &WireMessage::GetBlocks { locator, stop }, cfg)?;
-    let response = read_message(stream, cfg)?;
-    match response {
-        WireMessage::Inv { items } => {
-            let mut hashes = Vec::<Hash256>::new();
-            for item in items {
-                match item {
-                    InventoryItem::Block(hash) => hashes.push(hash),
-                    InventoryItem::Tx(hash) => {
-                        return Err(TransportError::UnexpectedInventoryItem {
-                            expected: "block hash inventory",
-                            got: format!("tx:{hash}"),
-                        });
+    for _ in 0..16 {
+        let response = read_message(stream, cfg)?;
+        match response {
+            WireMessage::Inv { items } => {
+                let mut hashes = Vec::<Hash256>::new();
+                for item in items {
+                    match item {
+                        InventoryItem::Block(hash) => hashes.push(hash),
+                        InventoryItem::Tx(hash) => {
+                            return Err(TransportError::UnexpectedInventoryItem {
+                                expected: "block hash inventory",
+                                got: format!("tx:{hash}"),
+                            });
+                        }
                     }
                 }
+                return Ok(hashes);
             }
-            Ok(hashes)
+            WireMessage::SendRecon { .. } => continue,
+            other => {
+                return Err(TransportError::UnexpectedMessage {
+                    expected: "inv",
+                    got: format!("{other:?}"),
+                });
+            }
         }
-        other => Err(TransportError::UnexpectedMessage {
-            expected: "inv",
-            got: format!("{other:?}"),
-        }),
     }
+    Err(TransportError::UnexpectedMessage {
+        expected: "inv",
+        got: "too many SendRecon preface messages".to_owned(),
+    })
 }
 
 pub async fn request_blocks_async<S: AsyncRead + AsyncWrite + Unpin>(
@@ -409,28 +436,37 @@ pub async fn request_blocks_async<S: AsyncRead + AsyncWrite + Unpin>(
     stop: Option<Hash256>,
 ) -> Result<Vec<Hash256>, TransportError> {
     send_message_async(stream, &WireMessage::GetBlocks { locator, stop }, cfg).await?;
-    let response = read_message_async(stream, cfg).await?;
-    match response {
-        WireMessage::Inv { items } => {
-            let mut hashes = Vec::<Hash256>::new();
-            for item in items {
-                match item {
-                    InventoryItem::Block(hash) => hashes.push(hash),
-                    InventoryItem::Tx(hash) => {
-                        return Err(TransportError::UnexpectedInventoryItem {
-                            expected: "block hash inventory",
-                            got: format!("tx:{hash}"),
-                        });
+    for _ in 0..16 {
+        let response = read_message_async(stream, cfg).await?;
+        match response {
+            WireMessage::Inv { items } => {
+                let mut hashes = Vec::<Hash256>::new();
+                for item in items {
+                    match item {
+                        InventoryItem::Block(hash) => hashes.push(hash),
+                        InventoryItem::Tx(hash) => {
+                            return Err(TransportError::UnexpectedInventoryItem {
+                                expected: "block hash inventory",
+                                got: format!("tx:{hash}"),
+                            });
+                        }
                     }
                 }
+                return Ok(hashes);
             }
-            Ok(hashes)
+            WireMessage::SendRecon { .. } => continue,
+            other => {
+                return Err(TransportError::UnexpectedMessage {
+                    expected: "inv",
+                    got: format!("{other:?}"),
+                });
+            }
         }
-        other => Err(TransportError::UnexpectedMessage {
-            expected: "inv",
-            got: format!("{other:?}"),
-        }),
     }
+    Err(TransportError::UnexpectedMessage {
+        expected: "inv",
+        got: "too many SendRecon preface messages".to_owned(),
+    })
 }
 
 fn parse_version(message: WireMessage) -> Result<RemoteHandshake, TransportError> {
@@ -1086,14 +1122,25 @@ mod tests {
         let (chain, headers_map) = chain_headers(4);
         let header = headers_map.get(&chain[1]).expect("header").clone();
         let block_hash = chain[2];
+        let send_recon = WireMessage::SendRecon {
+            enabled: true,
+            version: 1,
+            short_id_bits: 32,
+            implementation: 0,
+            salt: 42,
+            max_sketch_items: 128,
+            max_diff_items: 128,
+        };
 
         let mut reads = Vec::new();
+        reads.extend_from_slice(&encode_framed_message_bytes(&cfg, &send_recon));
         reads.extend_from_slice(&encode_framed_message_bytes(
             &cfg,
             &WireMessage::Headers {
                 headers: vec![header.clone()],
             },
         ));
+        reads.extend_from_slice(&encode_framed_message_bytes(&cfg, &send_recon));
         reads.extend_from_slice(&encode_framed_message_bytes(
             &cfg,
             &WireMessage::Inv {

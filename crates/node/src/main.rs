@@ -1330,7 +1330,15 @@ fn load_runtime_from_db_or_genesis(
     runtime_db_path: &Path,
 ) -> Result<(ChainRuntime, &'static str), NodeError> {
     if runtime_db_path.exists() {
-        let archive = load_chain_archive_db(runtime_db_path)?;
+        let archive = load_with_retry(80, 25, is_runtime_db_lock_conflict, || {
+            load_chain_archive_db(runtime_db_path).map_err(NodeError::from)
+        })?
+        .ok_or_else(|| {
+            NodeError::Runtime(format!(
+                "runtime db is lock-contended: {}",
+                runtime_db_path.display()
+            ))
+        })?;
         if archive.network_id != cfg.network_id {
             return Err(NodeError::Runtime(format!(
                 "runtime db network mismatch: db='{}', config='{}'",
@@ -1415,6 +1423,38 @@ fn load_mempool_from_db_or_empty_with_retry(
     })
 }
 
+fn load_mempool_from_db_or_empty_strict_with_retry(
+    cfg: &ChainConfig,
+    mempool_db_path: &Path,
+    attempts: usize,
+    backoff_ms: u64,
+) -> Result<Mempool, NodeError> {
+    if !mempool_db_path.exists() {
+        return Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+            .map_err(NodeError::from);
+    }
+    let snapshot = load_with_retry(attempts, backoff_ms, is_mempool_db_lock_conflict, || {
+        load_mempool_db(mempool_db_path).map_err(NodeError::from)
+    })?
+    .ok_or_else(|| {
+        NodeError::Runtime(format!(
+            "mempool db is lock-contended: {}",
+            mempool_db_path.display()
+        ))
+    })?;
+    if snapshot.network_id != cfg.network_id {
+        return Err(NodeError::Runtime(format!(
+            "mempool db network mismatch: db='{}', config='{}'",
+            snapshot.network_id, cfg.network_id
+        )));
+    }
+    let mut mempool = Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)?;
+    for entry in snapshot.entries {
+        let _ = mempool.insert_with_fee(entry.tx, entry.fee);
+    }
+    Ok(mempool)
+}
+
 fn load_mempool_with_retry_inner<F>(
     cfg: &ChainConfig,
     attempts: usize,
@@ -1457,7 +1497,8 @@ fn remove_confirmed_txids_from_mempool_db(
     if txids.is_empty() {
         return Ok(0);
     }
-    let mut mempool = load_mempool_from_db_or_empty(cfg, mempool_db_path)?;
+    let mut mempool =
+        load_mempool_from_db_or_empty_strict_with_retry(cfg, mempool_db_path, 20, 25)?;
     let removed = mempool.remove_confirmed_txids(txids);
     if removed.is_empty() && !mempool_db_path.exists() {
         return Ok(0);
@@ -1468,22 +1509,30 @@ fn remove_confirmed_txids_from_mempool_db(
 
 fn is_runtime_db_lock_conflict(err: &NodeError) -> bool {
     let msg = err.to_string();
-    msg.contains("Database already open") || msg.contains("Cannot acquire lock")
+    msg.contains("Database already open")
+        || msg.contains("Cannot acquire lock")
+        || msg.contains("lock-contended")
 }
 
 fn is_mempool_db_lock_conflict(err: &NodeError) -> bool {
     let msg = err.to_string();
-    msg.contains("Database already open") || msg.contains("Cannot acquire lock")
+    msg.contains("Database already open")
+        || msg.contains("Cannot acquire lock")
+        || msg.contains("lock-contended")
 }
 
 fn is_pool_ledger_db_lock_conflict(err: &NodeError) -> bool {
     let msg = err.to_string();
-    msg.contains("Database already open") || msg.contains("Cannot acquire lock")
+    msg.contains("Database already open")
+        || msg.contains("Cannot acquire lock")
+        || msg.contains("lock-contended")
 }
 
 fn is_peer_book_db_lock_conflict(err: &NodeError) -> bool {
     let msg = err.to_string();
-    msg.contains("Database already open") || msg.contains("Cannot acquire lock")
+    msg.contains("Database already open")
+        || msg.contains("Cannot acquire lock")
+        || msg.contains("lock-contended")
 }
 
 fn load_pool_ledger_from_db_or_new(
@@ -3732,17 +3781,8 @@ fn load_wallet_reserved_outpoints(
     if !mempool_db_path.exists() {
         return Ok(HashSet::new());
     }
-    match load_mempool_from_db_or_empty_with_retry(cfg, mempool_db_path, 10, 15) {
-        Ok(mempool) => Ok(mempool_spent_outpoints(&mempool)),
-        Err(err) if is_mempool_db_lock_conflict(&err) => {
-            eprintln!(
-                "warning: wallet send could not read mempool db ({}), proceeding without reserved-input filter: {err}",
-                mempool_db_path.display()
-            );
-            Ok(HashSet::new())
-        }
-        Err(err) => Err(err),
-    }
+    let mempool = load_mempool_from_db_or_empty_strict_with_retry(cfg, mempool_db_path, 10, 15)?;
+    Ok(mempool_spent_outpoints(&mempool))
 }
 
 fn build_signed_transfer_tx(
@@ -5695,11 +5735,39 @@ impl StratumPoolTelemetryState {
     }
 }
 
-fn relay_fee_hint(tx: &Transaction) -> u64 {
-    let txid = tx.txid();
-    let mut hint = [0u8; 8];
-    hint.copy_from_slice(&txid.0[..8]);
-    u64::from_be_bytes(hint).saturating_add(1)
+fn relay_fee_hint(runtime: &ChainRuntime, mempool: &Mempool, tx: &Transaction) -> u64 {
+    tx_fee_from_known_prevouts(runtime, mempool, tx).unwrap_or(0)
+}
+
+fn tx_fee_from_known_prevouts(
+    runtime: &ChainRuntime,
+    mempool: &Mempool,
+    tx: &Transaction,
+) -> Option<u64> {
+    if tx.inputs.is_empty() {
+        return None;
+    }
+    let mut input_total = 0u128;
+    for input in &tx.inputs {
+        if input.prev_out.is_coinbase() {
+            return None;
+        }
+        if let Some(utxo) = runtime.utxo_set().get(&input.prev_out) {
+            input_total = input_total.checked_add(utxo.value as u128)?;
+            continue;
+        }
+        let (parent, _fee) = mempool.get_with_fee(&input.prev_out.txid)?;
+        let output = parent.outputs.get(input.prev_out.vout as usize)?;
+        input_total = input_total.checked_add(output.value as u128)?;
+    }
+    let output_total = tx
+        .outputs
+        .iter()
+        .try_fold(0u128, |acc, out| acc.checked_add(out.value as u128))?;
+    if input_total < output_total {
+        return None;
+    }
+    u64::try_from(input_total - output_total).ok()
 }
 
 fn relay_mark_outbound_worker_start(state: &Arc<Mutex<RelayServerState>>) {
@@ -5792,7 +5860,7 @@ fn relay_apply_main_chain_transition(
         if state.relay.mempool.contains(&txid) {
             continue;
         }
-        let fee_hint = relay_fee_hint(&tx);
+        let fee_hint = relay_fee_hint(&state.runtime, &state.relay.mempool, &tx);
 
         let missing = detect_missing_outpoints(&state.runtime, &state.relay.mempool, &tx);
         if missing.is_empty() {
@@ -6774,7 +6842,7 @@ fn process_relay_wire_message_inner(
             let txid = tx.txid();
             relay_parent_request_cache_cleanup(state, now_unix_sec);
             state.pending_parent_tx_requests.remove(&txid);
-            let fee_hint = relay_fee_hint(&tx);
+            let fee_hint = relay_fee_hint(&state.runtime, &state.relay.mempool, &tx);
             let missing_outpoints =
                 detect_missing_outpoints(&state.runtime, &state.relay.mempool, &tx);
             match admit_peer_tx_into_relay(
@@ -8959,14 +9027,16 @@ fn admit_peer_tx_into_relay(
 
     while let Some((candidate_tx, candidate_fee)) = pending.pop_front() {
         let missing = detect_missing_outpoints(runtime, &relay.mempool, &candidate_tx);
+        let effective_fee = tx_fee_from_known_prevouts(runtime, &relay.mempool, &candidate_tx)
+            .unwrap_or(candidate_fee);
         if !missing.is_empty() {
             let _ = relay
                 .orphan_pool
-                .insert(candidate_tx, candidate_fee, missing, now_unix_sec)?;
+                .insert(candidate_tx, effective_fee, missing, now_unix_sec)?;
             continue;
         }
 
-        let outcome = relay.mempool.insert_with_fee(candidate_tx, candidate_fee)?;
+        let outcome = relay.mempool.insert_with_fee(candidate_tx, effective_fee)?;
         let inserted_txid = match outcome {
             InsertOutcome::Accepted { txid } => Some(txid),
             InsertOutcome::Replaced { inserted, .. } => Some(inserted),
@@ -9621,6 +9691,50 @@ trait StratumTemplateProvider {
 #[derive(Clone, Copy, Debug, Default)]
 struct RuntimeTemplateProvider;
 
+fn sanitize_template_mempool_fees(
+    runtime: &ChainRuntime,
+    cfg: &ChainConfig,
+    mempool: &Mempool,
+) -> Result<Mempool, NodeError> {
+    let mut sanitized =
+        Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)?;
+    let mut pending = mempool.txids_by_feerate_desc();
+    let mut safety_budget = pending.len().saturating_mul(2).max(1);
+
+    while !pending.is_empty() && safety_budget > 0 {
+        safety_budget = safety_budget.saturating_sub(1);
+        let mut progressed = false;
+        let mut deferred = Vec::<Hash256>::new();
+        for txid in pending {
+            let Some((tx, stored_fee)) = mempool.get_with_fee(&txid) else {
+                continue;
+            };
+            let resolved_fee = tx_fee_from_known_prevouts(runtime, &sanitized, tx);
+            let fee = resolved_fee.unwrap_or(stored_fee);
+            let min_required = match sanitized.min_required_fee(tx) {
+                Ok(min) => min,
+                Err(_) => {
+                    deferred.push(txid);
+                    continue;
+                }
+            };
+            if fee < min_required {
+                continue;
+            }
+            match sanitized.insert_with_fee(tx.clone(), fee) {
+                Ok(_) => progressed = true,
+                Err(_) => deferred.push(txid),
+            }
+        }
+        if !progressed {
+            break;
+        }
+        pending = deferred;
+    }
+
+    Ok(sanitized)
+}
+
 impl StratumTemplateProvider for RuntimeTemplateProvider {
     fn build_template(
         &self,
@@ -9634,6 +9748,7 @@ impl StratumTemplateProvider for RuntimeTemplateProvider {
         let prev_block = runtime.tip_hash();
         let target = runtime.expected_target_for_next_block()?;
         let mempool = load_mempool_from_db_or_empty_with_retry(cfg, mempool_db_path, 10, 25)?;
+        let mempool = sanitize_template_mempool_fees(runtime, cfg, &mempool)?;
         let params = MempoolTemplateParams {
             version: 1,
             prev_block,
@@ -11021,12 +11136,14 @@ fn maybe_process_pool_payouts(ctx: &StratumServerContext) -> Result<(), NodeErro
                 continue;
             }
         };
-        let submit = submit_tx_via_mempool_db(
+        let submit = submit_tx_via_mempool_db_with_retry(
             &ctx.cfg,
             &ctx.runtime_db_path,
             &ctx.mempool_db_path,
             signed.tx,
             ctx.pool_payout_cfg.payout_tx_fee_atomic,
+            80,
+            25,
         );
         let (txid, _outcome, _fee) = match submit {
             Ok(ok) => ok,
@@ -11306,7 +11423,8 @@ fn submit_tx_via_mempool_db(
             runtime_db_path.display()
         ))
     })?;
-    let mut mempool = load_mempool_from_db_or_empty_with_retry(cfg, mempool_db_path, 10, 15)?;
+    let mut mempool =
+        load_mempool_from_db_or_empty_strict_with_retry(cfg, mempool_db_path, 10, 15)?;
     let implied_fee = validate_tx_for_local_admission(cfg, &runtime, &mempool, &tx)?;
     let fee = if requested_fee == 0 {
         implied_fee
@@ -11323,6 +11441,41 @@ fn submit_tx_via_mempool_db(
     let outcome = mempool.insert_with_fee(tx, fee)?;
     persist_mempool_db_with_retry(cfg, &mempool, mempool_db_path, 80, 25)?;
     Ok((txid, mempool_outcome_label(&outcome).to_owned(), fee))
+}
+
+fn submit_tx_via_mempool_db_with_retry(
+    cfg: &ChainConfig,
+    runtime_db_path: &Path,
+    mempool_db_path: &Path,
+    tx: Transaction,
+    requested_fee: u64,
+    attempts: usize,
+    backoff_ms: u64,
+) -> Result<(Hash256, String, u64), NodeError> {
+    let tries = attempts.max(1);
+    let mut last_err = None;
+    for idx in 0..tries {
+        match submit_tx_via_mempool_db(
+            cfg,
+            runtime_db_path,
+            mempool_db_path,
+            tx.clone(),
+            requested_fee,
+        ) {
+            Ok(value) => return Ok(value),
+            Err(err) if is_runtime_db_lock_conflict(&err) || is_mempool_db_lock_conflict(&err) => {
+                last_err = Some(err);
+                if idx + 1 < tries {
+                    std::thread::sleep(Duration::from_millis(backoff_ms.max(1)));
+                    continue;
+                }
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        NodeError::Runtime("mempool submit failed for unknown reason".to_owned())
+    }))
 }
 
 fn share_target_in_bounds(
@@ -15492,12 +15645,14 @@ async fn axum_wallet_send_handler(
         Ok(tx) => tx,
         Err(err) => return axum_internal_error(format!("tx decode failed: {err}")),
     };
-    let (txid, outcome, effective_fee) = match submit_tx_via_mempool_db(
+    let (txid, outcome, effective_fee) = match submit_tx_via_mempool_db_with_retry(
         &state.cfg,
         &state.runtime_db_path,
         &state.mempool_db_path,
         tx,
         preview_payload.fee,
+        80,
+        25,
     ) {
         Ok(value) => value,
         Err(err) => return axum_bad_request(err),
@@ -15531,12 +15686,14 @@ async fn axum_tx_submit_handler(
         Ok(value) => value,
         Err(err) => return axum_bad_request(err),
     };
-    let (txid, outcome, effective_fee) = match submit_tx_via_mempool_db(
+    let (txid, outcome, effective_fee) = match submit_tx_via_mempool_db_with_retry(
         &state.cfg,
         &state.runtime_db_path,
         &state.mempool_db_path,
         tx,
         requested_fee,
+        80,
+        25,
     ) {
         Ok(value) => value,
         Err(err) => return axum_bad_request(err),
@@ -16702,12 +16859,14 @@ fn run_rpc_serve_inner_legacy(
                     continue;
                 }
             };
-            let (txid, outcome, effective_fee) = match submit_tx_via_mempool_db(
+            let (txid, outcome, effective_fee) = match submit_tx_via_mempool_db_with_retry(
                 &cfg,
                 &runtime_db_path,
                 &mempool_db_path,
                 signed.tx.clone(),
                 req.fee,
+                80,
+                25,
             ) {
                 Ok(value) => value,
                 Err(err) => {
@@ -16759,12 +16918,14 @@ fn run_rpc_serve_inner_legacy(
                     continue;
                 }
             };
-            let (txid, outcome, effective_fee) = match submit_tx_via_mempool_db(
+            let (txid, outcome, effective_fee) = match submit_tx_via_mempool_db_with_retry(
                 &cfg,
                 &runtime_db_path,
                 &mempool_db_path,
                 tx,
                 requested_fee,
+                80,
+                25,
             ) {
                 Ok(value) => value,
                 Err(err) => {
@@ -16966,8 +17127,8 @@ mod tests {
         build_signed_transfer_tx, execute_soak_rounds, load_chain_config,
         mine_block_with_transactions, mine_blocks_on_runtime, persist_runtime_db,
         process_relay_getdata_with_archive_async, process_relay_wire_message,
-        process_relay_wire_message_with_archive, relay_fee_hint, request_template_from_provider,
-        run_add_peer, run_config_scaffold, run_reindex_runtime, run_rpc_serve, run_stratum_mine,
+        process_relay_wire_message_with_archive, request_template_from_provider, run_add_peer,
+        run_config_scaffold, run_reindex_runtime, run_rpc_serve, run_stratum_mine,
         run_stratum_serve, run_sv2_conformance, run_sv2_job_declarator, run_sv2_template_provider,
         run_sv2_translator, run_sync_book, run_wallet, select_utxos_for_amount,
         translate_remote_job_with_service, try_find_share_for_job, wallet_seed_from_mnemonic,
@@ -18125,16 +18286,19 @@ mod tests {
     fn lock_conflict_detectors_are_exact_and_case_sensitive_for_expected_fragments() {
         let lock_open = super::NodeError::Runtime("Database already open".to_owned());
         let lock_acquire = super::NodeError::Runtime("Cannot acquire lock".to_owned());
+        let lock_contended = super::NodeError::Runtime("runtime db is lock-contended".to_owned());
         let other = super::NodeError::Runtime("permission denied".to_owned());
         let lowercase = super::NodeError::Runtime("database already open".to_owned());
 
         assert!(super::is_runtime_db_lock_conflict(&lock_open));
         assert!(super::is_runtime_db_lock_conflict(&lock_acquire));
+        assert!(super::is_runtime_db_lock_conflict(&lock_contended));
         assert!(!super::is_runtime_db_lock_conflict(&other));
         assert!(!super::is_runtime_db_lock_conflict(&lowercase));
 
         assert!(super::is_mempool_db_lock_conflict(&lock_open));
         assert!(super::is_mempool_db_lock_conflict(&lock_acquire));
+        assert!(super::is_mempool_db_lock_conflict(&lock_contended));
         assert!(!super::is_mempool_db_lock_conflict(&other));
         assert!(!super::is_mempool_db_lock_conflict(&lowercase));
     }
@@ -25274,12 +25438,13 @@ mod tests {
         let second_is_conflict_reject = second_send.starts_with("HTTP/1.1 400 Bad Request")
             && (second_send.contains("replacement")
                 || second_send.contains("conflict")
-                || second_send.contains("mempool"));
+                || second_send.contains("mempool")
+                || second_send.contains("insufficient spendable funds"));
         let second_is_idempotent_ok = second_send.starts_with("HTTP/1.1 200 OK")
             && second_send.contains("\"mempool_outcome\": \"already_present\"");
         assert!(
             second_is_conflict_reject || second_is_idempotent_ok,
-            "expected conflict rejection or idempotent already_present, got: {second_send}"
+            "expected conflict/insufficient-funds rejection or idempotent already_present, got: {second_send}"
         );
 
         stop_rpc_server_for_test(server_shutdown, server, "rpc wallet-send reject server");
@@ -28541,6 +28706,100 @@ mod tests {
     }
 
     #[test]
+    fn relay_fee_hint_uses_known_prevout_values() {
+        let mut cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        cfg.coinbase_maturity = 1;
+        cfg.validate().expect("config validate");
+
+        let runtime = ChainRuntime::from_config(cfg).expect("runtime");
+        let (spend, spend_value) = runtime
+            .utxo_set()
+            .iter()
+            .next()
+            .map(|(outpoint, entry)| (outpoint.clone(), entry.value))
+            .expect("genesis utxo must exist");
+
+        let fee = 12_345u64;
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: spend,
+                signature: vec![3u8; 64],
+                pubkey_compressed: vec![0x02; 33],
+                sequence: 0,
+            }],
+            outputs: vec![TxOut {
+                value: spend_value.saturating_sub(fee),
+                key_hash20: [9u8; 20],
+            }],
+            lock_time: 0,
+        };
+        let mempool = Mempool::with_policy(64, 1_000).expect("mempool");
+        let hinted = super::relay_fee_hint(&runtime, &mempool, &tx);
+        assert_eq!(hinted, fee);
+
+        let mut old_hint_bytes = [0u8; 8];
+        old_hint_bytes.copy_from_slice(&tx.txid().0[..8]);
+        let old_hint = u64::from_be_bytes(old_hint_bytes).saturating_add(1);
+        assert_ne!(
+            hinted, old_hint,
+            "fee hint must not derive from txid prefix"
+        );
+    }
+
+    #[test]
+    fn sanitize_template_mempool_fees_recomputes_corrupted_fee_hints() {
+        let mut cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        cfg.coinbase_maturity = 1;
+        cfg.validate().expect("config validate");
+
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let (spend, spend_value) = runtime
+            .utxo_set()
+            .iter()
+            .next()
+            .map(|(outpoint, entry)| (outpoint.clone(), entry.value))
+            .expect("genesis utxo must exist");
+
+        let expected_fee = 8_765u64;
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: spend,
+                signature: vec![7u8; 64],
+                pubkey_compressed: vec![0x02; 33],
+                sequence: 0,
+            }],
+            outputs: vec![TxOut {
+                value: spend_value.saturating_sub(expected_fee),
+                key_hash20: [4u8; 20],
+            }],
+            lock_time: 0,
+        };
+        let mut bogus_bytes = [0u8; 8];
+        bogus_bytes.copy_from_slice(&tx.txid().0[..8]);
+        let bogus_fee = u64::from_be_bytes(bogus_bytes).saturating_add(1);
+        assert_ne!(bogus_fee, expected_fee);
+
+        let mut mempool =
+            Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool");
+        let _ = mempool
+            .insert_with_fee(tx.clone(), bogus_fee)
+            .expect("insert corrupted-fee tx");
+
+        let sanitized =
+            super::sanitize_template_mempool_fees(&runtime, &cfg, &mempool).expect("sanitize");
+        let (sanitized_tx, sanitized_fee) = sanitized
+            .get_with_fee(&tx.txid())
+            .expect("tx remains in sanitized mempool");
+        assert_eq!(sanitized_tx.txid(), tx.txid());
+        assert_eq!(sanitized_fee, expected_fee);
+    }
+
+    #[test]
     fn tx_submit_mine_and_sync_updates_receiver_balance() {
         let _net_guard = network_test_guard();
         let mut cfg: ChainConfig =
@@ -30808,9 +31067,12 @@ mod tests {
             gossip,
         };
 
-        let tx1 = relay_tx(base_outpoint.clone(), 1, 11);
-        let tx2 = relay_tx(base_outpoint.clone(), 2, 12);
-        let tx3 = relay_tx(base_outpoint.clone(), 3, 13);
+        let mut tx1 = relay_tx(base_outpoint.clone(), 1, 11);
+        tx1.outputs[0].value = 3;
+        let mut tx2 = relay_tx(base_outpoint.clone(), 2, 12);
+        tx2.outputs[0].value = 2;
+        let mut tx3 = relay_tx(base_outpoint.clone(), 3, 13);
+        tx3.outputs[0].value = 1;
 
         admit_peer_tx_into_relay(&mut relay, &runtime, 1, tx1, 1_000, 1_000).expect("first");
         admit_peer_tx_into_relay(&mut relay, &runtime, 1, tx2, 1_001, 1_001)
@@ -30859,12 +31121,13 @@ mod tests {
         };
         let mut state = RelayServerState::new(runtime, relay);
 
-        let mut txs = [
-            relay_tx(base_outpoint.clone(), 1, 11),
-            relay_tx(base_outpoint.clone(), 2, 12),
-            relay_tx(base_outpoint, 3, 13),
-        ];
-        txs.sort_by_key(relay_fee_hint);
+        let mut tx_low = relay_tx(base_outpoint.clone(), 1, 11);
+        tx_low.outputs[0].value = 3;
+        let mut tx_mid = relay_tx(base_outpoint.clone(), 2, 12);
+        tx_mid.outputs[0].value = 2;
+        let mut tx_high = relay_tx(base_outpoint, 3, 13);
+        tx_high.outputs[0].value = 1;
+        let txs = [tx_low, tx_mid, tx_high];
 
         let _ = process_relay_wire_message(
             &mut state,
