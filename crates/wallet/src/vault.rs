@@ -9,7 +9,7 @@ use scam_core::hash::{ParseHexError, decode_hex_array};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::mnemonic::{MnemonicError, WalletMnemonic};
+use crate::mnemonic::{MnemonicError, WalletMnemonic, WalletSeedMode};
 
 const WALLET_VAULT_VERSION: u32 = 1;
 const KDF_MEM_COST_KIB: u32 = 32 * 1024;
@@ -37,17 +37,34 @@ pub struct EncryptedWalletVault {
 pub struct DecryptedWalletSecret {
     pub mnemonic: WalletMnemonic,
     pub bip39_passphrase: String,
+    pub seed_mode: WalletSeedMode,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct WalletSecretPayload {
     mnemonic: String,
     bip39_passphrase: String,
+    #[serde(default)]
+    seed_mode: WalletSeedMode,
 }
 
 pub fn new_encrypted_wallet_vault(
     mnemonic_phrase: &str,
     bip39_passphrase: &str,
+    encryption_password: &str,
+) -> Result<EncryptedWalletVault, WalletVaultError> {
+    new_encrypted_wallet_vault_with_mode(
+        mnemonic_phrase,
+        bip39_passphrase,
+        WalletSeedMode::Bip39,
+        encryption_password,
+    )
+}
+
+pub fn new_encrypted_wallet_vault_with_mode(
+    mnemonic_phrase: &str,
+    bip39_passphrase: &str,
+    seed_mode: WalletSeedMode,
     encryption_password: &str,
 ) -> Result<EncryptedWalletVault, WalletVaultError> {
     if encryption_password.is_empty() {
@@ -58,6 +75,7 @@ pub fn new_encrypted_wallet_vault(
     let payload = WalletSecretPayload {
         mnemonic: mnemonic.phrase().to_owned(),
         bip39_passphrase: bip39_passphrase.to_owned(),
+        seed_mode,
     };
     let plaintext = serde_json::to_vec(&payload).map_err(WalletVaultError::EncodePayload)?;
 
@@ -132,6 +150,7 @@ pub fn decrypt_wallet_vault(
     Ok(DecryptedWalletSecret {
         mnemonic,
         bip39_passphrase: payload.bip39_passphrase,
+        seed_mode: payload.seed_mode,
     })
 }
 
@@ -232,8 +251,10 @@ mod tests {
 
     use std::path::PathBuf;
 
+    use crate::mnemonic::WalletSeedMode;
     use crate::vault::{
-        decrypt_wallet_vault, load_wallet_vault, new_encrypted_wallet_vault, save_wallet_vault,
+        decrypt_wallet_vault, load_wallet_vault, new_encrypted_wallet_vault,
+        new_encrypted_wallet_vault_with_mode, save_wallet_vault,
     };
 
     const MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
@@ -261,6 +282,7 @@ mod tests {
         let secret = decrypt_wallet_vault(&vault, "encrypt-pass").expect("decrypt");
         assert_eq!(secret.mnemonic.phrase(), MNEMONIC);
         assert_eq!(secret.bip39_passphrase, "seed-passphrase");
+        assert_eq!(secret.seed_mode, WalletSeedMode::Bip39);
     }
 
     #[test]
@@ -288,6 +310,26 @@ mod tests {
         let secret = decrypt_wallet_vault(&loaded, "vault-pass").expect("decrypt");
         assert_eq!(secret.mnemonic.phrase(), MNEMONIC);
         assert_eq!(secret.bip39_passphrase, "x");
+        assert_eq!(secret.seed_mode, WalletSeedMode::Bip39);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn vault_file_roundtrip_with_scam_blake_seed_mode() {
+        let vault = new_encrypted_wallet_vault_with_mode(
+            MNEMONIC,
+            "x",
+            WalletSeedMode::ScamBlake,
+            "vault-pass",
+        )
+        .expect("vault");
+        let path = temp_test_file("wallet-vault-blake");
+        save_wallet_vault(&path, &vault).expect("save");
+        let loaded = load_wallet_vault(&path).expect("load");
+        let secret = decrypt_wallet_vault(&loaded, "vault-pass").expect("decrypt");
+        assert_eq!(secret.mnemonic.phrase(), MNEMONIC);
+        assert_eq!(secret.bip39_passphrase, "x");
+        assert_eq!(secret.seed_mode, WalletSeedMode::ScamBlake);
         let _ = std::fs::remove_file(path);
     }
 }

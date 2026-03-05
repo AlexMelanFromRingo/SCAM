@@ -66,9 +66,10 @@ use scam_stratum::{
 };
 use scam_wallet::{
     AddressError, DeriveKeyError, MnemonicError, QrError, RescanError, SchnorrError, WalletKey,
-    WalletMnemonic, WalletVaultError, decrypt_wallet_vault, derive_wallet_key, derive_watched_keys,
-    load_wallet_vault, new_encrypted_wallet_vault, new_mnemonic, parse_address, qr_for_payment_uri,
-    rescan_blocks, save_wallet_vault, sign_digest, to_address, verify_digest,
+    WalletMnemonic, WalletSeedMode, WalletVaultError, decrypt_wallet_vault, derive_wallet_key,
+    derive_watched_keys, load_wallet_vault, new_encrypted_wallet_vault_with_mode, new_mnemonic,
+    parse_address, qr_for_payment_uri, rescan_blocks, save_wallet_vault, sign_digest, to_address,
+    verify_digest,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -1182,6 +1183,35 @@ fn parse_secure_transport_mode(value: &str) -> Result<SecureTransportMode, NodeE
     value
         .parse::<SecureTransportMode>()
         .map_err(|e| NodeError::Runtime(format!("invalid secure transport mode '{value}': {e}")))
+}
+
+const WALLET_SEED_MODE_ENV: &str = "SCAM_WALLET_SEED_MODE";
+
+fn wallet_seed_mode_from_optional(raw: Option<&str>) -> Result<WalletSeedMode, NodeError> {
+    raw.unwrap_or("bip39")
+        .parse::<WalletSeedMode>()
+        .map_err(NodeError::from)
+}
+
+fn wallet_seed_mode_from_env() -> Result<WalletSeedMode, NodeError> {
+    let raw = std::env::var(WALLET_SEED_MODE_ENV).ok();
+    wallet_seed_mode_from_optional(raw.as_deref())
+}
+
+fn wallet_seed_mode_from_request(raw: Option<&str>) -> Result<WalletSeedMode, NodeError> {
+    match raw {
+        Some(value) => wallet_seed_mode_from_optional(Some(value)),
+        None => wallet_seed_mode_from_env(),
+    }
+}
+
+fn wallet_seed_from_mnemonic(
+    mnemonic_phrase: &str,
+    passphrase: &str,
+    seed_mode: WalletSeedMode,
+) -> Result<[u8; 64], NodeError> {
+    let mnemonic = WalletMnemonic::parse(mnemonic_phrase)?;
+    Ok(mnemonic.to_seed_with_mode(passphrase, seed_mode))
 }
 
 #[derive(Debug, Error)]
@@ -2935,15 +2965,17 @@ fn run_hash_visual(args: HashVisualArgs) -> Result<(), NodeError> {
 }
 
 fn run_wallet(command: WalletCommand) -> Result<(), NodeError> {
+    let seed_mode = wallet_seed_mode_from_env()?;
+
     fn derive_and_print_address(
         mnemonic_phrase: &str,
         passphrase: &str,
+        seed_mode: WalletSeedMode,
         account: u32,
         index: u32,
         hrp: &str,
     ) -> Result<(), NodeError> {
-        let mnemonic = WalletMnemonic::parse(mnemonic_phrase)?;
-        let seed = mnemonic.to_seed(passphrase);
+        let seed = wallet_seed_from_mnemonic(mnemonic_phrase, passphrase, seed_mode)?;
         let key = derive_wallet_key(&seed, account, index)?;
         let address = to_address(hrp, key.pubkey_compressed())?;
 
@@ -2964,7 +2996,9 @@ fn run_wallet(command: WalletCommand) -> Result<(), NodeError> {
     ) -> Result<(), NodeError> {
         let vault = load_wallet_vault(wallet_path)?;
         let secret = decrypt_wallet_vault(&vault, password)?;
-        let seed = secret.mnemonic.to_seed(&secret.bip39_passphrase);
+        let seed = secret
+            .mnemonic
+            .to_seed_with_mode(&secret.bip39_passphrase, secret.seed_mode);
         let key = derive_wallet_key(&seed, account, index)?;
         let address = to_address(hrp, key.pubkey_compressed())?;
 
@@ -3040,7 +3074,7 @@ fn run_wallet(command: WalletCommand) -> Result<(), NodeError> {
             hrp,
         } => {
             let mnemonic = new_mnemonic(words)?;
-            let seed = mnemonic.to_seed(&passphrase);
+            let seed = mnemonic.to_seed_with_mode(&passphrase, seed_mode);
             let key = derive_wallet_key(&seed, account, index)?;
             let address = to_address(&hrp, key.pubkey_compressed())?;
 
@@ -3057,14 +3091,14 @@ fn run_wallet(command: WalletCommand) -> Result<(), NodeError> {
             account,
             index,
             hrp,
-        } => derive_and_print_address(&mnemonic, &passphrase, account, index, &hrp)?,
+        } => derive_and_print_address(&mnemonic, &passphrase, seed_mode, account, index, &hrp)?,
         WalletCommand::Restore {
             mnemonic,
             passphrase,
             account,
             index,
             hrp,
-        } => derive_and_print_address(&mnemonic, &passphrase, account, index, &hrp)?,
+        } => derive_and_print_address(&mnemonic, &passphrase, seed_mode, account, index, &hrp)?,
         WalletCommand::SecureNew {
             words,
             passphrase,
@@ -3075,10 +3109,15 @@ fn run_wallet(command: WalletCommand) -> Result<(), NodeError> {
             hrp,
         } => {
             let mnemonic = new_mnemonic(words)?;
-            let vault = new_encrypted_wallet_vault(mnemonic.phrase(), &passphrase, &password)?;
+            let vault = new_encrypted_wallet_vault_with_mode(
+                mnemonic.phrase(),
+                &passphrase,
+                seed_mode,
+                &password,
+            )?;
             save_wallet_vault(&out, &vault)?;
 
-            let seed = mnemonic.to_seed(&passphrase);
+            let seed = mnemonic.to_seed_with_mode(&passphrase, seed_mode);
             let key = derive_wallet_key(&seed, account, index)?;
             let address = to_address(&hrp, key.pubkey_compressed())?;
 
@@ -3100,10 +3139,15 @@ fn run_wallet(command: WalletCommand) -> Result<(), NodeError> {
             hrp,
         } => {
             let parsed = WalletMnemonic::parse(&mnemonic)?;
-            let vault = new_encrypted_wallet_vault(parsed.phrase(), &passphrase, &password)?;
+            let vault = new_encrypted_wallet_vault_with_mode(
+                parsed.phrase(),
+                &passphrase,
+                seed_mode,
+                &password,
+            )?;
             save_wallet_vault(&out, &vault)?;
 
-            let seed = parsed.to_seed(&passphrase);
+            let seed = parsed.to_seed_with_mode(&passphrase, seed_mode);
             let key = derive_wallet_key(&seed, account, index)?;
             let address = to_address(&hrp, key.pubkey_compressed())?;
 
@@ -3143,8 +3187,7 @@ fn run_wallet(command: WalletCommand) -> Result<(), NodeError> {
                 max_nonce,
                 "wallet-rescan",
             )?;
-            let mnemonic = WalletMnemonic::parse(&mnemonic)?;
-            let seed = mnemonic.to_seed(&passphrase);
+            let seed = wallet_seed_from_mnemonic(&mnemonic, &passphrase, seed_mode)?;
             run_rescan_for_seed(&runtime, &seed, account, start_index, end_index)?;
         }
         WalletCommand::SecureRescan {
@@ -3170,7 +3213,9 @@ fn run_wallet(command: WalletCommand) -> Result<(), NodeError> {
             )?;
             let vault = load_wallet_vault(&wallet)?;
             let secret = decrypt_wallet_vault(&vault, &password)?;
-            let seed = secret.mnemonic.to_seed(&secret.bip39_passphrase);
+            let seed = secret
+                .mnemonic
+                .to_seed_with_mode(&secret.bip39_passphrase, secret.seed_mode);
             run_rescan_for_seed(&runtime, &seed, account, start_index, end_index)?;
         }
         WalletCommand::Balance {
@@ -3194,8 +3239,7 @@ fn run_wallet(command: WalletCommand) -> Result<(), NodeError> {
                 "wallet-balance",
             )?;
 
-            let mnemonic = WalletMnemonic::parse(&mnemonic)?;
-            let seed = mnemonic.to_seed(&passphrase);
+            let seed = wallet_seed_from_mnemonic(&mnemonic, &passphrase, seed_mode)?;
             let key = derive_wallet_key(&seed, account, index)?;
             let key_hash20 = scam_core::hash160_blake3(&key.pubkey_compressed());
             let address = to_address(&runtime.config().hrp, key.pubkey_compressed())?;
@@ -3298,8 +3342,7 @@ fn run_wallet(command: WalletCommand) -> Result<(), NodeError> {
                 )));
             }
 
-            let mnemonic = WalletMnemonic::parse(&mnemonic)?;
-            let seed = mnemonic.to_seed(&passphrase);
+            let seed = wallet_seed_from_mnemonic(&mnemonic, &passphrase, seed_mode)?;
             let key = derive_wallet_key(&seed, account, index)?;
             let signed = build_signed_transfer_tx(
                 &runtime,
@@ -3340,9 +3383,8 @@ fn run_wallet(command: WalletCommand) -> Result<(), NodeError> {
             index,
             hrp,
         } => {
-            let mnemonic = WalletMnemonic::parse(&mnemonic)?;
             let digest = decode_fixed_hex::<32>("digest_hex", &digest_hex)?;
-            let seed = mnemonic.to_seed(&passphrase);
+            let seed = wallet_seed_from_mnemonic(&mnemonic, &passphrase, seed_mode)?;
             let key = derive_wallet_key(&seed, account, index)?;
             let signature = sign_digest(&key, digest)?;
             let address = to_address(&hrp, key.pubkey_compressed())?;
@@ -9648,7 +9690,6 @@ fn rewrite_block_coinbase_to_allowed_reward(
     Ok(())
 }
 
-#[allow(dead_code)]
 async fn issue_new_stratum_job_async<S: AsyncRead + AsyncWrite + Unpin>(
     session: &mut Sv2Session,
     ctx: &StratumServerContext,
@@ -13120,6 +13161,7 @@ struct HttpRequest {
 struct WalletNewRpcRequest {
     words: usize,
     passphrase: String,
+    seed_mode: Option<String>,
     account: u32,
     index: u32,
     hrp: Option<String>,
@@ -13130,6 +13172,7 @@ impl Default for WalletNewRpcRequest {
         Self {
             words: 12,
             passphrase: String::new(),
+            seed_mode: None,
             account: 0,
             index: 0,
             hrp: None,
@@ -13142,6 +13185,7 @@ impl Default for WalletNewRpcRequest {
 struct WalletAddressRpcRequest {
     mnemonic: String,
     passphrase: String,
+    seed_mode: Option<String>,
     account: u32,
     index: u32,
     hrp: Option<String>,
@@ -13157,6 +13201,7 @@ struct WalletDecodeRpcRequest {
 struct WalletBalanceRpcRequest {
     mnemonic: String,
     passphrase: String,
+    seed_mode: Option<String>,
     account: u32,
     index: u32,
 }
@@ -13188,6 +13233,7 @@ impl Default for WalletBalanceHistoryByAddressRpcRequest {
 struct WalletSendPreviewRpcRequest {
     mnemonic: String,
     passphrase: String,
+    seed_mode: Option<String>,
     account: u32,
     index: u32,
     to: String,
@@ -13200,6 +13246,7 @@ impl Default for WalletSendPreviewRpcRequest {
         Self {
             mnemonic: String::new(),
             passphrase: String::new(),
+            seed_mode: None,
             account: 0,
             index: 0,
             to: String::new(),
@@ -14698,8 +14745,8 @@ fn axum_wallet_send_preview_payload(
             accepted_hrps.join(", ")
         )));
     }
-    let mnemonic = WalletMnemonic::parse(&req.mnemonic)?;
-    let seed = mnemonic.to_seed(&req.passphrase);
+    let seed_mode = wallet_seed_mode_from_request(req.seed_mode.as_deref())?;
+    let seed = wallet_seed_from_mnemonic(&req.mnemonic, &req.passphrase, seed_mode)?;
     let key = derive_wallet_key(&seed, req.account, req.index)?;
     let signed = axum_runtime_for_query(state, |runtime| {
         build_signed_transfer_tx(
@@ -14963,7 +15010,11 @@ async fn axum_wallet_new_handler(
         Ok(value) => value,
         Err(err) => return axum_bad_request(err),
     };
-    let seed = mnemonic.to_seed(&req.passphrase);
+    let seed_mode = match wallet_seed_mode_from_request(req.seed_mode.as_deref()) {
+        Ok(mode) => mode,
+        Err(err) => return axum_bad_request(err),
+    };
+    let seed = mnemonic.to_seed_with_mode(&req.passphrase, seed_mode);
     let key = match derive_wallet_key(&seed, req.account, req.index) {
         Ok(value) => value,
         Err(err) => return axum_bad_request(err),
@@ -14997,11 +15048,14 @@ async fn axum_wallet_address_handler(
         Ok(req) => req,
         Err(err) => return axum_bad_request(err),
     };
-    let mnemonic = match WalletMnemonic::parse(&req.mnemonic) {
-        Ok(value) => value,
+    let seed_mode = match wallet_seed_mode_from_request(req.seed_mode.as_deref()) {
+        Ok(mode) => mode,
         Err(err) => return axum_bad_request(err),
     };
-    let seed = mnemonic.to_seed(&req.passphrase);
+    let seed = match wallet_seed_from_mnemonic(&req.mnemonic, &req.passphrase, seed_mode) {
+        Ok(seed) => seed,
+        Err(err) => return axum_bad_request(err),
+    };
     let key = match derive_wallet_key(&seed, req.account, req.index) {
         Ok(value) => value,
         Err(err) => return axum_bad_request(err),
@@ -15047,11 +15101,14 @@ async fn axum_wallet_balance_handler(
         Ok(req) => req,
         Err(err) => return axum_bad_request(err),
     };
-    let mnemonic = match WalletMnemonic::parse(&req.mnemonic) {
-        Ok(value) => value,
+    let seed_mode = match wallet_seed_mode_from_request(req.seed_mode.as_deref()) {
+        Ok(mode) => mode,
         Err(err) => return axum_bad_request(err),
     };
-    let seed = mnemonic.to_seed(&req.passphrase);
+    let seed = match wallet_seed_from_mnemonic(&req.mnemonic, &req.passphrase, seed_mode) {
+        Ok(seed) => seed,
+        Err(err) => return axum_bad_request(err),
+    };
     let key = match derive_wallet_key(&seed, req.account, req.index) {
         Ok(value) => value,
         Err(err) => return axum_bad_request(err),
@@ -15957,7 +16014,15 @@ fn run_rpc_serve_inner_legacy(
                     continue;
                 }
             };
-            let seed = mnemonic.to_seed(&req.passphrase);
+            let seed_mode = match wallet_seed_mode_from_request(req.seed_mode.as_deref()) {
+                Ok(mode) => mode,
+                Err(err) => {
+                    let body = json_error_body(&err.to_string());
+                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
+                    continue;
+                }
+            };
+            let seed = mnemonic.to_seed_with_mode(&req.passphrase, seed_mode);
             let key = match derive_wallet_key(&seed, req.account, req.index) {
                 Ok(value) => value,
                 Err(err) => {
@@ -16001,15 +16066,22 @@ fn run_rpc_serve_inner_legacy(
                     continue;
                 }
             };
-            let mnemonic = match WalletMnemonic::parse(&req.mnemonic) {
-                Ok(value) => value,
+            let seed_mode = match wallet_seed_mode_from_request(req.seed_mode.as_deref()) {
+                Ok(mode) => mode,
                 Err(err) => {
                     let body = json_error_body(&err.to_string());
                     write_http_json_response(&mut stream, "400 Bad Request", &body)?;
                     continue;
                 }
             };
-            let seed = mnemonic.to_seed(&req.passphrase);
+            let seed = match wallet_seed_from_mnemonic(&req.mnemonic, &req.passphrase, seed_mode) {
+                Ok(seed) => seed,
+                Err(err) => {
+                    let body = json_error_body(&err.to_string());
+                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
+                    continue;
+                }
+            };
             let key = match derive_wallet_key(&seed, req.account, req.index) {
                 Ok(value) => value,
                 Err(err) => {
@@ -16071,15 +16143,22 @@ fn run_rpc_serve_inner_legacy(
                     continue;
                 }
             };
-            let mnemonic = match WalletMnemonic::parse(&req.mnemonic) {
-                Ok(value) => value,
+            let seed_mode = match wallet_seed_mode_from_request(req.seed_mode.as_deref()) {
+                Ok(mode) => mode,
                 Err(err) => {
                     let body = json_error_body(&err.to_string());
                     write_http_json_response(&mut stream, "400 Bad Request", &body)?;
                     continue;
                 }
             };
-            let seed = mnemonic.to_seed(&req.passphrase);
+            let seed = match wallet_seed_from_mnemonic(&req.mnemonic, &req.passphrase, seed_mode) {
+                Ok(seed) => seed,
+                Err(err) => {
+                    let body = json_error_body(&err.to_string());
+                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
+                    continue;
+                }
+            };
             let key = match derive_wallet_key(&seed, req.account, req.index) {
                 Ok(value) => value,
                 Err(err) => {
@@ -16235,15 +16314,22 @@ fn run_rpc_serve_inner_legacy(
                 write_http_json_response(&mut stream, "400 Bad Request", &body)?;
                 continue;
             }
-            let mnemonic = match WalletMnemonic::parse(&req.mnemonic) {
-                Ok(value) => value,
+            let seed_mode = match wallet_seed_mode_from_request(req.seed_mode.as_deref()) {
+                Ok(mode) => mode,
                 Err(err) => {
                     let body = json_error_body(&err.to_string());
                     write_http_json_response(&mut stream, "400 Bad Request", &body)?;
                     continue;
                 }
             };
-            let seed = mnemonic.to_seed(&req.passphrase);
+            let seed = match wallet_seed_from_mnemonic(&req.mnemonic, &req.passphrase, seed_mode) {
+                Ok(seed) => seed,
+                Err(err) => {
+                    let body = json_error_body(&err.to_string());
+                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
+                    continue;
+                }
+            };
             let key = match derive_wallet_key(&seed, req.account, req.index) {
                 Ok(value) => value,
                 Err(err) => {
@@ -16330,15 +16416,22 @@ fn run_rpc_serve_inner_legacy(
                 write_http_json_response(&mut stream, "400 Bad Request", &body)?;
                 continue;
             }
-            let mnemonic = match WalletMnemonic::parse(&req.mnemonic) {
-                Ok(value) => value,
+            let seed_mode = match wallet_seed_mode_from_request(req.seed_mode.as_deref()) {
+                Ok(mode) => mode,
                 Err(err) => {
                     let body = json_error_body(&err.to_string());
                     write_http_json_response(&mut stream, "400 Bad Request", &body)?;
                     continue;
                 }
             };
-            let seed = mnemonic.to_seed(&req.passphrase);
+            let seed = match wallet_seed_from_mnemonic(&req.mnemonic, &req.passphrase, seed_mode) {
+                Ok(seed) => seed,
+                Err(err) => {
+                    let body = json_error_body(&err.to_string());
+                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
+                    continue;
+                }
+            };
             let key = match derive_wallet_key(&seed, req.account, req.index) {
                 Ok(value) => value,
                 Err(err) => {
@@ -16613,7 +16706,7 @@ mod tests {
         load_peer_book_db, save_mempool_db,
     };
     use scam_stratum::{IdentityTranslator, Sv2Message, Translator, read_frame, write_frame};
-    use scam_wallet::{WalletMnemonic, derive_wallet_key};
+    use scam_wallet::{WalletMnemonic, WalletSeedMode, derive_wallet_key};
 
     use super::{
         AddPeerArgs, ConfigScaffoldArgs, DifficultyAlgoArg, Network, ReindexRuntimeArgs,
@@ -16628,7 +16721,8 @@ mod tests {
         run_add_peer, run_config_scaffold, run_reindex_runtime, run_rpc_serve, run_stratum_mine,
         run_stratum_serve, run_sv2_conformance, run_sv2_job_declarator, run_sv2_template_provider,
         run_sv2_translator, run_sync_book, run_wallet, select_utxos_for_amount,
-        translate_remote_job_with_service, try_find_share_for_job,
+        translate_remote_job_with_service, try_find_share_for_job, wallet_seed_from_mnemonic,
+        wallet_seed_mode_from_request,
     };
 
     fn utxo(seed: u8, value: u64) -> SpendableUtxo {
@@ -16654,6 +16748,25 @@ mod tests {
         let mainnet = accepted_hrps_for_network(Network::Mainnet, "s");
         assert!(mainnet.iter().any(|hrp| hrp == "s"));
         assert!(mainnet.iter().any(|hrp| hrp == "sc"));
+    }
+
+    #[test]
+    fn wallet_seed_mode_parser_accepts_scam_blake() {
+        assert_eq!(
+            wallet_seed_mode_from_request(Some("scam-blake")).expect("seed mode"),
+            WalletSeedMode::ScamBlake
+        );
+        assert!(wallet_seed_mode_from_request(Some("unsupported")).is_err());
+    }
+
+    #[test]
+    fn wallet_seed_derivation_changes_with_mode() {
+        let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let bip39 =
+            wallet_seed_from_mnemonic(phrase, "passphrase", WalletSeedMode::Bip39).expect("seed");
+        let blake = wallet_seed_from_mnemonic(phrase, "passphrase", WalletSeedMode::ScamBlake)
+            .expect("seed");
+        assert_ne!(bip39, blake);
     }
 
     #[test]

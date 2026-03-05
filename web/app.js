@@ -433,6 +433,7 @@ function initWalletActions() {
     const payload = {
       words: parseNumber(raw.words, 12),
       passphrase: raw.passphrase || "",
+      seed_mode: raw.seed_mode || "bip39",
       account: parseNumber(raw.account, 0),
       index: parseNumber(raw.index, 0),
       ...(raw.hrp ? { hrp: raw.hrp } : {}),
@@ -453,6 +454,7 @@ function initWalletActions() {
       const payload = {
         mnemonic: raw.mnemonic,
         passphrase: raw.passphrase || "",
+        seed_mode: raw.seed_mode || "bip39",
         account: parseNumber(raw.account, 0),
         index: parseNumber(raw.index, 0),
         ...(raw.hrp ? { hrp: raw.hrp } : {}),
@@ -473,6 +475,7 @@ function initWalletActions() {
       const payload = {
         mnemonic: raw.mnemonic,
         passphrase: raw.passphrase || "",
+        seed_mode: raw.seed_mode || "bip39",
         account: parseNumber(raw.account, 0),
         index: parseNumber(raw.index, 0),
       };
@@ -506,6 +509,7 @@ function initWalletActions() {
     const payload = {
       mnemonic: raw.mnemonic,
       passphrase: raw.passphrase || "",
+      seed_mode: raw.seed_mode || "bip39",
       to: raw.to,
       amount: parseNumber(raw.amount, 0),
       fee: parseNumber(raw.fee, 1),

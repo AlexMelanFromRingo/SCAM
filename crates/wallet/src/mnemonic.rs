@@ -1,5 +1,37 @@
+use std::str::FromStr;
+
 use bip39::{Language, Mnemonic};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum WalletSeedMode {
+    #[default]
+    Bip39,
+    ScamBlake,
+}
+
+impl WalletSeedMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Bip39 => "bip39",
+            Self::ScamBlake => "scam-blake",
+        }
+    }
+}
+
+impl FromStr for WalletSeedMode {
+    type Err = MnemonicError;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "" | "bip39" | "sha512" => Ok(Self::Bip39),
+            "scam-blake" | "scam_blake" | "blake3" | "blake" => Ok(Self::ScamBlake),
+            other => Err(MnemonicError::InvalidSeedMode(other.to_owned())),
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct WalletMnemonic {
@@ -25,9 +57,31 @@ impl WalletMnemonic {
     }
 
     pub fn to_seed(&self, passphrase: &str) -> [u8; 64] {
+        self.to_seed_with_mode(passphrase, WalletSeedMode::Bip39)
+    }
+
+    pub fn to_seed_with_mode(&self, passphrase: &str, mode: WalletSeedMode) -> [u8; 64] {
+        match mode {
+            WalletSeedMode::Bip39 => self.to_seed_bip39(passphrase),
+            WalletSeedMode::ScamBlake => self.to_seed_scam_blake(passphrase),
+        }
+    }
+
+    fn to_seed_bip39(&self, passphrase: &str) -> [u8; 64] {
         let mnemonic = Mnemonic::parse_in_normalized(Language::English, &self.phrase)
             .expect("stored phrase must always be valid mnemonic");
         mnemonic.to_seed(passphrase)
+    }
+
+    fn to_seed_scam_blake(&self, passphrase: &str) -> [u8; 64] {
+        // SCAM-native deterministic KDF for optional non-BIP39 wallet derivation.
+        let mut hasher = blake3::Hasher::new_derive_key("SCAM wallet seed v1");
+        hasher.update(self.phrase.as_bytes());
+        hasher.update(&[0u8]);
+        hasher.update(passphrase.as_bytes());
+        let mut out = [0u8; 64];
+        hasher.finalize_xof().fill(&mut out);
+        out
     }
 }
 
@@ -46,6 +100,8 @@ pub enum MnemonicError {
     InvalidPhrase(#[source] bip39::Error),
     #[error("cannot generate mnemonic: {0}")]
     GenerateFailed(#[source] bip39::Error),
+    #[error("invalid seed mode: {0} (expected: bip39 or scam-blake)")]
+    InvalidSeedMode(String),
 }
 
 impl From<bip39::Error> for MnemonicError {
@@ -56,7 +112,7 @@ impl From<bip39::Error> for MnemonicError {
 
 #[cfg(test)]
 mod tests {
-    use crate::mnemonic::{WalletMnemonic, new_mnemonic};
+    use crate::mnemonic::{WalletMnemonic, WalletSeedMode, new_mnemonic};
 
     #[test]
     fn mnemonic_roundtrip() {
@@ -72,6 +128,30 @@ mod tests {
         let seed_a = mnemonic.to_seed("passphrase");
         let seed_b = mnemonic.to_seed("passphrase");
         assert_eq!(seed_a, seed_b);
+    }
+
+    #[test]
+    fn scam_blake_seed_is_deterministic_and_differs_from_bip39() {
+        let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let mnemonic = WalletMnemonic::parse(phrase).expect("known mnemonic should parse");
+        let blake_a = mnemonic.to_seed_with_mode("passphrase", WalletSeedMode::ScamBlake);
+        let blake_b = mnemonic.to_seed_with_mode("passphrase", WalletSeedMode::ScamBlake);
+        let bip39 = mnemonic.to_seed_with_mode("passphrase", WalletSeedMode::Bip39);
+        assert_eq!(blake_a, blake_b);
+        assert_ne!(blake_a, bip39);
+    }
+
+    #[test]
+    fn seed_mode_parser_accepts_aliases() {
+        assert_eq!(
+            "bip39".parse::<WalletSeedMode>().expect("mode"),
+            WalletSeedMode::Bip39
+        );
+        assert_eq!(
+            "blake3".parse::<WalletSeedMode>().expect("mode"),
+            WalletSeedMode::ScamBlake
+        );
+        assert!("unknown".parse::<WalletSeedMode>().is_err());
     }
 
     #[test]

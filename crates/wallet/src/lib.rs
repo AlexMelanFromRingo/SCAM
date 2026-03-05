@@ -8,7 +8,7 @@ pub mod vault;
 pub use address::{
     AddressError, DecodedAddress, key_hash20_from_compressed_pubkey, parse_address, to_address,
 };
-pub use mnemonic::{MnemonicError, WalletMnemonic, new_mnemonic};
+pub use mnemonic::{MnemonicError, WalletMnemonic, WalletSeedMode, new_mnemonic};
 pub use qr::{QrError, qr_for_payment_uri, qr_for_text};
 pub use rescan::{
     OwnedUtxo, RescanBalance, RescanError, RescanReport, WatchedKey, derive_watched_keys,
@@ -20,5 +20,6 @@ pub use signer::{
 };
 pub use vault::{
     DecryptedWalletSecret, EncryptedWalletVault, WalletVaultError, decrypt_wallet_vault,
-    load_wallet_vault, new_encrypted_wallet_vault, save_wallet_vault,
+    load_wallet_vault, new_encrypted_wallet_vault, new_encrypted_wallet_vault_with_mode,
+    save_wallet_vault,
 };
