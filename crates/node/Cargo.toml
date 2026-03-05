@@ -27,3 +27,6 @@ toml.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 tokio-socks.workspace = true
+
+[dev-dependencies]
+redb.workspace = true

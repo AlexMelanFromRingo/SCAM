@@ -1551,6 +1551,7 @@ dependencies = [
  "clap 4.5.57",
  "hex",
  "num-traits",
+ "redb",
  "scam-chain",
  "scam-consensus",
  "scam-core",

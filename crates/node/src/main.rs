@@ -25507,6 +25507,65 @@ mod tests {
     }
 
     #[test]
+    fn axum_status_payload_falls_back_to_cached_runtime_on_db_lock_conflict() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let work_dir = temp_dir("test-axum-runtime-cache-on-db-lock");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let runtime_db_path = work_dir.join("runtime.redb");
+
+        let mut persisted_runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        mine_blocks_on_runtime(
+            &mut persisted_runtime,
+            &super::MiningLoopParams {
+                count: 1,
+                interval_sec: cfg.target_block_time_sec,
+                max_nonce: 500_000,
+                subsidy: cfg.block_subsidy,
+                miner_key_hash: cfg.genesis_reward_key_hash20().expect("reward key"),
+                label_prefix: "axum-runtime-lock",
+                print_each: false,
+            },
+        )
+        .expect("mine persisted runtime");
+        persist_runtime_db(&persisted_runtime, &runtime_db_path).expect("persist runtime");
+
+        let cached_runtime = ChainRuntime::from_config(cfg.clone()).expect("cached runtime");
+        let expected_cached_tip_hash = cached_runtime.tip_hash();
+        let expected_cached_tip_height = cached_runtime.tip_height();
+        assert_ne!(
+            expected_cached_tip_hash,
+            persisted_runtime.tip_hash(),
+            "test requires cache/runtime mismatch"
+        );
+
+        let _runtime_db_lock = redb::Database::open(&runtime_db_path).expect("open db lock");
+        let state = super::AxumRpcState {
+            network: Network::Devnet,
+            cfg: cfg.clone(),
+            runtime_db_path: runtime_db_path.clone(),
+            runtime_cache: Arc::new(std::sync::Mutex::new(super::AxumRuntimeCache {
+                runtime: cached_runtime,
+                last_seen_mtime: None,
+            })),
+            mempool_db_path: work_dir.join("mempool.redb"),
+            relay_telemetry: None,
+            stratum_telemetry: None,
+            pool_ledger_db_path: work_dir.join("pool-ledger.redb"),
+            ui_dir: work_dir.join("ui"),
+        };
+        let payload = super::axum_status_payload(&state).expect("status payload");
+        assert_eq!(
+            payload.tip_hash,
+            expected_cached_tip_hash.to_hex(),
+            "db lock conflict should keep serving cached runtime snapshot"
+        );
+        assert_eq!(payload.tip_height, expected_cached_tip_height);
+
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
     fn refresh_mempool_from_db_if_changed_reloads_snapshot_when_mtime_changes() {
         let cfg: ChainConfig =
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
