@@ -22064,7 +22064,7 @@ mod tests {
                 let local_hello = LocalHandshake {
                     protocol_version: 1,
                     network_id: "devnet".to_owned(),
-                    consensus_fingerprint: devnet_consensus_fingerprint(),
+                    consensus_fingerprint: super::consensus_fingerprint(&cfg),
                     user_agent: "test-restart-client".to_owned(),
                     start_height: 0,
                 };
@@ -27197,7 +27197,7 @@ mod tests {
         let local_hello = LocalHandshake {
             protocol_version: 1,
             network_id: "devnet".to_owned(),
-            consensus_fingerprint: devnet_consensus_fingerprint(),
+            consensus_fingerprint: super::consensus_fingerprint(&cfg),
             user_agent: "test-relay-client".to_owned(),
             start_height: 0,
         };
@@ -31575,7 +31575,7 @@ mod tests {
         let ready_hello = LocalHandshake {
             protocol_version: 1,
             network_id: "devnet".to_owned(),
-            consensus_fingerprint: devnet_consensus_fingerprint(),
+            consensus_fingerprint: super::consensus_fingerprint(&cfg),
             user_agent: "relay-latency-ready-probe".to_owned(),
             start_height: 0,
         };
@@ -31624,7 +31624,7 @@ mod tests {
         let local_hello = LocalHandshake {
             protocol_version: 1,
             network_id: "devnet".to_owned(),
-            consensus_fingerprint: devnet_consensus_fingerprint(),
+            consensus_fingerprint: super::consensus_fingerprint(&cfg),
             user_agent: "relay-latency-sender".to_owned(),
             start_height: 0,
         };
