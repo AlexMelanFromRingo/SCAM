@@ -274,6 +274,200 @@ tr:last-child td {
   font-size: 0.84rem;
 }
 
+.wallet-result {
+  white-space: normal;
+  padding: 0.85rem;
+}
+
+.wallet-result.error {
+  white-space: pre-wrap;
+}
+
+.wallet-balance-layout {
+  display: grid;
+  gap: 0.72rem;
+}
+
+.wallet-balance-summary {
+  border: 1px solid var(--stroke);
+  border-radius: 0.78rem;
+  background: #fffaf2;
+  padding: 0.7rem 0.78rem;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.6rem;
+}
+
+.wallet-balance-summary h3 {
+  margin: 0;
+  font-size: 0.95rem;
+}
+
+.wallet-balance-subtitle {
+  margin-top: 0.24rem;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.wallet-balance-status {
+  border: 1px solid var(--stroke);
+  border-radius: 999px;
+  padding: 0.2rem 0.56rem;
+  font-size: 0.75rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.wallet-balance-status.ready {
+  color: #065f46;
+  background: rgba(167, 243, 208, 0.45);
+  border-color: rgba(6, 95, 70, 0.28);
+}
+
+.wallet-balance-status.partial {
+  color: #92400e;
+  background: rgba(253, 230, 138, 0.42);
+  border-color: rgba(146, 64, 14, 0.24);
+}
+
+.wallet-balance-status.immature,
+.wallet-balance-status.empty {
+  color: #9a3412;
+  background: rgba(251, 191, 36, 0.24);
+  border-color: rgba(146, 64, 14, 0.2);
+}
+
+.wallet-meta-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.52rem;
+}
+
+.wallet-meta-item {
+  border: 1px solid var(--stroke);
+  border-radius: 0.72rem;
+  background: #fffdf8;
+  padding: 0.55rem 0.62rem;
+}
+
+.wallet-meta-item-wide {
+  grid-column: 1 / -1;
+}
+
+.wallet-meta-label {
+  display: block;
+  font-size: 0.72rem;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.wallet-meta-value {
+  display: block;
+  margin-top: 0.2rem;
+  font-size: 0.85rem;
+  font-weight: 600;
+  word-break: break-word;
+}
+
+.wallet-balance-grid {
+  display: grid;
+  gap: 0.52rem;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.wallet-balance-card {
+  border: 1px solid var(--stroke);
+  border-radius: 0.74rem;
+  background: #fffdf8;
+  padding: 0.58rem 0.62rem;
+}
+
+.wallet-balance-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.wallet-balance-label {
+  font-size: 0.74rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+
+.wallet-balance-pct {
+  font-size: 0.72rem;
+  color: var(--muted);
+}
+
+.wallet-balance-value {
+  margin-top: 0.25rem;
+  font-size: 0.95rem;
+  font-weight: 700;
+}
+
+.wallet-balance-atomic {
+  margin-top: 0.14rem;
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
+.wallet-balance-progress {
+  margin-top: 0.34rem;
+  height: 0.34rem;
+  border-radius: 999px;
+  background: #efe3cd;
+  overflow: hidden;
+}
+
+.wallet-balance-progress span {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+}
+
+.wallet-balance-progress.tone-total span {
+  background: linear-gradient(130deg, #0f766e 0%, #0b5f58 100%);
+}
+
+.wallet-balance-progress.tone-spendable span {
+  background: linear-gradient(130deg, #ca8a04 0%, #a66a03 100%);
+}
+
+.wallet-balance-progress.tone-immature span {
+  background: linear-gradient(130deg, #c2410c 0%, #9a3412 100%);
+}
+
+.wallet-utxo-grid {
+  display: grid;
+  gap: 0.52rem;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.wallet-utxo-card {
+  border: 1px solid var(--stroke);
+  border-radius: 0.72rem;
+  background: #fffdf8;
+  padding: 0.54rem 0.6rem;
+}
+
+.wallet-utxo-label {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+
+.wallet-utxo-value {
+  margin-top: 0.2rem;
+  font-size: 0.96rem;
+  font-weight: 700;
+}
+
 .tabs {
   display: flex;
   gap: 0.45rem;
@@ -346,5 +540,11 @@ tr:last-child td {
 
   .endpoint-row {
     flex-direction: column;
+  }
+
+  .wallet-balance-grid,
+  .wallet-utxo-grid,
+  .wallet-meta-grid {
+    grid-template-columns: 1fr;
   }
 }

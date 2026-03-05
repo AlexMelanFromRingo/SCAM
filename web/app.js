@@ -84,17 +84,18 @@ function formatJson(data) {
 }
 
 function setResult(el, data, isError = false) {
+  el.innerHTML = "";
   el.textContent = typeof data === "string" ? data : formatJson(data);
   el.classList.toggle("error", isError);
 }
 
-function formatAtomicScam(value) {
-  const n = Number(value);
-  if (!Number.isFinite(n)) return `${value}`;
-  return `${(n / 1e8).toLocaleString(undefined, {
-    minimumFractionDigits: 8,
-    maximumFractionDigits: 8,
-  })} SCAM (${n.toLocaleString()} atomic)`;
+function escapeHtml(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
 }
 
 function isWalletBalancePayload(data) {
@@ -108,44 +109,125 @@ function isWalletBalancePayload(data) {
   );
 }
 
-function formatWalletBalanceSummary(data) {
+function formatScamOnly(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return `${value}`;
+  return `${(n / 1e8).toLocaleString(undefined, {
+    minimumFractionDigits: 8,
+    maximumFractionDigits: 8,
+  })} SCAM`;
+}
+
+function formatAtomicOnly(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return `${value}`;
+  return `${n.toLocaleString()} atomic`;
+}
+
+function getWalletBalanceStatus(total, spendable, immature) {
+  if (total <= 0) {
+    return {
+      kind: "empty",
+      title: "No Funds",
+      detail: "This address has no UTXOs yet.",
+    };
+  }
+  if (spendable <= 0 && immature > 0) {
+    return {
+      kind: "immature",
+      title: "Immature Balance",
+      detail: "Mining rewards are locked by coinbase maturity.",
+    };
+  }
+  if (spendable > 0 && immature > 0) {
+    return {
+      kind: "partial",
+      title: "Partially Spendable",
+      detail: "Some UTXOs are spendable, some are still maturing.",
+    };
+  }
+  return {
+    kind: "ready",
+    title: "Spendable",
+    detail: "All detected funds are currently spendable.",
+  };
+}
+
+function balanceLineHtml(label, valueAtomic, pct, tone) {
+  const boundedPct = Math.min(100, Math.max(0, Number(pct) || 0));
+  return `
+    <article class="wallet-balance-card">
+      <div class="wallet-balance-card-head">
+        <span class="wallet-balance-label">${escapeHtml(label)}</span>
+        <span class="wallet-balance-pct">${boundedPct.toFixed(2)}%</span>
+      </div>
+      <div class="wallet-balance-value">${escapeHtml(formatScamOnly(valueAtomic))}</div>
+      <div class="wallet-balance-atomic">${escapeHtml(formatAtomicOnly(valueAtomic))}</div>
+      <div class="wallet-balance-progress ${escapeHtml(tone)}"><span style="width:${boundedPct}%"></span></div>
+    </article>
+  `;
+}
+
+function renderWalletBalanceCard(data) {
   const total = Number(data.total) || 0;
   const spendable = Number(data.spendable) || 0;
   const immature = Number(data.immature) || 0;
-  const spendablePct = total > 0 ? ((spendable / total) * 100).toFixed(2) : "0.00";
-  const immaturePct = total > 0 ? ((immature / total) * 100).toFixed(2) : "0.00";
-  let status = "Status: no funds detected";
-  if (total > 0 && spendable === 0 && immature > 0) {
-    status = "Status: funds are immature (coinbase maturity not reached yet)";
-  } else if (spendable > 0 && immature > 0) {
-    status = "Status: partially spendable";
-  } else if (spendable > 0 && immature === 0) {
-    status = "Status: fully spendable";
-  }
-  return [
-    "Wallet Balance Summary",
-    "======================",
-    `Network      : ${data.network_id ?? "-"}`,
-    `Address      : ${data.address ?? "-"}`,
-    `Tip Height   : ${data.tip_height ?? "-"}`,
-    "",
-    "Balances",
-    `  Total      : ${formatAtomicScam(total)}`,
-    `  Spendable  : ${formatAtomicScam(spendable)} (${spendablePct}%)`,
-    `  Immature   : ${formatAtomicScam(immature)} (${immaturePct}%)`,
-    "",
-    "UTXO counts",
-    `  Total      : ${(data.utxo_count ?? 0).toLocaleString()}`,
-    `  Spendable  : ${(data.spendable_utxo_count ?? 0).toLocaleString()}`,
-    `  Immature   : ${(data.immature_utxo_count ?? 0).toLocaleString()}`,
-    "",
-    status,
-  ].join("\n");
+  const spendablePct = total > 0 ? (spendable / total) * 100 : 0;
+  const immaturePct = total > 0 ? (immature / total) * 100 : 0;
+  const status = getWalletBalanceStatus(total, spendable, immature);
+  return `
+    <section class="wallet-balance-layout">
+      <header class="wallet-balance-summary">
+        <div>
+          <h3>Wallet Balance</h3>
+          <div class="wallet-balance-subtitle">${escapeHtml(status.detail)}</div>
+        </div>
+        <span class="wallet-balance-status ${escapeHtml(status.kind)}">${escapeHtml(status.title)}</span>
+      </header>
+
+      <div class="wallet-meta-grid">
+        <div class="wallet-meta-item">
+          <span class="wallet-meta-label">Network</span>
+          <span class="wallet-meta-value">${escapeHtml(data.network_id ?? "-")}</span>
+        </div>
+        <div class="wallet-meta-item">
+          <span class="wallet-meta-label">Tip Height</span>
+          <span class="wallet-meta-value">${escapeHtml(data.tip_height ?? "-")}</span>
+        </div>
+        <div class="wallet-meta-item wallet-meta-item-wide">
+          <span class="wallet-meta-label">Address</span>
+          <span class="wallet-meta-value mono">${escapeHtml(data.address ?? "-")}</span>
+        </div>
+      </div>
+
+      <div class="wallet-balance-grid">
+        ${balanceLineHtml("Total", total, 100, "tone-total")}
+        ${balanceLineHtml("Spendable", spendable, spendablePct, "tone-spendable")}
+        ${balanceLineHtml("Immature", immature, immaturePct, "tone-immature")}
+      </div>
+
+      <div class="wallet-utxo-grid">
+        <article class="wallet-utxo-card">
+          <div class="wallet-utxo-label">UTXOs Total</div>
+          <div class="wallet-utxo-value">${(data.utxo_count ?? 0).toLocaleString()}</div>
+        </article>
+        <article class="wallet-utxo-card">
+          <div class="wallet-utxo-label">Spendable UTXOs</div>
+          <div class="wallet-utxo-value">${(data.spendable_utxo_count ?? 0).toLocaleString()}</div>
+        </article>
+        <article class="wallet-utxo-card">
+          <div class="wallet-utxo-label">Immature UTXOs</div>
+          <div class="wallet-utxo-value">${(data.immature_utxo_count ?? 0).toLocaleString()}</div>
+        </article>
+      </div>
+    </section>
+  `;
 }
 
 function setWalletResult(data, isError = false) {
   if (!isError && isWalletBalancePayload(data)) {
-    setResult(walletOut, formatWalletBalanceSummary(data));
+    walletOut.innerHTML = renderWalletBalanceCard(data);
+    walletOut.classList.remove("error");
     return;
   }
   setResult(walletOut, data, isError);
