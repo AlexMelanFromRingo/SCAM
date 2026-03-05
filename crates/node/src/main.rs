@@ -1481,6 +1481,11 @@ fn is_pool_ledger_db_lock_conflict(err: &NodeError) -> bool {
     msg.contains("Database already open") || msg.contains("Cannot acquire lock")
 }
 
+fn is_peer_book_db_lock_conflict(err: &NodeError) -> bool {
+    let msg = err.to_string();
+    msg.contains("Database already open") || msg.contains("Cannot acquire lock")
+}
+
 fn load_pool_ledger_from_db_or_new(
     cfg: &ChainConfig,
     runtime: &ChainRuntime,
@@ -3666,9 +3671,18 @@ struct SignedTransferTx {
     is_self_transfer: bool,
 }
 
+#[cfg(test)]
 fn collect_spendable_utxos(
     runtime: &ChainRuntime,
     owner_key_hash20: [u8; 20],
+) -> (Vec<SpendableUtxo>, u128) {
+    collect_spendable_utxos_excluding(runtime, owner_key_hash20, &HashSet::new())
+}
+
+fn collect_spendable_utxos_excluding(
+    runtime: &ChainRuntime,
+    owner_key_hash20: [u8; 20],
+    excluded_outpoints: &HashSet<OutPoint>,
 ) -> (Vec<SpendableUtxo>, u128) {
     let tip_height = runtime.tip_height();
     let coinbase_maturity = runtime.config().coinbase_maturity as u64;
@@ -3677,6 +3691,9 @@ fn collect_spendable_utxos(
 
     for (outpoint, utxo) in runtime.utxo_set() {
         if utxo.key_hash20 != owner_key_hash20 {
+            continue;
+        }
+        if excluded_outpoints.contains(outpoint) {
             continue;
         }
         let is_immature_coinbase =
@@ -3694,6 +3711,40 @@ fn collect_spendable_utxos(
     (spendable, spendable_total)
 }
 
+fn mempool_spent_outpoints(mempool: &Mempool) -> HashSet<OutPoint> {
+    let mut spent = HashSet::<OutPoint>::new();
+    for txid in mempool.txids_by_feerate_desc() {
+        if let Some(tx) = mempool.get(&txid) {
+            for input in &tx.inputs {
+                if !input.prev_out.is_coinbase() {
+                    spent.insert(input.prev_out.clone());
+                }
+            }
+        }
+    }
+    spent
+}
+
+fn load_wallet_reserved_outpoints(
+    cfg: &ChainConfig,
+    mempool_db_path: &Path,
+) -> Result<HashSet<OutPoint>, NodeError> {
+    if !mempool_db_path.exists() {
+        return Ok(HashSet::new());
+    }
+    match load_mempool_from_db_or_empty_with_retry(cfg, mempool_db_path, 10, 15) {
+        Ok(mempool) => Ok(mempool_spent_outpoints(&mempool)),
+        Err(err) if is_mempool_db_lock_conflict(&err) => {
+            eprintln!(
+                "warning: wallet send could not read mempool db ({}), proceeding without reserved-input filter: {err}",
+                mempool_db_path.display()
+            );
+            Ok(HashSet::new())
+        }
+        Err(err) => Err(err),
+    }
+}
+
 fn build_signed_transfer_tx(
     runtime: &ChainRuntime,
     network_id: &str,
@@ -3701,6 +3752,26 @@ fn build_signed_transfer_tx(
     recipient_key_hash20: [u8; 20],
     amount: u64,
     fee: u64,
+) -> Result<SignedTransferTx, NodeError> {
+    build_signed_transfer_tx_with_exclusions(
+        runtime,
+        network_id,
+        sender_key,
+        recipient_key_hash20,
+        amount,
+        fee,
+        &HashSet::new(),
+    )
+}
+
+fn build_signed_transfer_tx_with_exclusions(
+    runtime: &ChainRuntime,
+    network_id: &str,
+    sender_key: &WalletKey,
+    recipient_key_hash20: [u8; 20],
+    amount: u64,
+    fee: u64,
+    excluded_outpoints: &HashSet<OutPoint>,
 ) -> Result<SignedTransferTx, NodeError> {
     if amount == 0 {
         return Err(NodeError::Runtime(
@@ -3715,7 +3786,8 @@ fn build_signed_transfer_tx(
     let sender_key_hash20 = scam_core::hash160_blake3(&sender_pubkey);
     let is_self_transfer = recipient_key_hash20 == sender_key_hash20;
 
-    let (spendable, spendable_total) = collect_spendable_utxos(runtime, sender_key_hash20);
+    let (spendable, spendable_total) =
+        collect_spendable_utxos_excluding(runtime, sender_key_hash20, excluded_outpoints);
     let (selected, selected_total) =
         select_utxos_for_amount(&spendable, needed).ok_or(NodeError::InsufficientFunds {
             needed,
@@ -6932,7 +7004,12 @@ fn load_relay_outbound_targets(
     network_name: &str,
 ) -> Result<Vec<String>, NodeError> {
     let (peers_db_path, legacy_txt_path) = peer_book_paths(peers_dir, network_name);
-    let mut peer_book = load_or_init_peer_book(network_name, &peers_db_path, &legacy_txt_path)?;
+    let mut peer_book = match load_with_retry(10, 15, is_peer_book_db_lock_conflict, || {
+        load_or_init_peer_book(network_name, &peers_db_path, &legacy_txt_path)
+    })? {
+        Some(book) => book,
+        None => return Ok(Vec::new()),
+    };
     sort_and_dedup_peer_book(&mut peer_book);
     Ok(peer_book
         .peers
@@ -6946,7 +7023,12 @@ fn load_relay_known_peer_addresses(
     network_name: &str,
 ) -> Result<Vec<PeerAddress>, NodeError> {
     let (peers_db_path, legacy_txt_path) = peer_book_paths(peers_dir, network_name);
-    let mut peer_book = load_or_init_peer_book(network_name, &peers_db_path, &legacy_txt_path)?;
+    let mut peer_book = match load_with_retry(10, 15, is_peer_book_db_lock_conflict, || {
+        load_or_init_peer_book(network_name, &peers_db_path, &legacy_txt_path)
+    })? {
+        Some(book) => book,
+        None => return Ok(Vec::new()),
+    };
     sort_and_dedup_peer_book(&mut peer_book);
     let mut peers = peer_book
         .peers
@@ -6970,7 +7052,12 @@ fn load_relay_outbound_targets_selected(
     rotate_after_sec: u64,
 ) -> Result<Vec<String>, NodeError> {
     let (peers_db_path, legacy_txt_path) = peer_book_paths(peers_dir, &cfg.network_id);
-    let mut peer_book = load_or_init_peer_book(&cfg.network_id, &peers_db_path, &legacy_txt_path)?;
+    let mut peer_book = match load_with_retry(10, 15, is_peer_book_db_lock_conflict, || {
+        load_or_init_peer_book(&cfg.network_id, &peers_db_path, &legacy_txt_path)
+    })? {
+        Some(book) => book,
+        None => return Ok(Vec::new()),
+    };
     sort_and_dedup_peer_book(&mut peer_book);
     let now = current_unix_sec()?;
     let reputation_store = PeerReputationStore::from_peers_dir(peers_dir, &cfg.network_id);
@@ -11210,8 +11297,16 @@ fn submit_tx_via_mempool_db(
     tx: Transaction,
     requested_fee: u64,
 ) -> Result<(Hash256, String, u64), NodeError> {
-    let (runtime, _) = load_runtime_from_db_or_genesis(cfg, runtime_db_path)?;
-    let mut mempool = load_mempool_from_db_or_empty(cfg, mempool_db_path)?;
+    let runtime = load_with_retry(10, 15, is_runtime_db_lock_conflict, || {
+        load_runtime_from_db_or_genesis(cfg, runtime_db_path).map(|(runtime, _)| runtime)
+    })?
+    .ok_or_else(|| {
+        NodeError::Runtime(format!(
+            "runtime db is lock-contended: {}",
+            runtime_db_path.display()
+        ))
+    })?;
+    let mut mempool = load_mempool_from_db_or_empty_with_retry(cfg, mempool_db_path, 10, 15)?;
     let implied_fee = validate_tx_for_local_admission(cfg, &runtime, &mempool, &tx)?;
     let fee = if requested_fee == 0 {
         implied_fee
@@ -13782,8 +13877,19 @@ fn mempool_tx_count_from_db(mempool_db_path: &Path) -> Result<(bool, usize), Nod
     if !mempool_db_path.exists() {
         return Ok((false, 0));
     }
-    let snapshot = load_mempool_db(mempool_db_path)?;
-    Ok((true, snapshot.entries.len()))
+    let snapshot = load_with_retry(10, 15, is_mempool_db_lock_conflict, || {
+        load_mempool_db(mempool_db_path).map_err(NodeError::from)
+    })?;
+    match snapshot {
+        Some(value) => Ok((true, value.entries.len())),
+        None => {
+            eprintln!(
+                "warning: mempool db {} is lock-contended; snapshot temporarily unavailable",
+                mempool_db_path.display()
+            );
+            Ok((false, 0))
+        }
+    }
 }
 
 fn build_rpc_event_snapshot(
@@ -14865,14 +14971,16 @@ fn axum_wallet_send_preview_payload(
     let seed_mode = wallet_seed_mode_from_request(req.seed_mode.as_deref())?;
     let seed = wallet_seed_from_mnemonic(&req.mnemonic, &req.passphrase, seed_mode)?;
     let key = derive_wallet_key(&seed, req.account, req.index)?;
+    let reserved_outpoints = load_wallet_reserved_outpoints(&state.cfg, &state.mempool_db_path)?;
     let signed = axum_runtime_for_query(state, |runtime| {
-        build_signed_transfer_tx(
+        build_signed_transfer_tx_with_exclusions(
             runtime,
             &state.cfg.network_id,
             &key,
             recipient.key_hash20,
             req.amount,
             req.fee,
+            &reserved_outpoints,
         )
     })?;
     let tx_bincode_hex = hex::encode(
@@ -16455,13 +16563,24 @@ fn run_rpc_serve_inner_legacy(
                     continue;
                 }
             };
-            let signed = match build_signed_transfer_tx(
+            let reserved_outpoints = match load_wallet_reserved_outpoints(&cfg, &mempool_db_path) {
+                Ok(value) => value,
+                Err(err) => {
+                    let body = json_error_body(&format!(
+                        "wallet send-preview failed to load mempool state: {err}"
+                    ));
+                    write_http_json_response(&mut stream, "500 Internal Server Error", &body)?;
+                    continue;
+                }
+            };
+            let signed = match build_signed_transfer_tx_with_exclusions(
                 &runtime,
                 &cfg.network_id,
                 &key,
                 recipient.key_hash20,
                 req.amount,
                 req.fee,
+                &reserved_outpoints,
             ) {
                 Ok(value) => value,
                 Err(err) => {
@@ -16557,13 +16676,24 @@ fn run_rpc_serve_inner_legacy(
                     continue;
                 }
             };
-            let signed = match build_signed_transfer_tx(
+            let reserved_outpoints = match load_wallet_reserved_outpoints(&cfg, &mempool_db_path) {
+                Ok(value) => value,
+                Err(err) => {
+                    let body = json_error_body(&format!(
+                        "wallet send failed to load mempool state: {err}"
+                    ));
+                    write_http_json_response(&mut stream, "500 Internal Server Error", &body)?;
+                    continue;
+                }
+            };
+            let signed = match build_signed_transfer_tx_with_exclusions(
                 &runtime,
                 &cfg.network_id,
                 &key,
                 recipient.key_hash20,
                 req.amount,
                 req.fee,
+                &reserved_outpoints,
             ) {
                 Ok(value) => value,
                 Err(err) => {
@@ -28109,6 +28239,60 @@ mod tests {
         .expect("signed tx with change");
         assert_eq!(with_change.change_value, 1);
         assert_eq!(with_change.tx.outputs.len(), 2);
+    }
+
+    #[test]
+    fn build_signed_transfer_tx_with_exclusions_avoids_reserved_inputs() {
+        let mut cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        cfg.coinbase_maturity = 1;
+        cfg.validate().expect("config validate");
+
+        let mut runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let mnemonic = WalletMnemonic::parse(SOAK_FLOW_MNEMONIC).expect("mnemonic");
+        let seed = mnemonic.to_seed("");
+        let sender_key = derive_wallet_key(&seed, 0, 0).expect("sender key");
+        let sender_key_hash20 = scam_core::hash160_blake3(&sender_key.pubkey_compressed());
+        let recipient_key_hash20 = [0x42; 20];
+
+        let params = super::MiningLoopParams {
+            count: 3,
+            interval_sec: 30,
+            max_nonce: 500_000,
+            subsidy: cfg.block_subsidy,
+            miner_key_hash: sender_key_hash20,
+            label_prefix: "excluded-inputs",
+            print_each: false,
+        };
+        mine_blocks_on_runtime(&mut runtime, &params).expect("mine blocks");
+
+        let (spendable, _) = super::collect_spendable_utxos(&runtime, sender_key_hash20);
+        assert!(
+            spendable.len() >= 2,
+            "expected at least two matured UTXOs for exclusion test"
+        );
+        let excluded = spendable[0].outpoint.clone();
+        let mut excluded_set = HashSet::<OutPoint>::new();
+        excluded_set.insert(excluded.clone());
+
+        let signed = super::build_signed_transfer_tx_with_exclusions(
+            &runtime,
+            &cfg.network_id,
+            &sender_key,
+            recipient_key_hash20,
+            1_000_000,
+            1,
+            &excluded_set,
+        )
+        .expect("signed tx with exclusions");
+
+        assert!(
+            signed
+                .selected_inputs
+                .iter()
+                .all(|input| input.outpoint != excluded),
+            "selected inputs must not include excluded outpoint"
+        );
     }
 
     #[test]
