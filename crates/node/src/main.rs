@@ -9627,6 +9627,27 @@ fn normalize_stratum_block_coinbase(
     Ok(())
 }
 
+fn rewrite_block_coinbase_to_allowed_reward(
+    block: &mut scam_core::Block,
+    allowed_coinbase_reward: u128,
+    channel_id: u32,
+    job_id: u32,
+) -> Result<(), NodeError> {
+    let allowed = u64::try_from(allowed_coinbase_reward).map_err(|_| {
+        NodeError::Runtime(format!(
+            "stratum allowed coinbase reward does not fit u64: allowed={allowed_coinbase_reward}"
+        ))
+    })?;
+    normalize_stratum_block_coinbase(&mut block.transactions, allowed, channel_id, job_id)?;
+    let txids = block
+        .transactions
+        .iter()
+        .map(Transaction::txid)
+        .collect::<Vec<_>>();
+    block.header.merkle_root = scam_core::merkle::merkle_root(&txids);
+    Ok(())
+}
+
 #[allow(dead_code)]
 async fn issue_new_stratum_job_async<S: AsyncRead + AsyncWrite + Unpin>(
     session: &mut Sv2Session,
@@ -10015,7 +10036,7 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
                                     .skip(1)
                                     .map(Transaction::txid)
                                     .collect::<Vec<_>>();
-                                let block = scam_core::Block {
+                                let mut block = scam_core::Block {
                                     header: scam_core::BlockHeader {
                                         version: work.job.version,
                                         prev_block: work.job.prev_hash,
@@ -10026,21 +10047,31 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
                                     },
                                     transactions: block_txs,
                                 };
-                                let block_reward_atomic = block
-                                    .transactions
-                                    .first()
-                                    .map(|tx| {
-                                        tx.outputs.iter().fold(0u128, |acc, output| {
-                                            acc.saturating_add(output.value as u128)
-                                        })
-                                    })
-                                    .unwrap_or(ctx.cfg.block_subsidy as u128);
                                 let mut tip_advanced = false;
                                 let mut submit_failed = false;
 
                                 {
                                     let mut runtime = lock_runtime(&ctx.runtime)?;
-                                    match runtime.submit_block(block) {
+                                    let submission = match runtime.submit_block(block.clone()) {
+                                        Ok(submission) => Ok(submission),
+                                        Err(ChainError::Validation(
+                                            TxValidationError::CoinbaseRewardTooHigh {
+                                                allowed,
+                                                got,
+                                            },
+                                        )) => {
+                                            eprintln!(
+                                                "warning: stratum coinbase reward mismatch for channel={} job={}: allowed={}, got={}; rewriting and retrying",
+                                                channel_id, job_id, allowed, got
+                                            );
+                                            rewrite_block_coinbase_to_allowed_reward(
+                                                &mut block, allowed, channel_id, job_id,
+                                            )?;
+                                            runtime.submit_block(block.clone())
+                                        }
+                                        Err(err) => Err(err),
+                                    };
+                                    match submission {
                                         Ok(submission) => {
                                             handle_runtime_persist_result(
                                                 persist_runtime_db_with_retry(
@@ -10061,6 +10092,20 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
                                                     new_height,
                                                     ..
                                                 } => {
+                                                    let block_reward_atomic = block
+                                                        .transactions
+                                                        .first()
+                                                        .map(|tx| {
+                                                            tx.outputs.iter().fold(
+                                                                0u128,
+                                                                |acc, output| {
+                                                                    acc.saturating_add(
+                                                                        output.value as u128,
+                                                                    )
+                                                                },
+                                                            )
+                                                        })
+                                                        .unwrap_or(ctx.cfg.block_subsidy as u128);
                                                     record_pool_round_closed(
                                                         &ctx,
                                                         &worker_label,
@@ -17091,6 +17136,53 @@ mod tests {
             err.to_string()
                 .contains("stratum template first tx is not coinbase")
         );
+    }
+
+    #[test]
+    fn rewrite_block_coinbase_to_allowed_reward_updates_value_and_merkle_root() {
+        let mut block = scam_core::Block {
+            header: scam_core::BlockHeader {
+                version: 1,
+                prev_block: Hash256([0x11; 32]),
+                merkle_root: Hash256::ZERO,
+                timestamp: 1_770_763_200,
+                target: Target::MAX,
+                nonce: 0,
+            },
+            transactions: vec![
+                super::build_coinbase_tx("rewrite".to_owned(), 9_999, [0x33; 20]),
+                Transaction {
+                    version: 1,
+                    inputs: vec![TxIn {
+                        prev_out: OutPoint {
+                            txid: Hash256([0x44; 32]),
+                            vout: 0,
+                        },
+                        signature: vec![0x55; 64],
+                        pubkey_compressed: vec![0x02; 33],
+                        sequence: u32::MAX,
+                    }],
+                    outputs: vec![TxOut {
+                        value: 1,
+                        key_hash20: [0x66; 20],
+                    }],
+                    lock_time: 0,
+                },
+            ],
+        };
+        let old_merkle = block.header.merkle_root;
+        super::rewrite_block_coinbase_to_allowed_reward(&mut block, 123, 7, 88)
+            .expect("rewrite should succeed");
+        assert_eq!(block.transactions[0].outputs[0].value, 123);
+        assert_ne!(block.header.merkle_root, old_merkle);
+        let recomputed = scam_core::merkle::merkle_root(
+            &block
+                .transactions
+                .iter()
+                .map(Transaction::txid)
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(block.header.merkle_root, recomputed);
     }
 
     #[test]
