@@ -1,7 +1,7 @@
 network_id = "testnet"
 target_block_time_sec = 120
-difficulty_adjustment_window = 20
-difficulty_algorithm = "windowed"
+difficulty_adjustment_window = 120
+difficulty_algorithm = "lwma"
 asert_half_life_sec = 3_600
 difficulty_clamp_up = 4.0
 difficulty_clamp_down = 0.25
