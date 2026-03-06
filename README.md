@@ -221,6 +221,24 @@ scripts/scam-easy.sh pool
 scripts/scam-easy.sh miner
 ```
 
+Dedicated single-purpose launchers:
+
+```bash
+# 1) Miner only (connect to remote/local pool, payout label = your address)
+POOL_ADDR=127.0.0.1:3347 \
+COINBASE_ADDRESS=sd1... \
+scripts/run-miner.sh start
+
+# 2) Node only (relay + RPC/UI, no local mining)
+scripts/run-node-only.sh start
+
+# 3) Node + local miner (relay + RPC/UI + stratum + miner)
+COINBASE_ADDRESS=sd1... \
+scripts/run-node-miner.sh start
+```
+
+Each script supports `start|stop|status|logs`.
+
 For local multi-node verification:
 
 ```bash
