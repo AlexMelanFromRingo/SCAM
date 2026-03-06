@@ -80,6 +80,31 @@ If you have peer book + seeds:
 scam-node sync-book --network devnet --config config/devnet.toml --runtime-db data/devnet.runtime.redb
 ```
 
+### 5.0 Quick Launch Scripts (with Bootstrap Peers)
+
+For operator-friendly startup wrappers:
+
+```bash
+# Node only (relay + RPC/UI)
+ADD_PEERS=203.0.113.10:18444,198.51.100.25:18444 \
+scripts/run-node-only.sh start
+
+# Node + local miner (relay + RPC/UI + stratum + miner)
+ADD_PEERS=203.0.113.10:18444,198.51.100.25:18444 \
+COINBASE_ADDRESS=sd1... \
+scripts/run-node-miner.sh start
+
+# Miner only (connect to an existing pool node)
+POOL_ADDR=127.0.0.1:3347 \
+COINBASE_ADDRESS=sd1... \
+scripts/run-miner.sh start
+```
+
+Notes:
+- `ADD_PEERS` is optional and used only by node scripts (`run-node-only.sh`, `run-node-miner.sh`).
+- If `ADD_PEERS` is omitted, discovery relies on existing peer book entries and configured DNS seeds.
+- `run-miner.sh` does not run a relay node, so peer discovery / `add-peer` is not applicable there.
+
 ### 5.1 Web Console (Explorer + Wallet GUI)
 
 Run RPC server against runtime DB and serve UI files:

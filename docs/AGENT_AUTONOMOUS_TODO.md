@@ -12,8 +12,8 @@
 - [x] Strengthen unit tests for `p2p::discovery` and `p2p::gossip` (boundaries + branch behavior).
 - [x] Strengthen `node` tests for env/policy/socks/diffusion/relay boundaries and flaky paths.
 - [x] Run targeted mutation loop for `scam-p2p` discovery/gossip until zero misses.
-- [ ] Run full stage2 mutation (`scam-stratum`, `scam-p2p`, `scam-node`) and close remaining misses.
-- [ ] Re-run stage2 mutation after fixes to confirm stable zero-miss/no-timeout state.
+- [x] Run full stage2 mutation (`scam-stratum`, `scam-p2p`, `scam-node`) and close remaining misses.
+- [x] Re-run stage2 mutation after fixes to confirm stable zero-miss/no-timeout state.
 
 ### Phase B: Battle-tested transport/protocol migration
 - [x] Migrate async SOCKS5 connect path to `tokio-socks` (remove hand-rolled async dial logic).
@@ -31,7 +31,7 @@
 - [x] `cargo check --workspace`
 - [x] `cargo test --workspace`
 - [x] `cargo clippy --workspace --all-targets -- -D warnings`
-- [ ] Mutation gate re-check for stage2.
+- [x] Mutation gate re-check for stage2.
 
 ### Phase D: Local commit policy (no push)
 - [x] Commit 1: Stage2 mutation fixes (`p2p/node`).
@@ -50,4 +50,5 @@
 - `p2p` targeted mutation loop for `discovery/gossip`: closed (0 misses in scoped run).
 - `rpc-serve` axum path: full route parity done, SSE and UI fallback included.
 - `p2p::transport` async frame path now uses `tokio-util` codec + strict magic/size checks.
-- Full stage2 mutation: pending final rerun after latest node/http changes.
+- Stage2 mutation closure: complete (`0 missed`, `0 timeout` on closure reruns).
+- Stage3 full workspace mutation closure: complete (`0 missed`, `0 timeout` on final rerun).
