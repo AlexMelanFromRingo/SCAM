@@ -468,6 +468,216 @@ tr:last-child td {
   font-weight: 700;
 }
 
+.wallet-history-layout {
+  margin-top: 0.72rem;
+  display: grid;
+  gap: 0.58rem;
+}
+
+.wallet-history-header {
+  border: 1px solid var(--stroke);
+  border-radius: 0.78rem;
+  background: #fffaf2;
+  padding: 0.58rem 0.7rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.52rem;
+}
+
+.wallet-history-header h3 {
+  margin: 0;
+  font-size: 0.9rem;
+}
+
+.wallet-history-count {
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+.wallet-history-warning {
+  border: 1px solid rgba(153, 27, 27, 0.2);
+  border-radius: 0.68rem;
+  background: rgba(254, 226, 226, 0.56);
+  color: #991b1b;
+  padding: 0.5rem 0.62rem;
+  font-size: 0.78rem;
+}
+
+.wallet-history-empty {
+  border: 1px dashed var(--stroke);
+  border-radius: 0.68rem;
+  background: #fffdf8;
+  color: var(--muted);
+  padding: 0.62rem;
+  font-size: 0.8rem;
+}
+
+.wallet-history-grid {
+  display: grid;
+  gap: 0.52rem;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.wallet-history-card {
+  border: 1px solid var(--stroke);
+  border-radius: 0.72rem;
+  background: #fffdf8;
+  padding: 0.58rem 0.62rem;
+  display: grid;
+  gap: 0.26rem;
+}
+
+.wallet-history-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.42rem;
+}
+
+.wallet-history-badge {
+  border: 1px solid var(--stroke);
+  border-radius: 999px;
+  padding: 0.12rem 0.45rem;
+  font-size: 0.7rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.wallet-history-badge.in {
+  color: #065f46;
+  border-color: rgba(6, 95, 70, 0.26);
+  background: rgba(167, 243, 208, 0.44);
+}
+
+.wallet-history-badge.out {
+  color: #9a3412;
+  border-color: rgba(154, 52, 18, 0.24);
+  background: rgba(253, 186, 116, 0.34);
+}
+
+.wallet-history-badge.self,
+.wallet-history-badge.coinbase {
+  color: #92400e;
+  border-color: rgba(146, 64, 14, 0.24);
+  background: rgba(253, 230, 138, 0.36);
+}
+
+.wallet-history-height {
+  color: var(--muted);
+  font-size: 0.74rem;
+}
+
+.wallet-history-net {
+  font-size: 0.92rem;
+  font-weight: 700;
+}
+
+.wallet-history-flow {
+  color: var(--muted);
+  font-size: 0.76rem;
+}
+
+.wallet-history-amounts {
+  display: grid;
+  gap: 0.06rem;
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+.wallet-history-txid {
+  margin-top: 0.12rem;
+  font-size: 0.76rem;
+  color: #4a4235;
+}
+
+.wallet-send-layout {
+  display: grid;
+  gap: 0.7rem;
+}
+
+.wallet-send-summary {
+  border: 1px solid var(--stroke);
+  border-radius: 0.78rem;
+  background: #fffaf2;
+  padding: 0.7rem 0.78rem;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.6rem;
+}
+
+.wallet-send-summary h3 {
+  margin: 0;
+  font-size: 0.95rem;
+}
+
+.wallet-send-subtitle {
+  margin-top: 0.24rem;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.wallet-send-status {
+  border: 1px solid var(--stroke);
+  border-radius: 999px;
+  padding: 0.2rem 0.56rem;
+  font-size: 0.75rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.wallet-send-status.accepted {
+  color: #065f46;
+  background: rgba(167, 243, 208, 0.45);
+  border-color: rgba(6, 95, 70, 0.28);
+}
+
+.wallet-send-status.rejected {
+  color: #991b1b;
+  background: rgba(254, 202, 202, 0.44);
+  border-color: rgba(153, 27, 27, 0.2);
+}
+
+.wallet-send-status.neutral {
+  color: #92400e;
+  background: rgba(253, 230, 138, 0.45);
+  border-color: rgba(146, 64, 14, 0.24);
+}
+
+.wallet-send-inputs {
+  border: 1px solid var(--stroke);
+  border-radius: 0.74rem;
+  background: #fffdf8;
+  padding: 0.58rem 0.62rem;
+}
+
+.wallet-send-inputs-title {
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+
+.wallet-send-input-list {
+  margin-top: 0.45rem;
+  display: grid;
+  gap: 0.36rem;
+}
+
+.wallet-send-input-card {
+  border: 1px solid #eadfcf;
+  border-radius: 0.62rem;
+  background: #fffaf2;
+  padding: 0.42rem 0.48rem;
+  display: flex;
+  justify-content: space-between;
+  gap: 0.44rem;
+  font-size: 0.78rem;
+}
+
 .tabs {
   display: flex;
   gap: 0.45rem;
@@ -544,7 +754,8 @@ tr:last-child td {
 
   .wallet-balance-grid,
   .wallet-utxo-grid,
-  .wallet-meta-grid {
+  .wallet-meta-grid,
+  .wallet-history-grid {
     grid-template-columns: 1fr;
   }
 }

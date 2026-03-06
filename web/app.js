@@ -109,6 +109,27 @@ function isWalletBalancePayload(data) {
   );
 }
 
+function isWalletBalanceHistoryPayload(data) {
+  return (
+    data &&
+    typeof data === "object" &&
+    data.balance &&
+    typeof data.balance === "object" &&
+    Array.isArray(data.tx_history)
+  );
+}
+
+function isWalletSendPayload(data) {
+  return (
+    data &&
+    typeof data === "object" &&
+    "txid" in data &&
+    "mempool_outcome" in data &&
+    "amount" in data &&
+    "fee" in data
+  );
+}
+
 function formatScamOnly(value) {
   const n = Number(value);
   if (!Number.isFinite(n)) return `${value}`;
@@ -224,9 +245,193 @@ function renderWalletBalanceCard(data) {
   `;
 }
 
+function txDirectionMeta(direction, coinbase) {
+  if (coinbase) {
+    return {
+      cls: "coinbase",
+      title: "Coinbase",
+      flow: "Block reward -> your wallet",
+      sign: "+",
+    };
+  }
+  if (direction === "in") {
+    return {
+      cls: "in",
+      title: "Incoming",
+      flow: "Sender -> your wallet",
+      sign: "+",
+    };
+  }
+  if (direction === "out") {
+    return {
+      cls: "out",
+      title: "Outgoing",
+      flow: "Your wallet -> recipient(s)",
+      sign: "-",
+    };
+  }
+  return {
+    cls: "self",
+    title: "Self",
+    flow: "Your wallet -> your wallet",
+    sign: "±",
+  };
+}
+
+function renderWalletHistorySection(txHistory, historyError = "") {
+  const entries = Array.isArray(txHistory) ? txHistory : [];
+  let bodyHtml = "";
+  if (!entries.length) {
+    bodyHtml = `
+      <div class="wallet-history-empty">
+        No transactions detected for this wallet yet.
+      </div>
+    `;
+  } else {
+    bodyHtml = `
+      <div class="wallet-history-grid">
+        ${entries
+          .map((entry) => {
+            const direction = txDirectionMeta(entry.direction, entry.coinbase);
+            const netAtomic = Number(entry.net) || 0;
+            return `
+              <article class="wallet-history-card">
+                <div class="wallet-history-head">
+                  <span class="wallet-history-badge ${escapeHtml(direction.cls)}">${escapeHtml(direction.title)}</span>
+                  <span class="wallet-history-height">H${escapeHtml(entry.height ?? "-")}</span>
+                </div>
+                <div class="wallet-history-net">${escapeHtml(direction.sign)}${escapeHtml(formatScamOnly(netAtomic))}</div>
+                <div class="wallet-history-flow">${escapeHtml(direction.flow)}</div>
+                <div class="wallet-history-amounts">
+                  <span>Received: ${escapeHtml(formatScamOnly(entry.received ?? 0))}</span>
+                  <span>Sent: ${escapeHtml(formatScamOnly(entry.sent ?? 0))}</span>
+                </div>
+                <div class="wallet-history-txid mono" title="${escapeHtml(entry.txid ?? "-")}">
+                  ${escapeHtml(shortHash(entry.txid ?? "-", 16, 12))}
+                </div>
+              </article>
+            `;
+          })
+          .join("")}
+      </div>
+    `;
+  }
+
+  return `
+    <section class="wallet-history-layout">
+      <header class="wallet-history-header">
+        <h3>Transaction History</h3>
+        <span class="wallet-history-count">${entries.length} entries</span>
+      </header>
+      ${
+        historyError
+          ? `<div class="wallet-history-warning">History temporarily unavailable: ${escapeHtml(historyError)}</div>`
+          : ""
+      }
+      ${bodyHtml}
+    </section>
+  `;
+}
+
+function renderWalletBalanceWithHistory(payload) {
+  const balance = payload.balance;
+  return `
+    ${renderWalletBalanceCard(balance)}
+    ${renderWalletHistorySection(payload.tx_history, payload.history_error || "")}
+  `;
+}
+
+function sendOutcomeMeta(outcome) {
+  switch (outcome) {
+    case "accepted":
+      return { cls: "accepted", title: "Accepted", detail: "Transaction accepted into mempool." };
+    case "replaced":
+      return { cls: "accepted", title: "Replaced", detail: "Accepted and replaced conflicting transaction(s)." };
+    case "accepted_with_eviction":
+      return { cls: "accepted", title: "Accepted (evicted)", detail: "Accepted with low-fee eviction from mempool." };
+    case "already_present":
+      return { cls: "neutral", title: "Already Present", detail: "This transaction already exists in mempool." };
+    case "rejected_conflict_insufficient_fee":
+      return { cls: "rejected", title: "Rejected", detail: "Conflict replacement fee was too low." };
+    case "rejected_conflict_insufficient_feerate":
+      return { cls: "rejected", title: "Rejected", detail: "Conflict replacement feerate was too low." };
+    default:
+      return { cls: "neutral", title: outcome || "Unknown", detail: "Mempool returned an unclassified outcome." };
+  }
+}
+
+function renderWalletSendCard(data) {
+  const outcome = sendOutcomeMeta(data.mempool_outcome);
+  const selectedInputs = Array.isArray(data.selected_inputs) ? data.selected_inputs : [];
+  return `
+    <section class="wallet-send-layout">
+      <header class="wallet-send-summary">
+        <div>
+          <h3>Transaction Submit Result</h3>
+          <div class="wallet-send-subtitle">${escapeHtml(outcome.detail)}</div>
+        </div>
+        <span class="wallet-send-status ${escapeHtml(outcome.cls)}">${escapeHtml(outcome.title)}</span>
+      </header>
+
+      <div class="wallet-meta-grid">
+        <div class="wallet-meta-item">
+          <span class="wallet-meta-label">Network</span>
+          <span class="wallet-meta-value">${escapeHtml(data.network_id ?? "-")}</span>
+        </div>
+        <div class="wallet-meta-item">
+          <span class="wallet-meta-label">Mempool Outcome</span>
+          <span class="wallet-meta-value">${escapeHtml(data.mempool_outcome ?? "-")}</span>
+        </div>
+        <div class="wallet-meta-item wallet-meta-item-wide">
+          <span class="wallet-meta-label">TxID</span>
+          <span class="wallet-meta-value mono">${escapeHtml(data.txid ?? "-")}</span>
+        </div>
+      </div>
+
+      <div class="wallet-balance-grid">
+        ${balanceLineHtml("Amount", data.amount ?? 0, 100, "tone-total")}
+        ${balanceLineHtml("Fee", data.fee ?? 0, 100, "tone-immature")}
+        ${balanceLineHtml("Change", data.change ?? 0, 100, "tone-spendable")}
+      </div>
+
+      <div class="wallet-send-inputs">
+        <div class="wallet-send-inputs-title">Selected Inputs (${selectedInputs.length})</div>
+        ${
+          selectedInputs.length
+            ? `<div class="wallet-send-input-list">
+                ${selectedInputs
+                  .map(
+                    (input) => `
+                      <article class="wallet-send-input-card">
+                        <div class="mono" title="${escapeHtml(input.txid ?? "-")}">
+                          ${escapeHtml(shortHash(input.txid ?? "-", 16, 12))}:${escapeHtml(input.vout ?? "-")}
+                        </div>
+                        <div>${escapeHtml(formatScamOnly(input.value ?? 0))}</div>
+                      </article>
+                    `,
+                  )
+                  .join("")}
+              </div>`
+            : `<div class="wallet-history-empty">No input details returned by RPC.</div>`
+        }
+      </div>
+    </section>
+  `;
+}
+
 function setWalletResult(data, isError = false) {
+  if (!isError && isWalletBalanceHistoryPayload(data)) {
+    walletOut.innerHTML = renderWalletBalanceWithHistory(data);
+    walletOut.classList.remove("error");
+    return;
+  }
   if (!isError && isWalletBalancePayload(data)) {
     walletOut.innerHTML = renderWalletBalanceCard(data);
+    walletOut.classList.remove("error");
+    return;
+  }
+  if (!isError && isWalletSendPayload(data)) {
+    walletOut.innerHTML = renderWalletSendCard(data);
     walletOut.classList.remove("error");
     return;
   }
@@ -598,6 +803,15 @@ function initExplorerActions() {
 }
 
 function initWalletActions() {
+  const historyByAddress = async (address, maxEntries = 30) =>
+    request("/wallet/balance-history-by-address", {
+      method: "POST",
+      body: {
+        address,
+        max_entries: maxEntries,
+      },
+    });
+
   document.getElementById("walletNewForm").addEventListener("submit", async (event) => {
     event.preventDefault();
     const raw = serializeForm(event.currentTarget);
@@ -651,8 +865,21 @@ function initWalletActions() {
         index: parseNumber(raw.index, 0),
       };
       try {
-        const data = await request("/wallet/balance", { method: "POST", body: payload });
-        setWalletResult(data);
+        const balance = await request("/wallet/balance", { method: "POST", body: payload });
+        if (!balance?.address) {
+          setWalletResult(balance);
+          return;
+        }
+        try {
+          const withHistory = await historyByAddress(balance.address);
+          setWalletResult(withHistory);
+        } catch (historyError) {
+          setWalletResult({
+            balance,
+            tx_history: [],
+            history_error: historyError.message,
+          });
+        }
       } catch (error) {
         setWalletResult(error.message, true);
       }
@@ -667,10 +894,22 @@ function initWalletActions() {
         address: raw.address,
       };
       try {
-        const data = await request("/wallet/balance-by-address", { method: "POST", body: payload });
-        setWalletResult(data);
+        const withHistory = await historyByAddress(payload.address);
+        setWalletResult(withHistory);
       } catch (error) {
-        setWalletResult(error.message, true);
+        try {
+          const balance = await request("/wallet/balance-by-address", {
+            method: "POST",
+            body: payload,
+          });
+          setWalletResult({
+            balance,
+            tx_history: [],
+            history_error: error.message,
+          });
+        } catch (fallbackError) {
+          setWalletResult(fallbackError.message, true);
+        }
       }
     });
 
