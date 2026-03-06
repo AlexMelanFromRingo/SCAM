@@ -19,6 +19,7 @@ p2p_replacement_max_per_peer = 20
 p2p_replacement_penalty = 25
 dns_seeds = []
 coinbase_maturity = 20
+wallet_min_spendable_confirmations = 1
 block_subsidy = 5_000_000_000
 hrp = "sfd"
 stratum_share_target = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"

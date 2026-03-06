@@ -293,6 +293,8 @@ struct ConfigScaffoldArgs {
     dns_seeds: Vec<String>,
     #[arg(long, default_value_t = 100)]
     coinbase_maturity: u32,
+    #[arg(long, default_value_t = 1)]
+    wallet_min_spendable_confirmations: u32,
     #[arg(long, default_value_t = 5_000_000_000)]
     block_subsidy: u64,
     #[arg(
@@ -2220,6 +2222,7 @@ fn run_config_scaffold(args: ConfigScaffoldArgs) -> Result<(), NodeError> {
         p2p_replacement_max_per_peer: args.p2p_replacement_max_per_peer,
         p2p_replacement_penalty: args.p2p_replacement_penalty,
         coinbase_maturity: args.coinbase_maturity,
+        wallet_min_spendable_confirmations: args.wallet_min_spendable_confirmations,
         block_subsidy: args.block_subsidy,
         hrp: args.hrp.clone(),
         stratum_share_target: args.stratum_share_target.clone(),
@@ -3735,6 +3738,7 @@ fn collect_spendable_utxos_excluding(
 ) -> (Vec<SpendableUtxo>, u128) {
     let tip_height = runtime.tip_height();
     let coinbase_maturity = runtime.config().coinbase_maturity as u64;
+    let wallet_min_confirmations = runtime.config().wallet_min_spendable_confirmations as u64;
     let mut spendable = Vec::<SpendableUtxo>::new();
     let mut spendable_total = 0u128;
 
@@ -3745,9 +3749,13 @@ fn collect_spendable_utxos_excluding(
         if excluded_outpoints.contains(outpoint) {
             continue;
         }
-        let is_immature_coinbase =
-            utxo.is_coinbase && tip_height < utxo.created_height.saturating_add(coinbase_maturity);
-        if is_immature_coinbase {
+        if wallet_prevout_is_immature(
+            tip_height,
+            utxo.is_coinbase,
+            utxo.created_height,
+            coinbase_maturity,
+            wallet_min_confirmations,
+        ) {
             continue;
         }
         spendable_total = spendable_total.saturating_add(utxo.value as u128);
@@ -11043,14 +11051,20 @@ fn reconcile_pool_ledger_with_runtime(ctx: &StratumServerContext, fallback_unix_
 
 fn runtime_spendable_balance_for_key_hash(runtime: &ChainRuntime, key_hash20: [u8; 20]) -> u128 {
     let tip_height = runtime.tip_height();
-    let maturity = runtime.config().coinbase_maturity as u64;
+    let coinbase_maturity = runtime.config().coinbase_maturity as u64;
+    let wallet_min_confirmations = runtime.config().wallet_min_spendable_confirmations as u64;
     runtime
         .utxo_set()
         .values()
         .filter(|entry| entry.key_hash20 == key_hash20)
         .filter(|entry| {
-            !(entry.is_coinbase
-                && coinbase_prevout_is_immature(tip_height, entry.created_height, maturity))
+            !wallet_prevout_is_immature(
+                tip_height,
+                entry.is_coinbase,
+                entry.created_height,
+                coinbase_maturity,
+                wallet_min_confirmations,
+            )
         })
         .map(|entry| entry.value as u128)
         .fold(0u128, |acc, value| acc.saturating_add(value))
@@ -11390,6 +11404,27 @@ fn validate_tx_for_local_admission(
 
 fn coinbase_prevout_is_immature(tip_height: u64, created_height: u64, maturity: u64) -> bool {
     tip_height < created_height.saturating_add(maturity)
+}
+
+fn tx_output_confirmations(tip_height: u64, created_height: u64) -> u64 {
+    if tip_height < created_height {
+        0
+    } else {
+        tip_height.saturating_sub(created_height).saturating_add(1)
+    }
+}
+
+fn wallet_prevout_is_immature(
+    tip_height: u64,
+    is_coinbase: bool,
+    created_height: u64,
+    coinbase_maturity: u64,
+    wallet_min_confirmations: u64,
+) -> bool {
+    if is_coinbase {
+        return coinbase_prevout_is_immature(tip_height, created_height, coinbase_maturity);
+    }
+    tx_output_confirmations(tip_height, created_height) < wallet_min_confirmations
 }
 
 fn mempool_outcome_label(outcome: &InsertOutcome) -> &'static str {
@@ -13922,15 +13957,20 @@ fn wallet_balance_response(
 
     let tip_height = runtime.tip_height();
     let coinbase_maturity = runtime.config().coinbase_maturity as u64;
+    let wallet_min_confirmations = cfg.wallet_min_spendable_confirmations as u64;
     for utxo in runtime.utxo_set().values() {
         if utxo.key_hash20 != key_hash20 {
             continue;
         }
         utxo_count += 1;
         total = total.saturating_add(utxo.value as u128);
-        let is_immature_coinbase =
-            utxo.is_coinbase && tip_height < utxo.created_height.saturating_add(coinbase_maturity);
-        if is_immature_coinbase {
+        if wallet_prevout_is_immature(
+            tip_height,
+            utxo.is_coinbase,
+            utxo.created_height,
+            coinbase_maturity,
+            wallet_min_confirmations,
+        ) {
             immature_count += 1;
             immature = immature.saturating_add(utxo.value as u128);
         } else {
@@ -17617,6 +17657,30 @@ mod tests {
     }
 
     #[test]
+    fn wallet_prevout_policy_uses_coinbase_maturity_and_min_confirmations() {
+        assert_eq!(super::tx_output_confirmations(200, 198), 3);
+        assert_eq!(super::tx_output_confirmations(198, 198), 1);
+        assert_eq!(super::tx_output_confirmations(100, 101), 0);
+
+        assert!(
+            super::wallet_prevout_is_immature(105, true, 100, 10, 1),
+            "coinbase remains controlled by coinbase_maturity"
+        );
+        assert!(
+            !super::wallet_prevout_is_immature(110, true, 100, 10, 1),
+            "coinbase matures exactly at boundary"
+        );
+        assert!(
+            super::wallet_prevout_is_immature(10, false, 10, 100, 2),
+            "non-coinbase output at 1 confirmation should be immature for min_confirmations=2"
+        );
+        assert!(
+            !super::wallet_prevout_is_immature(11, false, 10, 100, 2),
+            "non-coinbase output becomes spendable at min_confirmations boundary"
+        );
+    }
+
+    #[test]
     fn tx_outputs_value_sum_u64_detects_overflow() {
         let tx = Transaction {
             version: 1,
@@ -20568,6 +20632,95 @@ mod tests {
         assert_eq!(
             super::runtime_spendable_balance_for_key_hash(&runtime, [0x55; 20]),
             0
+        );
+    }
+
+    #[test]
+    fn runtime_spendable_balance_for_key_hash_respects_wallet_min_confirmations() {
+        let mut cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        cfg.coinbase_maturity = 1;
+        cfg.wallet_min_spendable_confirmations = 2;
+        cfg.validate().expect("config validate");
+
+        let mnemonic = WalletMnemonic::parse(SOAK_FLOW_MNEMONIC).expect("mnemonic");
+        let seed = mnemonic.to_seed("");
+        let sender_key = derive_wallet_key(&seed, 0, 0).expect("sender key");
+        let recipient_key = derive_wallet_key(&seed, 0, 1).expect("recipient key");
+        let sender_key_hash20 = scam_core::hash160_blake3(&sender_key.pubkey_compressed());
+        let recipient_key_hash20 = scam_core::hash160_blake3(&recipient_key.pubkey_compressed());
+
+        let mut runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        mine_blocks_on_runtime(
+            &mut runtime,
+            &super::MiningLoopParams {
+                count: 2,
+                interval_sec: cfg.target_block_time_sec,
+                max_nonce: 500_000,
+                subsidy: cfg.block_subsidy,
+                miner_key_hash: sender_key_hash20,
+                label_prefix: "spendable-min-conf",
+                print_each: false,
+            },
+        )
+        .expect("mine funding blocks");
+
+        let fee = 1_000u64;
+        let amount = 700_000u64;
+        let signed = super::build_signed_transfer_tx(
+            &runtime,
+            &cfg.network_id,
+            &sender_key,
+            recipient_key_hash20,
+            amount,
+            fee,
+        )
+        .expect("signed tx");
+        let mut mempool =
+            Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool");
+        mempool
+            .insert_with_fee(signed.tx.clone(), fee)
+            .expect("insert tx");
+        let template_params = super::MempoolTemplateParams {
+            version: 1,
+            prev_block: runtime.tip_hash(),
+            timestamp: runtime
+                .tip_header()
+                .timestamp
+                .saturating_add(cfg.target_block_time_sec),
+            target: runtime.expected_target_for_next_block().expect("target"),
+            block_subsidy: cfg.block_subsidy,
+            miner_key_hash20: sender_key_hash20,
+            coinbase_tag: "spendable-min-conf-template".to_owned(),
+            max_txs: cfg.max_mempool_txs as usize,
+        };
+        let (template, _summary) =
+            super::build_template_from_mempool(&template_params, &mempool).expect("template");
+        let mined = mine_block(&template, 500_000).expect("mine tx block");
+        runtime.apply_next_block(mined).expect("apply tx block");
+
+        assert_eq!(
+            super::runtime_spendable_balance_for_key_hash(&runtime, recipient_key_hash20),
+            0
+        );
+
+        mine_blocks_on_runtime(
+            &mut runtime,
+            &super::MiningLoopParams {
+                count: 1,
+                interval_sec: cfg.target_block_time_sec,
+                max_nonce: 500_000,
+                subsidy: cfg.block_subsidy,
+                miner_key_hash: sender_key_hash20,
+                label_prefix: "spendable-min-conf-mature",
+                print_each: false,
+            },
+        )
+        .expect("mine confirmation block");
+        assert_eq!(
+            super::runtime_spendable_balance_for_key_hash(&runtime, recipient_key_hash20),
+            amount as u128
         );
     }
 
@@ -24420,6 +24573,115 @@ mod tests {
     }
 
     #[test]
+    fn wallet_balance_response_respects_wallet_min_confirmations_for_regular_outputs() {
+        let mut cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        cfg.coinbase_maturity = 1;
+        cfg.wallet_min_spendable_confirmations = 3;
+        cfg.validate().expect("config validate");
+
+        let mnemonic = WalletMnemonic::parse(SOAK_FLOW_MNEMONIC).expect("mnemonic");
+        let seed = mnemonic.to_seed("");
+        let sender_key = derive_wallet_key(&seed, 0, 0).expect("sender");
+        let recipient_key = derive_wallet_key(&seed, 0, 1).expect("recipient");
+        let sender_key_hash20 = scam_core::hash160_blake3(&sender_key.pubkey_compressed());
+        let recipient_key_hash20 = scam_core::hash160_blake3(&recipient_key.pubkey_compressed());
+        let recipient_address = super::to_address(&cfg.hrp, recipient_key.pubkey_compressed())
+            .expect("recipient address");
+
+        let mut runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        mine_blocks_on_runtime(
+            &mut runtime,
+            &super::MiningLoopParams {
+                count: 2,
+                interval_sec: cfg.target_block_time_sec,
+                max_nonce: 500_000,
+                subsidy: cfg.block_subsidy,
+                miner_key_hash: sender_key_hash20,
+                label_prefix: "wallet-min-conf-balance",
+                print_each: false,
+            },
+        )
+        .expect("mine funding");
+
+        let fee = 1_000u64;
+        let amount = 2_000_000u64;
+        let signed = super::build_signed_transfer_tx(
+            &runtime,
+            &cfg.network_id,
+            &sender_key,
+            recipient_key_hash20,
+            amount,
+            fee,
+        )
+        .expect("signed transfer");
+        let mut mempool =
+            Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool");
+        mempool
+            .insert_with_fee(signed.tx.clone(), fee)
+            .expect("insert tx");
+        let template_params = super::MempoolTemplateParams {
+            version: 1,
+            prev_block: runtime.tip_hash(),
+            timestamp: runtime
+                .tip_header()
+                .timestamp
+                .saturating_add(cfg.target_block_time_sec),
+            target: runtime.expected_target_for_next_block().expect("target"),
+            block_subsidy: cfg.block_subsidy,
+            miner_key_hash20: sender_key_hash20,
+            coinbase_tag: "wallet-min-conf-template".to_owned(),
+            max_txs: cfg.max_mempool_txs as usize,
+        };
+        let (template, _summary) =
+            super::build_template_from_mempool(&template_params, &mempool).expect("template");
+        let mined = mine_block(&template, 500_000).expect("mine tx block");
+        runtime.apply_next_block(mined).expect("apply tx block");
+
+        let fresh = super::wallet_balance_response(
+            &runtime,
+            &cfg,
+            0,
+            1,
+            recipient_address.clone(),
+            recipient_key_hash20,
+        );
+        assert_eq!(fresh.total, amount as u128);
+        assert_eq!(fresh.spendable, 0);
+        assert_eq!(fresh.immature, amount as u128);
+        assert_eq!(fresh.spendable_utxo_count, 0);
+        assert_eq!(fresh.immature_utxo_count, 1);
+
+        mine_blocks_on_runtime(
+            &mut runtime,
+            &super::MiningLoopParams {
+                count: 2,
+                interval_sec: cfg.target_block_time_sec,
+                max_nonce: 500_000,
+                subsidy: cfg.block_subsidy,
+                miner_key_hash: sender_key_hash20,
+                label_prefix: "wallet-min-conf-mature",
+                print_each: false,
+            },
+        )
+        .expect("mine extra confirmations");
+        let mature = super::wallet_balance_response(
+            &runtime,
+            &cfg,
+            0,
+            1,
+            recipient_address,
+            recipient_key_hash20,
+        );
+        assert_eq!(mature.total, amount as u128);
+        assert_eq!(mature.spendable, amount as u128);
+        assert_eq!(mature.immature, 0);
+        assert_eq!(mature.spendable_utxo_count, 1);
+        assert_eq!(mature.immature_utxo_count, 0);
+    }
+
+    #[test]
     fn rpc_event_snapshot_reports_runtime_and_mempool_state() {
         let cfg: ChainConfig =
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
@@ -27967,6 +28229,7 @@ mod tests {
                 "seed2.example.org".to_owned(),
             ],
             coinbase_maturity: 100,
+            wallet_min_spendable_confirmations: 1,
             block_subsidy: 5_000_000_000,
             stratum_share_target:
                 "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_owned(),
@@ -28014,6 +28277,7 @@ mod tests {
         assert_eq!(cfg.p2p_replacement_window_sec, 60);
         assert_eq!(cfg.p2p_replacement_max_per_peer, 20);
         assert_eq!(cfg.p2p_replacement_penalty, 25);
+        assert_eq!(cfg.wallet_min_spendable_confirmations, 1);
         assert_eq!(cfg.dns_seeds.len(), 2);
         assert_eq!(cfg.stratum_vardiff_target_shares_per_minute, 6);
         assert_eq!(cfg.stratum_vardiff_retarget_interval_shares, 24);
@@ -28354,6 +28618,99 @@ mod tests {
         let (other_spendable, other_total) = super::collect_spendable_utxos(&runtime, [0xAA; 20]);
         assert!(other_spendable.is_empty());
         assert_eq!(other_total, 0);
+    }
+
+    #[test]
+    fn collect_spendable_utxos_respects_wallet_min_confirmations_for_regular_outputs() {
+        let mut cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        cfg.coinbase_maturity = 1;
+        cfg.wallet_min_spendable_confirmations = 2;
+        cfg.validate().expect("config validate");
+
+        let mnemonic = WalletMnemonic::parse(SOAK_FLOW_MNEMONIC).expect("mnemonic");
+        let seed = mnemonic.to_seed("");
+        let sender_key = derive_wallet_key(&seed, 0, 0).expect("sender key");
+        let recipient_key = derive_wallet_key(&seed, 0, 1).expect("recipient key");
+        let sender_key_hash20 = scam_core::hash160_blake3(&sender_key.pubkey_compressed());
+        let recipient_key_hash20 = scam_core::hash160_blake3(&recipient_key.pubkey_compressed());
+
+        let mut runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        mine_blocks_on_runtime(
+            &mut runtime,
+            &super::MiningLoopParams {
+                count: 2,
+                interval_sec: cfg.target_block_time_sec,
+                max_nonce: 500_000,
+                subsidy: cfg.block_subsidy,
+                miner_key_hash: sender_key_hash20,
+                label_prefix: "collect-min-confirmations",
+                print_each: false,
+            },
+        )
+        .expect("mine funding blocks");
+
+        let fee = 1_000u64;
+        let amount = 1_500_000u64;
+        let signed = super::build_signed_transfer_tx(
+            &runtime,
+            &cfg.network_id,
+            &sender_key,
+            recipient_key_hash20,
+            amount,
+            fee,
+        )
+        .expect("build signed transfer");
+        let mut mempool =
+            Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool");
+        mempool
+            .insert_with_fee(signed.tx.clone(), fee)
+            .expect("insert transfer");
+        let template_params = super::MempoolTemplateParams {
+            version: 1,
+            prev_block: runtime.tip_hash(),
+            timestamp: runtime
+                .tip_header()
+                .timestamp
+                .saturating_add(cfg.target_block_time_sec),
+            target: runtime.expected_target_for_next_block().expect("target"),
+            block_subsidy: cfg.block_subsidy,
+            miner_key_hash20: sender_key_hash20,
+            coinbase_tag: "collect-min-confirm-template".to_owned(),
+            max_txs: cfg.max_mempool_txs as usize,
+        };
+        let (template, _summary) =
+            super::build_template_from_mempool(&template_params, &mempool).expect("template");
+        let mined = mine_block(&template, 500_000).expect("mine tx block");
+        runtime.apply_next_block(mined).expect("apply tx block");
+
+        let (recipient_spendable_now, recipient_total_now) =
+            super::collect_spendable_utxos(&runtime, recipient_key_hash20);
+        assert!(
+            recipient_spendable_now.is_empty(),
+            "recipient output should be immature at 1 confirmation when min_confirmations=2"
+        );
+        assert_eq!(recipient_total_now, 0);
+
+        mine_blocks_on_runtime(
+            &mut runtime,
+            &super::MiningLoopParams {
+                count: 1,
+                interval_sec: cfg.target_block_time_sec,
+                max_nonce: 500_000,
+                subsidy: cfg.block_subsidy,
+                miner_key_hash: sender_key_hash20,
+                label_prefix: "collect-min-confirmations-mature",
+                print_each: false,
+            },
+        )
+        .expect("mine confirmation block");
+
+        let (recipient_spendable_later, recipient_total_later) =
+            super::collect_spendable_utxos(&runtime, recipient_key_hash20);
+        assert_eq!(recipient_spendable_later.len(), 1);
+        assert_eq!(recipient_total_later, amount as u128);
     }
 
     #[test]

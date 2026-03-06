@@ -54,6 +54,8 @@ pub struct ChainConfig {
     #[serde(default = "default_p2p_replacement_penalty")]
     pub p2p_replacement_penalty: u32,
     pub coinbase_maturity: u32,
+    #[serde(default = "default_wallet_min_spendable_confirmations")]
+    pub wallet_min_spendable_confirmations: u32,
     pub block_subsidy: u64,
     pub hrp: String,
     #[serde(default = "default_stratum_share_target")]
@@ -188,6 +190,11 @@ impl ChainConfig {
         if self.p2p_replacement_penalty == 0 {
             return Err(ChainConfigError::InvalidField(
                 "p2p_replacement_penalty must be > 0".to_owned(),
+            ));
+        }
+        if self.wallet_min_spendable_confirmations == 0 {
+            return Err(ChainConfigError::InvalidField(
+                "wallet_min_spendable_confirmations must be > 0".to_owned(),
             ));
         }
         if self.dns_seeds.iter().any(|seed| seed.trim().is_empty()) {
@@ -437,6 +444,10 @@ const fn default_p2p_replacement_penalty() -> u32 {
     25
 }
 
+const fn default_wallet_min_spendable_confirmations() -> u32 {
+    1
+}
+
 fn default_stratum_share_target() -> String {
     "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_owned()
 }
@@ -557,6 +568,7 @@ mod tests {
             p2p_replacement_max_per_peer: 20,
             p2p_replacement_penalty: 25,
             coinbase_maturity: 100,
+            wallet_min_spendable_confirmations: 1,
             block_subsidy: 5_000_000_000,
             hrp: "sd".to_owned(),
             stratum_share_target:
@@ -619,6 +631,7 @@ mod tests {
             p2p_replacement_max_per_peer: 20,
             p2p_replacement_penalty: 25,
             coinbase_maturity: 100,
+            wallet_min_spendable_confirmations: 1,
             block_subsidy: 5_000_000_000,
             hrp: "sd".to_owned(),
             stratum_share_target:
@@ -689,6 +702,7 @@ genesis_reward_key_hash20 = "0000000000000000000000000000000000000000"
         assert_eq!(cfg.p2p_replacement_window_sec, 60);
         assert_eq!(cfg.p2p_replacement_max_per_peer, 20);
         assert_eq!(cfg.p2p_replacement_penalty, 25);
+        assert_eq!(cfg.wallet_min_spendable_confirmations, 1);
         assert_eq!(
             cfg.stratum_share_target,
             "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
@@ -723,6 +737,16 @@ genesis_reward_key_hash20 = "0000000000000000000000000000000000000000"
 
     #[test]
     fn config_rejects_cross_field_violations() {
+        let mut cfg = sample_config();
+        cfg.wallet_min_spendable_confirmations = 0;
+        let err = cfg
+            .validate()
+            .expect_err("wallet_min_spendable_confirmations == 0 must fail");
+        assert!(
+            err.to_string()
+                .contains("wallet_min_spendable_confirmations must be > 0")
+        );
+
         let mut cfg = sample_config();
         cfg.max_tx_size = cfg.max_block_size + 1;
         let err = cfg.validate().expect_err("max_tx_size > max_block_size");

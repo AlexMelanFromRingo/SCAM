@@ -186,6 +186,7 @@ Important config groups:
 - tx/pool: size/fee/orphan/replacement parameters,
 - p2p: DNS seeds, outbound bucket cap, ban thresholds,
 - stratum: vardiff/share limits/timeouts/secure mode,
+- wallet policy: `wallet_min_spendable_confirmations` for regular (non-coinbase) spendability,
 - genesis: message/timestamp/target/nonce/reward script hash,
 - address HRP.
 
