@@ -155,6 +155,12 @@ mod tests {
     }
 
     #[test]
+    fn seed_mode_as_str_is_stable() {
+        assert_eq!(WalletSeedMode::Bip39.as_str(), "bip39");
+        assert_eq!(WalletSeedMode::ScamBlake.as_str(), "scam-blake");
+    }
+
+    #[test]
     fn seed_matches_known_bip39_vector() {
         let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
         let mnemonic = WalletMnemonic::parse(phrase).expect("known mnemonic should parse");
@@ -164,5 +170,22 @@ mod tests {
             "1f09a6987599d18264c1e1c92f2cf141630c7a3c4ab7c81b2f001698e7463b04"
         );
         assert_eq!(hex::encode(seed), expected_hex);
+    }
+
+    #[test]
+    fn scam_blake_seed_is_not_trivial_and_changes_with_passphrase() {
+        let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let mnemonic = WalletMnemonic::parse(phrase).expect("known mnemonic should parse");
+        let seed_a = mnemonic.to_seed_with_mode("passphrase-a", WalletSeedMode::ScamBlake);
+        let seed_b = mnemonic.to_seed_with_mode("passphrase-b", WalletSeedMode::ScamBlake);
+        assert_ne!(seed_a, seed_b);
+        assert!(
+            seed_a.iter().any(|b| *b != 0),
+            "scam-blake seed must not be all zeros"
+        );
+        assert!(
+            seed_a.iter().any(|b| *b != 1),
+            "scam-blake seed must not be all ones"
+        );
     }
 }

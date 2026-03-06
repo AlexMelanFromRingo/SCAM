@@ -1224,6 +1224,10 @@ fn wallet_seed_mode_from_request(raw: Option<&str>) -> Result<WalletSeedMode, No
     }
 }
 
+fn should_refresh_jobs_after_submit(tip_advanced: bool, submit_failed: bool) -> bool {
+    tip_advanced || submit_failed
+}
+
 fn wallet_seed_from_mnemonic(
     mnemonic_phrase: &str,
     passphrase: &str,
@@ -1388,9 +1392,20 @@ fn persist_mempool_db(
     mempool: &Mempool,
     mempool_db_path: &Path,
 ) -> Result<(), NodeError> {
+    #[cfg(test)]
+    MEMPOOL_PERSIST_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let snapshot = mempool_snapshot_from_pool(cfg, mempool);
     save_mempool_db(mempool_db_path, &snapshot)?;
     Ok(())
+}
+
+#[cfg(test)]
+static MEMPOOL_PERSIST_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+fn mempool_persist_calls_for_tests() -> usize {
+    MEMPOOL_PERSIST_CALLS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 fn load_mempool_from_db_or_empty(
@@ -3785,9 +3800,8 @@ fn mempool_spent_outpoints(mempool: &Mempool) -> HashSet<OutPoint> {
     for txid in mempool.txids_by_feerate_desc() {
         if let Some(tx) = mempool.get(&txid) {
             for input in &tx.inputs {
-                if !input.prev_out.is_coinbase() {
-                    spent.insert(input.prev_out.clone());
-                }
+                // Mempool admission rejects coinbase prevouts, so every tracked input is reservable.
+                spent.insert(input.prev_out.clone());
             }
         }
     }
@@ -4239,6 +4253,14 @@ fn ensure_consensus_fingerprint_match(
     Err(NodeError::Runtime(format!(
         "{context}: expected consensus {expected}, got {got}"
     )))
+}
+
+fn submit_tx_retryable_lock_conflict(err: &NodeError) -> bool {
+    is_runtime_db_lock_conflict(err) || is_mempool_db_lock_conflict(err)
+}
+
+fn submit_tx_retry_has_remaining_attempts(idx: usize, tries: usize) -> bool {
+    idx.saturating_add(1) < tries
 }
 
 fn ensure_expected_hash(expected: Hash256, got: Hash256, context: &str) -> Result<(), NodeError> {
@@ -5788,6 +5810,22 @@ fn tx_fee_from_known_prevouts(
         return None;
     }
     u64::try_from(input_total - output_total).ok()
+}
+
+fn template_fee_meets_minimum(fee: u64, min_required: u64) -> bool {
+    fee >= min_required
+}
+
+fn sanitize_should_continue(pending_len: usize, safety_budget: usize) -> bool {
+    pending_len > 0 && safety_budget > 0
+}
+
+fn sanitize_stalled(progressed: bool) -> bool {
+    !progressed
+}
+
+fn should_persist_startup_mempool_cleanup(removed_confirmed_startup: usize) -> bool {
+    removed_confirmed_startup > 0
 }
 
 fn relay_mark_outbound_worker_start(state: &Arc<Mutex<RelayServerState>>) {
@@ -8583,7 +8621,7 @@ fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
     let mut startup_mempool = load_mempool_from_db_or_empty(&cfg, &mempool_db_path)?;
     let removed_confirmed_startup =
         remove_confirmed_txids_present_on_chain(&runtime, &mut startup_mempool);
-    if removed_confirmed_startup > 0 {
+    if should_persist_startup_mempool_cleanup(removed_confirmed_startup) {
         persist_mempool_db_with_retry(&cfg, &startup_mempool, &mempool_db_path, 80, 25)?;
         println!(
             "Mempool startup cleanup: removed {} already-confirmed tx(s)",
@@ -9731,7 +9769,7 @@ fn sanitize_template_mempool_fees(
     let mut pending = mempool.txids_by_feerate_desc();
     let mut safety_budget = pending.len().saturating_mul(2).max(1);
 
-    while !pending.is_empty() && safety_budget > 0 {
+    while sanitize_should_continue(pending.len(), safety_budget) {
         safety_budget = safety_budget.saturating_sub(1);
         let mut progressed = false;
         let mut deferred = Vec::<Hash256>::new();
@@ -9748,7 +9786,7 @@ fn sanitize_template_mempool_fees(
                     continue;
                 }
             };
-            if fee < min_required {
+            if !template_fee_meets_minimum(fee, min_required) {
                 continue;
             }
             match sanitized.insert_with_fee(tx.clone(), fee) {
@@ -9756,7 +9794,7 @@ fn sanitize_template_mempool_fees(
                 Err(_) => deferred.push(txid),
             }
         }
-        if !progressed {
+        if sanitize_stalled(progressed) {
             break;
         }
         pending = deferred;
@@ -9953,17 +9991,25 @@ fn rewrite_coinbase_to_expected_value(
     let other_outputs_sum = coinbase.outputs.iter().skip(1).fold(0u128, |acc, output| {
         acc.saturating_add(output.value as u128)
     });
-    if expected < other_outputs_sum {
+    let primary = coinbase_primary_value(expected_value, expected, other_outputs_sum)?;
+    coinbase.outputs[0].value = primary;
+    Ok(())
+}
+
+fn coinbase_primary_value(
+    expected_value: u64,
+    expected_total: u128,
+    other_outputs_sum: u128,
+) -> Result<u64, NodeError> {
+    if expected_total < other_outputs_sum {
         return Err(NodeError::Runtime(format!(
             "stratum template coinbase outputs exceed expected reward: expected={expected_value}, non_primary_outputs={other_outputs_sum}"
         )));
     }
-    let primary = expected - other_outputs_sum;
-    let primary = u64::try_from(primary).map_err(|_| {
+    let primary = expected_total - other_outputs_sum;
+    u64::try_from(primary).map_err(|_| {
         NodeError::Runtime("stratum template coinbase primary output overflow".to_owned())
-    })?;
-    coinbase.outputs[0].value = primary;
-    Ok(())
+    })
 }
 
 fn normalize_stratum_block_coinbase(
@@ -10527,7 +10573,7 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
                                     reconcile_pool_ledger_with_runtime(&ctx, ntime);
                                 }
 
-                                if tip_advanced || submit_failed {
+                                if should_refresh_jobs_after_submit(tip_advanced, submit_failed) {
                                     jobs.clear();
                                     if should_reissue_job_for_channel(
                                         channel_id,
@@ -11509,20 +11555,33 @@ fn submit_tx_via_mempool_db_with_retry(
     attempts: usize,
     backoff_ms: u64,
 ) -> Result<(Hash256, String, u64), NodeError> {
-    let tries = attempts.max(1);
-    let mut last_err = None;
-    for idx in 0..tries {
-        match submit_tx_via_mempool_db(
+    submit_tx_with_retry(attempts, backoff_ms, || {
+        submit_tx_via_mempool_db(
             cfg,
             runtime_db_path,
             mempool_db_path,
             tx.clone(),
             requested_fee,
-        ) {
+        )
+    })
+}
+
+fn submit_tx_with_retry<T, F>(
+    attempts: usize,
+    backoff_ms: u64,
+    mut submit_op: F,
+) -> Result<T, NodeError>
+where
+    F: FnMut() -> Result<T, NodeError>,
+{
+    let tries = attempts.max(1);
+    let mut last_err = None;
+    for idx in 0..tries {
+        match submit_op() {
             Ok(value) => return Ok(value),
-            Err(err) if is_runtime_db_lock_conflict(&err) || is_mempool_db_lock_conflict(&err) => {
+            Err(err) if submit_tx_retryable_lock_conflict(&err) => {
                 last_err = Some(err);
-                if idx + 1 < tries {
+                if submit_tx_retry_has_remaining_attempts(idx, tries) {
                     std::thread::sleep(Duration::from_millis(backoff_ms.max(1)));
                     continue;
                 }
@@ -14894,9 +14953,19 @@ fn axum_parse_json_body<T: DeserializeOwned>(body: AxumBytes) -> Result<T, NodeE
     parse_json_body::<T>(&request)
 }
 
-fn axum_runtime_for_query<T, F>(state: &AxumRpcState, query: F) -> Result<T, NodeError>
+fn axum_runtime_for_query_with_refresh<T, F, R>(
+    state: &AxumRpcState,
+    mut refresh: R,
+    query: F,
+) -> Result<T, NodeError>
 where
     F: FnOnce(&ChainRuntime) -> Result<T, NodeError>,
+    R: FnMut(
+        &ChainConfig,
+        &mut ChainRuntime,
+        &Path,
+        &mut Option<SystemTime>,
+    ) -> Result<(), NodeError>,
 {
     let mut cache = state
         .runtime_cache
@@ -14906,17 +14975,19 @@ where
         runtime,
         last_seen_mtime,
     } = &mut *cache;
-    match refresh_runtime_from_db_if_changed(
-        &state.cfg,
-        runtime,
-        &state.runtime_db_path,
-        last_seen_mtime,
-    ) {
+    match refresh(&state.cfg, runtime, &state.runtime_db_path, last_seen_mtime) {
         Ok(()) => {}
         Err(err) if is_runtime_db_lock_conflict(&err) => {}
         Err(err) => return Err(err),
     }
     query(&cache.runtime)
+}
+
+fn axum_runtime_for_query<T, F>(state: &AxumRpcState, query: F) -> Result<T, NodeError>
+where
+    F: FnOnce(&ChainRuntime) -> Result<T, NodeError>,
+{
+    axum_runtime_for_query_with_refresh(state, refresh_runtime_from_db_if_changed, query)
 }
 
 fn axum_status_payload(state: &AxumRpcState) -> Result<StatusResponse, NodeError> {
@@ -15290,7 +15361,7 @@ async fn axum_mempool_handler(AxumState(state): AxumState<AxumRpcState>) -> Axum
                     Ok(removed) => removed,
                     Err(err) => return axum_internal_error(err),
                 };
-                if removed_confirmed > 0
+                if should_persist_startup_mempool_cleanup(removed_confirmed)
                     && let Err(err) = persist_mempool_db_with_retry(
                         &state.cfg,
                         &mempool,
@@ -16291,7 +16362,7 @@ fn run_rpc_serve_inner_legacy(
                     Ok(mut mempool) => {
                         let removed_confirmed =
                             remove_confirmed_txids_present_on_chain(&runtime, &mut mempool);
-                        if removed_confirmed > 0
+                        if should_persist_startup_mempool_cleanup(removed_confirmed)
                             && let Err(err) = persist_mempool_db_with_retry(
                                 &cfg,
                                 &mempool,
@@ -17279,6 +17350,52 @@ mod tests {
     }
 
     #[test]
+    fn wallet_seed_mode_env_and_cli_conversions_are_stable() {
+        const KEY: &str = super::WALLET_SEED_MODE_ENV;
+        unsafe {
+            std::env::remove_var(KEY);
+        }
+        assert_eq!(
+            super::wallet_seed_mode_from_env().expect("default seed mode"),
+            WalletSeedMode::Bip39
+        );
+        unsafe {
+            std::env::set_var(KEY, "scam-blake");
+        }
+        assert_eq!(
+            super::wallet_seed_mode_from_env().expect("env seed mode"),
+            WalletSeedMode::ScamBlake
+        );
+        unsafe {
+            std::env::remove_var(KEY);
+        }
+
+        assert_eq!(
+            WalletSeedMode::from(super::WalletSeedModeArg::Bip39),
+            WalletSeedMode::Bip39
+        );
+        assert_eq!(
+            WalletSeedMode::from(super::WalletSeedModeArg::ScamBlake),
+            WalletSeedMode::ScamBlake
+        );
+    }
+
+    #[test]
+    fn network_as_str_covers_all_variants() {
+        assert_eq!(super::Network::Devnet.as_str(), "devnet");
+        assert_eq!(super::Network::Testnet.as_str(), "testnet");
+        assert_eq!(super::Network::Mainnet.as_str(), "mainnet");
+    }
+
+    #[test]
+    fn refresh_jobs_after_submit_helper_is_or_logic() {
+        assert!(!super::should_refresh_jobs_after_submit(false, false));
+        assert!(super::should_refresh_jobs_after_submit(true, false));
+        assert!(super::should_refresh_jobs_after_submit(false, true));
+        assert!(super::should_refresh_jobs_after_submit(true, true));
+    }
+
+    #[test]
     fn wallet_seed_derivation_changes_with_mode() {
         let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
         let bip39 =
@@ -17332,6 +17449,18 @@ mod tests {
         let cfg: ChainConfig =
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
         super::consensus_fingerprint(&cfg)
+    }
+
+    fn assert_rpc_route_match_contract_precondition() {
+        assert!(super::rpc_exact_route_matches(
+            "GET", "/health", "GET", "/health"
+        ));
+        assert!(!super::rpc_exact_route_matches(
+            "POST", "/health", "GET", "/health"
+        ));
+        assert!(!super::rpc_exact_route_matches(
+            "GET", "/status", "GET", "/health"
+        ));
     }
 
     fn allocate_local_addr() -> Option<String> {
@@ -17426,6 +17555,24 @@ mod tests {
     }
 
     fn send_http_request(addr: &str, request: &str) -> String {
+        fn header_end_offset(bytes: &[u8]) -> Option<usize> {
+            bytes
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|idx| idx + 4)
+        }
+
+        fn parse_content_length(bytes: &[u8]) -> Option<usize> {
+            let headers = std::str::from_utf8(bytes).ok()?;
+            for line in headers.lines() {
+                let (name, value) = line.split_once(':')?;
+                if name.trim().eq_ignore_ascii_case("content-length") {
+                    return value.trim().parse::<usize>().ok();
+                }
+            }
+            None
+        }
+
         let mut last_closed_like_err = None::<String>;
         for _attempt in 0..3 {
             let mut stream = connect_with_retry(addr);
@@ -17435,34 +17582,67 @@ mod tests {
             stream
                 .set_write_timeout(Some(Duration::from_secs(2)))
                 .expect("set write timeout");
-            if let Err(err) = stream.write_all(request.as_bytes()) {
+            let request_with_close = if request.contains("\r\nConnection:") {
+                request.to_owned()
+            } else {
+                request.replacen("\r\n\r\n", "\r\nConnection: close\r\n\r\n", 1)
+            };
+            if let Err(err) = stream.write_all(request_with_close.as_bytes()) {
                 if super::http_io_error_is_closed_like(&err) {
                     last_closed_like_err = Some(err.to_string());
                     continue;
                 }
                 panic!("write request bytes: {err}");
             }
-            let mut response = String::new();
-            match stream.read_to_string(&mut response) {
-                Ok(_) => return response,
-                Err(err) if super::http_io_error_is_closed_like(&err) => {
-                    if !response.is_empty() {
-                        return response;
+            let mut response = Vec::<u8>::new();
+            let mut header_end = None::<usize>;
+            let mut expected_total = None::<usize>;
+            let mut buffer = [0u8; 1024];
+            loop {
+                match stream.read(&mut buffer) {
+                    Ok(0) => {
+                        if !response.is_empty() {
+                            return String::from_utf8_lossy(&response).into_owned();
+                        }
+                        break;
                     }
-                    last_closed_like_err = Some(err.to_string());
-                }
-                Err(err)
-                    if matches!(
-                        err.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                    ) =>
-                {
-                    if !response.is_empty() {
-                        return response;
+                    Ok(read) => {
+                        response.extend_from_slice(&buffer[..read]);
+                        if header_end.is_none()
+                            && let Some(end) = header_end_offset(&response)
+                        {
+                            header_end = Some(end);
+                            expected_total =
+                                parse_content_length(&response[..end]).map(|len| end + len);
+                        }
+                        if let Some(total) = expected_total
+                            && response.len() >= total
+                        {
+                            response.truncate(total);
+                            return String::from_utf8_lossy(&response).into_owned();
+                        }
                     }
-                    last_closed_like_err = Some(err.to_string());
+                    Err(err) if super::http_io_error_is_closed_like(&err) => {
+                        if !response.is_empty() {
+                            return String::from_utf8_lossy(&response).into_owned();
+                        }
+                        last_closed_like_err = Some(err.to_string());
+                        break;
+                    }
+                    Err(err)
+                        if matches!(
+                            err.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        if !response.is_empty() {
+                            return String::from_utf8_lossy(&response).into_owned();
+                        }
+                        last_closed_like_err = Some(err.to_string());
+                        break;
+                    }
+                    Err(err) => panic!("read response: {err}"),
                 }
-                Err(err) => panic!("read response: {err}"),
             }
         }
         panic!(
@@ -17485,10 +17665,16 @@ mod tests {
         std::sync::Arc<std::sync::atomic::AtomicBool>,
         thread::JoinHandle<()>,
     ) {
+        const RPC_TEST_AUTOSTOP_SEC: u64 = 45;
         let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let shutdown_thread = std::sync::Arc::clone(&shutdown);
+        let shutdown_watchdog = std::sync::Arc::clone(&shutdown);
         let handle = thread::spawn(move || {
             super::run_rpc_serve_with_shutdown(args, shutdown_thread).expect("rpc serve");
+        });
+        thread::spawn(move || {
+            thread::sleep(Duration::from_secs(RPC_TEST_AUTOSTOP_SEC));
+            shutdown_watchdog.store(true, std::sync::atomic::Ordering::Relaxed);
         });
         (shutdown, handle)
     }
@@ -17500,6 +17686,21 @@ mod tests {
     ) {
         shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
         join_with_timeout(handle, Duration::from_secs(10), label);
+    }
+
+    fn with_rpc_server_shutdown<F>(
+        shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        handle: thread::JoinHandle<()>,
+        label: &str,
+        assertions: F,
+    ) where
+        F: FnOnce(),
+    {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(assertions));
+        stop_rpc_server_for_test(shutdown, handle, label);
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
     }
 
     fn send_http_request_until(
@@ -18434,6 +18635,85 @@ mod tests {
         assert!(super::is_mempool_db_lock_conflict(&lock_contended));
         assert!(!super::is_mempool_db_lock_conflict(&other));
         assert!(!super::is_mempool_db_lock_conflict(&lowercase));
+
+        assert!(super::is_peer_book_db_lock_conflict(&lock_open));
+        assert!(super::is_peer_book_db_lock_conflict(&lock_acquire));
+        assert!(super::is_peer_book_db_lock_conflict(&lock_contended));
+        assert!(!super::is_peer_book_db_lock_conflict(&other));
+        assert!(!super::is_peer_book_db_lock_conflict(&lowercase));
+
+        assert!(super::submit_tx_retryable_lock_conflict(&lock_open));
+        assert!(super::submit_tx_retryable_lock_conflict(&lock_acquire));
+        assert!(super::submit_tx_retryable_lock_conflict(&lock_contended));
+        assert!(!super::submit_tx_retryable_lock_conflict(&other));
+
+        assert!(super::submit_tx_retry_has_remaining_attempts(0, 2));
+        assert!(!super::submit_tx_retry_has_remaining_attempts(1, 2));
+        assert!(!super::submit_tx_retry_has_remaining_attempts(0, 1));
+    }
+
+    #[test]
+    fn submit_tx_with_retry_retries_only_on_lock_conflicts() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let lock_err = || super::NodeError::Runtime("Cannot acquire lock".to_owned());
+        let non_lock_err = || super::NodeError::Runtime("permission denied".to_owned());
+
+        let non_lock_calls = Arc::new(AtomicUsize::new(0));
+        let non_lock_calls_clone = non_lock_calls.clone();
+        let start = Instant::now();
+        let err = super::submit_tx_with_retry::<(), _>(4, 200, move || {
+            non_lock_calls_clone.fetch_add(1, Ordering::Relaxed);
+            Err(non_lock_err())
+        })
+        .expect_err("non-lock errors must return immediately");
+        assert!(err.to_string().contains("permission denied"));
+        assert_eq!(non_lock_calls.load(Ordering::Relaxed), 1);
+        assert!(
+            start.elapsed() < Duration::from_millis(300),
+            "non-lock path should not backoff"
+        );
+
+        let retry_then_ok_calls = Arc::new(AtomicUsize::new(0));
+        let retry_then_ok_calls_clone = retry_then_ok_calls.clone();
+        let result = super::submit_tx_with_retry(3, 1, move || {
+            let idx = retry_then_ok_calls_clone.fetch_add(1, Ordering::Relaxed);
+            if idx < 2 { Err(lock_err()) } else { Ok("ok") }
+        })
+        .expect("third attempt should succeed");
+        assert_eq!(result, "ok");
+        assert_eq!(retry_then_ok_calls.load(Ordering::Relaxed), 3);
+
+        let lock_exhausted_calls = Arc::new(AtomicUsize::new(0));
+        let lock_exhausted_calls_clone = lock_exhausted_calls.clone();
+        let start = Instant::now();
+        let exhausted = super::submit_tx_with_retry::<(), _>(3, 120, move || {
+            lock_exhausted_calls_clone.fetch_add(1, Ordering::Relaxed);
+            Err(lock_err())
+        })
+        .expect_err("lock conflicts must fail after bounded retries");
+        assert!(exhausted.to_string().contains("Cannot acquire lock"));
+        assert_eq!(lock_exhausted_calls.load(Ordering::Relaxed), 3);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(180),
+            "expected two backoff sleeps, elapsed={elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(450),
+            "unexpected extra sleeps, elapsed={elapsed:?}"
+        );
+
+        let single_try_calls = Arc::new(AtomicUsize::new(0));
+        let single_try_calls_clone = single_try_calls.clone();
+        let single = super::submit_tx_with_retry::<(), _>(0, 200, move || {
+            single_try_calls_clone.fetch_add(1, Ordering::Relaxed);
+            Err(lock_err())
+        })
+        .expect_err("attempts=0 should still run exactly one attempt");
+        assert!(single.to_string().contains("Cannot acquire lock"));
+        assert_eq!(single_try_calls.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -18697,23 +18977,13 @@ mod tests {
             },
         )
         .expect("save writable snapshot");
-        let before = fs::metadata(&writable_db)
-            .expect("metadata before")
-            .modified()
-            .expect("mtime before");
-        let before_bytes = fs::read(&writable_db).expect("read before");
-        thread::sleep(Duration::from_secs(1));
+        let persist_calls_before = super::mempool_persist_calls_for_tests();
         let removed = super::remove_confirmed_txids_from_mempool_db(&cfg, &writable_db, &[txid])
             .expect("existing writable db should still persist even when nothing is removed");
         assert_eq!(removed, 0);
-        let after = fs::metadata(&writable_db)
-            .expect("metadata after")
-            .modified()
-            .expect("mtime after");
-        let after_bytes = fs::read(&writable_db).expect("read after");
         assert!(
-            after > before || after_bytes != before_bytes,
-            "mempool db should be rewritten for existing db path even when removed set is empty: before={before:?} after={after:?}"
+            super::mempool_persist_calls_for_tests() > persist_calls_before,
+            "persist path must be exercised for existing writable db even when removed set is empty"
         );
 
         let _ = fs::remove_dir_all(work_dir);
@@ -25071,7 +25341,78 @@ mod tests {
     }
 
     #[test]
+    fn axum_handlers_reject_invalid_inputs_and_report_not_found_paths() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let work_dir = temp_dir("test-axum-handler-invalid-inputs");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let state = super::AxumRpcState {
+            network: Network::Devnet,
+            cfg: cfg.clone(),
+            runtime_db_path: work_dir.join("runtime.redb"),
+            runtime_cache: Arc::new(std::sync::Mutex::new(super::AxumRuntimeCache {
+                runtime: ChainRuntime::from_config(cfg.clone()).expect("runtime"),
+                last_seen_mtime: None,
+            })),
+            mempool_db_path: work_dir.join("mempool.redb"),
+            relay_telemetry: None,
+            stratum_telemetry: None,
+            pool_ledger_db_path: work_dir.join("pool-ledger.redb"),
+            ui_dir: work_dir.join("ui"),
+        };
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        rt.block_on(async {
+            let block_missing = super::axum_block_response(&state, u64::MAX);
+            assert_eq!(block_missing.status(), axum::http::StatusCode::NOT_FOUND);
+
+            let tx_bad_path = super::axum_tx_handler(
+                super::AxumPath("broken".to_owned()),
+                super::AxumState(state.clone()),
+            )
+            .await;
+            assert_eq!(tx_bad_path.status(), axum::http::StatusCode::BAD_REQUEST);
+
+            let wallet_new_invalid = super::axum_wallet_new_handler(
+                super::AxumState(state.clone()),
+                super::AxumBytes::from_static(br#"{"words":11}"#),
+            )
+            .await;
+            assert_eq!(
+                wallet_new_invalid.status(),
+                axum::http::StatusCode::BAD_REQUEST
+            );
+
+            let tx_submit_invalid = super::axum_tx_submit_handler(
+                super::AxumState(state.clone()),
+                super::AxumBytes::from_static(br#"{}"#),
+            )
+            .await;
+            assert_eq!(
+                tx_submit_invalid.status(),
+                axum::http::StatusCode::BAD_REQUEST
+            );
+
+            let wallet_qr_invalid = super::axum_wallet_qr_handler(
+                super::AxumState(state),
+                super::AxumBytes::from_static(br#"{"address":""}"#),
+            )
+            .await;
+            assert_eq!(
+                wallet_qr_invalid.status(),
+                axum::http::StatusCode::BAD_REQUEST
+            );
+        });
+
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
     fn mutation_guard_stage2_regressions() {
+        assert_rpc_route_match_contract_precondition();
         let cfg: ChainConfig =
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
 
@@ -25300,16 +25641,21 @@ mod tests {
                 max_nonce: 500_000,
                 max_requests: 0,
             });
-            let post_events = send_http_request(
-                &addr,
-                "POST /events HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
-            );
-            assert!(post_events.starts_with("HTTP/1.1 404 Not Found"));
+            let assertions = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let post_events = send_http_request(
+                    &addr,
+                    "POST /events HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+                );
+                assert!(post_events.starts_with("HTTP/1.1 404 Not Found"));
+            }));
             stop_rpc_server_for_test(shutdown, handle, "mutation guard legacy rpc");
             unsafe {
                 std::env::remove_var(KEY);
             }
             let _ = fs::remove_dir_all(rpc_dir);
+            if let Err(payload) = assertions {
+                std::panic::resume_unwind(payload);
+            }
         }
 
         let _ = fs::remove_dir_all(work_dir);
@@ -25335,6 +25681,7 @@ mod tests {
 
     #[test]
     fn run_rpc_serve_dispatches_health_and_unknown_routes() {
+        assert_rpc_route_match_contract_precondition();
         let _net_guard = network_test_guard();
         let Some(addr) = allocate_local_addr() else {
             return;
@@ -25363,24 +25710,25 @@ mod tests {
             max_requests: 0,
         });
 
-        let health_response =
-            send_http_request(&addr, "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n");
-        assert!(health_response.starts_with("HTTP/1.1 200 OK"));
-        assert!(health_response.contains("{\"ok\":true}"));
+        with_rpc_server_shutdown(server_shutdown, server, "rpc health routes server", || {
+            let health_response =
+                send_http_request(&addr, "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n");
+            assert!(health_response.starts_with("HTTP/1.1 200 OK"));
+            assert!(health_response.contains("{\"ok\":true}"));
 
-        let unknown_response =
-            send_http_request(&addr, "GET /nope HTTP/1.1\r\nHost: localhost\r\n\r\n");
-        // With a present UI directory, unknown GET paths are intentionally served
-        // through index.html (SPA-style fallback), not 404.
-        assert!(unknown_response.starts_with("HTTP/1.1 200 OK"));
-        assert!(unknown_response.contains("<html>ui</html>"));
-
-        stop_rpc_server_for_test(server_shutdown, server, "rpc health routes server");
+            let unknown_response =
+                send_http_request(&addr, "GET /nope HTTP/1.1\r\nHost: localhost\r\n\r\n");
+            // With a present UI directory, unknown GET paths are intentionally served
+            // through index.html (SPA-style fallback), not 404.
+            assert!(unknown_response.starts_with("HTTP/1.1 200 OK"));
+            assert!(unknown_response.contains("<html>ui</html>"));
+        });
         let _ = fs::remove_dir_all(work_dir);
     }
 
     #[test]
     fn run_rpc_serve_legacy_backend_routes_are_strict_when_selected() {
+        assert_rpc_route_match_contract_precondition();
         const KEY: &str = "SCAM_RPC_HTTP_BACKEND";
         let _net_guard = network_test_guard();
         let Some(addr) = allocate_local_addr() else {
@@ -25413,17 +25761,18 @@ mod tests {
             max_requests: 0,
         });
 
-        let health = send_http_request(&addr, "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n");
-        assert!(health.starts_with("HTTP/1.1 200 OK"));
+        with_rpc_server_shutdown(server_shutdown, server, "rpc legacy routes server", || {
+            let health =
+                send_http_request(&addr, "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n");
+            assert!(health.starts_with("HTTP/1.1 200 OK"));
 
-        let post_events = send_http_request(
-            &addr,
-            "POST /events HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
-        );
-        assert!(post_events.starts_with("HTTP/1.1 404 Not Found"));
-        assert!(post_events.contains("\"unknown endpoint\""));
-
-        stop_rpc_server_for_test(server_shutdown, server, "rpc legacy routes server");
+            let post_events = send_http_request(
+                &addr,
+                "POST /events HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+            );
+            assert!(post_events.starts_with("HTTP/1.1 404 Not Found"));
+            assert!(post_events.contains("\"unknown endpoint\""));
+        });
         unsafe {
             std::env::remove_var(KEY);
         }
@@ -25432,6 +25781,7 @@ mod tests {
 
     #[test]
     fn run_rpc_serve_dispatches_core_and_wallet_routes() {
+        assert_rpc_route_match_contract_precondition();
         let _net_guard = network_test_guard();
         let Some(addr) = allocate_local_addr() else {
             return;
@@ -25468,62 +25818,66 @@ mod tests {
             max_requests: 0,
         });
 
-        let status = send_http_request(&addr, "GET /status HTTP/1.1\r\nHost: localhost\r\n\r\n");
-        assert!(status.starts_with("HTTP/1.1 200 OK"));
-        let block = send_http_request(&addr, "GET /block/0 HTTP/1.1\r\nHost: localhost\r\n\r\n");
-        assert!(block.starts_with("HTTP/1.1 200 OK"));
-        let tx = send_http_request(&addr, "GET /tx/0/0 HTTP/1.1\r\nHost: localhost\r\n\r\n");
-        assert!(tx.starts_with("HTTP/1.1 200 OK"));
-        let txid = send_http_request(
-            &addr,
-            &format!("GET /txid/{genesis_txid} HTTP/1.1\r\nHost: localhost\r\n\r\n"),
-        );
-        assert!(txid.starts_with("HTTP/1.1 200 OK"));
-        assert!(
-            txid.contains(&genesis_txid),
-            "txid lookup must return the requested txid"
-        );
+        with_rpc_server_shutdown(server_shutdown, server, "rpc core routes server", || {
+            let status =
+                send_http_request(&addr, "GET /status HTTP/1.1\r\nHost: localhost\r\n\r\n");
+            assert!(status.starts_with("HTTP/1.1 200 OK"));
+            let block =
+                send_http_request(&addr, "GET /block/0 HTTP/1.1\r\nHost: localhost\r\n\r\n");
+            assert!(block.starts_with("HTTP/1.1 200 OK"));
+            let tx = send_http_request(&addr, "GET /tx/0/0 HTTP/1.1\r\nHost: localhost\r\n\r\n");
+            assert!(tx.starts_with("HTTP/1.1 200 OK"));
+            let txid = send_http_request(
+                &addr,
+                &format!("GET /txid/{genesis_txid} HTTP/1.1\r\nHost: localhost\r\n\r\n"),
+            );
+            assert!(txid.starts_with("HTTP/1.1 200 OK"));
+            assert!(
+                txid.contains(&genesis_txid),
+                "txid lookup must return the requested txid"
+            );
 
-        let wallet_new = send_http_json_post(&addr, "/wallet/new", "{}");
-        assert!(wallet_new.starts_with("HTTP/1.1 200 OK"));
-        let wallet_address = send_http_json_post(&addr, "/wallet/address", "{}");
-        assert!(wallet_address.starts_with("HTTP/1.1 400 Bad Request"));
-        let wallet_decode = send_http_json_post(&addr, "/wallet/decode", "{}");
-        assert!(wallet_decode.starts_with("HTTP/1.1 400 Bad Request"));
-        let wallet_balance = send_http_json_post(&addr, "/wallet/balance", "{}");
-        assert!(wallet_balance.starts_with("HTTP/1.1 400 Bad Request"));
-        let wallet_send = send_http_json_post(&addr, "/wallet/send-preview", "{}");
-        assert!(wallet_send.starts_with("HTTP/1.1 400 Bad Request"));
-        let wallet_qr = send_http_json_post(&addr, "/wallet/qr", "{\"address\":\"scam\"}");
-        assert!(wallet_qr.starts_with("HTTP/1.1 200 OK"));
-        let pool_status = send_http_request(
-            &addr,
-            "GET /pool/status HTTP/1.1\r\nHost: localhost\r\n\r\n",
-        );
-        assert!(pool_status.starts_with("HTTP/1.1 404 Not Found"));
-        assert!(
-            pool_status.contains("snapshot not available")
-                || pool_status.contains("pool telemetry and ledger snapshots are not available")
-        );
-        let pool_pending = send_http_request(
-            &addr,
-            "GET /pool/payouts/pending HTTP/1.1\r\nHost: localhost\r\n\r\n",
-        );
-        assert!(pool_pending.starts_with("HTTP/1.1 404 Not Found"));
-        assert!(pool_pending.contains("pool ledger snapshot not available"));
-        let pool_completed = send_http_request(
-            &addr,
-            "GET /pool/payouts/completed HTTP/1.1\r\nHost: localhost\r\n\r\n",
-        );
-        assert!(pool_completed.starts_with("HTTP/1.1 404 Not Found"));
-        assert!(pool_completed.contains("pool ledger snapshot not available"));
-
-        stop_rpc_server_for_test(server_shutdown, server, "rpc core routes server");
+            let wallet_new = send_http_json_post(&addr, "/wallet/new", "{}");
+            assert!(wallet_new.starts_with("HTTP/1.1 200 OK"));
+            let wallet_address = send_http_json_post(&addr, "/wallet/address", "{}");
+            assert!(wallet_address.starts_with("HTTP/1.1 400 Bad Request"));
+            let wallet_decode = send_http_json_post(&addr, "/wallet/decode", "{}");
+            assert!(wallet_decode.starts_with("HTTP/1.1 400 Bad Request"));
+            let wallet_balance = send_http_json_post(&addr, "/wallet/balance", "{}");
+            assert!(wallet_balance.starts_with("HTTP/1.1 400 Bad Request"));
+            let wallet_send = send_http_json_post(&addr, "/wallet/send-preview", "{}");
+            assert!(wallet_send.starts_with("HTTP/1.1 400 Bad Request"));
+            let wallet_qr = send_http_json_post(&addr, "/wallet/qr", "{\"address\":\"scam\"}");
+            assert!(wallet_qr.starts_with("HTTP/1.1 200 OK"));
+            let pool_status = send_http_request(
+                &addr,
+                "GET /pool/status HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            );
+            assert!(pool_status.starts_with("HTTP/1.1 404 Not Found"));
+            assert!(
+                pool_status.contains("snapshot not available")
+                    || pool_status
+                        .contains("pool telemetry and ledger snapshots are not available")
+            );
+            let pool_pending = send_http_request(
+                &addr,
+                "GET /pool/payouts/pending HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            );
+            assert!(pool_pending.starts_with("HTTP/1.1 404 Not Found"));
+            assert!(pool_pending.contains("pool ledger snapshot not available"));
+            let pool_completed = send_http_request(
+                &addr,
+                "GET /pool/payouts/completed HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            );
+            assert!(pool_completed.starts_with("HTTP/1.1 404 Not Found"));
+            assert!(pool_completed.contains("pool ledger snapshot not available"));
+        });
         let _ = fs::remove_dir_all(work_dir);
     }
 
     #[test]
     fn run_rpc_serve_pool_status_and_worker_routes_use_stratum_telemetry_snapshot() {
+        assert_rpc_route_match_contract_precondition();
         let _net_guard = network_test_guard();
         let Some(addr) = allocate_local_addr() else {
             return;
@@ -25585,48 +25939,50 @@ mod tests {
             max_requests: 0,
         });
 
-        let status = send_http_request(&addr, "GET /status HTTP/1.1\r\nHost: localhost\r\n\r\n");
-        assert!(status.starts_with("HTTP/1.1 200 OK"));
-        assert!(status.contains("\"stratum_active_clients\": 3"));
-        assert!(status.contains("\"stratum_workers_active\": 2"));
-        assert!(status.contains("\"stratum_pool_hashrate_hps\": 42000.0"));
+        with_rpc_server_shutdown(server_shutdown, server, "rpc pool routes server", || {
+            let status =
+                send_http_request(&addr, "GET /status HTTP/1.1\r\nHost: localhost\r\n\r\n");
+            assert!(status.starts_with("HTTP/1.1 200 OK"));
+            assert!(status.contains("\"stratum_active_clients\": 3"));
+            assert!(status.contains("\"stratum_workers_active\": 2"));
+            assert!(status.contains("\"stratum_pool_hashrate_hps\": 42000.0"));
 
-        let pool_status = send_http_request(
-            &addr,
-            "GET /pool/status HTTP/1.1\r\nHost: localhost\r\n\r\n",
-        );
-        assert!(pool_status.starts_with("HTTP/1.1 200 OK"));
-        assert!(pool_status.contains("\"pool_hashrate_hps\": 42000.0"));
-        assert!(pool_status.contains("\"worker\": \"miner.alpha\""));
+            let pool_status = send_http_request(
+                &addr,
+                "GET /pool/status HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            );
+            assert!(pool_status.starts_with("HTTP/1.1 200 OK"));
+            assert!(pool_status.contains("\"pool_hashrate_hps\": 42000.0"));
+            assert!(pool_status.contains("\"worker\": \"miner.alpha\""));
 
-        let worker = send_http_request(
-            &addr,
-            "GET /pool/worker/miner.alpha HTTP/1.1\r\nHost: localhost\r\n\r\n",
-        );
-        assert!(worker.starts_with("HTTP/1.1 200 OK"));
-        assert!(worker.contains("\"worker\": \"miner.alpha\""));
-        assert!(worker.contains("\"hashrate_hps\": 31000.0"));
+            let worker = send_http_request(
+                &addr,
+                "GET /pool/worker/miner.alpha HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            );
+            assert!(worker.starts_with("HTTP/1.1 200 OK"));
+            assert!(worker.contains("\"worker\": \"miner.alpha\""));
+            assert!(worker.contains("\"hashrate_hps\": 31000.0"));
 
-        let unknown_worker = send_http_request(
-            &addr,
-            "GET /pool/worker/miner.gamma HTTP/1.1\r\nHost: localhost\r\n\r\n",
-        );
-        assert!(unknown_worker.starts_with("HTTP/1.1 404 Not Found"));
-        assert!(unknown_worker.contains("not found"));
+            let unknown_worker = send_http_request(
+                &addr,
+                "GET /pool/worker/miner.gamma HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            );
+            assert!(unknown_worker.starts_with("HTTP/1.1 404 Not Found"));
+            assert!(unknown_worker.contains("not found"));
 
-        let missing_worker = send_http_request(
-            &addr,
-            "GET /pool/worker/ HTTP/1.1\r\nHost: localhost\r\n\r\n",
-        );
-        assert!(missing_worker.starts_with("HTTP/1.1 400 Bad Request"));
-        assert!(missing_worker.contains("worker label must not be empty"));
-
-        stop_rpc_server_for_test(server_shutdown, server, "rpc pool routes server");
+            let missing_worker = send_http_request(
+                &addr,
+                "GET /pool/worker/ HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            );
+            assert!(missing_worker.starts_with("HTTP/1.1 400 Bad Request"));
+            assert!(missing_worker.contains("worker label must not be empty"));
+        });
         let _ = fs::remove_dir_all(work_dir);
     }
 
     #[test]
     fn run_rpc_serve_streams_event_snapshots() {
+        assert_rpc_route_match_contract_precondition();
         let _net_guard = network_test_guard();
         let Some(addr) = allocate_local_addr() else {
             return;
@@ -25655,60 +26011,62 @@ mod tests {
             max_requests: 0,
         });
 
-        let events = send_http_request_until(
-            &addr,
-            "GET /events HTTP/1.1\r\nHost: localhost\r\n\r\n",
-            "event: snapshot",
-            Duration::from_secs(5),
-        );
-        assert!(events.starts_with("HTTP/1.1 200 OK"));
-        assert!(events.contains("text/event-stream"));
-        assert!(events.contains(": heartbeat"));
-        assert!(events.contains("event: snapshot"));
-        assert!(events.contains("data: {\"network_id\":\"devnet\""));
-        assert!(events.contains("\"last_block_age_sec\""));
-        let snapshot_line = events
-            .lines()
-            .find(|line| line.starts_with("data: "))
-            .expect("snapshot data line");
-        let payload = snapshot_line.trim_start_matches("data: ").trim();
-        let parsed: serde_json::Value = serde_json::from_str(payload).expect("snapshot json");
-        for required_key in [
-            "network_id",
-            "tip_height",
-            "tip_hash",
-            "utxo_count",
-            "cumulative_work",
-            "network_hashrate_hps",
-            "mempool_available",
-            "mempool_tx_count",
-            "relay_active_peers",
-            "relay_tip_height",
-            "relay_mempool_len",
-            "relay_snapshot_age_sec",
-            "sync_lag_blocks",
-            "stratum_active_clients",
-            "stratum_workers_active",
-            "stratum_pool_hashrate_hps",
-            "stratum_snapshot_age_sec",
-            "last_block_age_sec",
-            "unix_sec",
-        ] {
-            assert!(
-                parsed.get(required_key).is_some(),
-                "snapshot must include key {required_key}"
+        with_rpc_server_shutdown(server_shutdown, server, "rpc events server", || {
+            let events = send_http_request_until(
+                &addr,
+                "GET /events HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                "event: snapshot",
+                Duration::from_secs(5),
             );
-        }
+            assert!(events.starts_with("HTTP/1.1 200 OK"));
+            assert!(events.contains("text/event-stream"));
+            assert!(events.contains(": heartbeat"));
+            assert!(events.contains("event: snapshot"));
+            assert!(events.contains("data: {\"network_id\":\"devnet\""));
+            assert!(events.contains("\"last_block_age_sec\""));
+            let snapshot_line = events
+                .lines()
+                .find(|line| line.starts_with("data: "))
+                .expect("snapshot data line");
+            let payload = snapshot_line.trim_start_matches("data: ").trim();
+            let parsed: serde_json::Value = serde_json::from_str(payload).expect("snapshot json");
+            for required_key in [
+                "network_id",
+                "tip_height",
+                "tip_hash",
+                "utxo_count",
+                "cumulative_work",
+                "network_hashrate_hps",
+                "mempool_available",
+                "mempool_tx_count",
+                "relay_active_peers",
+                "relay_tip_height",
+                "relay_mempool_len",
+                "relay_snapshot_age_sec",
+                "sync_lag_blocks",
+                "stratum_active_clients",
+                "stratum_workers_active",
+                "stratum_pool_hashrate_hps",
+                "stratum_snapshot_age_sec",
+                "last_block_age_sec",
+                "unix_sec",
+            ] {
+                assert!(
+                    parsed.get(required_key).is_some(),
+                    "snapshot must include key {required_key}"
+                );
+            }
 
-        let health = send_http_request(&addr, "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n");
-        assert!(health.starts_with("HTTP/1.1 200 OK"));
-
-        stop_rpc_server_for_test(server_shutdown, server, "rpc events server");
+            let health =
+                send_http_request(&addr, "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n");
+            assert!(health.starts_with("HTTP/1.1 200 OK"));
+        });
         let _ = fs::remove_dir_all(work_dir);
     }
 
     #[test]
     fn run_rpc_serve_wallet_send_rejects_invalid_and_double_spend_paths() {
+        assert_rpc_route_match_contract_precondition();
         let _net_guard = network_test_guard();
         let Some(addr) = allocate_local_addr() else {
             return;
@@ -25764,94 +26122,100 @@ mod tests {
             max_requests: 0,
         });
 
-        let zero_amount_req = serde_json::json!({
-            "mnemonic": SOAK_FLOW_MNEMONIC,
-            "passphrase": "",
-            "account": 0,
-            "index": 0,
-            "to": valid_recipient,
-            "amount": 0,
-            "fee": 1
-        })
-        .to_string();
-        let zero_amount = send_http_json_post(&addr, "/wallet/send", &zero_amount_req);
-        assert!(zero_amount.starts_with("HTTP/1.1 400 Bad Request"));
-        assert!(zero_amount.contains("amount must be > 0"));
+        with_rpc_server_shutdown(
+            server_shutdown,
+            server,
+            "rpc wallet-send reject server",
+            || {
+                let zero_amount_req = serde_json::json!({
+                    "mnemonic": SOAK_FLOW_MNEMONIC,
+                    "passphrase": "",
+                    "account": 0,
+                    "index": 0,
+                    "to": valid_recipient,
+                    "amount": 0,
+                    "fee": 1
+                })
+                .to_string();
+                let zero_amount = send_http_json_post(&addr, "/wallet/send", &zero_amount_req);
+                assert!(zero_amount.starts_with("HTTP/1.1 400 Bad Request"));
+                assert!(zero_amount.contains("amount must be > 0"));
 
-        let negative_amount_req = format!(
-            "{{\"mnemonic\":\"{}\",\"passphrase\":\"\",\"account\":0,\"index\":0,\"to\":\"{}\",\"amount\":-1,\"fee\":1}}",
-            SOAK_FLOW_MNEMONIC, valid_recipient
+                let negative_amount_req = format!(
+                    "{{\"mnemonic\":\"{}\",\"passphrase\":\"\",\"account\":0,\"index\":0,\"to\":\"{}\",\"amount\":-1,\"fee\":1}}",
+                    SOAK_FLOW_MNEMONIC, valid_recipient
+                );
+                let negative_amount =
+                    send_http_json_post(&addr, "/wallet/send", &negative_amount_req);
+                assert!(negative_amount.starts_with("HTTP/1.1 400 Bad Request"));
+                assert!(
+                    negative_amount.contains("invalid type")
+                        || negative_amount.contains("invalid value")
+                        || negative_amount.contains("out of range"),
+                    "expected serde numeric type error, got: {negative_amount}"
+                );
+
+                let invalid_hrp_req = serde_json::json!({
+                    "mnemonic": SOAK_FLOW_MNEMONIC,
+                    "passphrase": "",
+                    "account": 0,
+                    "index": 0,
+                    "to": invalid_hrp_recipient,
+                    "amount": 1,
+                    "fee": 1
+                })
+                .to_string();
+                let invalid_hrp = send_http_json_post(&addr, "/wallet/send", &invalid_hrp_req);
+                assert!(invalid_hrp.starts_with("HTTP/1.1 400 Bad Request"));
+                assert!(invalid_hrp.contains("address hrp"));
+
+                let insufficient_req = serde_json::json!({
+                    "mnemonic": SOAK_FLOW_MNEMONIC,
+                    "passphrase": "",
+                    "account": 0,
+                    "index": 0,
+                    "to": valid_recipient,
+                    "amount": u64::MAX,
+                    "fee": 1
+                })
+                .to_string();
+                let insufficient = send_http_json_post(&addr, "/wallet/send", &insufficient_req);
+                assert!(insufficient.starts_with("HTTP/1.1 400 Bad Request"));
+                assert!(
+                    insufficient.contains("insufficient spendable funds")
+                        || insufficient.contains("amount + fee overflow")
+                        || insufficient.contains("total required amount overflows"),
+                    "expected insufficient-funds style rejection, got: {insufficient}"
+                );
+
+                let valid_send_req = serde_json::json!({
+                    "mnemonic": SOAK_FLOW_MNEMONIC,
+                    "passphrase": "",
+                    "account": 0,
+                    "index": 0,
+                    "to": valid_recipient,
+                    "amount": 1_000_000u64,
+                    "fee": 500u64
+                })
+                .to_string();
+                let first_send = send_http_json_post(&addr, "/wallet/send", &valid_send_req);
+                assert!(first_send.starts_with("HTTP/1.1 200 OK"));
+                assert!(first_send.contains("\"mempool_outcome\""));
+
+                let second_send = send_http_json_post(&addr, "/wallet/send", &valid_send_req);
+                let second_is_conflict_reject = second_send.starts_with("HTTP/1.1 400 Bad Request")
+                    && (second_send.contains("replacement")
+                        || second_send.contains("conflict")
+                        || second_send.contains("mempool")
+                        || second_send.contains("insufficient spendable funds"));
+                let second_is_idempotent_ok = second_send.starts_with("HTTP/1.1 200 OK")
+                    && second_send.contains("\"mempool_outcome\": \"already_present\"");
+                assert!(
+                    second_is_conflict_reject || second_is_idempotent_ok,
+                    "expected conflict/insufficient-funds rejection or idempotent already_present, got: {second_send}"
+                );
+            },
         );
-        let negative_amount = send_http_json_post(&addr, "/wallet/send", &negative_amount_req);
-        assert!(negative_amount.starts_with("HTTP/1.1 400 Bad Request"));
-        assert!(
-            negative_amount.contains("invalid type")
-                || negative_amount.contains("invalid value")
-                || negative_amount.contains("out of range"),
-            "expected serde numeric type error, got: {negative_amount}"
-        );
-
-        let invalid_hrp_req = serde_json::json!({
-            "mnemonic": SOAK_FLOW_MNEMONIC,
-            "passphrase": "",
-            "account": 0,
-            "index": 0,
-            "to": invalid_hrp_recipient,
-            "amount": 1,
-            "fee": 1
-        })
-        .to_string();
-        let invalid_hrp = send_http_json_post(&addr, "/wallet/send", &invalid_hrp_req);
-        assert!(invalid_hrp.starts_with("HTTP/1.1 400 Bad Request"));
-        assert!(invalid_hrp.contains("address hrp"));
-
-        let insufficient_req = serde_json::json!({
-            "mnemonic": SOAK_FLOW_MNEMONIC,
-            "passphrase": "",
-            "account": 0,
-            "index": 0,
-            "to": valid_recipient,
-            "amount": u64::MAX,
-            "fee": 1
-        })
-        .to_string();
-        let insufficient = send_http_json_post(&addr, "/wallet/send", &insufficient_req);
-        assert!(insufficient.starts_with("HTTP/1.1 400 Bad Request"));
-        assert!(
-            insufficient.contains("insufficient spendable funds")
-                || insufficient.contains("amount + fee overflow")
-                || insufficient.contains("total required amount overflows"),
-            "expected insufficient-funds style rejection, got: {insufficient}"
-        );
-
-        let valid_send_req = serde_json::json!({
-            "mnemonic": SOAK_FLOW_MNEMONIC,
-            "passphrase": "",
-            "account": 0,
-            "index": 0,
-            "to": valid_recipient,
-            "amount": 1_000_000u64,
-            "fee": 500u64
-        })
-        .to_string();
-        let first_send = send_http_json_post(&addr, "/wallet/send", &valid_send_req);
-        assert!(first_send.starts_with("HTTP/1.1 200 OK"));
-        assert!(first_send.contains("\"mempool_outcome\""));
-
-        let second_send = send_http_json_post(&addr, "/wallet/send", &valid_send_req);
-        let second_is_conflict_reject = second_send.starts_with("HTTP/1.1 400 Bad Request")
-            && (second_send.contains("replacement")
-                || second_send.contains("conflict")
-                || second_send.contains("mempool")
-                || second_send.contains("insufficient spendable funds"));
-        let second_is_idempotent_ok = second_send.starts_with("HTTP/1.1 200 OK")
-            && second_send.contains("\"mempool_outcome\": \"already_present\"");
-        assert!(
-            second_is_conflict_reject || second_is_idempotent_ok,
-            "expected conflict/insufficient-funds rejection or idempotent already_present, got: {second_send}"
-        );
-
-        stop_rpc_server_for_test(server_shutdown, server, "rpc wallet-send reject server");
     }
 
     #[test]
@@ -25884,6 +26248,7 @@ mod tests {
 
     #[test]
     fn run_rpc_serve_route_matching_and_hrp_validation_are_strict() {
+        assert_rpc_route_match_contract_precondition();
         let _net_guard = network_test_guard();
         let Some(addr) = allocate_local_addr() else {
             return;
@@ -25927,138 +26292,143 @@ mod tests {
             max_requests: 0,
         });
 
-        let health = send_http_request(&addr, "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n");
-        assert!(health.starts_with("HTTP/1.1 200 OK"));
+        with_rpc_server_shutdown(server_shutdown, server, "rpc strict routes server", || {
+            let health =
+                send_http_request(&addr, "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n");
+            assert!(health.starts_with("HTTP/1.1 200 OK"));
 
-        let unknown = send_http_request(&addr, "GET /unknown HTTP/1.1\r\nHost: localhost\r\n\r\n");
-        assert!(unknown.starts_with("HTTP/1.1 404 Not Found"));
-        assert!(unknown.contains("\"unknown endpoint\""));
-        let post_pool_worker = send_http_request(
-            &addr,
-            "POST /pool/worker/miner.alpha HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
-        );
-        assert!(post_pool_worker.starts_with("HTTP/1.1 404 Not Found"));
-        assert!(
-            post_pool_worker.contains("\"unknown endpoint\""),
-            "non-GET pool worker routes must stay outside worker handler"
-        );
+            let unknown =
+                send_http_request(&addr, "GET /unknown HTTP/1.1\r\nHost: localhost\r\n\r\n");
+            assert!(unknown.starts_with("HTTP/1.1 404 Not Found"));
+            assert!(unknown.contains("\"unknown endpoint\""));
+            let post_pool_worker = send_http_request(
+                &addr,
+                "POST /pool/worker/miner.alpha HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+            );
+            assert!(post_pool_worker.starts_with("HTTP/1.1 404 Not Found"));
+            assert!(
+                post_pool_worker.contains("\"unknown endpoint\""),
+                "non-GET pool worker routes must stay outside worker handler"
+            );
 
-        let mempool = send_http_request(&addr, "GET /mempool HTTP/1.1\r\nHost: localhost\r\n\r\n");
-        assert!(mempool.starts_with("HTTP/1.1 200 OK"));
-        assert!(mempool.contains("\"available\""));
+            let mempool =
+                send_http_request(&addr, "GET /mempool HTTP/1.1\r\nHost: localhost\r\n\r\n");
+            assert!(mempool.starts_with("HTTP/1.1 200 OK"));
+            assert!(mempool.contains("\"available\""));
 
-        let tx = send_http_request(&addr, "GET /tx/0/0 HTTP/1.1\r\nHost: localhost\r\n\r\n");
-        assert!(tx.starts_with("HTTP/1.1 200 OK"));
-        let txid = send_http_request(
-            &addr,
-            &format!("GET /txid/{genesis_txid} HTTP/1.1\r\nHost: localhost\r\n\r\n"),
-        );
-        assert!(txid.starts_with("HTTP/1.1 200 OK"));
-        assert!(
-            txid.contains(&genesis_txid),
-            "txid lookup must return the requested txid"
-        );
-        let malformed_txid_path =
-            send_http_request(&addr, "GET /txid/ HTTP/1.1\r\nHost: localhost\r\n\r\n");
-        assert!(malformed_txid_path.starts_with("HTTP/1.1 400 Bad Request"));
-        assert!(malformed_txid_path.contains("txid path must be /txid/<hex-txid>"));
-        let extra_segment_txid =
-            send_http_request(&addr, "GET /txid/aa/bb HTTP/1.1\r\nHost: localhost\r\n\r\n");
-        assert!(extra_segment_txid.starts_with("HTTP/1.1 400 Bad Request"));
-        assert!(extra_segment_txid.contains("txid path must be /txid/<hex-txid>"));
-        let bad_txid = send_http_request(
-            &addr,
-            "GET /txid/not-hex HTTP/1.1\r\nHost: localhost\r\n\r\n",
-        );
-        assert!(bad_txid.starts_with("HTTP/1.1 400 Bad Request"));
-        assert!(bad_txid.contains("invalid txid hex"));
-        let block = send_http_request(&addr, "GET /block/0 HTTP/1.1\r\nHost: localhost\r\n\r\n");
-        assert!(block.starts_with("HTTP/1.1 200 OK"));
+            let tx = send_http_request(&addr, "GET /tx/0/0 HTTP/1.1\r\nHost: localhost\r\n\r\n");
+            assert!(tx.starts_with("HTTP/1.1 200 OK"));
+            let txid = send_http_request(
+                &addr,
+                &format!("GET /txid/{genesis_txid} HTTP/1.1\r\nHost: localhost\r\n\r\n"),
+            );
+            assert!(txid.starts_with("HTTP/1.1 200 OK"));
+            assert!(
+                txid.contains(&genesis_txid),
+                "txid lookup must return the requested txid"
+            );
+            let malformed_txid_path =
+                send_http_request(&addr, "GET /txid/ HTTP/1.1\r\nHost: localhost\r\n\r\n");
+            assert!(malformed_txid_path.starts_with("HTTP/1.1 400 Bad Request"));
+            assert!(malformed_txid_path.contains("txid path must be /txid/<hex-txid>"));
+            let extra_segment_txid =
+                send_http_request(&addr, "GET /txid/aa/bb HTTP/1.1\r\nHost: localhost\r\n\r\n");
+            assert!(extra_segment_txid.starts_with("HTTP/1.1 400 Bad Request"));
+            assert!(extra_segment_txid.contains("txid path must be /txid/<hex-txid>"));
+            let bad_txid = send_http_request(
+                &addr,
+                "GET /txid/not-hex HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            );
+            assert!(bad_txid.starts_with("HTTP/1.1 400 Bad Request"));
+            assert!(bad_txid.contains("invalid txid hex"));
+            let block =
+                send_http_request(&addr, "GET /block/0 HTTP/1.1\r\nHost: localhost\r\n\r\n");
+            assert!(block.starts_with("HTTP/1.1 200 OK"));
 
-        let wallet_address_req = serde_json::json!({
-            "mnemonic": SOAK_FLOW_MNEMONIC,
-            "passphrase": "",
-            "account": 0,
-            "index": 0
-        })
-        .to_string();
-        let wallet_address = send_http_json_post(&addr, "/wallet/address", &wallet_address_req);
-        assert!(wallet_address.starts_with("HTTP/1.1 200 OK"));
-        assert!(wallet_address.contains("\"address\""));
+            let wallet_address_req = serde_json::json!({
+                "mnemonic": SOAK_FLOW_MNEMONIC,
+                "passphrase": "",
+                "account": 0,
+                "index": 0
+            })
+            .to_string();
+            let wallet_address = send_http_json_post(&addr, "/wallet/address", &wallet_address_req);
+            assert!(wallet_address.starts_with("HTTP/1.1 200 OK"));
+            assert!(wallet_address.contains("\"address\""));
 
-        let valid_send_req = serde_json::json!({
-            "mnemonic": SOAK_FLOW_MNEMONIC,
-            "passphrase": "",
-            "account": 0,
-            "index": 0,
-            "to": valid_recipient,
-            // Force deterministic non-funding error path after HRP validation.
-            "amount": u64::MAX,
-            "fee": 1
-        })
-        .to_string();
-        let valid_send = send_http_json_post(&addr, "/wallet/send-preview", &valid_send_req);
-        assert!(valid_send.starts_with("HTTP/1.1 400 Bad Request"));
-        assert!(
-            !valid_send.contains("address hrp"),
-            "valid network hrp must not be rejected as wrong network"
-        );
+            let valid_send_req = serde_json::json!({
+                "mnemonic": SOAK_FLOW_MNEMONIC,
+                "passphrase": "",
+                "account": 0,
+                "index": 0,
+                "to": valid_recipient,
+                // Force deterministic non-funding error path after HRP validation.
+                "amount": u64::MAX,
+                "fee": 1
+            })
+            .to_string();
+            let valid_send = send_http_json_post(&addr, "/wallet/send-preview", &valid_send_req);
+            assert!(valid_send.starts_with("HTTP/1.1 400 Bad Request"));
+            assert!(
+                !valid_send.contains("address hrp"),
+                "valid network hrp must not be rejected as wrong network"
+            );
 
-        let invalid_send_req = serde_json::json!({
-            "mnemonic": SOAK_FLOW_MNEMONIC,
-            "passphrase": "",
-            "account": 0,
-            "index": 0,
-            "to": invalid_recipient,
-            "amount": 1,
-            "fee": 1
-        })
-        .to_string();
-        let invalid_send = send_http_json_post(&addr, "/wallet/send-preview", &invalid_send_req);
-        assert!(invalid_send.starts_with("HTTP/1.1 400 Bad Request"));
-        assert!(invalid_send.contains("address hrp"));
+            let invalid_send_req = serde_json::json!({
+                "mnemonic": SOAK_FLOW_MNEMONIC,
+                "passphrase": "",
+                "account": 0,
+                "index": 0,
+                "to": invalid_recipient,
+                "amount": 1,
+                "fee": 1
+            })
+            .to_string();
+            let invalid_send =
+                send_http_json_post(&addr, "/wallet/send-preview", &invalid_send_req);
+            assert!(invalid_send.starts_with("HTTP/1.1 400 Bad Request"));
+            assert!(invalid_send.contains("address hrp"));
 
-        // Keep counted routes last so `max_requests` is reached after assertions above.
-        let wallet_balance_req = serde_json::json!({
-            "mnemonic": SOAK_FLOW_MNEMONIC,
-            "passphrase": "",
-            "account": 0,
-            "index": 0
-        })
-        .to_string();
-        let wallet_balance = send_http_json_post(&addr, "/wallet/balance", &wallet_balance_req);
-        assert!(wallet_balance.starts_with("HTTP/1.1 200 OK"));
-        assert!(wallet_balance.contains("\"spendable\""));
+            // Keep counted routes last so `max_requests` is reached after assertions above.
+            let wallet_balance_req = serde_json::json!({
+                "mnemonic": SOAK_FLOW_MNEMONIC,
+                "passphrase": "",
+                "account": 0,
+                "index": 0
+            })
+            .to_string();
+            let wallet_balance = send_http_json_post(&addr, "/wallet/balance", &wallet_balance_req);
+            assert!(wallet_balance.starts_with("HTTP/1.1 200 OK"));
+            assert!(wallet_balance.contains("\"spendable\""));
 
-        let wallet_balance_by_address_req = serde_json::json!({
-            "address": valid_recipient
-        })
-        .to_string();
-        let wallet_balance_by_address = send_http_json_post(
-            &addr,
-            "/wallet/balance-by-address",
-            &wallet_balance_by_address_req,
-        );
-        assert!(wallet_balance_by_address.starts_with("HTTP/1.1 200 OK"));
-        assert!(wallet_balance_by_address.contains("\"address\""));
+            let wallet_balance_by_address_req = serde_json::json!({
+                "address": valid_recipient
+            })
+            .to_string();
+            let wallet_balance_by_address = send_http_json_post(
+                &addr,
+                "/wallet/balance-by-address",
+                &wallet_balance_by_address_req,
+            );
+            assert!(wallet_balance_by_address.starts_with("HTTP/1.1 200 OK"));
+            assert!(wallet_balance_by_address.contains("\"address\""));
 
-        let wallet_balance_history_by_address = send_http_json_post(
-            &addr,
-            "/wallet/balance-history-by-address",
-            &wallet_balance_by_address_req,
-        );
-        assert!(wallet_balance_history_by_address.starts_with("HTTP/1.1 200 OK"));
-        assert!(wallet_balance_history_by_address.contains("\"tx_history\""));
+            let wallet_balance_history_by_address = send_http_json_post(
+                &addr,
+                "/wallet/balance-history-by-address",
+                &wallet_balance_by_address_req,
+            );
+            assert!(wallet_balance_history_by_address.starts_with("HTTP/1.1 200 OK"));
+            assert!(wallet_balance_history_by_address.contains("\"tx_history\""));
 
-        let wallet_decode_req = serde_json::json!({
-            "address": invalid_recipient.clone()
-        })
-        .to_string();
-        let wallet_decode = send_http_json_post(&addr, "/wallet/decode", &wallet_decode_req);
-        assert!(wallet_decode.starts_with("HTTP/1.1 200 OK"));
-        assert!(wallet_decode.contains("\"key_hash20_hex\""));
-
-        stop_rpc_server_for_test(server_shutdown, server, "rpc strict routes server");
+            let wallet_decode_req = serde_json::json!({
+                "address": invalid_recipient.clone()
+            })
+            .to_string();
+            let wallet_decode = send_http_json_post(&addr, "/wallet/decode", &wallet_decode_req);
+            assert!(wallet_decode.starts_with("HTTP/1.1 200 OK"));
+            assert!(wallet_decode.contains("\"key_hash20_hex\""));
+        });
         let _ = fs::remove_dir_all(work_dir);
     }
 
@@ -26669,6 +27039,89 @@ mod tests {
     }
 
     #[test]
+    fn axum_runtime_for_query_refresh_guard_handles_lock_and_non_lock_errors_strictly() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let work_dir = temp_dir("test-axum-runtime-refresh-guard");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let runtime_db_path = work_dir.join("runtime.redb");
+
+        let state = super::AxumRpcState {
+            network: Network::Devnet,
+            cfg: cfg.clone(),
+            runtime_db_path: runtime_db_path.clone(),
+            runtime_cache: Arc::new(std::sync::Mutex::new(super::AxumRuntimeCache {
+                runtime: ChainRuntime::from_config(cfg.clone()).expect("cached runtime"),
+                last_seen_mtime: None,
+            })),
+            mempool_db_path: work_dir.join("mempool.redb"),
+            relay_telemetry: None,
+            stratum_telemetry: None,
+            pool_ledger_db_path: work_dir.join("pool-ledger.redb"),
+            ui_dir: work_dir.join("ui"),
+        };
+
+        let lock_value = super::axum_runtime_for_query_with_refresh(
+            &state,
+            |_cfg, _runtime, _path, _last_seen| {
+                Err(super::NodeError::Runtime(
+                    "Database already open".to_owned(),
+                ))
+            },
+            |runtime| Ok::<u64, super::NodeError>(runtime.tip_height()),
+        )
+        .expect("lock conflict must keep serving cached runtime");
+        assert_eq!(lock_value, 0);
+
+        let non_lock_err = super::axum_runtime_for_query_with_refresh(
+            &state,
+            |_cfg, _runtime, _path, _last_seen| {
+                Err(super::NodeError::Runtime("permission denied".to_owned()))
+            },
+            |runtime| Ok::<u64, super::NodeError>(runtime.tip_height()),
+        )
+        .expect_err("non-lock refresh errors must propagate");
+        assert!(non_lock_err.to_string().contains("permission denied"));
+
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
+    fn axum_runtime_for_query_propagates_non_lock_refresh_errors() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let work_dir = temp_dir("test-axum-runtime-cache-non-lock-error");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let runtime_db_path = work_dir.join("runtime.redb");
+
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let mut archive = super::runtime_to_archive(&runtime).expect("archive");
+        archive.network_id = "wrongnet".to_owned();
+        super::save_chain_archive_db(&runtime_db_path, &archive).expect("save mismatched archive");
+
+        let state = super::AxumRpcState {
+            network: Network::Devnet,
+            cfg: cfg.clone(),
+            runtime_db_path: runtime_db_path.clone(),
+            runtime_cache: Arc::new(std::sync::Mutex::new(super::AxumRuntimeCache {
+                runtime: ChainRuntime::from_config(cfg.clone()).expect("cached runtime"),
+                last_seen_mtime: None,
+            })),
+            mempool_db_path: work_dir.join("mempool.redb"),
+            relay_telemetry: None,
+            stratum_telemetry: None,
+            pool_ledger_db_path: work_dir.join("pool-ledger.redb"),
+            ui_dir: work_dir.join("ui"),
+        };
+
+        let err = super::axum_runtime_for_query(&state, |_runtime| Ok::<u64, super::NodeError>(1))
+            .expect_err("non-lock refresh errors must propagate to caller");
+        assert!(err.to_string().contains("network mismatch"));
+
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
     fn refresh_mempool_from_db_if_changed_reloads_snapshot_when_mtime_changes() {
         let cfg: ChainConfig =
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
@@ -27179,7 +27632,9 @@ mod tests {
         let listener = TcpListener::bind(&target).expect("bind outbound test listener");
         let (tx, rx) = mpsc::channel::<()>();
         let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept");
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
             let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
             let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
             let framing = FramingConfig::default();
@@ -27190,11 +27645,14 @@ mod tests {
                 user_agent: "test-outbound-peer".to_owned(),
                 start_height: 0,
             };
-            let remote = server_handshake(&mut stream, &framing, &local_hello).expect("handshake");
-            assert_eq!(remote.network_id, "devnet");
-            let _ = tx.send(());
+            if let Ok(remote) = server_handshake(&mut stream, &framing, &local_hello)
+                && remote.network_id == "devnet"
+            {
+                let _ = tx.send(());
+            }
         });
 
+        let target_for_worker = target.clone();
         let worker = thread::spawn({
             let stop = stop.clone();
             let next_peer = next_peer.clone();
@@ -27203,7 +27661,7 @@ mod tests {
             let cfg = cfg.clone();
             move || {
                 super::run_relay_outbound_worker(
-                    target,
+                    target_for_worker,
                     "127.0.0.1:18444".to_owned(),
                     stop,
                     next_peer,
@@ -27222,12 +27680,15 @@ mod tests {
             }
         });
 
-        rx.recv_timeout(Duration::from_secs(5))
-            .expect("outbound worker should connect and handshake");
+        let connected = rx.recv_timeout(Duration::from_secs(5)).is_ok();
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if !connected {
+            let _ = TcpStream::connect(&target);
+        }
 
         join_with_timeout(worker, Duration::from_secs(6), "relay outbound worker");
         join_with_timeout(server, Duration::from_secs(5), "relay outbound peer");
+        assert!(connected, "outbound worker should connect and handshake");
     }
 
     #[test]
@@ -27270,7 +27731,9 @@ mod tests {
 
         let (tx, rx) = mpsc::channel::<()>();
         let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept");
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
             let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
             let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
             let framing = FramingConfig::default();
@@ -27281,9 +27744,11 @@ mod tests {
                 user_agent: "test-outbound-supervisor-peer".to_owned(),
                 start_height: 0,
             };
-            let remote = server_handshake(&mut stream, &framing, &local_hello).expect("handshake");
-            assert_eq!(remote.network_id, "devnet");
-            let _ = tx.send(());
+            if let Ok(remote) = server_handshake(&mut stream, &framing, &local_hello)
+                && remote.network_id == "devnet"
+            {
+                let _ = tx.send(());
+            }
         });
 
         let supervisor = thread::spawn({
@@ -27314,9 +27779,11 @@ mod tests {
             }
         });
 
-        rx.recv_timeout(Duration::from_secs(6))
-            .expect("supervisor should spawn worker and connect");
+        let connected = rx.recv_timeout(Duration::from_secs(6)).is_ok();
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if !connected {
+            let _ = TcpStream::connect(&target);
+        }
 
         join_with_timeout(
             supervisor,
@@ -27328,6 +27795,7 @@ mod tests {
             Duration::from_secs(5),
             "relay outbound supervisor peer",
         );
+        assert!(connected, "supervisor should spawn worker and connect");
         let _ = fs::remove_dir_all(peers_dir);
     }
 
@@ -27356,7 +27824,9 @@ mod tests {
         let listener = TcpListener::bind(&target).expect("bind async worker listener");
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept");
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
             let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
             let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
             let framing = FramingConfig::default();
@@ -27367,18 +27837,21 @@ mod tests {
                 user_agent: "test-async-outbound-peer".to_owned(),
                 start_height: 0,
             };
-            let remote = server_handshake(&mut stream, &framing, &local_hello).expect("handshake");
-            assert_eq!(remote.network_id, "devnet");
-            let _ = tx.send(());
+            if let Ok(remote) = server_handshake(&mut stream, &framing, &local_hello)
+                && remote.network_id == "devnet"
+            {
+                let _ = tx.send(());
+            }
         });
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("tokio runtime");
+        let target_for_worker = target.clone();
         rt.block_on(async {
             let task = tokio::spawn(super::run_relay_outbound_worker_async(
-                target,
+                target_for_worker,
                 "127.0.0.1:18444".to_owned(),
                 stop.clone(),
                 next_peer,
@@ -27394,16 +27867,18 @@ mod tests {
                 1,
                 None,
             ));
-            tokio::time::timeout(Duration::from_secs(6), rx)
-                .await
-                .expect("async outbound worker should connect in time")
-                .expect("async outbound worker connect signal");
+            let connect_result = tokio::time::timeout(Duration::from_secs(6), rx).await;
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
             tokio::time::timeout(Duration::from_secs(8), task)
                 .await
                 .expect("worker async join timeout")
                 .expect("worker async task");
+            assert!(
+                matches!(connect_result, Ok(Ok(()))),
+                "async outbound worker should connect in time"
+            );
         });
+        let _ = TcpStream::connect(&target);
         join_with_timeout(server, Duration::from_secs(5), "relay outbound async peer");
     }
 
@@ -27448,7 +27923,9 @@ mod tests {
 
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept");
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
             let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
             let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
             let framing = FramingConfig::default();
@@ -27459,9 +27936,11 @@ mod tests {
                 user_agent: "test-async-supervisor-peer".to_owned(),
                 start_height: 0,
             };
-            let remote = server_handshake(&mut stream, &framing, &local_hello).expect("handshake");
-            assert_eq!(remote.network_id, "devnet");
-            let _ = tx.send(());
+            if let Ok(remote) = server_handshake(&mut stream, &framing, &local_hello)
+                && remote.network_id == "devnet"
+            {
+                let _ = tx.send(());
+            }
         });
 
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -27486,17 +27965,19 @@ mod tests {
                 1,
                 None,
             ));
-            tokio::time::timeout(Duration::from_secs(8), rx)
-                .await
-                .expect("async supervisor should spawn worker and connect in time")
-                .expect("async supervisor connect signal");
+            let connect_result = tokio::time::timeout(Duration::from_secs(8), rx).await;
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
             tokio::time::timeout(Duration::from_secs(10), supervisor)
                 .await
                 .expect("supervisor async join timeout")
                 .expect("supervisor async task");
+            assert!(
+                matches!(connect_result, Ok(Ok(()))),
+                "async supervisor should spawn worker and connect in time"
+            );
         });
 
+        let _ = TcpStream::connect(&target);
         join_with_timeout(
             server,
             Duration::from_secs(5),
@@ -29296,6 +29777,180 @@ mod tests {
             .expect("tx remains in sanitized mempool");
         assert_eq!(sanitized_tx.txid(), tx.txid());
         assert_eq!(sanitized_fee, expected_fee);
+    }
+
+    #[test]
+    fn load_wallet_reserved_outpoints_roundtrip_from_mempool_db() {
+        let mut cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        cfg.coinbase_maturity = 1;
+        cfg.validate().expect("config validate");
+
+        let work_dir = temp_dir("test-wallet-reserved-outpoints");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let mempool_db = work_dir.join("mempool.redb");
+
+        let reserved = OutPoint {
+            txid: Hash256([0x42; 32]),
+            vout: 7,
+        };
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: reserved.clone(),
+                signature: vec![1u8; 64],
+                pubkey_compressed: vec![0x02; 33],
+                sequence: 0,
+            }],
+            outputs: vec![TxOut {
+                value: 1_000,
+                key_hash20: [8u8; 20],
+            }],
+            lock_time: 0,
+        };
+
+        let mut mempool =
+            Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool");
+        let _ = mempool.insert_with_fee(tx, 1_000).expect("insert");
+        super::persist_mempool_db(&cfg, &mempool, &mempool_db).expect("persist");
+
+        let loaded =
+            super::load_wallet_reserved_outpoints(&cfg, &mempool_db).expect("load reserved");
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded.contains(&reserved));
+
+        let empty = super::load_wallet_reserved_outpoints(&cfg, &work_dir.join("missing.redb"))
+            .expect("missing file should map to empty set");
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn consensus_fingerprint_and_match_guard_are_strict() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let fp = super::consensus_fingerprint(&cfg);
+        assert_eq!(fp.len(), 64);
+        assert!(fp.chars().all(|ch| ch.is_ascii_hexdigit()));
+
+        let mut changed = cfg.clone();
+        changed.block_subsidy = changed.block_subsidy.saturating_add(1);
+        let changed_fp = super::consensus_fingerprint(&changed);
+        assert_ne!(fp, changed_fp);
+
+        super::ensure_consensus_fingerprint_match(&fp, &fp, "ctx").expect("equal fingerprints");
+        let err = super::ensure_consensus_fingerprint_match(&fp, &changed_fp, "ctx")
+            .expect_err("mismatch must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("ctx"));
+        assert!(msg.contains(&fp));
+        assert!(msg.contains(&changed_fp));
+    }
+
+    #[test]
+    fn template_fee_helpers_and_startup_cleanup_guards_are_strict() {
+        assert!(super::template_fee_meets_minimum(10, 10));
+        assert!(super::template_fee_meets_minimum(11, 10));
+        assert!(!super::template_fee_meets_minimum(9, 10));
+
+        assert!(super::sanitize_should_continue(1, 1));
+        assert!(!super::sanitize_should_continue(0, 1));
+        assert!(!super::sanitize_should_continue(1, 0));
+        assert!(super::sanitize_stalled(false));
+        assert!(!super::sanitize_stalled(true));
+
+        assert!(!super::should_persist_startup_mempool_cleanup(0));
+        assert!(super::should_persist_startup_mempool_cleanup(1));
+    }
+
+    #[test]
+    fn tx_fee_from_known_prevouts_handles_equal_and_overspend_outputs() {
+        let mut cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        cfg.coinbase_maturity = 1;
+        cfg.validate().expect("config validate");
+        let runtime = ChainRuntime::from_config(cfg).expect("runtime");
+        let mempool = Mempool::with_policy(64, 1_000).expect("mempool");
+        let (spend, spend_value) = runtime
+            .utxo_set()
+            .iter()
+            .next()
+            .map(|(outpoint, entry)| (outpoint.clone(), entry.value))
+            .expect("genesis utxo must exist");
+
+        let exact = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: spend.clone(),
+                signature: vec![3u8; 64],
+                pubkey_compressed: vec![0x02; 33],
+                sequence: 0,
+            }],
+            outputs: vec![TxOut {
+                value: spend_value,
+                key_hash20: [9u8; 20],
+            }],
+            lock_time: 0,
+        };
+        assert_eq!(
+            super::tx_fee_from_known_prevouts(&runtime, &mempool, &exact),
+            Some(0)
+        );
+
+        let overspend = Transaction {
+            version: 1,
+            inputs: exact.inputs.clone(),
+            outputs: vec![TxOut {
+                value: spend_value.saturating_add(1),
+                key_hash20: [9u8; 20],
+            }],
+            lock_time: 0,
+        };
+        assert_eq!(
+            super::tx_fee_from_known_prevouts(&runtime, &mempool, &overspend),
+            None
+        );
+    }
+
+    #[test]
+    fn rewrite_coinbase_primary_value_uses_subtraction_and_boundary() {
+        let mut coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: OutPoint::coinbase(),
+                signature: b"coinbase".to_vec(),
+                pubkey_compressed: vec![0x02; 33],
+                sequence: 0,
+            }],
+            outputs: vec![
+                TxOut {
+                    value: 0,
+                    key_hash20: [1u8; 20],
+                },
+                TxOut {
+                    value: 3_000,
+                    key_hash20: [2u8; 20],
+                },
+            ],
+            lock_time: 0,
+        };
+        super::rewrite_coinbase_to_expected_value(&mut coinbase, 5_000).expect("rewrite");
+        assert_eq!(coinbase.outputs[0].value, 2_000);
+
+        super::rewrite_coinbase_to_expected_value(&mut coinbase, 3_000).expect("exact boundary");
+        assert_eq!(coinbase.outputs[0].value, 0);
+
+        let err = super::rewrite_coinbase_to_expected_value(&mut coinbase, 2_999)
+            .expect_err("expected lower than secondary outputs must fail");
+        assert!(
+            err.to_string().contains("exceed expected reward"),
+            "unexpected rewrite error: {err}"
+        );
+
+        assert_eq!(
+            super::coinbase_primary_value(5_000, 5_000, 3_000).expect("primary"),
+            2_000
+        );
     }
 
     #[test]
@@ -32491,7 +33146,7 @@ mod tests {
                     config: Some(config_path),
                     runtime_db: Some(runtime_db_b),
                     bind: bind_b,
-                    max_clients: 64,
+                    max_clients: 16,
                     max_messages_per_peer: 0,
                     read_timeout_sec: 1,
                     write_timeout_sec: 1,
@@ -32558,7 +33213,7 @@ mod tests {
             }
         });
 
-        thread::sleep(Duration::from_millis(1_200));
+        thread::sleep(Duration::from_millis(700));
         let mut sender = connect_with_retry(&bind_a);
         sender
             .set_read_timeout(Some(Duration::from_secs(2)))
@@ -32591,7 +33246,7 @@ mod tests {
         send_message(&mut sender, &WireMessage::Tx { tx: signed.tx }, &framing).expect("send tx");
 
         let mut observed = None::<Duration>;
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + Duration::from_secs(8);
         while Instant::now() < deadline {
             if let Ok(snapshot) = scam_storage::load_mempool_db(&mempool_db_b)
                 && snapshot.entries.iter().any(|entry| entry.txid == txid)
@@ -32602,30 +33257,35 @@ mod tests {
             thread::sleep(Duration::from_millis(100));
         }
 
-        let latency = observed.expect("relay B must observe tx in mempool within deadline");
-        assert!(
-            latency <= Duration::from_secs(15),
-            "expected relay tx propagation <= 15s, got {:?}",
-            latency
-        );
+        let latency = observed;
 
         let _ = sender.shutdown(Shutdown::Both);
         drop(sender);
 
         // Nudge relay B accept loop so it can reach max_clients and exit deterministically
         // even if outbound sessions churned during CI scheduling jitter.
-        for _ in 0..80 {
+        for _ in 0..30 {
             if let Ok(poke) = TcpStream::connect(&bind_b) {
                 let _ = poke.shutdown(Shutdown::Both);
             }
-            thread::sleep(Duration::from_millis(40));
+            thread::sleep(Duration::from_millis(30));
         }
 
-        join_with_timeout(server_a, Duration::from_secs(25), "relay latency server A")
-            .expect("relay A should exit");
-        join_with_timeout(server_b, Duration::from_secs(25), "relay latency server B")
-            .expect("relay B should exit");
+        let server_a_res =
+            join_with_timeout(server_a, Duration::from_secs(10), "relay latency server A");
+        let server_b_res =
+            join_with_timeout(server_b, Duration::from_secs(10), "relay latency server B");
         let _ = fs::remove_dir_all(work_dir);
+
+        server_a_res.expect("relay A should exit");
+        server_b_res.expect("relay B should exit");
+
+        let latency = latency.expect("relay B must observe tx in mempool within deadline");
+        assert!(
+            latency <= Duration::from_secs(6),
+            "expected relay tx propagation <= 6s, got {:?}",
+            latency
+        );
     }
 
     #[test]

@@ -1385,6 +1385,69 @@ mod tests {
     }
 
     #[test]
+    fn expected_target_windowed_boundary_uses_subtractive_window_start() {
+        let mut config: scam_core::ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        config.difficulty_algorithm = scam_core::DifficultyAlgorithm::Windowed;
+        config.difficulty_adjustment_window = 4;
+        let reward = config.genesis_reward_key_hash20().expect("key");
+        let mut runtime = ChainRuntime::from_config(config.clone()).expect("runtime");
+
+        for i in 0..7 {
+            let template = BlockTemplate {
+                version: 1,
+                prev_block: runtime.tip_hash(),
+                timestamp: runtime.tip_header().timestamp + 20 + i as u64,
+                target: runtime.expected_target_for_next_block().expect("target"),
+                transactions: vec![coinbase(
+                    config.block_subsidy,
+                    reward,
+                    format!("window-start-{i}").as_bytes(),
+                )],
+            };
+            let block = mine_block(&template, 200_000).expect("mine");
+            runtime.apply_next_block(block).expect("apply");
+        }
+        assert_eq!(runtime.tip_height(), 7);
+
+        let tip_hash = runtime.tip_hash();
+        let h2 = runtime.block_hash_at_height(2).expect("h2 hash");
+        let h4 = runtime.block_hash_at_height(4).expect("h4 hash");
+        let target_override = scam_core::Target::from_hex(
+            "00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        )
+        .expect("target parse");
+
+        runtime
+            .headers
+            .get_mut(&tip_hash)
+            .expect("tip header")
+            .target = target_override;
+        runtime
+            .headers
+            .get_mut(&tip_hash)
+            .expect("tip header")
+            .timestamp = 5_000;
+        runtime.headers.get_mut(&h2).expect("h2 header").timestamp = 4_500;
+        runtime.headers.get_mut(&h4).expect("h4 header").timestamp = 4_900;
+
+        let expected = retarget_next(
+            target_override,
+            5_000u64.saturating_sub(4_900),
+            4 * config.target_block_time_sec,
+            config.difficulty_clamp_down,
+            config.difficulty_clamp_up,
+            config.genesis_target().expect("max target"),
+        )
+        .expect("retarget");
+
+        assert_eq!(
+            runtime.expected_target_for_next_block().expect("target"),
+            expected
+        );
+    }
+
+    #[test]
     fn submit_block_extending_tip_reports_extended_tip_outcome() {
         let config: scam_core::ChainConfig =
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
