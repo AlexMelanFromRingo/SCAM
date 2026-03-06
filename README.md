@@ -230,14 +230,17 @@ COINBASE_ADDRESS=sd1... \
 scripts/run-miner.sh start
 
 # 2) Node only (relay + RPC/UI, no local mining)
+ADD_PEERS=203.0.113.10:18444,198.51.100.25:18444 \
 scripts/run-node-only.sh start
 
 # 3) Node + local miner (relay + RPC/UI + stratum + miner)
+ADD_PEERS=203.0.113.10:18444,198.51.100.25:18444 \
 COINBASE_ADDRESS=sd1... \
 scripts/run-node-miner.sh start
 ```
 
 Each script supports `start|stop|status|logs`.
+`ADD_PEERS` is optional and applies only to scripts that run a node (`run-node-only.sh`, `run-node-miner.sh`).
 
 For local multi-node verification:
 

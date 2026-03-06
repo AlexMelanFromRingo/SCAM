@@ -11,6 +11,9 @@ set -euo pipefail
 #   scripts/run-node-miner.sh stop
 #   scripts/run-node-miner.sh status
 #   scripts/run-node-miner.sh logs
+#
+# Optional bootstrap peers for node relay:
+#   ADD_PEERS="198.51.100.10:18444,203.0.113.7:18444"
 
 COMMAND="${1:-status}"
 
@@ -29,6 +32,7 @@ OUTBOUND_CONNECT="${OUTBOUND_CONNECT:-true}"
 OUTBOUND_REDIAL_SEC="${OUTBOUND_REDIAL_SEC:-5}"
 P2P_READ_TIMEOUT_SEC="${P2P_READ_TIMEOUT_SEC:-5}"
 P2P_WRITE_TIMEOUT_SEC="${P2P_WRITE_TIMEOUT_SEC:-5}"
+ADD_PEERS="${ADD_PEERS:-}"
 STRATUM_READ_TIMEOUT_SEC="${STRATUM_READ_TIMEOUT_SEC:-30}"
 MINER_READ_TIMEOUT_SEC="${MINER_READ_TIMEOUT_SEC:-2}"
 MINER_MAX_NONCE_PER_CYCLE="${MINER_MAX_NONCE_PER_CYCLE:-250000}"
@@ -87,6 +91,23 @@ ensure_started() {
   fi
 }
 
+seed_peer_book_from_env() {
+  local peers_raw
+  peers_raw="${ADD_PEERS//,/ }"
+  [[ -n "${peers_raw//[[:space:]]/}" ]] || return 0
+
+  echo "[node-miner] seeding peer book from ADD_PEERS"
+  local peer
+  for peer in ${peers_raw}; do
+    [[ -n "${peer//[[:space:]]/}" ]] || continue
+    "${SCAM_NODE_BIN}" add-peer \
+      --network "${NETWORK}" \
+      --peer "${peer}" \
+      --peers-dir "${PEERS_DIR}" \
+      >> "${LOG_DIR}/bootstrap.log" 2>&1
+  done
+}
+
 start() {
   require_bin
   if [[ -z "${COINBASE_ADDRESS}" ]]; then
@@ -94,6 +115,7 @@ start() {
     exit 2
   fi
   mkdir -p "${NODE_DIR}" "${LOG_DIR}" "${PEERS_DIR}"
+  seed_peer_book_from_env
 
   "${SCAM_NODE_BIN}" node \
     --network "${NETWORK}" \
@@ -165,6 +187,9 @@ start() {
   echo "[node-miner] rpc/ui: http://${RPC_BIND}/"
   echo "[node-miner] stratum: ${STRATUM_BIND}"
   echo "[node-miner] miner user/coinbase address: ${COINBASE_ADDRESS}"
+  if [[ -n "${ADD_PEERS//[[:space:]]/}" ]]; then
+    echo "[node-miner] bootstrap peers: ${ADD_PEERS}"
+  fi
 }
 
 stop() {
@@ -208,4 +233,3 @@ case "${COMMAND}" in
     exit 2
     ;;
 esac
-

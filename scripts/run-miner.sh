@@ -7,6 +7,9 @@ set -euo pipefail
 #   POOL_ADDR=<host:port>
 #   COINBASE_ADDRESS=<address used as miner user/payout label>
 #
+# Note:
+# - This script does not run a relay node, so `add-peer`/peer discovery is not applicable here.
+#
 # Commands:
 #   scripts/run-miner.sh start
 #   scripts/run-miner.sh stop
@@ -130,4 +133,3 @@ case "${COMMAND}" in
     exit 2
     ;;
 esac
-

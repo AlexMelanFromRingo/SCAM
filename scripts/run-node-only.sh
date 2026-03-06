@@ -12,6 +12,7 @@ set -euo pipefail
 # Notes:
 # - A node does not need its own payout address unless it mines.
 # - You can still use wallet RPC/UI on this node.
+# - Optional bootstrap peers: ADD_PEERS="198.51.100.10:18444,203.0.113.7:18444"
 
 COMMAND="${1:-status}"
 
@@ -28,6 +29,7 @@ OUTBOUND_CONNECT="${OUTBOUND_CONNECT:-true}"
 OUTBOUND_REDIAL_SEC="${OUTBOUND_REDIAL_SEC:-5}"
 P2P_READ_TIMEOUT_SEC="${P2P_READ_TIMEOUT_SEC:-5}"
 P2P_WRITE_TIMEOUT_SEC="${P2P_WRITE_TIMEOUT_SEC:-5}"
+ADD_PEERS="${ADD_PEERS:-}"
 
 LOG_DIR="${NODE_DIR}/logs"
 RELAY_LOG="${LOG_DIR}/relay.log"
@@ -76,9 +78,27 @@ ensure_started() {
   fi
 }
 
+seed_peer_book_from_env() {
+  local peers_raw
+  peers_raw="${ADD_PEERS//,/ }"
+  [[ -n "${peers_raw//[[:space:]]/}" ]] || return 0
+
+  echo "[node-only] seeding peer book from ADD_PEERS"
+  local peer
+  for peer in ${peers_raw}; do
+    [[ -n "${peer//[[:space:]]/}" ]] || continue
+    "${SCAM_NODE_BIN}" add-peer \
+      --network "${NETWORK}" \
+      --peer "${peer}" \
+      --peers-dir "${PEERS_DIR}" \
+      >> "${LOG_DIR}/bootstrap.log" 2>&1
+  done
+}
+
 start() {
   require_bin
   mkdir -p "${NODE_DIR}" "${LOG_DIR}" "${PEERS_DIR}"
+  seed_peer_book_from_env
 
   # Bootstrap/update runtime DB once (idempotent).
   "${SCAM_NODE_BIN}" node \
@@ -124,6 +144,9 @@ start() {
   echo "[node-only] relay: ${RELAY_BIND}"
   echo "[node-only] rpc/ui: http://${RPC_BIND}/"
   echo "[node-only] runtime db: ${RUNTIME_DB}"
+  if [[ -n "${ADD_PEERS//[[:space:]]/}" ]]; then
+    echo "[node-only] bootstrap peers: ${ADD_PEERS}"
+  fi
 }
 
 stop() {
@@ -163,4 +186,3 @@ case "${COMMAND}" in
     exit 2
     ;;
 esac
-
