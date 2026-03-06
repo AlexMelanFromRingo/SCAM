@@ -1509,6 +1509,18 @@ fn remove_confirmed_txids_from_mempool_db(
     Ok(removed.len())
 }
 
+fn remove_confirmed_txids_present_on_chain(runtime: &ChainRuntime, mempool: &mut Mempool) -> usize {
+    let confirmed_txids = mempool
+        .txids_by_feerate_desc()
+        .into_iter()
+        .filter(|txid| runtime_contains_txid(runtime, *txid))
+        .collect::<Vec<_>>();
+    if confirmed_txids.is_empty() {
+        return 0;
+    }
+    mempool.remove_confirmed_txids(&confirmed_txids).len()
+}
+
 fn is_runtime_db_lock_conflict(err: &NodeError) -> bool {
     let msg = err.to_string();
     msg.contains("Database already open")
@@ -8568,8 +8580,18 @@ fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
     RELAY_TX_DIFFUSION_BASE_MS.store(tx_diffusion_base_ms, Ordering::Relaxed);
     RELAY_TX_DIFFUSION_MAX_MS.store(tx_diffusion_max_ms, Ordering::Relaxed);
     let network_policy = RelayNetworkPolicy::from_env();
+    let mut startup_mempool = load_mempool_from_db_or_empty(&cfg, &mempool_db_path)?;
+    let removed_confirmed_startup =
+        remove_confirmed_txids_present_on_chain(&runtime, &mut startup_mempool);
+    if removed_confirmed_startup > 0 {
+        persist_mempool_db_with_retry(&cfg, &startup_mempool, &mempool_db_path, 80, 25)?;
+        println!(
+            "Mempool startup cleanup: removed {} already-confirmed tx(s)",
+            removed_confirmed_startup
+        );
+    }
     let relay = RelayAdmissionState {
-        mempool: load_mempool_from_db_or_empty(&cfg, &mempool_db_path)?,
+        mempool: startup_mempool,
         orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)?,
         gossip: GossipEngine::with_limits_and_replacement(
             max_inv_items,
@@ -15258,7 +15280,30 @@ async fn axum_mempool_handler(AxumState(state): AxumState<AxumRpcState>) -> Axum
     let mut tx_count = None::<usize>;
     if state.mempool_db_path.exists() {
         match load_mempool_from_db_or_empty_with_retry(&state.cfg, &state.mempool_db_path, 10, 15) {
-            Ok(mempool) => {
+            Ok(mut mempool) => {
+                let removed_confirmed = match axum_runtime_for_query(&state, |runtime| {
+                    Ok(remove_confirmed_txids_present_on_chain(
+                        runtime,
+                        &mut mempool,
+                    ))
+                }) {
+                    Ok(removed) => removed,
+                    Err(err) => return axum_internal_error(err),
+                };
+                if removed_confirmed > 0
+                    && let Err(err) = persist_mempool_db_with_retry(
+                        &state.cfg,
+                        &mempool,
+                        &state.mempool_db_path,
+                        80,
+                        25,
+                    )
+                {
+                    return axum_internal_error(format!(
+                        "mempool db persist after confirmed-prune failed ({}): {err}",
+                        state.mempool_db_path.display()
+                    ));
+                }
                 tx_count = Some(mempool.len());
                 txids = mempool
                     .txids_by_feerate_desc()
@@ -16243,14 +16288,38 @@ fn run_rpc_serve_inner_legacy(
         } else if rpc_exact_route_matches(method, path, "GET", "/mempool") {
             let (mempool_tx_count, mempool_txids) = if mempool_db_path.exists() {
                 match load_mempool_from_db_or_empty_with_retry(&cfg, &mempool_db_path, 10, 15) {
-                    Ok(mempool) => (
-                        Some(mempool.len()),
-                        mempool
-                            .txids_by_feerate_desc()
-                            .into_iter()
-                            .map(|txid| txid.to_hex())
-                            .collect::<Vec<_>>(),
-                    ),
+                    Ok(mut mempool) => {
+                        let removed_confirmed =
+                            remove_confirmed_txids_present_on_chain(&runtime, &mut mempool);
+                        if removed_confirmed > 0
+                            && let Err(err) = persist_mempool_db_with_retry(
+                                &cfg,
+                                &mempool,
+                                &mempool_db_path,
+                                80,
+                                25,
+                            )
+                        {
+                            let body = json_error_body(&format!(
+                                "mempool db persist after confirmed-prune failed ({}): {err}",
+                                mempool_db_path.display()
+                            ));
+                            write_http_json_response(
+                                &mut stream,
+                                "500 Internal Server Error",
+                                &body,
+                            )?;
+                            continue;
+                        }
+                        (
+                            Some(mempool.len()),
+                            mempool
+                                .txids_by_feerate_desc()
+                                .into_iter()
+                                .map(|txid| txid.to_hex())
+                                .collect::<Vec<_>>(),
+                        )
+                    }
                     Err(err) => {
                         let body = json_error_body(&format!(
                             "mempool db load failed ({}): {err}",
@@ -18648,6 +18717,79 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
+    fn remove_confirmed_txids_present_on_chain_drops_confirmed_entries() {
+        let mut cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        cfg.coinbase_maturity = 1;
+        cfg.validate().expect("config validate");
+
+        let mnemonic = WalletMnemonic::parse(SOAK_FLOW_MNEMONIC).expect("mnemonic");
+        let seed = mnemonic.to_seed("");
+        let sender_key = derive_wallet_key(&seed, 0, 0).expect("sender key");
+        let recipient_key = derive_wallet_key(&seed, 0, 1).expect("recipient key");
+        let sender_key_hash20 = scam_core::hash160_blake3(&sender_key.pubkey_compressed());
+        let recipient_key_hash20 = scam_core::hash160_blake3(&recipient_key.pubkey_compressed());
+
+        let mut runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        mine_blocks_on_runtime(
+            &mut runtime,
+            &super::MiningLoopParams {
+                count: 2,
+                interval_sec: cfg.target_block_time_sec,
+                max_nonce: 500_000,
+                subsidy: cfg.block_subsidy,
+                miner_key_hash: sender_key_hash20,
+                label_prefix: "remove-confirmed-helper",
+                print_each: false,
+            },
+        )
+        .expect("mine funding");
+
+        let fee = 1_000u64;
+        let signed = super::build_signed_transfer_tx(
+            &runtime,
+            &cfg.network_id,
+            &sender_key,
+            recipient_key_hash20,
+            100_000,
+            fee,
+        )
+        .expect("signed transfer");
+        let confirmed_txid = signed.tx.txid();
+
+        let mut mempool =
+            Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool");
+        mempool
+            .insert_with_fee(signed.tx.clone(), fee)
+            .expect("insert transfer");
+        assert!(mempool.contains(&confirmed_txid));
+
+        let template_params = super::MempoolTemplateParams {
+            version: 1,
+            prev_block: runtime.tip_hash(),
+            timestamp: runtime
+                .tip_header()
+                .timestamp
+                .saturating_add(cfg.target_block_time_sec),
+            target: runtime.expected_target_for_next_block().expect("target"),
+            block_subsidy: cfg.block_subsidy,
+            miner_key_hash20: sender_key_hash20,
+            coinbase_tag: "remove-confirmed-helper-template".to_owned(),
+            max_txs: cfg.max_mempool_txs as usize,
+        };
+        let (template, summary) =
+            super::build_template_from_mempool(&template_params, &mempool).expect("template");
+        assert!(summary.included_txids.contains(&confirmed_txid));
+        let mined = mine_block(&template, 500_000).expect("mine tx block");
+        runtime.apply_next_block(mined).expect("apply tx block");
+
+        let removed = super::remove_confirmed_txids_present_on_chain(&runtime, &mut mempool);
+        assert_eq!(removed, 1);
+        assert!(!mempool.contains(&confirmed_txid));
     }
 
     #[cfg(unix)]

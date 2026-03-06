@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
 use scam_chain::{BlockSubmissionOutcome, ChainRuntime};
-use scam_core::{ChainConfig, Hash256, OutPoint, Target, Transaction, TxIn, TxOut};
+use scam_core::{
+    ChainConfig, DifficultyAlgorithm, Hash256, OutPoint, Target, Transaction, TxIn, TxOut,
+};
 use scam_miner::{BlockTemplate, mine_block};
 use scam_p2p::{build_block_locator, select_block_hashes_for_peer, select_headers_for_peer};
 
@@ -177,7 +179,9 @@ fn fork_reorg_switches_to_heavier_chain() {
 
 #[test]
 fn difficulty_retargets_at_20_block_boundaries() {
-    let config = load_devnet_config();
+    let mut config = load_devnet_config();
+    config.difficulty_algorithm = DifficultyAlgorithm::Windowed;
+    config.difficulty_adjustment_window = 20;
     let mut runtime = ChainRuntime::from_config(config.clone()).expect("runtime");
 
     // Mine 19 fast blocks to force a lower target at height 20.
