@@ -66,10 +66,10 @@ use scam_stratum::{
 };
 use scam_wallet::{
     AddressError, DeriveKeyError, MnemonicError, QrError, RescanError, SchnorrError, WalletKey,
-    WalletMnemonic, WalletSeedMode, WalletVaultError, decrypt_wallet_vault, derive_wallet_key,
-    derive_watched_keys, load_wallet_vault, new_encrypted_wallet_vault_with_mode, new_mnemonic,
-    parse_address, qr_for_payment_uri, rescan_blocks, save_wallet_vault, sign_digest, to_address,
-    verify_digest,
+    WalletMnemonic, WalletSeedMode, WalletVaultError, account_index_from_derivation_path,
+    decrypt_wallet_vault, derive_wallet_key, derive_watched_keys, load_wallet_vault,
+    new_encrypted_wallet_vault_with_mode, new_mnemonic, parse_address, qr_for_payment_uri,
+    rescan_blocks, save_wallet_vault, sign_digest, to_address, verify_digest,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -908,6 +908,8 @@ enum WalletCommand {
         mnemonic: String,
         #[arg(long, default_value = "")]
         passphrase: String,
+        #[arg(long)]
+        path: Option<String>,
         #[arg(long, default_value_t = 0)]
         account: u32,
         #[arg(long, default_value_t = 0)]
@@ -920,6 +922,8 @@ enum WalletCommand {
         mnemonic: String,
         #[arg(long, default_value = "")]
         passphrase: String,
+        #[arg(long)]
+        path: Option<String>,
         #[arg(long, default_value_t = 0)]
         account: u32,
         #[arg(long, default_value_t = 0)]
@@ -1024,6 +1028,8 @@ enum WalletCommand {
         mnemonic: String,
         #[arg(long, default_value = "")]
         passphrase: String,
+        #[arg(long)]
+        path: Option<String>,
         #[arg(long, default_value_t = 0)]
         account: u32,
         #[arg(long, default_value_t = 0)]
@@ -1049,6 +1055,30 @@ enum WalletCommand {
         #[arg(long, default_value_t = 500_000)]
         max_nonce: u64,
     },
+    Discover {
+        #[arg(long, value_enum, default_value_t = Network::Devnet)]
+        network: Network,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        mnemonic: String,
+        #[arg(long, default_value = "")]
+        passphrase: String,
+        #[arg(long, default_value_t = 0)]
+        start_account: u32,
+        #[arg(long, default_value_t = 5)]
+        end_account: u32,
+        #[arg(long, default_value_t = 20)]
+        gap_limit: u32,
+        #[arg(long, default_value_t = 500)]
+        max_index: u32,
+        #[arg(long, default_value_t = 0)]
+        mine_blocks: u32,
+        #[arg(long, default_value_t = 120)]
+        interval_sec: u64,
+        #[arg(long, default_value_t = 500_000)]
+        max_nonce: u64,
+    },
     Send {
         #[arg(long, value_enum, default_value_t = Network::Devnet)]
         network: Network,
@@ -1058,6 +1088,8 @@ enum WalletCommand {
         mnemonic: String,
         #[arg(long, default_value = "")]
         passphrase: String,
+        #[arg(long)]
+        path: Option<String>,
         #[arg(long, default_value_t = 0)]
         account: u32,
         #[arg(long, default_value_t = 0)]
@@ -1235,6 +1267,30 @@ fn wallet_seed_from_mnemonic(
 ) -> Result<[u8; 64], NodeError> {
     let mnemonic = WalletMnemonic::parse(mnemonic_phrase)?;
     Ok(mnemonic.to_seed_with_mode(passphrase, seed_mode))
+}
+
+fn resolve_wallet_account_index(
+    path: Option<&str>,
+    account: u32,
+    index: u32,
+) -> Result<(u32, u32), NodeError> {
+    match path {
+        Some(raw_path) if !raw_path.trim().is_empty() => {
+            account_index_from_derivation_path(raw_path).map_err(NodeError::from)
+        }
+        _ => Ok((account, index)),
+    }
+}
+
+fn derive_wallet_key_from_request(
+    seed: &[u8],
+    path: Option<&str>,
+    account: u32,
+    index: u32,
+) -> Result<(WalletKey, u32, u32), NodeError> {
+    let (account, index) = resolve_wallet_account_index(path, account, index)?;
+    let key = derive_wallet_key(seed, account, index)?;
+    Ok((key, account, index))
 }
 
 #[derive(Debug, Error)]
@@ -3081,11 +3137,13 @@ fn run_wallet_with_seed_mode(
         mnemonic_phrase: &str,
         passphrase: &str,
         seed_mode: WalletSeedMode,
+        path: Option<&str>,
         account: u32,
         index: u32,
         hrp: &str,
     ) -> Result<(), NodeError> {
         let seed = wallet_seed_from_mnemonic(mnemonic_phrase, passphrase, seed_mode)?;
+        let (account, index) = resolve_wallet_account_index(path, account, index)?;
         let key = derive_wallet_key(&seed, account, index)?;
         let address = to_address(hrp, key.pubkey_compressed())?;
 
@@ -3093,6 +3151,7 @@ fn run_wallet_with_seed_mode(
             "PubKey (compressed): {}",
             hex::encode(key.pubkey_compressed())
         );
+        println!("Derivation path: m/44'/1337'/{account}'/0/{index}");
         println!("Address: {address}");
         Ok(())
     }
@@ -3100,6 +3159,7 @@ fn run_wallet_with_seed_mode(
     fn derive_and_print_address_from_vault(
         wallet_path: &Path,
         password: &str,
+        path: Option<&str>,
         account: u32,
         index: u32,
         hrp: &str,
@@ -3109,6 +3169,7 @@ fn run_wallet_with_seed_mode(
         let seed = secret
             .mnemonic
             .to_seed_with_mode(&secret.bip39_passphrase, secret.seed_mode);
+        let (account, index) = resolve_wallet_account_index(path, account, index)?;
         let key = derive_wallet_key(&seed, account, index)?;
         let address = to_address(hrp, key.pubkey_compressed())?;
 
@@ -3117,6 +3178,7 @@ fn run_wallet_with_seed_mode(
             "PubKey (compressed): {}",
             hex::encode(key.pubkey_compressed())
         );
+        println!("Derivation path: m/44'/1337'/{account}'/0/{index}");
         println!("Address: {address}");
         Ok(())
     }
@@ -3175,6 +3237,106 @@ fn run_wallet_with_seed_mode(
         Ok(())
     }
 
+    fn run_discovery_for_seed(
+        runtime: &ChainRuntime,
+        seed: &[u8],
+        start_account: u32,
+        end_account: u32,
+        gap_limit: u32,
+        max_index: u32,
+    ) -> Result<(), NodeError> {
+        if start_account > end_account {
+            return Err(NodeError::Runtime(format!(
+                "invalid account range: start_account={} end_account={}",
+                start_account, end_account
+            )));
+        }
+        if gap_limit == 0 {
+            return Err(NodeError::Runtime("gap_limit must be >= 1".to_owned()));
+        }
+
+        #[derive(Clone, Copy, Default)]
+        struct BalanceAggregate {
+            total: u128,
+            spendable: u128,
+            immature: u128,
+            utxo_count: usize,
+            spendable_count: usize,
+            immature_count: usize,
+        }
+
+        let mut by_key_hash = HashMap::<[u8; 20], BalanceAggregate>::new();
+        let tip_height = runtime.tip_height();
+        let coinbase_maturity = runtime.config().coinbase_maturity as u64;
+        let wallet_min_confirmations = runtime.config().wallet_min_spendable_confirmations as u64;
+        for utxo in runtime.utxo_set().values() {
+            let entry = by_key_hash.entry(utxo.key_hash20).or_default();
+            entry.utxo_count = entry.utxo_count.saturating_add(1);
+            entry.total = entry.total.saturating_add(utxo.value as u128);
+            if wallet_prevout_is_immature(
+                tip_height,
+                utxo.is_coinbase,
+                utxo.created_height,
+                coinbase_maturity,
+                wallet_min_confirmations,
+            ) {
+                entry.immature_count = entry.immature_count.saturating_add(1);
+                entry.immature = entry.immature.saturating_add(utxo.value as u128);
+            } else {
+                entry.spendable_count = entry.spendable_count.saturating_add(1);
+                entry.spendable = entry.spendable.saturating_add(utxo.value as u128);
+            }
+        }
+
+        println!("Wallet discovery report:");
+        println!("Network: {}", runtime.config().network_id);
+        println!(
+            "Scan policy: accounts={}..{} gap_limit={} max_index={}",
+            start_account, end_account, gap_limit, max_index
+        );
+        println!("Tip height: {}", runtime.tip_height());
+
+        let mut found_any = false;
+        for account in start_account..=end_account {
+            let mut empty_streak = 0u32;
+            for index in 0..=max_index {
+                if empty_streak >= gap_limit {
+                    break;
+                }
+                let key = derive_wallet_key(seed, account, index)?;
+                let key_hash20 = scam_core::hash160_blake3(&key.pubkey_compressed());
+                match by_key_hash.get(&key_hash20).copied() {
+                    Some(balance) if balance.utxo_count > 0 => {
+                        let address = to_address(&runtime.config().hrp, key.pubkey_compressed())?;
+                        found_any = true;
+                        empty_streak = 0;
+                        println!(
+                            "{} path=m/44'/1337'/{account}'/0/{index} total={} spendable={} immature={} utxos={} (spendable={} immature={})",
+                            address,
+                            balance.total,
+                            balance.spendable,
+                            balance.immature,
+                            balance.utxo_count,
+                            balance.spendable_count,
+                            balance.immature_count
+                        );
+                    }
+                    _ => {
+                        empty_streak = empty_streak.saturating_add(1);
+                    }
+                }
+            }
+        }
+
+        if !found_any {
+            println!(
+                "No funded derivation paths found in scan range account={}..{}, max_index={} (gap_limit={})",
+                start_account, end_account, max_index, gap_limit
+            );
+        }
+        Ok(())
+    }
+
     match command {
         WalletCommand::New {
             words,
@@ -3198,17 +3360,35 @@ fn run_wallet_with_seed_mode(
         WalletCommand::Address {
             mnemonic,
             passphrase,
+            path,
             account,
             index,
             hrp,
-        } => derive_and_print_address(&mnemonic, &passphrase, seed_mode, account, index, &hrp)?,
+        } => derive_and_print_address(
+            &mnemonic,
+            &passphrase,
+            seed_mode,
+            path.as_deref(),
+            account,
+            index,
+            &hrp,
+        )?,
         WalletCommand::Restore {
             mnemonic,
             passphrase,
+            path,
             account,
             index,
             hrp,
-        } => derive_and_print_address(&mnemonic, &passphrase, seed_mode, account, index, &hrp)?,
+        } => derive_and_print_address(
+            &mnemonic,
+            &passphrase,
+            seed_mode,
+            path.as_deref(),
+            account,
+            index,
+            &hrp,
+        )?,
         WalletCommand::SecureNew {
             words,
             passphrase,
@@ -3275,7 +3455,7 @@ fn run_wallet_with_seed_mode(
             account,
             index,
             hrp,
-        } => derive_and_print_address_from_vault(&wallet, &password, account, index, &hrp)?,
+        } => derive_and_print_address_from_vault(&wallet, &password, None, account, index, &hrp)?,
         WalletCommand::Rescan {
             network,
             config,
@@ -3333,6 +3513,7 @@ fn run_wallet_with_seed_mode(
             config,
             mnemonic,
             passphrase,
+            path,
             account,
             index,
             mine_blocks,
@@ -3350,6 +3531,7 @@ fn run_wallet_with_seed_mode(
             )?;
 
             let seed = wallet_seed_from_mnemonic(&mnemonic, &passphrase, seed_mode)?;
+            let (account, index) = resolve_wallet_account_index(path.as_deref(), account, index)?;
             let key = derive_wallet_key(&seed, account, index)?;
             let key_hash20 = scam_core::hash160_blake3(&key.pubkey_compressed());
             let address = to_address(&runtime.config().hrp, key.pubkey_compressed())?;
@@ -3413,11 +3595,44 @@ fn run_wallet_with_seed_mode(
             println!("Spendable: {}", summary.spendable);
             println!("Immature: {}", summary.immature);
         }
+        WalletCommand::Discover {
+            network,
+            config,
+            mnemonic,
+            passphrase,
+            start_account,
+            end_account,
+            gap_limit,
+            max_index,
+            mine_blocks,
+            interval_sec,
+            max_nonce,
+        } => {
+            let (_cfg, runtime) = build_runtime_for_query(
+                network,
+                config,
+                None,
+                mine_blocks,
+                interval_sec,
+                max_nonce,
+                "wallet-discover",
+            )?;
+            let seed = wallet_seed_from_mnemonic(&mnemonic, &passphrase, seed_mode)?;
+            run_discovery_for_seed(
+                &runtime,
+                &seed,
+                start_account,
+                end_account,
+                gap_limit,
+                max_index,
+            )?;
+        }
         WalletCommand::Send {
             network,
             config,
             mnemonic,
             passphrase,
+            path,
             account,
             index,
             to,
@@ -3453,6 +3668,7 @@ fn run_wallet_with_seed_mode(
             }
 
             let seed = wallet_seed_from_mnemonic(&mnemonic, &passphrase, seed_mode)?;
+            let (account, index) = resolve_wallet_account_index(path.as_deref(), account, index)?;
             let key = derive_wallet_key(&seed, account, index)?;
             let signed = build_signed_transfer_tx(
                 &runtime,
@@ -13667,6 +13883,7 @@ struct WalletAddressRpcRequest {
     mnemonic: String,
     passphrase: String,
     seed_mode: Option<String>,
+    path: Option<String>,
     account: u32,
     index: u32,
     hrp: Option<String>,
@@ -13683,6 +13900,7 @@ struct WalletBalanceRpcRequest {
     mnemonic: String,
     passphrase: String,
     seed_mode: Option<String>,
+    path: Option<String>,
     account: u32,
     index: u32,
 }
@@ -13715,6 +13933,7 @@ struct WalletSendPreviewRpcRequest {
     mnemonic: String,
     passphrase: String,
     seed_mode: Option<String>,
+    path: Option<String>,
     account: u32,
     index: u32,
     to: String,
@@ -13728,6 +13947,7 @@ impl Default for WalletSendPreviewRpcRequest {
             mnemonic: String::new(),
             passphrase: String::new(),
             seed_mode: None,
+            path: None,
             account: 0,
             index: 0,
             to: String::new(),
@@ -15256,7 +15476,8 @@ fn axum_wallet_send_preview_payload(
     }
     let seed_mode = wallet_seed_mode_from_request(req.seed_mode.as_deref())?;
     let seed = wallet_seed_from_mnemonic(&req.mnemonic, &req.passphrase, seed_mode)?;
-    let key = derive_wallet_key(&seed, req.account, req.index)?;
+    let (key, _account, _index) =
+        derive_wallet_key_from_request(&seed, req.path.as_deref(), req.account, req.index)?;
     let reserved_outpoints = load_wallet_reserved_outpoints(&state.cfg, &state.mempool_db_path)?;
     let signed = axum_runtime_for_query(state, |runtime| {
         build_signed_transfer_tx_with_exclusions(
@@ -15590,12 +15811,13 @@ async fn axum_wallet_address_handler(
         Ok(seed) => seed,
         Err(err) => return axum_bad_request(err),
     };
-    let key = match derive_wallet_key(&seed, req.account, req.index) {
-        Ok(value) => value,
-        Err(err) => return axum_bad_request(err),
-    };
+    let (key, account, index) =
+        match derive_wallet_key_from_request(&seed, req.path.as_deref(), req.account, req.index) {
+            Ok(value) => value,
+            Err(err) => return axum_bad_request(err),
+        };
     let hrp = req.hrp.unwrap_or_else(|| state.cfg.hrp.clone());
-    let payload = match wallet_address_response(&state.cfg, req.account, req.index, &hrp, &key) {
+    let payload = match wallet_address_response(&state.cfg, account, index, &hrp, &key) {
         Ok(value) => value,
         Err(err) => return axum_bad_request(err),
     };
@@ -15643,12 +15865,13 @@ async fn axum_wallet_balance_handler(
         Ok(seed) => seed,
         Err(err) => return axum_bad_request(err),
     };
-    let key = match derive_wallet_key(&seed, req.account, req.index) {
-        Ok(value) => value,
-        Err(err) => return axum_bad_request(err),
-    };
+    let (key, account, index) =
+        match derive_wallet_key_from_request(&seed, req.path.as_deref(), req.account, req.index) {
+            Ok(value) => value,
+            Err(err) => return axum_bad_request(err),
+        };
     let address_payload =
-        match wallet_address_response(&state.cfg, req.account, req.index, &state.cfg.hrp, &key) {
+        match wallet_address_response(&state.cfg, account, index, &state.cfg.hrp, &key) {
             Ok(value) => value,
             Err(err) => return axum_bad_request(err),
         };
@@ -15657,8 +15880,8 @@ async fn axum_wallet_balance_handler(
         Ok(wallet_balance_response(
             runtime,
             &state.cfg,
-            req.account,
-            req.index,
+            account,
+            index,
             address_payload.address.clone(),
             key_hash20,
         ))
@@ -16644,7 +16867,12 @@ fn run_rpc_serve_inner_legacy(
                     continue;
                 }
             };
-            let key = match derive_wallet_key(&seed, req.account, req.index) {
+            let (key, account, index) = match derive_wallet_key_from_request(
+                &seed,
+                req.path.as_deref(),
+                req.account,
+                req.index,
+            ) {
                 Ok(value) => value,
                 Err(err) => {
                     let body = json_error_body(&err.to_string());
@@ -16653,7 +16881,7 @@ fn run_rpc_serve_inner_legacy(
                 }
             };
             let hrp = req.hrp.unwrap_or_else(|| cfg.hrp.clone());
-            let payload = match wallet_address_response(&cfg, req.account, req.index, &hrp, &key) {
+            let payload = match wallet_address_response(&cfg, account, index, &hrp, &key) {
                 Ok(value) => value,
                 Err(err) => {
                     let body = json_error_body(&err.to_string());
@@ -16721,7 +16949,12 @@ fn run_rpc_serve_inner_legacy(
                     continue;
                 }
             };
-            let key = match derive_wallet_key(&seed, req.account, req.index) {
+            let (key, account, index) = match derive_wallet_key_from_request(
+                &seed,
+                req.path.as_deref(),
+                req.account,
+                req.index,
+            ) {
                 Ok(value) => value,
                 Err(err) => {
                     let body = json_error_body(&err.to_string());
@@ -16730,7 +16963,7 @@ fn run_rpc_serve_inner_legacy(
                 }
             };
             let address_payload =
-                match wallet_address_response(&cfg, req.account, req.index, &cfg.hrp, &key) {
+                match wallet_address_response(&cfg, account, index, &cfg.hrp, &key) {
                     Ok(value) => value,
                     Err(err) => {
                         let body = json_error_body(&err.to_string());
@@ -16742,8 +16975,8 @@ fn run_rpc_serve_inner_legacy(
             let payload = wallet_balance_response(
                 &runtime,
                 &cfg,
-                req.account,
-                req.index,
+                account,
+                index,
                 address_payload.address,
                 key_hash20,
             );
@@ -16892,7 +17125,12 @@ fn run_rpc_serve_inner_legacy(
                     continue;
                 }
             };
-            let key = match derive_wallet_key(&seed, req.account, req.index) {
+            let (key, _account, _index) = match derive_wallet_key_from_request(
+                &seed,
+                req.path.as_deref(),
+                req.account,
+                req.index,
+            ) {
                 Ok(value) => value,
                 Err(err) => {
                     let body = json_error_body(&err.to_string());
@@ -17005,7 +17243,12 @@ fn run_rpc_serve_inner_legacy(
                     continue;
                 }
             };
-            let key = match derive_wallet_key(&seed, req.account, req.index) {
+            let (key, _account, _index) = match derive_wallet_key_from_request(
+                &seed,
+                req.path.as_deref(),
+                req.account,
+                req.index,
+            ) {
                 Ok(value) => value,
                 Err(err) => {
                     let body = json_error_body(&err.to_string());
@@ -17378,6 +17621,21 @@ mod tests {
             WalletSeedMode::from(super::WalletSeedModeArg::ScamBlake),
             WalletSeedMode::ScamBlake
         );
+    }
+
+    #[test]
+    fn resolve_wallet_account_index_prefers_explicit_path_when_present() {
+        let (account, index) =
+            super::resolve_wallet_account_index(Some("m/44'/1337'/4'/0/9"), 1, 2).expect("path");
+        assert_eq!(account, 4);
+        assert_eq!(index, 9);
+    }
+
+    #[test]
+    fn resolve_wallet_account_index_falls_back_to_account_index_without_path() {
+        let (account, index) = super::resolve_wallet_account_index(None, 3, 11).expect("fallback");
+        assert_eq!(account, 3);
+        assert_eq!(index, 11);
     }
 
     #[test]
@@ -26682,6 +26940,7 @@ mod tests {
             config: Some(config_path),
             mnemonic: SOAK_FLOW_MNEMONIC.to_owned(),
             passphrase: "".to_owned(),
+            path: None,
             account: 0,
             index: 0,
             to: mainnet_address,
@@ -26720,6 +26979,7 @@ mod tests {
         let address_err = run_wallet(super::WalletCommand::Address {
             mnemonic: "invalid mnemonic words".to_owned(),
             passphrase: "".to_owned(),
+            path: None,
             account: 0,
             index: 0,
             hrp: "sd".to_owned(),

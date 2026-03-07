@@ -381,6 +381,15 @@ Derive address from mnemonic:
 cargo run -p scam-node -- wallet address --mnemonic "<words>" --hrp sd
 ```
 
+Derive address by explicit derivation path:
+
+```bash
+cargo run -p scam-node -- wallet address \
+  --mnemonic "<words>" \
+  --path "m/44'/1337'/0'/0/12" \
+  --hrp sd
+```
+
 Check balance:
 
 ```bash
@@ -388,6 +397,29 @@ cargo run -p scam-node -- wallet balance \
   --network devnet \
   --config config/devnet.toml \
   --mnemonic "<words>"
+```
+
+Check balance by explicit derivation path:
+
+```bash
+cargo run -p scam-node -- wallet balance \
+  --network devnet \
+  --config config/devnet.toml \
+  --mnemonic "<words>" \
+  --path "m/44'/1337'/0'/0/12"
+```
+
+Discover funded paths in account/index ranges (gap-limit scan):
+
+```bash
+cargo run -p scam-node -- wallet discover \
+  --network devnet \
+  --config config/devnet.toml \
+  --mnemonic "<words>" \
+  --start-account 0 \
+  --end-account 5 \
+  --gap-limit 20 \
+  --max-index 500
 ```
 
 Watch-only balance by address:

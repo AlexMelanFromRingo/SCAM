@@ -16,7 +16,8 @@ pub use rescan::{
 };
 pub use signer::{
     BIP44_PURPOSE, DeriveKeyError, EXTERNAL_CHANGE, SCAM_COIN_TYPE, SchnorrError, WalletKey,
-    derivation_path, derivation_path_string, derive_wallet_key, sign_digest, verify_digest,
+    account_index_from_derivation_path, derivation_path, derivation_path_string, derive_wallet_key,
+    derive_wallet_key_from_path, sign_digest, verify_digest,
 };
 pub use vault::{
     DecryptedWalletSecret, EncryptedWalletVault, WalletVaultError, decrypt_wallet_vault,

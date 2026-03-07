@@ -1,3 +1,5 @@
+use std::str::FromStr;
+
 use bitcoin::Network;
 use bitcoin::bip32::{ChildNumber, DerivationPath, Xpriv};
 use secp256k1::schnorr::Signature;
@@ -40,6 +42,84 @@ pub fn derivation_path(account: u32, index: u32) -> Result<DerivationPath, Deriv
 
 pub fn derivation_path_string(account: u32, index: u32) -> Result<String, DeriveKeyError> {
     Ok(format!("m/{}", derivation_path(account, index)?))
+}
+
+pub fn account_index_from_derivation_path(path: &str) -> Result<(u32, u32), DeriveKeyError> {
+    let parsed = path.trim();
+    if parsed.is_empty() {
+        return Err(DeriveKeyError::InvalidDerivationPath(path.to_owned()));
+    }
+
+    let mut parts = parsed.split('/');
+    if parts.next() != Some("m") {
+        return Err(DeriveKeyError::InvalidDerivationPath(path.to_owned()));
+    }
+    let Some(purpose_raw) = parts.next() else {
+        return Err(DeriveKeyError::InvalidDerivationPath(path.to_owned()));
+    };
+    let Some(coin_type_raw) = parts.next() else {
+        return Err(DeriveKeyError::InvalidDerivationPath(path.to_owned()));
+    };
+    let Some(account_raw) = parts.next() else {
+        return Err(DeriveKeyError::InvalidDerivationPath(path.to_owned()));
+    };
+    let Some(change_raw) = parts.next() else {
+        return Err(DeriveKeyError::InvalidDerivationPath(path.to_owned()));
+    };
+    let Some(index_raw) = parts.next() else {
+        return Err(DeriveKeyError::InvalidDerivationPath(path.to_owned()));
+    };
+    if parts.next().is_some() {
+        return Err(DeriveKeyError::InvalidDerivationPath(path.to_owned()));
+    }
+
+    let purpose = parse_hardened_path_component(purpose_raw, path)?;
+    if purpose != BIP44_PURPOSE {
+        return Err(DeriveKeyError::InvalidDerivationPath(path.to_owned()));
+    }
+
+    let coin_type = parse_hardened_path_component(coin_type_raw, path)?;
+    if coin_type != SCAM_COIN_TYPE {
+        return Err(DeriveKeyError::InvalidDerivationPath(path.to_owned()));
+    }
+
+    let account = parse_hardened_path_component(account_raw, path)?;
+    let change = parse_normal_path_component(change_raw, path)?;
+    if change != EXTERNAL_CHANGE {
+        return Err(DeriveKeyError::InvalidDerivationPath(path.to_owned()));
+    }
+
+    let index = parse_normal_path_component(index_raw, path)?;
+    let expected = derivation_path_string(account, index)?;
+    if expected != parsed {
+        return Err(DeriveKeyError::InvalidDerivationPath(path.to_owned()));
+    }
+    Ok((account, index))
+}
+
+pub fn derive_wallet_key_from_path(
+    seed: &[u8],
+    path: &str,
+) -> Result<(WalletKey, u32, u32), DeriveKeyError> {
+    let (account, index) = account_index_from_derivation_path(path)?;
+    let key = derive_wallet_key(seed, account, index)?;
+    Ok((key, account, index))
+}
+
+fn parse_hardened_path_component(component: &str, full_path: &str) -> Result<u32, DeriveKeyError> {
+    let Some(raw_value) = component.strip_suffix('\'') else {
+        return Err(DeriveKeyError::InvalidDerivationPath(full_path.to_owned()));
+    };
+    u32::from_str(raw_value)
+        .map_err(|_| DeriveKeyError::InvalidDerivationPath(full_path.to_owned()))
+}
+
+fn parse_normal_path_component(component: &str, full_path: &str) -> Result<u32, DeriveKeyError> {
+    if component.ends_with('\'') {
+        return Err(DeriveKeyError::InvalidDerivationPath(full_path.to_owned()));
+    }
+    u32::from_str(component)
+        .map_err(|_| DeriveKeyError::InvalidDerivationPath(full_path.to_owned()))
 }
 
 pub fn derive_wallet_key(
@@ -95,6 +175,8 @@ pub fn verify_digest(
 pub enum DeriveKeyError {
     #[error("seed must not be empty")]
     EmptySeed,
+    #[error("invalid derivation path '{0}' (expected m/44'/1337'/<account>'/0/<index>)")]
+    InvalidDerivationPath(String),
     #[error("bip32 derivation failed: {0}")]
     Bip32(#[source] bitcoin::bip32::Error),
     #[error("invalid bip32 path component: {0}")]
@@ -111,7 +193,10 @@ pub enum SchnorrError {
 
 #[cfg(test)]
 mod tests {
-    use crate::signer::{derivation_path_string, derive_wallet_key, sign_digest, verify_digest};
+    use crate::signer::{
+        account_index_from_derivation_path, derivation_path_string, derive_wallet_key,
+        derive_wallet_key_from_path, sign_digest, verify_digest,
+    };
 
     #[test]
     fn schnorr_sign_verify_roundtrip() {
@@ -163,5 +248,36 @@ mod tests {
         assert_ne!(sk_b, [0u8; 32]);
         assert_ne!(sk_b, [1u8; 32]);
         assert_ne!(sk_a, sk_b);
+    }
+
+    #[test]
+    fn parse_derivation_path_extracts_account_and_index() {
+        let (account, index) =
+            account_index_from_derivation_path("m/44'/1337'/12'/0/34").expect("path");
+        assert_eq!(account, 12);
+        assert_eq!(index, 34);
+    }
+
+    #[test]
+    fn parse_derivation_path_rejects_wrong_purpose_coin_type_or_shape() {
+        assert!(account_index_from_derivation_path("m/84'/1337'/0'/0/0").is_err());
+        assert!(account_index_from_derivation_path("m/44'/0'/0'/0/0").is_err());
+        assert!(account_index_from_derivation_path("m/44'/1337'/0'/1/0").is_err());
+        assert!(account_index_from_derivation_path("44'/1337'/0'/0/0").is_err());
+    }
+
+    #[test]
+    fn derive_wallet_key_from_path_matches_account_index_derivation() {
+        let seed = [55u8; 64];
+        let (by_path, account, index) =
+            derive_wallet_key_from_path(&seed, "m/44'/1337'/2'/0/7").expect("derive by path");
+        let by_components =
+            derive_wallet_key(&seed, account, index).expect("derive by account/index");
+        assert_eq!(account, 2);
+        assert_eq!(index, 7);
+        assert_eq!(
+            by_path.pubkey_compressed(),
+            by_components.pubkey_compressed()
+        );
     }
 }
