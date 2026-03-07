@@ -1747,6 +1747,37 @@ fn remove_confirmed_txids_present_on_chain(runtime: &ChainRuntime, mempool: &mut
     mempool.remove_confirmed_txids(&confirmed_txids).len()
 }
 
+fn remove_mempool_txs_with_missing_inputs(runtime: &ChainRuntime, mempool: &mut Mempool) -> usize {
+    let mut removed_total = 0usize;
+    loop {
+        let stale = mempool
+            .txids_by_feerate_desc()
+            .into_iter()
+            .filter(|txid| {
+                mempool
+                    .get_with_fee(txid)
+                    .map(|(tx, _)| !detect_missing_outpoints(runtime, mempool, tx).is_empty())
+                    .unwrap_or(false)
+            })
+            .collect::<Vec<_>>();
+        if stale.is_empty() {
+            break;
+        }
+        let removed = mempool.remove_confirmed_txids(&stale);
+        if removed.is_empty() {
+            break;
+        }
+        removed_total = removed_total.saturating_add(removed.len());
+    }
+    removed_total
+}
+
+fn cleanup_mempool_against_chain(runtime: &ChainRuntime, mempool: &mut Mempool) -> usize {
+    let removed_confirmed = remove_confirmed_txids_present_on_chain(runtime, mempool);
+    let removed_missing = remove_mempool_txs_with_missing_inputs(runtime, mempool);
+    removed_confirmed.saturating_add(removed_missing)
+}
+
 fn is_runtime_db_lock_conflict(err: &NodeError) -> bool {
     let msg = err.to_string();
     msg.contains("Database already open")
@@ -6164,8 +6195,11 @@ fn relay_apply_main_chain_transition(
         }
     }
 
-    let confirmed = connected_txids.iter().copied().collect::<Vec<_>>();
-    let _ = state.relay.mempool.remove_confirmed_txids(&confirmed);
+    if !connected_hashes.is_empty() || !disconnected_hashes.is_empty() {
+        let confirmed = connected_txids.iter().copied().collect::<Vec<_>>();
+        let _ = state.relay.mempool.remove_confirmed_txids(&confirmed);
+        let _ = remove_mempool_txs_with_missing_inputs(&state.runtime, &mut state.relay.mempool);
+    }
 
     for block in connected_blocks {
         let _ = state.relay.gossip.announce_block(block.clone());
@@ -6696,7 +6730,12 @@ fn load_relay_outbound_feeler_target(
     excluded_targets: &HashSet<String>,
 ) -> Result<Option<String>, NodeError> {
     let (peers_db_path, legacy_txt_path) = peer_book_paths(peers_dir, &cfg.network_id);
-    let mut peer_book = load_or_init_peer_book(&cfg.network_id, &peers_db_path, &legacy_txt_path)?;
+    let mut peer_book = match load_with_retry(10, 15, is_peer_book_db_lock_conflict, || {
+        load_or_init_peer_book(&cfg.network_id, &peers_db_path, &legacy_txt_path)
+    })? {
+        Some(book) => book,
+        None => return Ok(None),
+    };
     sort_and_dedup_peer_book(&mut peer_book);
     let network_policy = RelayNetworkPolicy::from_env();
     let mut candidates = peer_book
@@ -8890,8 +8929,7 @@ fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
     RELAY_TX_DIFFUSION_MAX_MS.store(tx_diffusion_max_ms, Ordering::Relaxed);
     let network_policy = RelayNetworkPolicy::from_env();
     let mut startup_mempool = load_mempool_from_db_or_empty(&cfg, &mempool_db_path)?;
-    let removed_confirmed_startup =
-        remove_confirmed_txids_present_on_chain(&runtime, &mut startup_mempool);
+    let removed_confirmed_startup = cleanup_mempool_against_chain(&runtime, &mut startup_mempool);
     if should_persist_startup_mempool_cleanup(removed_confirmed_startup) {
         persist_mempool_db_with_retry(&cfg, &startup_mempool, &mempool_db_path, 80, 25)?;
         println!(
@@ -15629,10 +15667,7 @@ async fn axum_mempool_handler(AxumState(state): AxumState<AxumRpcState>) -> Axum
         match load_mempool_from_db_or_empty_with_retry(&state.cfg, &state.mempool_db_path, 10, 15) {
             Ok(mut mempool) => {
                 let removed_confirmed = match axum_runtime_for_query(&state, |runtime| {
-                    Ok(remove_confirmed_txids_present_on_chain(
-                        runtime,
-                        &mut mempool,
-                    ))
+                    Ok(cleanup_mempool_against_chain(runtime, &mut mempool))
                 }) {
                     Ok(removed) => removed,
                     Err(err) => return axum_internal_error(err),
@@ -16639,7 +16674,7 @@ fn run_rpc_serve_inner_legacy(
                 match load_mempool_from_db_or_empty_with_retry(&cfg, &mempool_db_path, 10, 15) {
                     Ok(mut mempool) => {
                         let removed_confirmed =
-                            remove_confirmed_txids_present_on_chain(&runtime, &mut mempool);
+                            cleanup_mempool_against_chain(&runtime, &mut mempool);
                         if should_persist_startup_mempool_cleanup(removed_confirmed)
                             && let Err(err) = persist_mempool_db_with_retry(
                                 &cfg,

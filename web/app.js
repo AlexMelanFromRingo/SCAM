@@ -15,6 +15,8 @@ const statRelayMempool = document.getElementById("statRelayMempool");
 const statNetworkHashrate = document.getElementById("statNetworkHashrate");
 const statPoolHashrate = document.getElementById("statPoolHashrate");
 const statPoolWorkers = document.getElementById("statPoolWorkers");
+const statSystemTime = document.getElementById("statSystemTime");
+const statDifficulty = document.getElementById("statDifficulty");
 const latestRange = document.getElementById("latestRange");
 const latestBlocksBody = document.getElementById("latestBlocksBody");
 
@@ -60,6 +62,7 @@ const state = {
     blockError: "",
     txError: "",
   },
+  latestTarget: null,
 };
 
 function parseNumber(value, fallback = 0) {
@@ -93,6 +96,15 @@ function formatHashrate(value) {
   return `${n.toFixed(2)} H/s`;
 }
 
+function formatSystemTime24h(date = new Date()) {
+  return date.toLocaleTimeString([], {
+    hour12: false,
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
 function formatJson(data) {
   return JSON.stringify(data, null, 2);
 }
@@ -101,6 +113,11 @@ function setResult(el, data, isError = false) {
   el.innerHTML = "";
   el.textContent = typeof data === "string" ? data : formatJson(data);
   el.classList.toggle("error", isError);
+}
+
+function setTextIfPresent(el, value, format = (v) => `${v}`) {
+  if (value === null || value === undefined || Number.isNaN(value)) return;
+  el.textContent = format(value);
 }
 
 function formatUnixTimestamp(unixSec) {
@@ -711,20 +728,13 @@ async function request(path, { method = "GET", body } = {}) {
 
 async function loadStatus() {
   const status = await request("/status");
-  statNetwork.textContent = status.network_id ?? "-";
-  statHeight.textContent = `${status.tip_height ?? "-"}`;
-  statUtxo.textContent = `${status.utxo_count ?? "-"}`;
-  statWork.textContent = status.cumulative_work ?? "-";
-  statRelayPeers.textContent = "-";
-  statSyncLag.textContent = "-";
-  statLastBlockAge.textContent = "-";
-  statRelayMempool.textContent = "-";
-  statNetworkHashrate.textContent = formatHashrate(status.network_hashrate_hps);
-  statPoolHashrate.textContent = formatHashrate(status.stratum_pool_hashrate_hps);
-  statPoolWorkers.textContent =
-    status.stratum_workers_active === null || status.stratum_workers_active === undefined
-      ? "-"
-      : `${status.stratum_workers_active}`;
+  setTextIfPresent(statNetwork, status.network_id);
+  setTextIfPresent(statHeight, status.tip_height);
+  setTextIfPresent(statUtxo, status.utxo_count);
+  setTextIfPresent(statWork, status.cumulative_work);
+  setTextIfPresent(statNetworkHashrate, status.network_hashrate_hps, formatHashrate);
+  setTextIfPresent(statPoolHashrate, status.stratum_pool_hashrate_hps, formatHashrate);
+  setTextIfPresent(statPoolWorkers, status.stratum_workers_active);
   return status;
 }
 
@@ -743,6 +753,10 @@ function renderLatestBlocks(blocks, tipHeight) {
   }
   const first = blocks.length ? blocks[blocks.length - 1].height : tipHeight;
   latestRange.textContent = `${first}..${tipHeight}`;
+  if (blocks.length && blocks[0].target) {
+    state.latestTarget = blocks[0].target;
+    statDifficulty.textContent = blocks[0].target;
+  }
 }
 
 async function loadLatestBlocks(tipHeight, count = 12) {
@@ -787,6 +801,9 @@ async function loadMempool() {
       state.lastMempoolCount = countFromField;
     } else if (Number.isFinite(countFromTxids)) {
       state.lastMempoolCount = countFromTxids;
+    }
+    if (Number.isFinite(state.lastMempoolCount)) {
+      statRelayMempool.textContent = `${state.lastMempoolCount}`;
     }
     setResult(mempoolOut, mempool);
   } catch (error) {
@@ -839,29 +856,17 @@ async function refreshDashboard() {
 
 function applyLiveSnapshot(snapshot) {
   if (!snapshot || typeof snapshot !== "object") return;
-  statNetwork.textContent = snapshot.network_id ?? "-";
-  statHeight.textContent = `${snapshot.tip_height ?? "-"}`;
-  statUtxo.textContent = `${snapshot.utxo_count ?? "-"}`;
-  statWork.textContent = snapshot.cumulative_work ?? "-";
-  statRelayPeers.textContent =
-    snapshot.relay_active_peers === null || snapshot.relay_active_peers === undefined
-      ? "-"
-      : `${snapshot.relay_active_peers}`;
-  statSyncLag.textContent =
-    snapshot.sync_lag_blocks === null || snapshot.sync_lag_blocks === undefined
-      ? "-"
-      : `${snapshot.sync_lag_blocks} blk`;
-  statLastBlockAge.textContent = formatAgeSeconds(snapshot.last_block_age_sec);
-  statRelayMempool.textContent =
-    snapshot.relay_mempool_len === null || snapshot.relay_mempool_len === undefined
-      ? "-"
-      : `${snapshot.relay_mempool_len}`;
-  statNetworkHashrate.textContent = formatHashrate(snapshot.network_hashrate_hps);
-  statPoolHashrate.textContent = formatHashrate(snapshot.stratum_pool_hashrate_hps);
-  statPoolWorkers.textContent =
-    snapshot.stratum_workers_active === null || snapshot.stratum_workers_active === undefined
-      ? "-"
-      : `${snapshot.stratum_workers_active}`;
+  setTextIfPresent(statNetwork, snapshot.network_id);
+  setTextIfPresent(statHeight, snapshot.tip_height);
+  setTextIfPresent(statUtxo, snapshot.utxo_count);
+  setTextIfPresent(statWork, snapshot.cumulative_work);
+  setTextIfPresent(statRelayPeers, snapshot.relay_active_peers);
+  setTextIfPresent(statSyncLag, snapshot.sync_lag_blocks, (v) => `${v} blk`);
+  setTextIfPresent(statLastBlockAge, snapshot.last_block_age_sec, formatAgeSeconds);
+  setTextIfPresent(statRelayMempool, snapshot.relay_mempool_len);
+  setTextIfPresent(statNetworkHashrate, snapshot.network_hashrate_hps, formatHashrate);
+  setTextIfPresent(statPoolHashrate, snapshot.stratum_pool_hashrate_hps, formatHashrate);
+  setTextIfPresent(statPoolWorkers, snapshot.stratum_workers_active);
 
   const tipHeight = Number(snapshot.tip_height);
   if (Number.isFinite(tipHeight) && tipHeight !== state.lastTipHeight) {
@@ -878,6 +883,16 @@ function applyLiveSnapshot(snapshot) {
       setResult(mempoolOut, `Live mempool refresh failed: ${error.message}`, true);
     });
   }
+}
+
+function startSystemClock() {
+  const tick = () => {
+    if (statSystemTime) {
+      statSystemTime.textContent = formatSystemTime24h();
+    }
+  };
+  tick();
+  setInterval(tick, 1000);
 }
 
 function startLiveStream() {
@@ -1234,6 +1249,7 @@ async function bootstrap() {
   initWalletActions();
   await refreshDashboard();
   startLiveStream();
+  startSystemClock();
   setInterval(() => {
     refreshDashboard().catch((error) => {
       setResult(mempoolOut, `Auto refresh failed: ${error.message}`, true);

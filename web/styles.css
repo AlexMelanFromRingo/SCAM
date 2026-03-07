@@ -215,6 +215,14 @@ code,
   word-break: break-word;
 }
 
+.stat-card-wide {
+  width: 100%;
+}
+
+.stat-card .value.centered {
+  text-align: center;
+}
+
 .table-wrap {
   overflow: auto;
   border: 1px solid var(--stroke);

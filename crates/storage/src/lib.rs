@@ -1,5 +1,6 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use redb::{Database, ReadableTable, TableDefinition};
 use scam_consensus::{UtxoEntry, UtxoSet};
@@ -1091,12 +1092,16 @@ fn bytes_to_hash(raw: &[u8], context: &str) -> Result<Hash256, StorageError> {
     Ok(Hash256(buf))
 }
 
-fn temp_db_path(path: &Path) -> std::path::PathBuf {
+static TEMP_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn temp_db_path(path: &Path) -> PathBuf {
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
-        .map(|name| format!("{name}.tmp"))
-        .unwrap_or_else(|| "chain.tmp".to_owned());
+        .unwrap_or("chain");
+    let suffix = TEMP_DB_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let file_name = format!("{file_name}.tmp.{pid}.{suffix}");
     path.with_file_name(file_name)
 }
 
@@ -1174,6 +1179,16 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&path);
         path
+    }
+
+    #[test]
+    fn temp_db_path_is_unique_per_call() {
+        let base = PathBuf::from("target/storage-temp-path/runtime.redb");
+        let one = super::temp_db_path(&base);
+        let two = super::temp_db_path(&base);
+        assert_ne!(one, two);
+        assert_eq!(one.parent(), base.parent());
+        assert_eq!(two.parent(), base.parent());
     }
 
     #[test]
