@@ -203,6 +203,8 @@ struct StatusArgs {
     network: Network,
     #[arg(long)]
     config: Option<PathBuf>,
+    #[arg(long)]
+    runtime_db: Option<PathBuf>,
     #[arg(long, default_value_t = 0)]
     mine_blocks: u32,
     #[arg(long, default_value_t = 120)]
@@ -220,6 +222,8 @@ struct GetBlockArgs {
     #[arg(long)]
     config: Option<PathBuf>,
     #[arg(long)]
+    runtime_db: Option<PathBuf>,
+    #[arg(long)]
     height: u64,
     #[arg(long, default_value_t = 120)]
     interval_sec: u64,
@@ -235,6 +239,8 @@ struct GetTxArgs {
     network: Network,
     #[arg(long)]
     config: Option<PathBuf>,
+    #[arg(long)]
+    runtime_db: Option<PathBuf>,
     #[arg(long)]
     height: u64,
     #[arg(long)]
@@ -2342,7 +2348,7 @@ fn run_status(args: StatusArgs) -> Result<(), NodeError> {
     let (cfg, runtime) = build_runtime_for_query(
         args.network,
         args.config,
-        None,
+        args.runtime_db,
         args.mine_blocks,
         args.interval_sec,
         args.max_nonce,
@@ -2383,7 +2389,7 @@ fn run_get_block(args: GetBlockArgs) -> Result<(), NodeError> {
     let (_cfg, runtime) = build_runtime_for_query(
         args.network,
         args.config,
-        None,
+        args.runtime_db,
         mine_blocks,
         args.interval_sec,
         args.max_nonce,
@@ -2424,7 +2430,7 @@ fn run_get_tx(args: GetTxArgs) -> Result<(), NodeError> {
     let (_cfg, runtime) = build_runtime_for_query(
         args.network,
         args.config,
-        None,
+        args.runtime_db,
         mine_blocks,
         args.interval_sec,
         args.max_nonce,
@@ -8945,15 +8951,17 @@ fn run_relay_peer_session<IO: Read + Write>(
             if should_stop_after_seen_messages(read_limit, seen) {
                 break;
             }
-            {
+            let now_for_periodic = current_unix_sec().unwrap_or(0);
+            let periodic_outbound = {
                 let mut guard = state
                     .lock()
                     .map_err(|_| NodeError::Runtime("relay state mutex poisoned".to_owned()))?;
-                refresh_runtime_from_db_if_changed(
+                let _ = refresh_relay_runtime_from_db_if_changed(
                     cfg,
-                    &mut guard.runtime,
+                    &mut guard,
                     runtime_db_path,
                     &mut runtime_db_seen_mtime,
+                    now_for_periodic,
                 )?;
                 refresh_mempool_from_db_if_changed(
                     cfg,
@@ -8961,6 +8969,28 @@ fn run_relay_peer_session<IO: Read + Write>(
                     mempool_db_path,
                     &mut mempool_db_seen_mtime,
                 )?;
+                let mut periodic = relay_proactive_inventory_messages(
+                    &guard,
+                    &mut last_tip_announced,
+                    &mut announced_txids,
+                    max_inv_items,
+                );
+                let recon = guard
+                    .relay
+                    .gossip
+                    .maybe_start_reconciliation(peer_id, now_for_periodic)?;
+                periodic.extend(relay_gossip_outbound_for_peer(&guard, peer_id, recon));
+                if let Some(get_headers) =
+                    relay_maybe_request_headers_catchup(&mut guard, peer_id, now_for_periodic)
+                {
+                    periodic.push(get_headers);
+                }
+                relay_messages_for_peer(&guard, peer_id, periodic)
+            };
+            if !periodic_outbound.is_empty()
+                && !relay_send_messages_until_closed(stream, &periodic_outbound, &framing)?
+            {
+                break;
             }
 
             let inbound = match map_relay_read_result(read_message(stream, &framing))? {
@@ -8971,33 +9001,6 @@ fn run_relay_peer_session<IO: Read + Write>(
                     }
                     if stop_flag.load(Ordering::Relaxed) {
                         break;
-                    }
-                    let now = current_unix_sec().unwrap_or(0);
-                    let proactive = {
-                        let mut guard = state.lock().map_err(|_| {
-                            NodeError::Runtime("relay state mutex poisoned".to_owned())
-                        })?;
-                        let mut proactive = relay_proactive_inventory_messages(
-                            &guard,
-                            &mut last_tip_announced,
-                            &mut announced_txids,
-                            max_inv_items,
-                        );
-                        let recon = guard
-                            .relay
-                            .gossip
-                            .maybe_start_reconciliation(peer_id, now)?;
-                        proactive.extend(relay_gossip_outbound_for_peer(&guard, peer_id, recon));
-                        if let Some(get_headers) =
-                            relay_maybe_request_headers_catchup(&mut guard, peer_id, now)
-                        {
-                            proactive.push(get_headers);
-                        }
-                        relay_messages_for_peer(&guard, peer_id, proactive)
-                    };
-                    match relay_send_messages_until_closed(stream, &proactive, &framing)? {
-                        true => {}
-                        false => break,
                     }
                     continue;
                 }
@@ -9224,15 +9227,17 @@ async fn run_relay_peer_session_async<S: AsyncRead + AsyncWrite + Unpin>(
             if should_stop_after_seen_messages(read_limit, seen) {
                 break;
             }
-            {
+            let now_for_periodic = current_unix_sec().unwrap_or(0);
+            let periodic_outbound = {
                 let mut guard = state
                     .lock()
                     .map_err(|_| NodeError::Runtime("relay state mutex poisoned".to_owned()))?;
-                refresh_runtime_from_db_if_changed(
+                let _ = refresh_relay_runtime_from_db_if_changed(
                     cfg,
-                    &mut guard.runtime,
+                    &mut guard,
                     runtime_db_path,
                     &mut runtime_db_seen_mtime,
+                    now_for_periodic,
                 )?;
                 refresh_mempool_from_db_if_changed(
                     cfg,
@@ -9240,60 +9245,54 @@ async fn run_relay_peer_session_async<S: AsyncRead + AsyncWrite + Unpin>(
                     mempool_db_path,
                     &mut mempool_db_seen_mtime,
                 )?;
-            }
-
-            let inbound = match relay_read_with_timeout_async(stream, &framing, read_timeout_sec)
+                let mut periodic = relay_proactive_inventory_messages(
+                    &guard,
+                    &mut last_tip_announced,
+                    &mut announced_txids,
+                    max_inv_items,
+                );
+                let recon = guard
+                    .relay
+                    .gossip
+                    .maybe_start_reconciliation(peer_id, now_for_periodic)?;
+                periodic.extend(relay_gossip_outbound_for_peer(&guard, peer_id, recon));
+                if let Some(get_headers) =
+                    relay_maybe_request_headers_catchup(&mut guard, peer_id, now_for_periodic)
+                {
+                    periodic.push(get_headers);
+                }
+                relay_messages_for_peer(&guard, peer_id, periodic)
+            };
+            if !periodic_outbound.is_empty()
+                && !relay_send_messages_until_closed_async(
+                    stream,
+                    &periodic_outbound,
+                    &framing,
+                    write_timeout_sec,
+                )
                 .await?
             {
-                RelayReadOutcome::Timeout => {
-                    timeout_streak = timeout_streak.saturating_add(1);
-                    if relay_timeout_streak_reached_limit(timeout_streak) {
-                        break;
-                    }
-                    if stop_flag.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    let now = current_unix_sec().unwrap_or(0);
-                    let proactive = {
-                        let mut guard = state.lock().map_err(|_| {
-                            NodeError::Runtime("relay state mutex poisoned".to_owned())
-                        })?;
-                        let mut proactive = relay_proactive_inventory_messages(
-                            &guard,
-                            &mut last_tip_announced,
-                            &mut announced_txids,
-                            max_inv_items,
-                        );
-                        let recon = guard
-                            .relay
-                            .gossip
-                            .maybe_start_reconciliation(peer_id, now)?;
-                        proactive.extend(relay_gossip_outbound_for_peer(&guard, peer_id, recon));
-                        if let Some(get_headers) =
-                            relay_maybe_request_headers_catchup(&mut guard, peer_id, now)
-                        {
-                            proactive.push(get_headers);
+                break;
+            }
+
+            let inbound =
+                match relay_read_with_timeout_async(stream, &framing, read_timeout_sec).await? {
+                    RelayReadOutcome::Timeout => {
+                        timeout_streak = timeout_streak.saturating_add(1);
+                        if relay_timeout_streak_reached_limit(timeout_streak) {
+                            break;
                         }
-                        relay_messages_for_peer(&guard, peer_id, proactive)
-                    };
-                    if !relay_send_messages_until_closed_async(
-                        stream,
-                        &proactive,
-                        &framing,
-                        write_timeout_sec,
-                    )
-                    .await?
-                    {
-                        break;
+                        if stop_flag.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        continue;
                     }
-                    continue;
-                }
-                RelayReadOutcome::Closed => break,
-                RelayReadOutcome::Message(message) => {
-                    timeout_streak = 0;
-                    message
-                }
-            };
+                    RelayReadOutcome::Closed => break,
+                    RelayReadOutcome::Message(message) => {
+                        timeout_streak = 0;
+                        message
+                    }
+                };
 
             seen = seen.saturating_add(1);
             let now = current_unix_sec()?;
@@ -15571,6 +15570,23 @@ fn refresh_runtime_from_db_if_changed(
     Ok(())
 }
 
+fn refresh_relay_runtime_from_db_if_changed(
+    cfg: &ChainConfig,
+    state: &mut RelayServerState,
+    runtime_db_path: &Path,
+    last_seen_mtime: &mut Option<SystemTime>,
+    now_unix_sec: u64,
+) -> Result<bool, NodeError> {
+    let chain_before = state.runtime.block_hashes().to_vec();
+    refresh_runtime_from_db_if_changed(cfg, &mut state.runtime, runtime_db_path, last_seen_mtime)?;
+    let chain_after = state.runtime.block_hashes().to_vec();
+    if chain_before == chain_after {
+        return Ok(false);
+    }
+    relay_apply_main_chain_transition(state, &chain_before, &chain_after, now_unix_sec);
+    Ok(true)
+}
+
 fn refresh_mempool_from_db_if_changed(
     cfg: &ChainConfig,
     relay: &mut RelayAdmissionState,
@@ -18218,7 +18234,14 @@ fn run_rpc_serve_with_shutdown(
 }
 
 fn run_command(cli: Cli) -> Result<(), NodeError> {
-    match cli.command {
+    let Cli {
+        command,
+        network: global_network,
+        config: global_config,
+        runtime_db: global_runtime_db,
+        print_genesis: global_print_genesis,
+    } = cli;
+    match command {
         Some(Command::Node(args)) => run_node(
             args.network,
             args.config,
@@ -18226,9 +18249,33 @@ fn run_command(cli: Cli) -> Result<(), NodeError> {
             args.print_genesis,
         ),
         Some(Command::RunMode(args)) => run_mode(args),
-        Some(Command::Status(args)) => run_status(args),
-        Some(Command::GetBlock(args)) => run_get_block(args),
-        Some(Command::GetTx(args)) => run_get_tx(args),
+        Some(Command::Status(mut args)) => {
+            if args.config.is_none() {
+                args.config = global_config.clone();
+            }
+            if args.runtime_db.is_none() {
+                args.runtime_db = global_runtime_db.clone();
+            }
+            run_status(args)
+        }
+        Some(Command::GetBlock(mut args)) => {
+            if args.config.is_none() {
+                args.config = global_config.clone();
+            }
+            if args.runtime_db.is_none() {
+                args.runtime_db = global_runtime_db.clone();
+            }
+            run_get_block(args)
+        }
+        Some(Command::GetTx(mut args)) => {
+            if args.config.is_none() {
+                args.config = global_config.clone();
+            }
+            if args.runtime_db.is_none() {
+                args.runtime_db = global_runtime_db.clone();
+            }
+            run_get_tx(args)
+        }
         Some(Command::ConfigScaffold(args)) => run_config_scaffold(args),
         Some(Command::AddPeer(args)) => run_add_peer(args),
         Some(Command::HashVisual(args)) => run_hash_visual(args),
@@ -18256,7 +18303,12 @@ fn run_command(cli: Cli) -> Result<(), NodeError> {
         Some(Command::RpcServe(args)) => run_rpc_serve(args),
         Some(Command::Snapshot(args)) => run_snapshot(args.command),
         Some(Command::P2pDemo) => run_p2p_demo().map(|_| ()),
-        None => run_node(cli.network, cli.config, cli.runtime_db, cli.print_genesis),
+        None => run_node(
+            global_network,
+            global_config,
+            global_runtime_db,
+            global_print_genesis,
+        ),
     }
 }
 
@@ -23724,6 +23776,7 @@ mod tests {
         let status_err = super::run_status(super::StatusArgs {
             network: Network::Devnet,
             config: Some(missing_cfg.clone()),
+            runtime_db: None,
             mine_blocks: 0,
             interval_sec: 120,
             max_nonce: 1,
@@ -23735,6 +23788,7 @@ mod tests {
         let block_err = super::run_get_block(super::GetBlockArgs {
             network: Network::Devnet,
             config: Some(missing_cfg.clone()),
+            runtime_db: None,
             height: 0,
             interval_sec: 120,
             max_nonce: 1,
@@ -23746,6 +23800,7 @@ mod tests {
         let tx_err = super::run_get_tx(super::GetTxArgs {
             network: Network::Devnet,
             config: Some(missing_cfg),
+            runtime_db: None,
             height: 0,
             tx_index: 0,
             interval_sec: 120,
@@ -28590,6 +28645,78 @@ mod tests {
         assert_eq!(local_runtime.tip_height(), producer.tip_height());
         assert!(super::runtime_db_mtime(&runtime_db_path).is_some());
         assert!(super::file_mtime(&runtime_db_path).is_some());
+
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
+    fn refresh_relay_runtime_from_db_if_changed_announces_connected_blocks() {
+        let mut cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("devnet config");
+        cfg.coinbase_maturity = 1;
+        cfg.validate().expect("config validate");
+
+        let work_dir = temp_dir("test-refresh-relay-runtime-announces");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let runtime_db_path = work_dir.join("runtime.redb");
+
+        let mut producer = ChainRuntime::from_config(cfg.clone()).expect("producer runtime");
+        mine_blocks_on_runtime(
+            &mut producer,
+            &super::MiningLoopParams {
+                count: 1,
+                interval_sec: cfg.target_block_time_sec,
+                max_nonce: 500_000,
+                subsidy: cfg.block_subsidy,
+                miner_key_hash: cfg.genesis_reward_key_hash20().expect("reward key"),
+                label_prefix: "refresh-relay-runtime",
+                print_each: false,
+            },
+        )
+        .expect("mine producer");
+        persist_runtime_db(&producer, &runtime_db_path).expect("persist runtime");
+
+        let relay = RelayAdmissionState {
+            mempool: Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip: GossipEngine::new(cfg.p2p_max_inv_items as usize).expect("gossip"),
+        };
+        let mut state = RelayServerState::new(
+            ChainRuntime::from_config(cfg.clone()).expect("local runtime"),
+            relay,
+        );
+        let mut seen = None;
+
+        let changed = super::refresh_relay_runtime_from_db_if_changed(
+            &cfg,
+            &mut state,
+            &runtime_db_path,
+            &mut seen,
+            super::current_unix_sec().expect("now"),
+        )
+        .expect("refresh relay runtime");
+        assert!(changed, "runtime update should be detected");
+        assert_eq!(state.runtime.tip_hash(), producer.tip_hash());
+        assert_eq!(state.runtime.tip_height(), producer.tip_height());
+        assert!(
+            state
+                .relay
+                .gossip
+                .has_inventory(&InventoryItem::Block(producer.tip_hash())),
+            "connected block must be announced into local gossip inventory"
+        );
+
+        let unchanged = super::refresh_relay_runtime_from_db_if_changed(
+            &cfg,
+            &mut state,
+            &runtime_db_path,
+            &mut seen,
+            super::current_unix_sec().expect("now"),
+        )
+        .expect("refresh unchanged runtime");
+        assert!(!unchanged, "same mtime must not force redundant transition");
 
         let _ = fs::remove_dir_all(work_dir);
     }
@@ -35285,5 +35412,48 @@ mod tests {
         ])
         .expect_err("run_from_args must execute command dispatch");
         assert!(err.to_string().contains("config"));
+    }
+
+    #[test]
+    fn run_from_args_status_uses_global_config_and_runtime_db_fallbacks() {
+        let work_dir = temp_dir("run-from-args-global-runtime-db");
+        fs::create_dir_all(&work_dir).expect("create work dir");
+        let cfg_path = work_dir.join("devnet.toml");
+        fs::write(&cfg_path, include_str!("../../../config/devnet.toml")).expect("write cfg");
+        let runtime_db = work_dir.join("runtime.redb");
+
+        super::run_node(
+            Network::Devnet,
+            Some(cfg_path.clone()),
+            Some(runtime_db.clone()),
+            false,
+        )
+        .expect("initialize runtime db");
+
+        super::run_from_args([
+            "scam-node",
+            "--network",
+            "devnet",
+            "--config",
+            cfg_path.to_str().expect("cfg path"),
+            "--runtime-db",
+            runtime_db.to_str().expect("runtime db path"),
+            "status",
+        ])
+        .expect("status should use global config/runtime_db fallbacks");
+
+        super::run_from_args([
+            "scam-node",
+            "--network",
+            "devnet",
+            "--config",
+            cfg_path.to_str().expect("cfg path"),
+            "--runtime-db",
+            runtime_db.to_str().expect("runtime db path"),
+            "get-block",
+            "--height",
+            "0",
+        ])
+        .expect("get-block should use global config/runtime_db fallbacks");
     }
 }
