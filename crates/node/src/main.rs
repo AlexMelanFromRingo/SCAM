@@ -1293,6 +1293,161 @@ fn derive_wallet_key_from_request(
     Ok((key, account, index))
 }
 
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+struct WalletDiscoveryAggregate {
+    total: u128,
+    spendable: u128,
+    immature: u128,
+    utxo_count: usize,
+    spendable_count: usize,
+    immature_count: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WalletDiscoveryEntry {
+    account: u32,
+    index: u32,
+    address: String,
+    key_hash20: [u8; 20],
+    total: u128,
+    spendable: u128,
+    immature: u128,
+    utxo_count: usize,
+    spendable_count: usize,
+    immature_count: usize,
+}
+
+fn wallet_discovery_aggregate_by_key(
+    runtime: &ChainRuntime,
+) -> HashMap<[u8; 20], WalletDiscoveryAggregate> {
+    let mut by_key_hash = HashMap::<[u8; 20], WalletDiscoveryAggregate>::new();
+    let tip_height = runtime.tip_height();
+    let coinbase_maturity = runtime.config().coinbase_maturity as u64;
+    let wallet_min_confirmations = runtime.config().wallet_min_spendable_confirmations as u64;
+    for utxo in runtime.utxo_set().values() {
+        let entry = by_key_hash.entry(utxo.key_hash20).or_default();
+        entry.utxo_count = entry.utxo_count.saturating_add(1);
+        entry.total = entry.total.saturating_add(utxo.value as u128);
+        if wallet_prevout_is_immature(
+            tip_height,
+            utxo.is_coinbase,
+            utxo.created_height,
+            coinbase_maturity,
+            wallet_min_confirmations,
+        ) {
+            entry.immature_count = entry.immature_count.saturating_add(1);
+            entry.immature = entry.immature.saturating_add(utxo.value as u128);
+        } else {
+            entry.spendable_count = entry.spendable_count.saturating_add(1);
+            entry.spendable = entry.spendable.saturating_add(utxo.value as u128);
+        }
+    }
+    by_key_hash
+}
+
+fn discover_wallet_paths_for_seed(
+    runtime: &ChainRuntime,
+    seed: &[u8],
+    start_account: u32,
+    end_account: u32,
+    gap_limit: u32,
+    max_index: u32,
+) -> Result<Vec<WalletDiscoveryEntry>, NodeError> {
+    if start_account > end_account {
+        return Err(NodeError::Runtime(format!(
+            "invalid account range: start_account={} end_account={}",
+            start_account, end_account
+        )));
+    }
+    if gap_limit == 0 {
+        return Err(NodeError::Runtime("gap_limit must be >= 1".to_owned()));
+    }
+
+    let by_key_hash = wallet_discovery_aggregate_by_key(runtime);
+    let mut entries = Vec::<WalletDiscoveryEntry>::new();
+    for account in start_account..=end_account {
+        let mut empty_streak = 0u32;
+        for index in 0..=max_index {
+            if empty_streak >= gap_limit {
+                break;
+            }
+            let key = derive_wallet_key(seed, account, index)?;
+            let key_hash20 = scam_core::hash160_blake3(&key.pubkey_compressed());
+            match by_key_hash.get(&key_hash20).copied() {
+                Some(balance) => {
+                    let address = to_address(&runtime.config().hrp, key.pubkey_compressed())?;
+                    empty_streak = 0;
+                    entries.push(WalletDiscoveryEntry {
+                        account,
+                        index,
+                        address,
+                        key_hash20,
+                        total: balance.total,
+                        spendable: balance.spendable,
+                        immature: balance.immature,
+                        utxo_count: balance.utxo_count,
+                        spendable_count: balance.spendable_count,
+                        immature_count: balance.immature_count,
+                    });
+                }
+                _ => {
+                    empty_streak = empty_streak.saturating_add(1);
+                }
+            }
+        }
+    }
+    Ok(entries)
+}
+
+fn run_discovery_for_seed(
+    runtime: &ChainRuntime,
+    seed: &[u8],
+    start_account: u32,
+    end_account: u32,
+    gap_limit: u32,
+    max_index: u32,
+) -> Result<(), NodeError> {
+    let entries = discover_wallet_paths_for_seed(
+        runtime,
+        seed,
+        start_account,
+        end_account,
+        gap_limit,
+        max_index,
+    )?;
+
+    println!("Wallet discovery report:");
+    println!("Network: {}", runtime.config().network_id);
+    println!(
+        "Scan policy: accounts={}..{} gap_limit={} max_index={}",
+        start_account, end_account, gap_limit, max_index
+    );
+    println!("Tip height: {}", runtime.tip_height());
+
+    for entry in &entries {
+        println!(
+            "{} path=m/44'/1337'/{account}'/0/{index} total={} spendable={} immature={} utxos={} (spendable={} immature={})",
+            entry.address,
+            entry.total,
+            entry.spendable,
+            entry.immature,
+            entry.utxo_count,
+            entry.spendable_count,
+            entry.immature_count,
+            account = entry.account,
+            index = entry.index,
+        );
+    }
+
+    if entries.is_empty() {
+        println!(
+            "No funded derivation paths found in scan range account={}..{}, max_index={} (gap_limit={})",
+            start_account, end_account, max_index, gap_limit
+        );
+    }
+    Ok(())
+}
+
 #[derive(Debug, Error)]
 enum NodeError {
     #[error("cannot read config from {path}: {source}")]
@@ -3232,106 +3387,6 @@ fn run_wallet_with_seed_mode(
                 balance.spendable,
                 balance.immature,
                 balance.unspent_count
-            );
-        }
-        Ok(())
-    }
-
-    fn run_discovery_for_seed(
-        runtime: &ChainRuntime,
-        seed: &[u8],
-        start_account: u32,
-        end_account: u32,
-        gap_limit: u32,
-        max_index: u32,
-    ) -> Result<(), NodeError> {
-        if start_account > end_account {
-            return Err(NodeError::Runtime(format!(
-                "invalid account range: start_account={} end_account={}",
-                start_account, end_account
-            )));
-        }
-        if gap_limit == 0 {
-            return Err(NodeError::Runtime("gap_limit must be >= 1".to_owned()));
-        }
-
-        #[derive(Clone, Copy, Default)]
-        struct BalanceAggregate {
-            total: u128,
-            spendable: u128,
-            immature: u128,
-            utxo_count: usize,
-            spendable_count: usize,
-            immature_count: usize,
-        }
-
-        let mut by_key_hash = HashMap::<[u8; 20], BalanceAggregate>::new();
-        let tip_height = runtime.tip_height();
-        let coinbase_maturity = runtime.config().coinbase_maturity as u64;
-        let wallet_min_confirmations = runtime.config().wallet_min_spendable_confirmations as u64;
-        for utxo in runtime.utxo_set().values() {
-            let entry = by_key_hash.entry(utxo.key_hash20).or_default();
-            entry.utxo_count = entry.utxo_count.saturating_add(1);
-            entry.total = entry.total.saturating_add(utxo.value as u128);
-            if wallet_prevout_is_immature(
-                tip_height,
-                utxo.is_coinbase,
-                utxo.created_height,
-                coinbase_maturity,
-                wallet_min_confirmations,
-            ) {
-                entry.immature_count = entry.immature_count.saturating_add(1);
-                entry.immature = entry.immature.saturating_add(utxo.value as u128);
-            } else {
-                entry.spendable_count = entry.spendable_count.saturating_add(1);
-                entry.spendable = entry.spendable.saturating_add(utxo.value as u128);
-            }
-        }
-
-        println!("Wallet discovery report:");
-        println!("Network: {}", runtime.config().network_id);
-        println!(
-            "Scan policy: accounts={}..{} gap_limit={} max_index={}",
-            start_account, end_account, gap_limit, max_index
-        );
-        println!("Tip height: {}", runtime.tip_height());
-
-        let mut found_any = false;
-        for account in start_account..=end_account {
-            let mut empty_streak = 0u32;
-            for index in 0..=max_index {
-                if empty_streak >= gap_limit {
-                    break;
-                }
-                let key = derive_wallet_key(seed, account, index)?;
-                let key_hash20 = scam_core::hash160_blake3(&key.pubkey_compressed());
-                match by_key_hash.get(&key_hash20).copied() {
-                    Some(balance) if balance.utxo_count > 0 => {
-                        let address = to_address(&runtime.config().hrp, key.pubkey_compressed())?;
-                        found_any = true;
-                        empty_streak = 0;
-                        println!(
-                            "{} path=m/44'/1337'/{account}'/0/{index} total={} spendable={} immature={} utxos={} (spendable={} immature={})",
-                            address,
-                            balance.total,
-                            balance.spendable,
-                            balance.immature,
-                            balance.utxo_count,
-                            balance.spendable_count,
-                            balance.immature_count
-                        );
-                    }
-                    _ => {
-                        empty_streak = empty_streak.saturating_add(1);
-                    }
-                }
-            }
-        }
-
-        if !found_any {
-            println!(
-                "No funded derivation paths found in scan range account={}..{}, max_index={} (gap_limit={})",
-                start_account, end_account, max_index, gap_limit
             );
         }
         Ok(())
@@ -17639,6 +17694,100 @@ mod tests {
     }
 
     #[test]
+    fn resolve_wallet_account_index_ignores_blank_path_and_uses_fallback() {
+        let (account, index) =
+            super::resolve_wallet_account_index(Some("   \t"), 7, 19).expect("blank path");
+        assert_eq!(account, 7);
+        assert_eq!(index, 19);
+    }
+
+    #[test]
+    fn discover_wallet_paths_for_seed_validates_scan_inputs() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let runtime = ChainRuntime::from_config(cfg).expect("runtime");
+        let seed = WalletMnemonic::parse(SOAK_FLOW_MNEMONIC)
+            .expect("mnemonic")
+            .to_seed("");
+
+        let range_err = super::discover_wallet_paths_for_seed(&runtime, &seed, 3, 2, 1, 10)
+            .expect_err("range must fail");
+        assert!(range_err.to_string().contains("invalid account range"));
+
+        let gap_err = super::discover_wallet_paths_for_seed(&runtime, &seed, 0, 0, 0, 10)
+            .expect_err("gap limit must fail");
+        assert!(gap_err.to_string().contains("gap_limit must be >= 1"));
+    }
+
+    #[test]
+    fn discover_wallet_paths_for_seed_finds_funded_keys_and_enforces_gap_limit() {
+        let mut cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        cfg.coinbase_maturity = 1;
+        cfg.wallet_min_spendable_confirmations = 1;
+        cfg.min_relay_fee_per_kb = 0;
+        cfg.validate().expect("config validate");
+
+        let seed = WalletMnemonic::parse(SOAK_FLOW_MNEMONIC)
+            .expect("mnemonic")
+            .to_seed("");
+
+        let funded_key = derive_wallet_key(&seed, 0, 0).expect("funded key");
+        let funded_hash20 = scam_core::hash160_blake3(&funded_key.pubkey_compressed());
+        let mut runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let funded_params = super::MiningLoopParams {
+            count: 2,
+            interval_sec: cfg.target_block_time_sec,
+            max_nonce: 500_000,
+            subsidy: cfg.block_subsidy,
+            miner_key_hash: funded_hash20,
+            label_prefix: "discover-funded",
+            print_each: false,
+        };
+        super::mine_blocks_on_runtime(&mut runtime, &funded_params).expect("mine funded");
+
+        let funded_entries = super::discover_wallet_paths_for_seed(&runtime, &seed, 0, 0, 2, 8)
+            .expect("discover funded");
+        assert_eq!(funded_entries.len(), 1);
+        let funded = &funded_entries[0];
+        assert_eq!(funded.account, 0);
+        assert_eq!(funded.index, 0);
+        assert_eq!(funded.key_hash20, funded_hash20);
+        assert!(funded.utxo_count > 0);
+        assert_eq!(
+            funded.utxo_count,
+            funded.spendable_count + funded.immature_count
+        );
+
+        let late_key = derive_wallet_key(&seed, 0, 4).expect("late key");
+        let late_hash20 = scam_core::hash160_blake3(&late_key.pubkey_compressed());
+        let mut late_runtime = ChainRuntime::from_config(cfg).expect("runtime");
+        let late_params = super::MiningLoopParams {
+            count: 2,
+            interval_sec: late_runtime.config().target_block_time_sec,
+            max_nonce: 500_000,
+            subsidy: late_runtime.config().block_subsidy,
+            miner_key_hash: late_hash20,
+            label_prefix: "discover-late",
+            print_each: false,
+        };
+        super::mine_blocks_on_runtime(&mut late_runtime, &late_params).expect("mine late");
+
+        let truncated = super::discover_wallet_paths_for_seed(&late_runtime, &seed, 0, 0, 2, 8)
+            .expect("discover truncated");
+        assert!(
+            truncated.is_empty(),
+            "gap-limit=2 must stop before index 4 when lower indices are empty"
+        );
+
+        let wide_gap = super::discover_wallet_paths_for_seed(&late_runtime, &seed, 0, 0, 5, 8)
+            .expect("discover wide gap");
+        assert_eq!(wide_gap.len(), 1);
+        assert_eq!(wide_gap[0].index, 4);
+        assert_eq!(wide_gap[0].key_hash20, late_hash20);
+    }
+
+    #[test]
     fn network_as_str_covers_all_variants() {
         assert_eq!(super::Network::Devnet.as_str(), "devnet");
         assert_eq!(super::Network::Testnet.as_str(), "testnet");
@@ -25669,6 +25818,95 @@ mod tests {
     }
 
     #[test]
+    fn axum_wallet_address_and_balance_handlers_honor_path_override() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let work_dir = temp_dir("test-axum-wallet-path-override");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let state = super::AxumRpcState {
+            network: Network::Devnet,
+            cfg: cfg.clone(),
+            runtime_db_path: work_dir.join("runtime.redb"),
+            runtime_cache: Arc::new(std::sync::Mutex::new(super::AxumRuntimeCache {
+                runtime: ChainRuntime::from_config(cfg).expect("runtime"),
+                last_seen_mtime: None,
+            })),
+            mempool_db_path: work_dir.join("mempool.redb"),
+            relay_telemetry: None,
+            stratum_telemetry: None,
+            pool_ledger_db_path: work_dir.join("pool-ledger.redb"),
+            ui_dir: work_dir.join("ui"),
+        };
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        rt.block_on(async {
+            let address_req = serde_json::json!({
+                "mnemonic": SOAK_FLOW_MNEMONIC,
+                "passphrase": "",
+                "path": "m/44'/1337'/2'/0/5",
+                "account": 0,
+                "index": 0
+            })
+            .to_string();
+            let address_response = super::axum_wallet_address_handler(
+                super::AxumState(state.clone()),
+                super::AxumBytes::from(address_req.into_bytes()),
+            )
+            .await;
+            assert_eq!(address_response.status(), axum::http::StatusCode::OK);
+            let address_body = axum::body::to_bytes(address_response.into_body(), usize::MAX)
+                .await
+                .expect("address body");
+            let address_json: serde_json::Value =
+                serde_json::from_slice(&address_body).expect("address json");
+            assert_eq!(
+                address_json.get("account").and_then(|v| v.as_u64()),
+                Some(2)
+            );
+            assert_eq!(address_json.get("index").and_then(|v| v.as_u64()), Some(5));
+            let address = address_json
+                .get("address")
+                .and_then(|v| v.as_str())
+                .expect("address string")
+                .to_owned();
+
+            let balance_req = serde_json::json!({
+                "mnemonic": SOAK_FLOW_MNEMONIC,
+                "passphrase": "",
+                "path": "m/44'/1337'/2'/0/5",
+                "account": 0,
+                "index": 0
+            })
+            .to_string();
+            let balance_response = super::axum_wallet_balance_handler(
+                super::AxumState(state),
+                super::AxumBytes::from(balance_req.into_bytes()),
+            )
+            .await;
+            assert_eq!(balance_response.status(), axum::http::StatusCode::OK);
+            let balance_body = axum::body::to_bytes(balance_response.into_body(), usize::MAX)
+                .await
+                .expect("balance body");
+            let balance_json: serde_json::Value =
+                serde_json::from_slice(&balance_body).expect("balance json");
+            assert_eq!(
+                balance_json.get("account").and_then(|v| v.as_u64()),
+                Some(2)
+            );
+            assert_eq!(balance_json.get("index").and_then(|v| v.as_u64()), Some(5));
+            assert_eq!(
+                balance_json.get("address").and_then(|v| v.as_str()),
+                Some(address.as_str())
+            );
+        });
+
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
     fn mutation_guard_stage2_regressions() {
         assert_rpc_route_match_contract_precondition();
         let cfg: ChainConfig =
@@ -26034,6 +26272,56 @@ mod tests {
         unsafe {
             std::env::remove_var(KEY);
         }
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
+    fn run_rpc_serve_inner_legacy_serves_health_and_stops_on_max_requests() {
+        assert_rpc_route_match_contract_precondition();
+        let _net_guard = network_test_guard();
+        let Some(addr) = allocate_local_addr() else {
+            return;
+        };
+        let work_dir = temp_dir("test-rpc-inner-legacy-health");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let config_path = work_dir.join("devnet.toml");
+        fs::write(&config_path, include_str!("../../../config/devnet.toml")).expect("write cfg");
+        let runtime_db = work_dir.join("runtime.redb");
+        let ui_dir = work_dir.join("ui");
+        fs::create_dir_all(&ui_dir).expect("mkdir ui");
+        fs::write(ui_dir.join("index.html"), "<html>ui</html>").expect("write ui");
+
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+        let shutdown_clone = Arc::clone(&shutdown_flag);
+        let bind_addr = addr.clone();
+        let handle = thread::spawn(move || {
+            super::run_rpc_serve_inner_legacy(
+                RpcServeArgs {
+                    network: Network::Devnet,
+                    config: Some(config_path),
+                    runtime_db: Some(runtime_db),
+                    bind: bind_addr,
+                    ui_dir,
+                    relay_telemetry: None,
+                    stratum_telemetry: None,
+                    pool_ledger: None,
+                    mine_blocks: 0,
+                    interval_sec: 120,
+                    max_nonce: 500_000,
+                    max_requests: 1,
+                },
+                Some(shutdown_clone),
+            )
+        });
+
+        let health = send_http_request(&addr, "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        assert!(health.starts_with("HTTP/1.1 200 OK"));
+        assert!(health.contains("{\"ok\":true}"));
+
+        let server_result =
+            join_with_timeout(handle, Duration::from_secs(10), "rpc legacy inner server");
+        server_result.expect("legacy inner server should exit without errors");
+
         let _ = fs::remove_dir_all(work_dir);
     }
 
@@ -26971,6 +27259,35 @@ mod tests {
                 .contains("is not valid for network"),
             "unexpected balance-by-address error: {balance_addr_err}"
         );
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
+    fn run_wallet_discover_rejects_invalid_account_scan_range() {
+        let work_dir = temp_dir("test-wallet-discover-invalid-range");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let config_path = work_dir.join("devnet.toml");
+        fs::write(&config_path, include_str!("../../../config/devnet.toml")).expect("write cfg");
+
+        let err = run_wallet(super::WalletCommand::Discover {
+            network: Network::Devnet,
+            config: Some(config_path),
+            mnemonic: SOAK_FLOW_MNEMONIC.to_owned(),
+            passphrase: "".to_owned(),
+            start_account: 4,
+            end_account: 1,
+            gap_limit: 5,
+            max_index: 50,
+            mine_blocks: 0,
+            interval_sec: 120,
+            max_nonce: 500_000,
+        })
+        .expect_err("invalid discover range must fail");
+        assert!(
+            err.to_string().contains("invalid account range"),
+            "unexpected discover error: {err}"
+        );
+
         let _ = fs::remove_dir_all(work_dir);
     }
 
