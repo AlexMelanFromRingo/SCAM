@@ -4135,7 +4135,12 @@ fn load_wallet_reserved_outpoints(
     if !mempool_db_path.exists() {
         return Ok(HashSet::new());
     }
-    let mempool = load_mempool_from_db_or_empty_strict_with_retry(cfg, mempool_db_path, 10, 15)?;
+    let mempool = load_mempool_from_db_or_empty_strict_with_retry(
+        cfg,
+        mempool_db_path,
+        rpc_db_retry_attempts(),
+        rpc_db_retry_backoff_ms(),
+    )?;
     Ok(mempool_spent_outpoints(&mempool))
 }
 
@@ -4581,6 +4586,28 @@ fn submit_tx_retryable_lock_conflict(err: &NodeError) -> bool {
 
 fn submit_tx_retry_has_remaining_attempts(idx: usize, tries: usize) -> bool {
     idx.saturating_add(1) < tries
+}
+
+fn rpc_db_retry_attempts() -> usize {
+    env_opt("SCAM_RPC_DB_RETRY_ATTEMPTS")
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(120)
+}
+
+fn rpc_db_retry_backoff_ms() -> u64 {
+    env_opt("SCAM_RPC_DB_RETRY_BACKOFF_MS")
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(20)
+}
+
+fn mempool_summary_should_fallback_on_error(err: &NodeError) -> bool {
+    is_mempool_db_lock_conflict(err)
+}
+
+fn mempool_cleanup_persist_is_fatal(err: &NodeError) -> bool {
+    !is_mempool_db_lock_conflict(err)
 }
 
 fn ensure_expected_hash(expected: Hash256, got: Hash256, context: &str) -> Result<(), NodeError> {
@@ -12381,9 +12408,25 @@ fn submit_tx_via_mempool_db(
             runtime_db_path.display()
         ))
     })?;
-    let mut mempool =
-        load_mempool_from_db_or_empty_strict_with_retry(cfg, mempool_db_path, 10, 15)?;
-    let implied_fee = validate_tx_for_local_admission(cfg, &runtime, &mempool, &tx)?;
+    submit_tx_via_mempool_db_for_runtime(cfg, &runtime, mempool_db_path, tx, requested_fee)
+}
+
+fn submit_tx_via_mempool_db_for_runtime(
+    cfg: &ChainConfig,
+    runtime: &ChainRuntime,
+    mempool_db_path: &Path,
+    tx: Transaction,
+    requested_fee: u64,
+) -> Result<(Hash256, String, u64), NodeError> {
+    let retry_attempts = rpc_db_retry_attempts();
+    let retry_backoff_ms = rpc_db_retry_backoff_ms();
+    let mut mempool = load_mempool_from_db_or_empty_strict_with_retry(
+        cfg,
+        mempool_db_path,
+        retry_attempts,
+        retry_backoff_ms,
+    )?;
+    let implied_fee = validate_tx_for_local_admission(cfg, runtime, &mempool, &tx)?;
     let fee = if requested_fee == 0 {
         implied_fee
     } else {
@@ -12397,8 +12440,34 @@ fn submit_tx_via_mempool_db(
     }
     let txid = tx.txid();
     let outcome = mempool.insert_with_fee(tx, fee)?;
-    persist_mempool_db_with_retry(cfg, &mempool, mempool_db_path, 80, 25)?;
+    persist_mempool_db_with_retry(
+        cfg,
+        &mempool,
+        mempool_db_path,
+        retry_attempts,
+        retry_backoff_ms,
+    )?;
     Ok((txid, mempool_outcome_label(&outcome).to_owned(), fee))
+}
+
+fn submit_tx_via_mempool_db_for_runtime_with_retry(
+    cfg: &ChainConfig,
+    runtime: &ChainRuntime,
+    mempool_db_path: &Path,
+    tx: Transaction,
+    requested_fee: u64,
+    attempts: usize,
+    backoff_ms: u64,
+) -> Result<(Hash256, String, u64), NodeError> {
+    submit_tx_with_retry(attempts, backoff_ms, || {
+        submit_tx_via_mempool_db_for_runtime(
+            cfg,
+            runtime,
+            mempool_db_path,
+            tx.clone(),
+            requested_fee,
+        )
+    })
 }
 
 fn submit_tx_via_mempool_db_with_retry(
@@ -16222,7 +16291,12 @@ async fn axum_mempool_handler(AxumState(state): AxumState<AxumRpcState>) -> Axum
     let mut txids = Vec::<String>::new();
     let mut tx_count = None::<usize>;
     if state.mempool_db_path.exists() {
-        match load_mempool_from_db_or_empty_with_retry(&state.cfg, &state.mempool_db_path, 10, 15) {
+        match load_mempool_from_db_or_empty_with_retry(
+            &state.cfg,
+            &state.mempool_db_path,
+            rpc_db_retry_attempts(),
+            rpc_db_retry_backoff_ms(),
+        ) {
             Ok(mut mempool) => {
                 let removed_confirmed = match axum_runtime_for_query(&state, |runtime| {
                     Ok(cleanup_mempool_against_chain(runtime, &mut mempool))
@@ -16235,14 +16309,20 @@ async fn axum_mempool_handler(AxumState(state): AxumState<AxumRpcState>) -> Axum
                         &state.cfg,
                         &mempool,
                         &state.mempool_db_path,
-                        80,
-                        25,
+                        rpc_db_retry_attempts(),
+                        rpc_db_retry_backoff_ms(),
                     )
                 {
-                    return axum_internal_error(format!(
-                        "mempool db persist after confirmed-prune failed ({}): {err}",
+                    if mempool_cleanup_persist_is_fatal(&err) {
+                        return axum_internal_error(format!(
+                            "mempool db persist after confirmed-prune failed ({}): {err}",
+                            state.mempool_db_path.display()
+                        ));
+                    }
+                    eprintln!(
+                        "warning: mempool db cleanup persist lock contention ({}): {err}",
                         state.mempool_db_path.display()
-                    ));
+                    );
                 }
                 tx_count = Some(mempool.len());
                 txids = mempool
@@ -16252,13 +16332,20 @@ async fn axum_mempool_handler(AxumState(state): AxumState<AxumRpcState>) -> Axum
                     .collect();
             }
             Err(err) => {
-                return axum_json_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    json_error_body(&format!(
-                        "mempool db load failed ({}): {err}",
+                if mempool_summary_should_fallback_on_error(&err) {
+                    eprintln!(
+                        "warning: mempool db lock contention while serving /mempool ({}): {err}",
                         state.mempool_db_path.display()
-                    )),
-                );
+                    );
+                } else {
+                    return axum_json_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        json_error_body(&format!(
+                            "mempool db load failed ({}): {err}",
+                            state.mempool_db_path.display()
+                        )),
+                    );
+                }
             }
         }
     }
@@ -16672,15 +16759,17 @@ async fn axum_wallet_send_handler(
         Ok(tx) => tx,
         Err(err) => return axum_internal_error(format!("tx decode failed: {err}")),
     };
-    let (txid, outcome, effective_fee) = match submit_tx_via_mempool_db_with_retry(
-        &state.cfg,
-        &state.runtime_db_path,
-        &state.mempool_db_path,
-        tx,
-        preview_payload.fee,
-        80,
-        25,
-    ) {
+    let (txid, outcome, effective_fee) = match axum_runtime_for_query(&state, |runtime| {
+        submit_tx_via_mempool_db_for_runtime_with_retry(
+            &state.cfg,
+            runtime,
+            &state.mempool_db_path,
+            tx.clone(),
+            preview_payload.fee,
+            rpc_db_retry_attempts(),
+            rpc_db_retry_backoff_ms(),
+        )
+    }) {
         Ok(value) => value,
         Err(err) => return axum_bad_request(err),
     };
@@ -16713,15 +16802,17 @@ async fn axum_tx_submit_handler(
         Ok(value) => value,
         Err(err) => return axum_bad_request(err),
     };
-    let (txid, outcome, effective_fee) = match submit_tx_via_mempool_db_with_retry(
-        &state.cfg,
-        &state.runtime_db_path,
-        &state.mempool_db_path,
-        tx,
-        requested_fee,
-        80,
-        25,
-    ) {
+    let (txid, outcome, effective_fee) = match axum_runtime_for_query(&state, |runtime| {
+        submit_tx_via_mempool_db_for_runtime_with_retry(
+            &state.cfg,
+            runtime,
+            &state.mempool_db_path,
+            tx.clone(),
+            requested_fee,
+            rpc_db_retry_attempts(),
+            rpc_db_retry_backoff_ms(),
+        )
+    }) {
         Ok(value) => value,
         Err(err) => return axum_bad_request(err),
     };
@@ -17229,7 +17320,12 @@ fn run_rpc_serve_inner_legacy(
             }
         } else if rpc_exact_route_matches(method, path, "GET", "/mempool") {
             let (mempool_tx_count, mempool_txids) = if mempool_db_path.exists() {
-                match load_mempool_from_db_or_empty_with_retry(&cfg, &mempool_db_path, 10, 15) {
+                match load_mempool_from_db_or_empty_with_retry(
+                    &cfg,
+                    &mempool_db_path,
+                    rpc_db_retry_attempts(),
+                    rpc_db_retry_backoff_ms(),
+                ) {
                     Ok(mut mempool) => {
                         let removed_confirmed =
                             cleanup_mempool_against_chain(&runtime, &mut mempool);
@@ -17238,20 +17334,26 @@ fn run_rpc_serve_inner_legacy(
                                 &cfg,
                                 &mempool,
                                 &mempool_db_path,
-                                80,
-                                25,
+                                rpc_db_retry_attempts(),
+                                rpc_db_retry_backoff_ms(),
                             )
                         {
-                            let body = json_error_body(&format!(
-                                "mempool db persist after confirmed-prune failed ({}): {err}",
+                            if mempool_cleanup_persist_is_fatal(&err) {
+                                let body = json_error_body(&format!(
+                                    "mempool db persist after confirmed-prune failed ({}): {err}",
+                                    mempool_db_path.display()
+                                ));
+                                write_http_json_response(
+                                    &mut stream,
+                                    "500 Internal Server Error",
+                                    &body,
+                                )?;
+                                continue;
+                            }
+                            eprintln!(
+                                "warning: mempool db cleanup persist lock contention ({}): {err}",
                                 mempool_db_path.display()
-                            ));
-                            write_http_json_response(
-                                &mut stream,
-                                "500 Internal Server Error",
-                                &body,
-                            )?;
-                            continue;
+                            );
                         }
                         (
                             Some(mempool.len()),
@@ -17263,12 +17365,24 @@ fn run_rpc_serve_inner_legacy(
                         )
                     }
                     Err(err) => {
-                        let body = json_error_body(&format!(
-                            "mempool db load failed ({}): {err}",
-                            mempool_db_path.display()
-                        ));
-                        write_http_json_response(&mut stream, "500 Internal Server Error", &body)?;
-                        continue;
+                        if mempool_summary_should_fallback_on_error(&err) {
+                            eprintln!(
+                                "warning: mempool db lock contention while serving /mempool ({}): {err}",
+                                mempool_db_path.display()
+                            );
+                            (None, Vec::new())
+                        } else {
+                            let body = json_error_body(&format!(
+                                "mempool db load failed ({}): {err}",
+                                mempool_db_path.display()
+                            ));
+                            write_http_json_response(
+                                &mut stream,
+                                "500 Internal Server Error",
+                                &body,
+                            )?;
+                            continue;
+                        }
                     }
                 }
             } else {
@@ -17930,22 +18044,23 @@ fn run_rpc_serve_inner_legacy(
                     continue;
                 }
             };
-            let (txid, outcome, effective_fee) = match submit_tx_via_mempool_db_with_retry(
-                &cfg,
-                &runtime_db_path,
-                &mempool_db_path,
-                signed.tx.clone(),
-                req.fee,
-                80,
-                25,
-            ) {
-                Ok(value) => value,
-                Err(err) => {
-                    let body = json_error_body(&err.to_string());
-                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
-                    continue;
-                }
-            };
+            let (txid, outcome, effective_fee) =
+                match submit_tx_via_mempool_db_for_runtime_with_retry(
+                    &cfg,
+                    &runtime,
+                    &mempool_db_path,
+                    signed.tx.clone(),
+                    req.fee,
+                    rpc_db_retry_attempts(),
+                    rpc_db_retry_backoff_ms(),
+                ) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        let body = json_error_body(&err.to_string());
+                        write_http_json_response(&mut stream, "400 Bad Request", &body)?;
+                        continue;
+                    }
+                };
             let payload = WalletSendRpcResponse {
                 network_id: cfg.network_id.clone(),
                 txid: txid.to_hex(),
@@ -17989,22 +18104,23 @@ fn run_rpc_serve_inner_legacy(
                     continue;
                 }
             };
-            let (txid, outcome, effective_fee) = match submit_tx_via_mempool_db_with_retry(
-                &cfg,
-                &runtime_db_path,
-                &mempool_db_path,
-                tx,
-                requested_fee,
-                80,
-                25,
-            ) {
-                Ok(value) => value,
-                Err(err) => {
-                    let body = json_error_body(&err.to_string());
-                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
-                    continue;
-                }
-            };
+            let (txid, outcome, effective_fee) =
+                match submit_tx_via_mempool_db_for_runtime_with_retry(
+                    &cfg,
+                    &runtime,
+                    &mempool_db_path,
+                    tx,
+                    requested_fee,
+                    rpc_db_retry_attempts(),
+                    rpc_db_retry_backoff_ms(),
+                ) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        let body = json_error_body(&err.to_string());
+                        write_http_json_response(&mut stream, "400 Bad Request", &body)?;
+                        continue;
+                    }
+                };
             let payload = TxSubmitRpcResponse {
                 network_id: cfg.network_id.clone(),
                 txid: txid.to_hex(),
@@ -19099,6 +19215,52 @@ mod tests {
             "miner.alpha",
             "miner.beta"
         ));
+        const RETRY_ATTEMPTS_KEY: &str = "SCAM_RPC_DB_RETRY_ATTEMPTS";
+        const RETRY_BACKOFF_KEY: &str = "SCAM_RPC_DB_RETRY_BACKOFF_MS";
+        let saved_attempts = std::env::var(RETRY_ATTEMPTS_KEY).ok();
+        let saved_backoff = std::env::var(RETRY_BACKOFF_KEY).ok();
+        unsafe {
+            std::env::remove_var(RETRY_ATTEMPTS_KEY);
+            std::env::remove_var(RETRY_BACKOFF_KEY);
+        }
+        assert_eq!(super::rpc_db_retry_attempts(), 120);
+        assert_eq!(super::rpc_db_retry_backoff_ms(), 20);
+        unsafe {
+            std::env::set_var(RETRY_ATTEMPTS_KEY, "1");
+            std::env::set_var(RETRY_BACKOFF_KEY, "1");
+        }
+        assert_eq!(super::rpc_db_retry_attempts(), 1);
+        assert_eq!(super::rpc_db_retry_backoff_ms(), 1);
+        unsafe {
+            std::env::set_var(RETRY_ATTEMPTS_KEY, "0");
+            std::env::set_var(RETRY_BACKOFF_KEY, "0");
+        }
+        assert_eq!(super::rpc_db_retry_attempts(), 120);
+        assert_eq!(super::rpc_db_retry_backoff_ms(), 20);
+        if let Some(value) = saved_attempts {
+            unsafe {
+                std::env::set_var(RETRY_ATTEMPTS_KEY, value);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var(RETRY_ATTEMPTS_KEY);
+            }
+        }
+        if let Some(value) = saved_backoff {
+            unsafe {
+                std::env::set_var(RETRY_BACKOFF_KEY, value);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var(RETRY_BACKOFF_KEY);
+            }
+        }
+        let lock_err = super::NodeError::Runtime("Database already open".to_owned());
+        let other_err = super::NodeError::Runtime("other error".to_owned());
+        assert!(super::mempool_summary_should_fallback_on_error(&lock_err));
+        assert!(!super::mempool_summary_should_fallback_on_error(&other_err));
+        assert!(!super::mempool_cleanup_persist_is_fatal(&lock_err));
+        assert!(super::mempool_cleanup_persist_is_fatal(&other_err));
 
         assert!(!super::should_emit_periodic_round(1, 2));
         assert!(super::should_emit_periodic_round(2, 2));
@@ -30952,6 +31114,69 @@ mod tests {
         let (txid, outcome, fee) =
             super::submit_tx_via_mempool_db(&cfg, &runtime_db, &mempool_db, signed.tx, 500)
                 .expect("submit tx");
+
+        assert_eq!(fee, 500);
+        assert_eq!(outcome, "accepted");
+        let snapshot = scam_storage::load_mempool_db(&mempool_db).expect("load mempool db");
+        assert_eq!(snapshot.network_id, cfg.network_id);
+        assert!(snapshot.entries.iter().any(|entry| entry.txid == txid));
+
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
+    fn submit_tx_via_mempool_db_for_runtime_with_retry_accepts_valid_signed_transaction() {
+        let mut cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        cfg.coinbase_maturity = 1;
+        cfg.validate().expect("config validate");
+
+        let work_dir = temp_dir("test-submit-mempool-runtime-retry");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let mempool_db = work_dir.join("mempool.redb");
+
+        let mnemonic = WalletMnemonic::parse(SOAK_FLOW_MNEMONIC).expect("mnemonic");
+        let seed = mnemonic.to_seed("");
+        let sender_key = derive_wallet_key(&seed, 0, 0).expect("sender key");
+        let recipient_key = derive_wallet_key(&seed, 0, 1).expect("recipient key");
+        let sender_key_hash20 = scam_core::hash160_blake3(&sender_key.pubkey_compressed());
+        let recipient_key_hash20 = scam_core::hash160_blake3(&recipient_key.pubkey_compressed());
+
+        let mut runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        mine_blocks_on_runtime(
+            &mut runtime,
+            &super::MiningLoopParams {
+                count: 2,
+                interval_sec: cfg.target_block_time_sec,
+                max_nonce: 500_000,
+                subsidy: cfg.block_subsidy,
+                miner_key_hash: sender_key_hash20,
+                label_prefix: "submit-mempool-runtime-retry",
+                print_each: false,
+            },
+        )
+        .expect("mine blocks");
+
+        let signed = build_signed_transfer_tx(
+            &runtime,
+            &cfg.network_id,
+            &sender_key,
+            recipient_key_hash20,
+            1_000_000,
+            500,
+        )
+        .expect("build signed tx");
+
+        let (txid, outcome, fee) = super::submit_tx_via_mempool_db_for_runtime_with_retry(
+            &cfg,
+            &runtime,
+            &mempool_db,
+            signed.tx,
+            500,
+            5,
+            1,
+        )
+        .expect("submit tx");
 
         assert_eq!(fee, 500);
         assert_eq!(outcome, "accepted");

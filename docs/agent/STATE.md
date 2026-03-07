@@ -1,24 +1,38 @@
 # Agent State (Recovery Notes)
 
-Last updated: 2026-02-15
+Last updated: 2026-03-07
 
-## Mutation status snapshot
-- Stage1 (`scripts/mutation-staged.sh stage1`): `529 mutants tested in 3m: 471 caught, 58 unviable` (0 missed, 0 timeout).
-- Stage2 focused set (node/p2p/stratum risky paths):
-  - `81 mutants tested in 3m: 77 caught, 4 unviable`.
-  - `90 mutants tested in 3m: 86 caught, 4 unviable`.
-  - Focus includes: `decode_optional_hex32`, `max_requests_reached`, `map_sv2_read_result`, `update_sv2_conformance_state`, HTTP read/timeout/closed guards, `guess_content_type`, `run_command`, `run_wallet`, `run_sv2_conformance`, `run_stratum_serve`, p2p `send_message`.
-- Full Stage2 (`scripts/mutation-staged.sh stage2`): previously interrupted by power outage; rerun still required from latest commit.
-- Stage2 old-hotspot replay (after fixes):
-  - `81 mutants tested in 4m: 77 caught, 4 unviable` (0 missed, 0 timeout).
+## Current reliable baseline
+- `cargo fmt --all`: pass.
+- `cargo check --workspace`: pass.
+- `cargo test --workspace --all-targets`: pass.
+- `cargo clippy --workspace --all-targets -- -D warnings`: pass.
+- `cargo test -p scam-node --bin scam-node -- --test-threads=1`: pass (308 tests).
 
-## Recent commits relevant to recovery
-- `e5c7548` - stratum payout wiring + watch-only balance by address + rpc runtime refresh + lab script updates.
-- `8e95f74` - additional node mutation-killer tests (IO guard behavior, sv2 conformance error tracking, HTTP close/error paths, svg content-type, run_from_args dispatch, wallet balance-address HRP validation).
-- `bbfc563` - mutation CI/script acceleration knobs (`shard`, `examine_re`, `exclude_re`, `iterate`) for targeted and split runs.
+## Today’s hardening batch (uncommitted at this note update)
+- File: `crates/node/src/main.rs`
+- Added resilient RPC DB retry knobs:
+  - `rpc_db_retry_attempts()`
+  - `rpc_db_retry_backoff_ms()`
+- Added explicit lock-fallback guards for `/mempool` serving:
+  - `mempool_summary_should_fallback_on_error()`
+  - `mempool_cleanup_persist_is_fatal()`
+- Switched submit path to runtime-cached validation for RPC handlers:
+  - new `submit_tx_via_mempool_db_for_runtime()`
+  - new `submit_tx_via_mempool_db_for_runtime_with_retry()`
+  - Axum and legacy `/wallet/send` + `/tx/submit` now avoid runtime DB reopen on every submit.
+- Increased retry usage in wallet reserved-outpoint load path.
+- Added/extended tests:
+  - helper guard invariants for retry+fallback logic
+  - runtime-based submit path coverage
+
+## Mutation note
+- Focused mutation run for new RPC retry helpers was started and then interrupted intentionally.
+- Partial output showed misses concentrated in retry-helper boundary functions.
+- Action item before full staged rerun: finalize targeted mutation closure for the new helper functions, then rerun Stage2 and Stage3.
 
 ## Immediate next actions
-1. Run full Stage2 mutation pass on latest `master`.
-2. Triage remaining missed/timeout mutants (if any) and add targeted tests.
-3. Re-run Stage3 after Stage2 is clean.
-4. Keep this file updated after each long run to survive interruptions.
+1. Commit current RPC hardening batch.
+2. Run focused mutation on changed node functions (retry/fallback/submit-runtime).
+3. Close misses with narrow tests (no broad refactor), then rerun Stage2.
+4. After Stage2 is clean, rerun Stage3 and only then mark RC2 gate.
