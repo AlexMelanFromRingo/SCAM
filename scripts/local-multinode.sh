@@ -19,6 +19,7 @@ set -euo pipefail
 #   BASE_STRATUM_PORT=19347
 #   RUN_RPC=true
 #   RUN_STRATUM=false
+#   WIRE_PEERS=true
 #   BUILD=true
 #   CARGO_PROFILE=debug   # debug|release
 #   SYNC_BOOK=true
@@ -43,6 +44,7 @@ BASE_RPC_PORT="${BASE_RPC_PORT:-19080}"
 BASE_STRATUM_PORT="${BASE_STRATUM_PORT:-19347}"
 RUN_RPC="${RUN_RPC:-true}"
 RUN_STRATUM="${RUN_STRATUM:-false}"
+WIRE_PEERS="${WIRE_PEERS:-true}"
 BUILD="${BUILD:-true}"
 CARGO_PROFILE="${CARGO_PROFILE:-debug}"
 SYNC_BOOK="${SYNC_BOOK:-true}"
@@ -144,6 +146,37 @@ pid_is_alive() {
     return 1
   fi
   kill -0 "${pid}" 2>/dev/null
+}
+
+peer_book_lock_conflict() {
+  local raw="${1:-}"
+  [[ "${raw}" == *"Database already open"* || "${raw}" == *"Cannot acquire lock"* || "${raw}" == *"lock-contended"* ]]
+}
+
+add_peer_with_retry() {
+  local bin="$1"
+  local network="$2"
+  local peer="$3"
+  local peersdir="$4"
+  local max_attempts="${5:-25}"
+  local delay_sec="${6:-0.05}"
+  local attempt
+  for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+    local output
+    if output="$("${bin}" add-peer \
+      --network "${network}" \
+      --peer "${peer}" \
+      --peers-dir "${peersdir}" 2>&1)"; then
+      return 0
+    fi
+    if peer_book_lock_conflict "${output}"; then
+      sleep "${delay_sec}"
+      continue
+    fi
+    echo "${output}" >&2
+    return 1
+  done
+  return 1
 }
 
 stop_pid_file() {
@@ -298,21 +331,27 @@ start_cluster() {
 
   sleep 1
 
-  echo "[cluster] wiring peer books"
-  for ((i = 0; i < NODE_COUNT; i++)); do
-    local peersdir
-    peersdir="$(peers_dir_path "${i}")"
-    for ((j = 0; j < NODE_COUNT; j++)); do
-      if [[ "${i}" == "${j}" ]]; then
-        continue
-      fi
-      "${bin}" add-peer \
-        --network "${NETWORK}" \
-        --peer "127.0.0.1:$(p2p_port_for "${j}")" \
-        --peers-dir "${peersdir}" \
-        > /dev/null
+  if is_true "${WIRE_PEERS}"; then
+    echo "[cluster] wiring peer books"
+    for ((i = 0; i < NODE_COUNT; i++)); do
+      local peersdir
+      peersdir="$(peers_dir_path "${i}")"
+      for ((j = 0; j < NODE_COUNT; j++)); do
+        if [[ "${i}" == "${j}" ]]; then
+          continue
+        fi
+        if ! add_peer_with_retry \
+          "${bin}" \
+          "${NETWORK}" \
+          "127.0.0.1:$(p2p_port_for "${j}")" \
+          "${peersdir}"; then
+          echo "[cluster] warning: add-peer failed for node-${i} -> node-${j}" >&2
+        fi
+      done
     done
-  done
+  else
+    echo "[cluster] skipping peer-book wiring (WIRE_PEERS=false)"
+  fi
 
   if is_true "${SYNC_BOOK}"; then
     echo "[cluster] running initial sync-book pass"
