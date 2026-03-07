@@ -274,6 +274,148 @@ tr:last-child td {
   font-size: 0.84rem;
 }
 
+.lookup-result {
+  white-space: normal;
+}
+
+.view-toggle {
+  margin-top: 0.62rem;
+  display: inline-flex;
+  gap: 0.35rem;
+  border: 1px solid var(--stroke);
+  border-radius: 999px;
+  background: #fff8ec;
+  padding: 0.2rem;
+}
+
+.view-toggle-btn {
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted);
+  padding: 0.24rem 0.62rem;
+  font-size: 0.74rem;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  box-shadow: none;
+}
+
+.view-toggle-btn.active {
+  color: #fff;
+  border-color: transparent;
+  background: linear-gradient(155deg, #ca8a04 0%, #b77903 100%);
+}
+
+.lookup-card-layout {
+  display: grid;
+  gap: 0.6rem;
+}
+
+.lookup-card-header {
+  border: 1px solid var(--stroke);
+  border-radius: 0.74rem;
+  background: #fffaf2;
+  padding: 0.56rem 0.64rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.45rem;
+}
+
+.lookup-card-header h3 {
+  margin: 0;
+  font-size: 0.9rem;
+}
+
+.lookup-kv-grid {
+  display: grid;
+  gap: 0.5rem;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.lookup-kv-card {
+  border: 1px solid var(--stroke);
+  border-radius: 0.68rem;
+  background: #fffdf8;
+  padding: 0.5rem 0.56rem;
+}
+
+.lookup-kv-card.wide {
+  grid-column: 1 / -1;
+}
+
+.lookup-kv-label {
+  font-size: 0.72rem;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.lookup-kv-value {
+  margin-top: 0.2rem;
+  font-size: 0.8rem;
+  font-weight: 600;
+  word-break: break-word;
+}
+
+.lookup-subsection {
+  border: 1px solid var(--stroke);
+  border-radius: 0.72rem;
+  background: #fffdf8;
+  padding: 0.54rem 0.6rem;
+}
+
+.lookup-subsection-title {
+  font-size: 0.74rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+
+.lookup-chip-list {
+  margin-top: 0.44rem;
+  display: flex;
+  gap: 0.32rem;
+  flex-wrap: wrap;
+}
+
+.lookup-chip {
+  border: 1px solid #eadfcf;
+  border-radius: 999px;
+  padding: 0.14rem 0.44rem;
+  font-size: 0.72rem;
+  background: #fff8ec;
+}
+
+.lookup-io-grid {
+  margin-top: 0.44rem;
+  display: grid;
+  gap: 0.4rem;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.lookup-io-card {
+  border: 1px solid #eadfcf;
+  border-radius: 0.64rem;
+  background: #fffaf2;
+  padding: 0.48rem 0.52rem;
+  display: grid;
+  gap: 0.16rem;
+}
+
+.lookup-io-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.3rem;
+}
+
+.lookup-io-line {
+  font-size: 0.75rem;
+  color: #4a4235;
+  word-break: break-word;
+}
+
 .wallet-result {
   white-space: normal;
   padding: 0.85rem;
@@ -755,7 +897,9 @@ tr:last-child td {
   .wallet-balance-grid,
   .wallet-utxo-grid,
   .wallet-meta-grid,
-  .wallet-history-grid {
+  .wallet-history-grid,
+  .lookup-kv-grid,
+  .lookup-io-grid {
     grid-template-columns: 1fr;
   }
 }

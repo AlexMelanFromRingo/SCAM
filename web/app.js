@@ -21,6 +21,8 @@ const latestBlocksBody = document.getElementById("latestBlocksBody");
 const blockLookupForm = document.getElementById("blockLookupForm");
 const blockHeightInput = document.getElementById("blockHeightInput");
 const blockLookupOut = document.getElementById("blockLookupOut");
+const blockLookupViewCardBtn = document.getElementById("blockLookupViewCard");
+const blockLookupViewRawBtn = document.getElementById("blockLookupViewRaw");
 
 const txLookupForm = document.getElementById("txLookupForm");
 const txHeightInput = document.getElementById("txHeightInput");
@@ -28,6 +30,8 @@ const txIndexInput = document.getElementById("txIndexInput");
 const txidLookupForm = document.getElementById("txidLookupForm");
 const txidInput = document.getElementById("txidInput");
 const txLookupOut = document.getElementById("txLookupOut");
+const txLookupViewCardBtn = document.getElementById("txLookupViewCard");
+const txLookupViewRawBtn = document.getElementById("txLookupViewRaw");
 
 const mempoolOut = document.getElementById("mempoolOut");
 const poolStatusForm = document.getElementById("poolStatusForm");
@@ -46,6 +50,16 @@ const state = {
   events: null,
   lastTipHeight: null,
   lastMempoolCount: null,
+  lookupView: {
+    block: localStorage.getItem("scam.console.lookupView.block") || "card",
+    tx: localStorage.getItem("scam.console.lookupView.tx") || "card",
+  },
+  lookupCache: {
+    block: null,
+    tx: null,
+    blockError: "",
+    txError: "",
+  },
 };
 
 function parseNumber(value, fallback = 0) {
@@ -87,6 +101,191 @@ function setResult(el, data, isError = false) {
   el.innerHTML = "";
   el.textContent = typeof data === "string" ? data : formatJson(data);
   el.classList.toggle("error", isError);
+}
+
+function formatUnixTimestamp(unixSec) {
+  const sec = Number(unixSec);
+  if (!Number.isFinite(sec)) return "-";
+  const d = new Date(sec * 1000);
+  if (Number.isNaN(d.getTime())) return `${unixSec}`;
+  return `${d.toISOString()} (${sec})`;
+}
+
+function renderLookupKvGrid(items) {
+  return `
+    <div class="lookup-kv-grid">
+      ${items
+        .map(
+          (item) => `
+            <article class="lookup-kv-card ${escapeHtml(item.wide ? "wide" : "")}">
+              <div class="lookup-kv-label">${escapeHtml(item.label)}</div>
+              <div class="lookup-kv-value ${escapeHtml(item.mono ? "mono" : "")}" title="${escapeHtml(item.title ?? item.value ?? "-")}">
+                ${escapeHtml(item.value ?? "-")}
+              </div>
+            </article>
+          `,
+        )
+        .join("")}
+    </div>
+  `;
+}
+
+function renderBlockLookupCard(block) {
+  if (!block || typeof block !== "object") {
+    return `<div class="wallet-history-empty">No block payload loaded yet.</div>`;
+  }
+  const txs = Array.isArray(block.transactions) ? block.transactions : [];
+  return `
+    <section class="lookup-card-layout">
+      <header class="lookup-card-header">
+        <h3>Block #${escapeHtml(block.height ?? "-")}</h3>
+        <span class="wallet-history-badge self">${escapeHtml((block.tx_count ?? txs.length ?? 0).toString())} tx</span>
+      </header>
+      ${renderLookupKvGrid([
+        { label: "Hash", value: block.hash ?? "-", mono: true, wide: true },
+        { label: "Prev Hash", value: block.prev_hash ?? "-", mono: true, wide: true },
+        { label: "Timestamp", value: formatUnixTimestamp(block.timestamp) },
+        { label: "Target", value: block.target ?? "-", mono: true, wide: true },
+        { label: "Merkle Root", value: block.merkle_root ?? "-", mono: true, wide: true },
+        { label: "Version", value: block.version ?? "-" },
+        { label: "Nonce", value: block.nonce ?? "-" },
+      ])}
+      ${
+        txs.length
+          ? `<section class="lookup-subsection">
+              <div class="lookup-subsection-title">Transactions (${txs.length})</div>
+              <div class="lookup-chip-list">
+                ${txs
+                  .map((tx, index) => {
+                    const txid = tx && typeof tx === "object" ? tx.txid ?? shortHash(JSON.stringify(tx)) : `${tx}`;
+                    return `<span class="lookup-chip mono" title="${escapeHtml(txid)}">#${index}: ${escapeHtml(shortHash(txid, 18, 12))}</span>`;
+                  })
+                  .join("")}
+              </div>
+            </section>`
+          : `<div class="wallet-history-empty">Detailed transaction list is not available in this response. Use TX Lookup for full tx body.</div>`
+      }
+    </section>
+  `;
+}
+
+function renderTxInputRow(input, index) {
+  const pubkey = input?.pubkey_compressed_hex ?? "-";
+  return `
+    <article class="lookup-io-card">
+      <div class="lookup-io-head">
+        <span class="lookup-chip">Input #${index}</span>
+        <span class="lookup-chip mono">${escapeHtml((input?.prev_vout ?? "-").toString())}</span>
+      </div>
+      <div class="lookup-io-line mono" title="${escapeHtml(input?.prev_txid ?? "-")}">prev_txid: ${escapeHtml(shortHash(input?.prev_txid ?? "-", 16, 12))}</div>
+      <div class="lookup-io-line">sequence: ${escapeHtml((input?.sequence ?? "-").toString())}</div>
+      <div class="lookup-io-line mono" title="${escapeHtml(pubkey)}">pubkey: ${escapeHtml(shortHash(pubkey, 16, 10))}</div>
+      <div class="lookup-io-line">coinbase_input: ${escapeHtml(Boolean(input?.is_coinbase_input).toString())}</div>
+    </article>
+  `;
+}
+
+function renderTxOutputRow(output, index) {
+  const keyHash = output?.key_hash20_hex ?? "-";
+  return `
+    <article class="lookup-io-card">
+      <div class="lookup-io-head">
+        <span class="lookup-chip">Output #${index}</span>
+        <span class="lookup-chip">${escapeHtml(formatScamOnly(output?.value ?? 0))}</span>
+      </div>
+      <div class="lookup-io-line">atomic: ${escapeHtml(formatAtomicOnly(output?.value ?? 0))}</div>
+      <div class="lookup-io-line mono" title="${escapeHtml(keyHash)}">key_hash20: ${escapeHtml(shortHash(keyHash, 18, 10))}</div>
+    </article>
+  `;
+}
+
+function renderTxLookupCard(tx) {
+  if (!tx || typeof tx !== "object") {
+    return `<div class="wallet-history-empty">No transaction payload loaded yet.</div>`;
+  }
+  const inputs = Array.isArray(tx.inputs) ? tx.inputs : [];
+  const outputs = Array.isArray(tx.outputs) ? tx.outputs : [];
+  return `
+    <section class="lookup-card-layout">
+      <header class="lookup-card-header">
+        <h3>Transaction</h3>
+        <span class="wallet-history-badge ${tx.coinbase ? "coinbase" : "self"}">${tx.coinbase ? "Coinbase" : "Regular"}</span>
+      </header>
+      ${renderLookupKvGrid([
+        { label: "TxID", value: tx.txid ?? "-", mono: true, wide: true },
+        { label: "Block Height", value: tx.block_height ?? "-" },
+        { label: "Tx Index", value: tx.tx_index ?? "-" },
+        { label: "Version", value: tx.version ?? "-" },
+        { label: "Lock Time", value: tx.lock_time ?? "-" },
+        { label: "Input Count", value: tx.input_count ?? inputs.length ?? 0 },
+        { label: "Output Count", value: tx.output_count ?? outputs.length ?? 0 },
+      ])}
+      <section class="lookup-subsection">
+        <div class="lookup-subsection-title">Inputs (${inputs.length})</div>
+        ${
+          inputs.length
+            ? `<div class="lookup-io-grid">${inputs.map((input, index) => renderTxInputRow(input, index)).join("")}</div>`
+            : `<div class="wallet-history-empty">No inputs in payload.</div>`
+        }
+      </section>
+      <section class="lookup-subsection">
+        <div class="lookup-subsection-title">Outputs (${outputs.length})</div>
+        ${
+          outputs.length
+            ? `<div class="lookup-io-grid">${outputs.map((output, index) => renderTxOutputRow(output, index)).join("")}</div>`
+            : `<div class="wallet-history-empty">No outputs in payload.</div>`
+        }
+      </section>
+    </section>
+  `;
+}
+
+function setLookupToggleState(kind) {
+  const isBlock = kind === "block";
+  const mode = state.lookupView[kind] === "raw" ? "raw" : "card";
+  const cardBtn = isBlock ? blockLookupViewCardBtn : txLookupViewCardBtn;
+  const rawBtn = isBlock ? blockLookupViewRawBtn : txLookupViewRawBtn;
+  if (!cardBtn || !rawBtn) return;
+  cardBtn.classList.toggle("active", mode === "card");
+  rawBtn.classList.toggle("active", mode === "raw");
+}
+
+function renderBlockLookupResult() {
+  const error = state.lookupCache.blockError;
+  const data = state.lookupCache.block;
+  if (error) {
+    setResult(blockLookupOut, error, true);
+    return;
+  }
+  if (!data) {
+    setResult(blockLookupOut, "No block loaded yet.", false);
+    return;
+  }
+  if (state.lookupView.block === "raw") {
+    setResult(blockLookupOut, data, false);
+    return;
+  }
+  blockLookupOut.classList.remove("error");
+  blockLookupOut.innerHTML = renderBlockLookupCard(data);
+}
+
+function renderTxLookupResult() {
+  const error = state.lookupCache.txError;
+  const data = state.lookupCache.tx;
+  if (error) {
+    setResult(txLookupOut, error, true);
+    return;
+  }
+  if (!data) {
+    setResult(txLookupOut, "No transaction loaded yet.", false);
+    return;
+  }
+  if (state.lookupView.tx === "raw") {
+    setResult(txLookupOut, data, false);
+    return;
+  }
+  txLookupOut.classList.remove("error");
+  txLookupOut.innerHTML = renderTxLookupCard(data);
 }
 
 function escapeHtml(value) {
@@ -738,14 +937,51 @@ function initTabs() {
 }
 
 function initExplorerActions() {
+  setLookupToggleState("block");
+  setLookupToggleState("tx");
+  renderBlockLookupResult();
+  renderTxLookupResult();
+
+  blockLookupViewCardBtn?.addEventListener("click", () => {
+    state.lookupView.block = "card";
+    localStorage.setItem("scam.console.lookupView.block", "card");
+    setLookupToggleState("block");
+    renderBlockLookupResult();
+  });
+
+  blockLookupViewRawBtn?.addEventListener("click", () => {
+    state.lookupView.block = "raw";
+    localStorage.setItem("scam.console.lookupView.block", "raw");
+    setLookupToggleState("block");
+    renderBlockLookupResult();
+  });
+
+  txLookupViewCardBtn?.addEventListener("click", () => {
+    state.lookupView.tx = "card";
+    localStorage.setItem("scam.console.lookupView.tx", "card");
+    setLookupToggleState("tx");
+    renderTxLookupResult();
+  });
+
+  txLookupViewRawBtn?.addEventListener("click", () => {
+    state.lookupView.tx = "raw";
+    localStorage.setItem("scam.console.lookupView.tx", "raw");
+    setLookupToggleState("tx");
+    renderTxLookupResult();
+  });
+
   blockLookupForm.addEventListener("submit", async (event) => {
     event.preventDefault();
     const height = parseNumber(blockHeightInput.value, 0);
     try {
       const block = await request(`/block/${height}`);
-      setResult(blockLookupOut, block);
+      state.lookupCache.block = block;
+      state.lookupCache.blockError = "";
+      renderBlockLookupResult();
     } catch (error) {
-      setResult(blockLookupOut, error.message, true);
+      state.lookupCache.block = null;
+      state.lookupCache.blockError = error.message;
+      renderBlockLookupResult();
     }
   });
 
@@ -755,9 +991,13 @@ function initExplorerActions() {
     const index = parseNumber(txIndexInput.value, 0);
     try {
       const tx = await request(`/tx/${height}/${index}`);
-      setResult(txLookupOut, tx);
+      state.lookupCache.tx = tx;
+      state.lookupCache.txError = "";
+      renderTxLookupResult();
     } catch (error) {
-      setResult(txLookupOut, error.message, true);
+      state.lookupCache.tx = null;
+      state.lookupCache.txError = error.message;
+      renderTxLookupResult();
     }
   });
 
@@ -765,14 +1005,20 @@ function initExplorerActions() {
     event.preventDefault();
     const txid = (txidInput.value || "").trim().toLowerCase();
     if (!txid) {
-      setResult(txLookupOut, "txid is required", true);
+      state.lookupCache.tx = null;
+      state.lookupCache.txError = "txid is required";
+      renderTxLookupResult();
       return;
     }
     try {
       const tx = await request(`/txid/${encodeURIComponent(txid)}`);
-      setResult(txLookupOut, tx);
+      state.lookupCache.tx = tx;
+      state.lookupCache.txError = "";
+      renderTxLookupResult();
     } catch (error) {
-      setResult(txLookupOut, error.message, true);
+      state.lookupCache.tx = null;
+      state.lookupCache.txError = error.message;
+      renderTxLookupResult();
     }
   });
 

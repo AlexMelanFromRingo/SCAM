@@ -115,7 +115,11 @@
             <input id="blockHeightInput" type="number" min="0" placeholder="Height" required />
             <button type="submit">Load Block</button>
           </form>
-          <pre id="blockLookupOut" class="result"></pre>
+          <div class="view-toggle" role="group" aria-label="Block lookup view mode">
+            <button id="blockLookupViewCard" class="view-toggle-btn active" type="button">Card</button>
+            <button id="blockLookupViewRaw" class="view-toggle-btn" type="button">RAW JSON</button>
+          </div>
+          <div id="blockLookupOut" class="result lookup-result"></div>
         </article>
 
         <article class="panel">
@@ -129,7 +133,11 @@
             <input id="txidInput" type="text" placeholder="TxID (hex)" required />
             <button type="submit">Load By TxID</button>
           </form>
-          <pre id="txLookupOut" class="result"></pre>
+          <div class="view-toggle" role="group" aria-label="TX lookup view mode">
+            <button id="txLookupViewCard" class="view-toggle-btn active" type="button">Card</button>
+            <button id="txLookupViewRaw" class="view-toggle-btn" type="button">RAW JSON</button>
+          </div>
+          <div id="txLookupOut" class="result lookup-result"></div>
         </article>
       </section>
 
