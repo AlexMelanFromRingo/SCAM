@@ -10,6 +10,7 @@ const statUtxo = document.getElementById("statUtxo");
 const statWork = document.getElementById("statWork");
 const statRelayPeers = document.getElementById("statRelayPeers");
 const statSyncLag = document.getElementById("statSyncLag");
+const statSyncLagDetail = document.getElementById("statSyncLagDetail");
 const statLastBlockAge = document.getElementById("statLastBlockAge");
 const statRelayMempool = document.getElementById("statRelayMempool");
 const statNetworkHashrate = document.getElementById("statNetworkHashrate");
@@ -94,6 +95,14 @@ function formatHashrate(value) {
   if (n >= 1e6) return `${(n / 1e6).toFixed(2)} MH/s`;
   if (n >= 1e3) return `${(n / 1e3).toFixed(2)} KH/s`;
   return `${n.toFixed(2)} H/s`;
+}
+
+function formatSyncLagDetail(localLag, telemetryAgeSec) {
+  const local = Number(localLag);
+  const age = Number(telemetryAgeSec);
+  const localText = Number.isFinite(local) ? `${Math.max(0, Math.floor(local))} blk` : "-";
+  const ageText = Number.isFinite(age) ? formatAgeSeconds(Math.max(0, age)) : "-";
+  return `local: ${localText} | telemetry age: ${ageText}`;
 }
 
 function formatSystemTime24h(date = new Date()) {
@@ -862,6 +871,11 @@ function applyLiveSnapshot(snapshot) {
   setTextIfPresent(statWork, snapshot.cumulative_work);
   setTextIfPresent(statRelayPeers, snapshot.relay_active_peers);
   setTextIfPresent(statSyncLag, snapshot.sync_lag_blocks, (v) => `${v} blk`);
+  setTextIfPresent(
+    statSyncLagDetail,
+    formatSyncLagDetail(snapshot.sync_lag_local_blocks, snapshot.relay_snapshot_age_sec),
+    (v) => v,
+  );
   setTextIfPresent(statLastBlockAge, snapshot.last_block_age_sec, formatAgeSeconds);
   setTextIfPresent(statRelayMempool, snapshot.relay_mempool_len);
   setTextIfPresent(statNetworkHashrate, snapshot.network_hashrate_hps, formatHashrate);

@@ -215,6 +215,13 @@ code,
   word-break: break-word;
 }
 
+.stat-card .value-sub {
+  margin-top: 0.22rem;
+  font-size: 0.72rem;
+  color: var(--muted);
+  word-break: break-word;
+}
+
 .stat-card-wide {
   width: 100%;
 }

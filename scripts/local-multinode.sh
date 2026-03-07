@@ -27,6 +27,7 @@ set -euo pipefail
 #   RUN_SYNC_LOOP=false
 #   SYNC_LOOP_INTERVAL_SEC=5
 #   FORCE_SYNC_LOOP_WITH_RELAY=false
+#   FORCE_INITIAL_SYNC_BOOK_WITH_RELAY=false
 #   P2P_READ_TIMEOUT_SEC=5
 #   P2P_WRITE_TIMEOUT_SEC=5
 #   RELAY_OUTBOUND_CONNECT=true
@@ -53,6 +54,7 @@ SYNC_MAX_BATCHES_PER_PEER="${SYNC_MAX_BATCHES_PER_PEER:-8}"
 RUN_SYNC_LOOP="${RUN_SYNC_LOOP:-false}"
 SYNC_LOOP_INTERVAL_SEC="${SYNC_LOOP_INTERVAL_SEC:-5}"
 FORCE_SYNC_LOOP_WITH_RELAY="${FORCE_SYNC_LOOP_WITH_RELAY:-false}"
+FORCE_INITIAL_SYNC_BOOK_WITH_RELAY="${FORCE_INITIAL_SYNC_BOOK_WITH_RELAY:-false}"
 P2P_READ_TIMEOUT_SEC="${P2P_READ_TIMEOUT_SEC:-5}"
 P2P_WRITE_TIMEOUT_SEC="${P2P_WRITE_TIMEOUT_SEC:-5}"
 RELAY_OUTBOUND_CONNECT="${RELAY_OUTBOUND_CONNECT:-true}"
@@ -356,23 +358,28 @@ start_cluster() {
   fi
 
   if is_true "${SYNC_BOOK}"; then
-    echo "[cluster] running initial sync-book pass"
-    for ((idx = 1; idx < NODE_COUNT; idx++)); do
-      local logsdir runtime_db peersdir
-      logsdir="$(logs_dir_path "${idx}")"
-      runtime_db="$(runtime_db_path "${idx}")"
-      peersdir="$(peers_dir_path "${idx}")"
-      if ! "${bin}" sync-book \
-        --network "${NETWORK}" \
-        --config "${CONFIG}" \
-        --runtime-db "${runtime_db}" \
-        --peers-dir "${peersdir}" \
-        --max-peers "${NODE_COUNT}" \
-        --max-batches-per-peer "${SYNC_MAX_BATCHES_PER_PEER}" \
-        > "${logsdir}/sync-book.log" 2>&1; then
-        echo "[cluster] node-${idx} sync-book returned non-zero (see ${logsdir}/sync-book.log)"
-      fi
-    done
+    if ! is_true "${FORCE_INITIAL_SYNC_BOOK_WITH_RELAY}"; then
+      echo "[cluster] skip initial sync-book pass: relay runtime holds runtime DB locks and handles realtime propagation"
+      echo "[cluster] set FORCE_INITIAL_SYNC_BOOK_WITH_RELAY=true to force one-shot sync-book (not recommended)"
+    else
+      echo "[cluster] running initial sync-book pass (FORCE_INITIAL_SYNC_BOOK_WITH_RELAY=true)"
+      for ((idx = 1; idx < NODE_COUNT; idx++)); do
+        local logsdir runtime_db peersdir
+        logsdir="$(logs_dir_path "${idx}")"
+        runtime_db="$(runtime_db_path "${idx}")"
+        peersdir="$(peers_dir_path "${idx}")"
+        if ! "${bin}" sync-book \
+          --network "${NETWORK}" \
+          --config "${CONFIG}" \
+          --runtime-db "${runtime_db}" \
+          --peers-dir "${peersdir}" \
+          --max-peers "${NODE_COUNT}" \
+          --max-batches-per-peer "${SYNC_MAX_BATCHES_PER_PEER}" \
+          > "${logsdir}/sync-book.log" 2>&1; then
+          echo "[cluster] node-${idx} sync-book returned non-zero (see ${logsdir}/sync-book.log)"
+        fi
+      done
+    fi
   fi
 
   if is_true "${RUN_SYNC_LOOP}"; then
