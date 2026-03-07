@@ -87,11 +87,14 @@ fn diversity_key(ip: IpAddr) -> String {
 }
 
 fn sort_candidates(candidates: &mut [PeerCandidate], rotate_after_sec: u64, now_unix_sec: u64) {
-    let _ = rotate_after_sec;
-    let _ = now_unix_sec;
+    let stale_cutoff = now_unix_sec.saturating_sub(rotate_after_sec.max(1));
     candidates.sort_unstable_by(|a, b| {
+        let a_stale = a.last_connected_unix_sec == 0 || a.last_connected_unix_sec <= stale_cutoff;
+        let b_stale = b.last_connected_unix_sec == 0 || b.last_connected_unix_sec <= stale_cutoff;
         a.failure_count
             .cmp(&b.failure_count)
+            // Rotate away from recently-used peers.
+            .then_with(|| b_stale.cmp(&a_stale))
             // Prefer peers that have not been selected recently.
             .then_with(|| a.last_connected_unix_sec.cmp(&b.last_connected_unix_sec))
             .then_with(|| a.addr.cmp(&b.addr))

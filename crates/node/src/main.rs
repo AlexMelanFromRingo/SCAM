@@ -2722,6 +2722,24 @@ impl PeerAnchorStore {
     }
 }
 
+#[derive(Clone, Debug)]
+struct PeerBookStore {
+    peers_db_path: PathBuf,
+    legacy_txt_path: PathBuf,
+    network_id: String,
+}
+
+impl PeerBookStore {
+    fn from_peers_dir(peers_dir: &Path, network_id: &str) -> Self {
+        let (peers_db_path, legacy_txt_path) = peer_book_paths(peers_dir, network_id);
+        Self {
+            peers_db_path,
+            legacy_txt_path,
+            network_id: network_id.to_owned(),
+        }
+    }
+}
+
 fn load_peer_reputation_book(
     path: &Path,
     network_id: &str,
@@ -5204,6 +5222,7 @@ fn run_sync_book(args: SyncBookArgs) -> Result<(), NodeError> {
 struct RelayServerState {
     runtime: ChainRuntime,
     relay: RelayAdmissionState,
+    peer_book_store: Option<PeerBookStore>,
     pending_block_orphans: HashMap<Hash256, scam_core::Block>,
     pending_block_orphan_order: VecDeque<Hash256>,
     last_parent_sync_request_sec: HashMap<Hash256, u64>,
@@ -5212,6 +5231,7 @@ struct RelayServerState {
     pending_parent_tx_requests: HashMap<Hash256, u64>,
     pending_compact_blocks: HashMap<Hash256, PendingCompactBlock>,
     known_peer_addresses: Vec<PeerAddress>,
+    pending_peer_book_updates: Vec<PeerAddress>,
     outbound_worker_starts_total: u64,
     outbound_supervisor_starts_total: u64,
 }
@@ -5221,6 +5241,7 @@ impl RelayServerState {
         Self {
             runtime,
             relay,
+            peer_book_store: None,
             pending_block_orphans: HashMap::new(),
             pending_block_orphan_order: VecDeque::new(),
             last_parent_sync_request_sec: HashMap::new(),
@@ -5229,9 +5250,15 @@ impl RelayServerState {
             pending_parent_tx_requests: HashMap::new(),
             pending_compact_blocks: HashMap::new(),
             known_peer_addresses: Vec::new(),
+            pending_peer_book_updates: Vec::new(),
             outbound_worker_starts_total: 0,
             outbound_supervisor_starts_total: 0,
         }
+    }
+
+    fn with_peer_book_store(mut self, store: PeerBookStore) -> Self {
+        self.peer_book_store = Some(store);
+        self
     }
 }
 
@@ -5252,6 +5279,7 @@ const RELAY_INBOUND_ACCEPT_MAX_PER_IP: usize = 64;
 const RELAY_MAX_CONSECUTIVE_READ_TIMEOUTS: u32 = 16;
 const RELAY_PROTOCOL_PENALTY: u32 = 25;
 const RELAY_MAX_ADDR_ITEMS: usize = 1_000;
+const RELAY_MAX_PENDING_PEER_BOOK_UPDATES: usize = 4_000;
 const RELAY_MAX_LOCATOR_ITEMS: usize = 101;
 const RELAY_MAX_HEADERS_PER_ANNOUNCEMENT: usize = 2_000;
 const RELAY_MAX_GETBLOCKTXN_INDEXES: usize = 1_024;
@@ -6763,6 +6791,40 @@ fn relay_known_peer_addresses(state: &RelayServerState, max_items: usize) -> Vec
         .collect::<Vec<_>>()
 }
 
+fn relay_queue_peer_book_update(state: &mut RelayServerState, entry: PeerAddress) {
+    if entry.address.trim().is_empty() {
+        return;
+    }
+    if parse_relay_target_endpoint(&entry.address).is_none() {
+        return;
+    }
+    if let Some(existing) = state
+        .pending_peer_book_updates
+        .iter_mut()
+        .find(|known| known.address == entry.address)
+    {
+        existing.last_seen_unix_sec = existing.last_seen_unix_sec.max(entry.last_seen_unix_sec);
+        existing.services |= entry.services;
+        return;
+    }
+    state.pending_peer_book_updates.push(entry);
+    if state.pending_peer_book_updates.len() > RELAY_MAX_PENDING_PEER_BOOK_UPDATES {
+        state
+            .pending_peer_book_updates
+            .sort_unstable_by(|a, b| a.address.cmp(&b.address));
+        state
+            .pending_peer_book_updates
+            .dedup_by(|a, b| a.address == b.address);
+        let overflow = state
+            .pending_peer_book_updates
+            .len()
+            .saturating_sub(RELAY_MAX_PENDING_PEER_BOOK_UPDATES);
+        if overflow > 0 {
+            state.pending_peer_book_updates.drain(0..overflow);
+        }
+    }
+}
+
 fn relay_merge_known_peer_addresses(state: &mut RelayServerState, incoming: &[PeerAddress]) {
     if incoming.is_empty() {
         return;
@@ -6781,16 +6843,129 @@ fn relay_merge_known_peer_addresses(state: &mut RelayServerState, incoming: &[Pe
         by_addr
             .entry(entry.address.clone())
             .and_modify(|existing| {
+                let before_seen = existing.last_seen_unix_sec;
+                let before_services = existing.services;
                 existing.last_seen_unix_sec =
                     existing.last_seen_unix_sec.max(entry.last_seen_unix_sec);
                 existing.services |= entry.services;
+                if existing.last_seen_unix_sec != before_seen
+                    || existing.services != before_services
+                {
+                    relay_queue_peer_book_update(state, existing.clone());
+                }
             })
-            .or_insert_with(|| entry.clone());
+            .or_insert_with(|| {
+                relay_queue_peer_book_update(state, entry.clone());
+                entry.clone()
+            });
     }
     let mut merged = by_addr.into_values().collect::<Vec<_>>();
     merged.sort_unstable_by(|a, b| a.address.cmp(&b.address));
     merged.truncate(2_000);
     state.known_peer_addresses = merged;
+}
+
+fn relay_persist_peer_book_updates(
+    store: &PeerBookStore,
+    updates: &[PeerAddress],
+) -> Result<(), NodeError> {
+    if updates.is_empty() {
+        return Ok(());
+    }
+    let now_unix_sec = current_unix_sec().unwrap_or(0);
+    let mut unique_updates = updates
+        .iter()
+        .filter(|entry| !entry.address.trim().is_empty())
+        .filter(|entry| parse_relay_target_endpoint(&entry.address).is_some())
+        .cloned()
+        .collect::<Vec<_>>();
+    if unique_updates.is_empty() {
+        return Ok(());
+    }
+    unique_updates.sort_unstable_by(|a, b| a.address.cmp(&b.address));
+    unique_updates.dedup_by(|a, b| a.address == b.address);
+
+    let mut peer_book = match load_with_retry(8, 10, is_peer_book_db_lock_conflict, || {
+        load_or_init_peer_book(
+            &store.network_id,
+            &store.peers_db_path,
+            &store.legacy_txt_path,
+        )
+    })? {
+        Some(book) => book,
+        None => return Ok(()),
+    };
+
+    let mut changed = false;
+    for entry in unique_updates {
+        if let Some(existing) = find_peer_record_mut(&mut peer_book, &entry.address) {
+            let next_last_seen = existing
+                .last_seen_unix_sec
+                .max(entry.last_seen_unix_sec)
+                .max(now_unix_sec);
+            if next_last_seen != existing.last_seen_unix_sec {
+                existing.last_seen_unix_sec = next_last_seen;
+                changed = true;
+            }
+            let next_ban = existing.ban_score.saturating_sub(1);
+            if next_ban != existing.ban_score {
+                existing.ban_score = next_ban;
+                changed = true;
+            }
+            continue;
+        }
+        peer_book.peers.push(PeerAddressRecord {
+            address: entry.address,
+            last_seen_unix_sec: entry.last_seen_unix_sec.max(now_unix_sec),
+            ban_score: 0,
+        });
+        changed = true;
+    }
+
+    if !changed {
+        return Ok(());
+    }
+    sort_and_dedup_peer_book(&mut peer_book);
+    persist_with_retry(
+        8,
+        10,
+        is_peer_book_db_lock_conflict,
+        "peer book persist failed for unknown reason",
+        || save_peer_book_db(&store.peers_db_path, &peer_book).map_err(NodeError::from),
+    )
+}
+
+fn relay_flush_pending_peer_book_updates(
+    state: &Arc<Mutex<RelayServerState>>,
+) -> Result<(), NodeError> {
+    let (store, updates) = {
+        let mut guard = state
+            .lock()
+            .map_err(|_| NodeError::Runtime("relay state mutex poisoned".to_owned()))?;
+        if guard.pending_peer_book_updates.is_empty() {
+            return Ok(());
+        }
+        let updates = std::mem::take(&mut guard.pending_peer_book_updates);
+        (guard.peer_book_store.clone(), updates)
+    };
+    let Some(store) = store else {
+        return Ok(());
+    };
+    relay_persist_peer_book_updates(&store, &updates)
+}
+
+fn relay_register_connected_peer_address(state: &mut RelayServerState, address: &str, now: u64) {
+    if address.trim().is_empty() {
+        return;
+    }
+    relay_merge_known_peer_addresses(
+        state,
+        &[PeerAddress {
+            address: address.to_owned(),
+            services: 1,
+            last_seen_unix_sec: now,
+        }],
+    );
 }
 
 fn relay_submit_incoming_block(
@@ -7435,6 +7610,7 @@ enum RelayPeerSessionMode {
     Outbound,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn load_relay_outbound_targets(
     peers_dir: &Path,
     network_name: &str,
@@ -7737,6 +7913,7 @@ fn run_relay_outbound_supervisor(
     read_timeout_sec: u64,
     write_timeout_sec: u64,
     redial_sec: u64,
+    rotate_after_sec: u64,
     peer_reputation_store: Option<PeerReputationStore>,
 ) {
     let redial_delay = Duration::from_secs(redial_sec.max(1));
@@ -7760,7 +7937,12 @@ fn run_relay_outbound_supervisor(
             }
         }
 
-        match load_relay_outbound_targets(&peers_dir, &cfg.network_id) {
+        match load_relay_outbound_targets_selected(
+            &peers_dir,
+            &cfg,
+            RELAY_OUTBOUND_MAX_PEERS,
+            rotate_after_sec,
+        ) {
             Ok(targets) => {
                 for target in targets {
                     if workers.contains_key(&target) {
@@ -8160,6 +8342,24 @@ fn relay_outbound_feeler_due(now_unix_sec: u64, last_feeler_unix_sec: u64) -> bo
         .is_some()
 }
 
+fn relay_outbound_rotate_after_sec() -> u64 {
+    env_opt("SCAM_RELAY_OUTBOUND_ROTATE_AFTER_SEC")
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(RELAY_OUTBOUND_ROTATE_AFTER_SEC)
+}
+
+fn relay_outbound_worker_rotation_due(
+    now_unix_sec: u64,
+    worker_started_unix_sec: u64,
+    rotate_after_sec: u64,
+) -> bool {
+    now_unix_sec
+        .saturating_sub(worker_started_unix_sec)
+        .checked_sub(rotate_after_sec.max(1))
+        .is_some()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_relay_outbound_supervisor_async(
     stop_flag: Arc<AtomicBool>,
@@ -8176,12 +8376,14 @@ async fn run_relay_outbound_supervisor_async(
     read_timeout_sec: u64,
     write_timeout_sec: u64,
     redial_sec: u64,
+    rotate_after_sec: u64,
     peer_reputation_store: Option<PeerReputationStore>,
 ) {
     let redial_delay = Duration::from_secs(redial_sec.max(1));
     relay_mark_outbound_supervisor_start(&state);
     let mut workers = HashMap::<String, tokio::task::JoinHandle<()>>::new();
     let mut worker_targets = HashSet::<String>::new();
+    let mut worker_started_unix_sec = HashMap::<String, u64>::new();
     let anchor_store = peer_reputation_store
         .as_ref()
         .map(PeerAnchorStore::from_reputation_store);
@@ -8205,6 +8407,7 @@ async fn run_relay_outbound_supervisor_async(
                     Err(err) => eprintln!("warning: outbound relay worker task failed: {err}"),
                 }
                 worker_targets.remove(&target);
+                worker_started_unix_sec.remove(&target);
             }
         }
 
@@ -8212,7 +8415,7 @@ async fn run_relay_outbound_supervisor_async(
             &peers_dir,
             &cfg,
             RELAY_OUTBOUND_MAX_PEERS,
-            RELAY_OUTBOUND_ROTATE_AFTER_SEC,
+            rotate_after_sec,
         ) {
             Ok(targets) => targets,
             Err(err) => {
@@ -8239,6 +8442,21 @@ async fn run_relay_outbound_supervisor_async(
         };
         let targets = merge_outbound_targets(anchor_targets, selected_targets);
 
+        let now_unix_sec = current_unix_sec().unwrap_or(0);
+        if let Some((stale_target, _)) = worker_started_unix_sec
+            .iter()
+            .find(|(_, started_at)| {
+                relay_outbound_worker_rotation_due(now_unix_sec, **started_at, rotate_after_sec)
+            })
+            .map(|(target, started_at)| (target.clone(), *started_at))
+            && let Some(handle) = workers.remove(&stale_target)
+        {
+            handle.abort();
+            let _ = handle.await;
+            worker_targets.remove(&stale_target);
+            worker_started_unix_sec.remove(&stale_target);
+        }
+
         for target in targets {
             if worker_targets.contains(&target) {
                 continue;
@@ -8246,7 +8464,8 @@ async fn run_relay_outbound_supervisor_async(
             if relay_target_matches_bind(&bind_addr, &target) {
                 continue;
             }
-            worker_targets.insert(target.clone());
+            let target_key = target.clone();
+            worker_targets.insert(target_key.clone());
             let stop_clone = stop_flag.clone();
             let next_peer_clone = next_peer_id.clone();
             let state_clone = state.clone();
@@ -8257,7 +8476,7 @@ async fn run_relay_outbound_supervisor_async(
             let bind_addr_clone = bind_addr.clone();
             let reputation_store_clone = peer_reputation_store.clone();
             workers.insert(
-                target.clone(),
+                target_key.clone(),
                 tokio::spawn(async move {
                     run_relay_outbound_worker_async(
                         target,
@@ -8279,9 +8498,9 @@ async fn run_relay_outbound_supervisor_async(
                     .await
                 }),
             );
+            worker_started_unix_sec.insert(target_key, now_unix_sec);
         }
 
-        let now_unix_sec = current_unix_sec().unwrap_or(0);
         if relay_outbound_feeler_due(now_unix_sec, last_feeler_unix_sec) {
             let mut excluded = worker_targets.clone();
             excluded.insert(bind_addr.clone());
@@ -8392,6 +8611,15 @@ fn run_relay_peer_session<IO: Read + Write>(
             guard.relay.gossip.connect_peer(peer_id);
             guard.peer_compact_pref.insert(peer_id, false);
             guard.peer_runtime_reputation.entry(peer_id).or_default();
+            if matches!(mode, RelayPeerSessionMode::Outbound)
+                && let Some(address) = peer_address
+            {
+                relay_register_connected_peer_address(
+                    &mut guard,
+                    address,
+                    current_unix_sec().unwrap_or(0),
+                );
+            }
             guard.relay.gossip.build_send_recon(peer_id)?
         };
 
@@ -8531,6 +8759,9 @@ fn run_relay_peer_session<IO: Read + Write>(
                 persist_mempool_db_with_retry(cfg, &guard.relay.mempool, mempool_db_path, 80, 25)?;
                 mempool_db_seen_mtime = mempool_db_mtime(mempool_db_path);
             }
+            if let Err(err) = relay_flush_pending_peer_book_updates(state) {
+                eprintln!("warning: cannot flush discovered peer addresses: {err}");
+            }
             match relay_send_messages_until_closed(stream, &outbound, &framing)? {
                 true => {}
                 false => break,
@@ -8544,6 +8775,9 @@ fn run_relay_peer_session<IO: Read + Write>(
             if banned {
                 break;
             }
+        }
+        if let Err(err) = relay_flush_pending_peer_book_updates(state) {
+            eprintln!("warning: cannot flush discovered peer addresses: {err}");
         }
         Ok(())
     })();
@@ -8637,6 +8871,15 @@ async fn run_relay_peer_session_async<S: AsyncRead + AsyncWrite + Unpin>(
             guard.relay.gossip.connect_peer(peer_id);
             guard.peer_compact_pref.insert(peer_id, false);
             guard.peer_runtime_reputation.entry(peer_id).or_default();
+            if matches!(mode, RelayPeerSessionMode::Outbound)
+                && let Some(address) = peer_address
+            {
+                relay_register_connected_peer_address(
+                    &mut guard,
+                    address,
+                    current_unix_sec().unwrap_or(0),
+                );
+            }
             guard.relay.gossip.build_send_recon(peer_id)?
         };
 
@@ -8805,6 +9048,9 @@ async fn run_relay_peer_session_async<S: AsyncRead + AsyncWrite + Unpin>(
                 persist_mempool_db_with_retry(cfg, &guard.relay.mempool, mempool_db_path, 80, 25)?;
                 mempool_db_seen_mtime = mempool_db_mtime(mempool_db_path);
             }
+            if let Err(err) = relay_flush_pending_peer_book_updates(state) {
+                eprintln!("warning: cannot flush discovered peer addresses: {err}");
+            }
             if !relay_send_messages_until_closed_async(
                 stream,
                 &outbound,
@@ -8826,6 +9072,9 @@ async fn run_relay_peer_session_async<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
 
+        if let Err(err) = relay_flush_pending_peer_book_updates(state) {
+            eprintln!("warning: cannot flush discovered peer addresses: {err}");
+        }
         Ok(())
     }
     .await;
@@ -8946,7 +9195,10 @@ fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
             replacement,
         )?,
     };
-    let state = Arc::new(Mutex::new(RelayServerState::new(runtime, relay)));
+    let peer_book_store = PeerBookStore::from_peers_dir(&args.peers_dir, &cfg.network_id);
+    let state = Arc::new(Mutex::new(
+        RelayServerState::new(runtime, relay).with_peer_book_store(peer_book_store.clone()),
+    ));
     let active_peers = Arc::new(Mutex::new(0usize));
     let next_peer_id = Arc::new(AtomicU64::new(0));
     match load_relay_known_peer_addresses(&args.peers_dir, &cfg.network_id) {
@@ -9020,6 +9272,7 @@ fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
     let telemetry_every_sec = args.telemetry_every_sec.max(1);
     let outbound_connect = args.outbound_connect;
     let outbound_redial_sec = args.outbound_redial_sec.max(1);
+    let outbound_rotate_after_sec = relay_outbound_rotate_after_sec();
     let max_clients = args.max_clients;
     let read_limit = args.max_messages_per_peer;
     let peer_reputation_store_for_runtime = peer_reputation_store.clone();
@@ -9027,8 +9280,8 @@ fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
     println!("Max concurrent sessions: {}", max_active_sessions);
     if outbound_connect {
         println!(
-            "Outbound relay dialer: enabled (redial={}s)",
-            outbound_redial_sec
+            "Outbound relay dialer: enabled (redial={}s rotate={}s)",
+            outbound_redial_sec, outbound_rotate_after_sec
         );
     } else {
         println!("Outbound relay dialer: disabled");
@@ -9093,6 +9346,7 @@ fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
                     read_timeout_sec,
                     write_timeout_sec,
                     outbound_redial_sec,
+                    outbound_rotate_after_sec,
                     Some(peer_reputation_store_clone),
                 )
                 .await;
@@ -27891,6 +28145,62 @@ mod tests {
     }
 
     #[test]
+    fn relay_flush_pending_peer_book_updates_persists_discovered_addresses() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let relay = RelayAdmissionState {
+            mempool: Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip: GossipEngine::new(32).expect("gossip"),
+        };
+
+        let peers_dir = temp_dir("test-relay-flush-peer-book-updates");
+        fs::create_dir_all(&peers_dir).expect("mkdir peers");
+        let store = super::PeerBookStore::from_peers_dir(&peers_dir, "devnet");
+        let state = Arc::new(std::sync::Mutex::new(
+            RelayServerState::new(runtime, relay).with_peer_book_store(store.clone()),
+        ));
+
+        {
+            let mut guard = state.lock().expect("state lock");
+            super::relay_register_connected_peer_address(&mut guard, "127.0.0.1:18444", 42);
+            super::relay_merge_known_peer_addresses(
+                &mut guard,
+                &[super::PeerAddress {
+                    address: "127.0.0.1:18445".to_owned(),
+                    services: 1,
+                    last_seen_unix_sec: 99,
+                }],
+            );
+            assert!(
+                !guard.pending_peer_book_updates.is_empty(),
+                "updates should be queued before flush"
+            );
+        }
+
+        super::relay_flush_pending_peer_book_updates(&state).expect("flush peer-book updates");
+
+        let book = load_peer_book_db(&store.peers_db_path).expect("load persisted peer book");
+        let addresses = book
+            .peers
+            .iter()
+            .map(|entry| entry.address.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        assert!(addresses.contains("127.0.0.1:18444"));
+        assert!(addresses.contains("127.0.0.1:18445"));
+
+        let guard = state.lock().expect("state lock");
+        assert!(
+            guard.pending_peer_book_updates.is_empty(),
+            "flush should clear pending updates"
+        );
+        let _ = fs::remove_dir_all(peers_dir);
+    }
+
+    #[test]
     fn load_relay_outbound_targets_selected_returns_only_valid_socket_addresses() {
         let peers_dir = temp_dir("test-relay-selected-targets");
         fs::create_dir_all(&peers_dir).expect("mkdir");
@@ -28200,6 +28510,7 @@ mod tests {
                     1,
                     1,
                     1,
+                    60,
                     None,
                 );
             }
@@ -28386,6 +28697,7 @@ mod tests {
                     1,
                     1,
                     1,
+                    60,
                     None,
                 );
             }
@@ -28575,6 +28887,7 @@ mod tests {
                 1,
                 1,
                 1,
+                60,
                 None,
             ));
             let connect_result = tokio::time::timeout(Duration::from_secs(8), rx).await;
@@ -28776,6 +29089,14 @@ mod tests {
     }
 
     #[test]
+    fn relay_outbound_worker_rotation_due_enforces_boundary() {
+        assert!(!super::relay_outbound_worker_rotation_due(10, 10, 60));
+        assert!(!super::relay_outbound_worker_rotation_due(69, 10, 60));
+        assert!(super::relay_outbound_worker_rotation_due(70, 10, 60));
+        assert!(super::relay_outbound_worker_rotation_due(71, 10, 60));
+    }
+
+    #[test]
     fn run_relay_outbound_worker_async_marks_start_counter() {
         let cfg: ChainConfig =
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
@@ -28864,6 +29185,7 @@ mod tests {
                 1,
                 1,
                 1,
+                60,
                 None,
             )
             .await;

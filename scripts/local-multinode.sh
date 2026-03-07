@@ -26,6 +26,7 @@ set -euo pipefail
 #   SYNC_MAX_BATCHES_PER_PEER=8
 #   RUN_SYNC_LOOP=false
 #   SYNC_LOOP_INTERVAL_SEC=5
+#   FORCE_SYNC_LOOP_WITH_RELAY=false
 #   P2P_READ_TIMEOUT_SEC=5
 #   P2P_WRITE_TIMEOUT_SEC=5
 #   RELAY_OUTBOUND_CONNECT=true
@@ -51,6 +52,7 @@ SYNC_BOOK="${SYNC_BOOK:-true}"
 SYNC_MAX_BATCHES_PER_PEER="${SYNC_MAX_BATCHES_PER_PEER:-8}"
 RUN_SYNC_LOOP="${RUN_SYNC_LOOP:-false}"
 SYNC_LOOP_INTERVAL_SEC="${SYNC_LOOP_INTERVAL_SEC:-5}"
+FORCE_SYNC_LOOP_WITH_RELAY="${FORCE_SYNC_LOOP_WITH_RELAY:-false}"
 P2P_READ_TIMEOUT_SEC="${P2P_READ_TIMEOUT_SEC:-5}"
 P2P_WRITE_TIMEOUT_SEC="${P2P_WRITE_TIMEOUT_SEC:-5}"
 RELAY_OUTBOUND_CONNECT="${RELAY_OUTBOUND_CONNECT:-true}"
@@ -374,29 +376,34 @@ start_cluster() {
   fi
 
   if is_true "${RUN_SYNC_LOOP}"; then
-    echo "[cluster] starting periodic sync-book loops (interval=${SYNC_LOOP_INTERVAL_SEC}s)"
-    for ((idx = 1; idx < NODE_COUNT; idx++)); do
-      local logsdir runtime_db peersdir nodedir
-      logsdir="$(logs_dir_path "${idx}")"
-      runtime_db="$(runtime_db_path "${idx}")"
-      peersdir="$(peers_dir_path "${idx}")"
-      nodedir="$(node_dir "${idx}")"
-      (
-        while true; do
-          "${bin}" sync-book \
-            --network "${NETWORK}" \
-            --config "${CONFIG}" \
-            --runtime-db "${runtime_db}" \
-            --peers-dir "${peersdir}" \
-            --max-peers "${NODE_COUNT}" \
-            --max-batches-per-peer "${SYNC_MAX_BATCHES_PER_PEER}" \
-            >> "${logsdir}/sync-loop.log" 2>&1 || true
-          sleep "${SYNC_LOOP_INTERVAL_SEC}"
-        done
-      ) &
-      write_pid "${nodedir}/sync-loop.pid" "$!"
-      ensure_pid_started "${nodedir}/sync-loop.pid" "node-${idx} sync-loop" "${logsdir}/sync-loop.log"
-    done
+    if ! is_true "${FORCE_SYNC_LOOP_WITH_RELAY}"; then
+      echo "[cluster] skip periodic sync-book loops: relay already handles realtime propagation; external sync-loop can cause runtime DB lock contention"
+      echo "[cluster] set FORCE_SYNC_LOOP_WITH_RELAY=true to override (not recommended)"
+    else
+      echo "[cluster] starting periodic sync-book loops (interval=${SYNC_LOOP_INTERVAL_SEC}s)"
+      for ((idx = 1; idx < NODE_COUNT; idx++)); do
+        local logsdir runtime_db peersdir nodedir
+        logsdir="$(logs_dir_path "${idx}")"
+        runtime_db="$(runtime_db_path "${idx}")"
+        peersdir="$(peers_dir_path "${idx}")"
+        nodedir="$(node_dir "${idx}")"
+        (
+          while true; do
+            "${bin}" sync-book \
+              --network "${NETWORK}" \
+              --config "${CONFIG}" \
+              --runtime-db "${runtime_db}" \
+              --peers-dir "${peersdir}" \
+              --max-peers "${NODE_COUNT}" \
+              --max-batches-per-peer "${SYNC_MAX_BATCHES_PER_PEER}" \
+              >> "${logsdir}/sync-loop.log" 2>&1 || true
+            sleep "${SYNC_LOOP_INTERVAL_SEC}"
+          done
+        ) &
+        write_pid "${nodedir}/sync-loop.pid" "$!"
+        ensure_pid_started "${nodedir}/sync-loop.pid" "node-${idx} sync-loop" "${logsdir}/sync-loop.log"
+      done
+    fi
   fi
 
   echo "[cluster] up"
