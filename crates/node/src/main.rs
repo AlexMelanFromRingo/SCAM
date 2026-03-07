@@ -20245,6 +20245,183 @@ mod tests {
         assert!(!mempool.contains(&confirmed_txid));
     }
 
+    #[test]
+    fn remove_mempool_txs_with_missing_inputs_removes_stale_dependency_chain() {
+        let mut cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        cfg.coinbase_maturity = 1;
+        cfg.min_relay_fee_per_kb = 0;
+        cfg.validate().expect("config validate");
+
+        let mnemonic = WalletMnemonic::parse(SOAK_FLOW_MNEMONIC).expect("mnemonic");
+        let seed = mnemonic.to_seed("");
+        let sender_key = derive_wallet_key(&seed, 0, 0).expect("sender key");
+        let sender_key_hash20 = scam_core::hash160_blake3(&sender_key.pubkey_compressed());
+        let recipient_key_hash20 = scam_core::hash160_blake3(
+            &derive_wallet_key(&seed, 0, 1)
+                .expect("recipient key")
+                .pubkey_compressed(),
+        );
+
+        let mut runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        mine_blocks_on_runtime(
+            &mut runtime,
+            &super::MiningLoopParams {
+                count: 2,
+                interval_sec: cfg.target_block_time_sec,
+                max_nonce: 500_000,
+                subsidy: cfg.block_subsidy,
+                miner_key_hash: sender_key_hash20,
+                label_prefix: "remove-missing-helper",
+                print_each: false,
+            },
+        )
+        .expect("mine funding");
+
+        let signed_parent = super::build_signed_transfer_tx(
+            &runtime,
+            &cfg.network_id,
+            &sender_key,
+            recipient_key_hash20,
+            100_000,
+            1_000,
+        )
+        .expect("signed parent");
+        let mut stale_parent = signed_parent.tx;
+        stale_parent.inputs[0].prev_out = OutPoint {
+            txid: Hash256([0xA5; 32]),
+            vout: 0,
+        };
+        let stale_parent_txid = stale_parent.txid();
+
+        let stale_child = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: OutPoint {
+                    txid: stale_parent_txid,
+                    vout: 0,
+                },
+                signature: vec![1],
+                pubkey_compressed: sender_key.pubkey_compressed().to_vec(),
+                sequence: u32::MAX,
+            }],
+            outputs: vec![TxOut {
+                value: 50_000,
+                key_hash20: sender_key_hash20,
+            }],
+            lock_time: 0,
+        };
+        let stale_child_txid = stale_child.txid();
+
+        let mut mempool =
+            Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool");
+        mempool
+            .insert_with_fee(stale_parent, 10_000)
+            .expect("insert stale parent");
+        mempool
+            .insert_with_fee(stale_child, 10_000)
+            .expect("insert stale child");
+        assert!(mempool.contains(&stale_parent_txid));
+        assert!(mempool.contains(&stale_child_txid));
+
+        let removed = super::remove_mempool_txs_with_missing_inputs(&runtime, &mut mempool);
+        assert_eq!(removed, 2, "stale parent + child must both be removed");
+        assert!(!mempool.contains(&stale_parent_txid));
+        assert!(!mempool.contains(&stale_child_txid));
+        assert!(mempool.is_empty());
+    }
+
+    #[test]
+    fn cleanup_mempool_against_chain_returns_total_removed_for_stale_dependency_chain() {
+        let mut cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        cfg.coinbase_maturity = 1;
+        cfg.min_relay_fee_per_kb = 0;
+        cfg.validate().expect("config validate");
+
+        let mnemonic = WalletMnemonic::parse(SOAK_FLOW_MNEMONIC).expect("mnemonic");
+        let seed = mnemonic.to_seed("");
+        let sender_key = derive_wallet_key(&seed, 0, 0).expect("sender key");
+        let sender_key_hash20 = scam_core::hash160_blake3(&sender_key.pubkey_compressed());
+        let recipient_key_hash20 = scam_core::hash160_blake3(
+            &derive_wallet_key(&seed, 0, 1)
+                .expect("recipient key")
+                .pubkey_compressed(),
+        );
+
+        let mut runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        mine_blocks_on_runtime(
+            &mut runtime,
+            &super::MiningLoopParams {
+                count: 2,
+                interval_sec: cfg.target_block_time_sec,
+                max_nonce: 500_000,
+                subsidy: cfg.block_subsidy,
+                miner_key_hash: sender_key_hash20,
+                label_prefix: "cleanup-missing-helper",
+                print_each: false,
+            },
+        )
+        .expect("mine funding");
+
+        let signed_parent = super::build_signed_transfer_tx(
+            &runtime,
+            &cfg.network_id,
+            &sender_key,
+            recipient_key_hash20,
+            100_000,
+            1_000,
+        )
+        .expect("signed parent");
+        let mut stale_parent = signed_parent.tx;
+        stale_parent.inputs[0].prev_out = OutPoint {
+            txid: Hash256([0xC3; 32]),
+            vout: 0,
+        };
+        let stale_parent_txid = stale_parent.txid();
+
+        let stale_child = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: OutPoint {
+                    txid: stale_parent_txid,
+                    vout: 0,
+                },
+                signature: vec![2],
+                pubkey_compressed: sender_key.pubkey_compressed().to_vec(),
+                sequence: u32::MAX,
+            }],
+            outputs: vec![TxOut {
+                value: 40_000,
+                key_hash20: sender_key_hash20,
+            }],
+            lock_time: 0,
+        };
+        let stale_child_txid = stale_child.txid();
+
+        let mut mempool =
+            Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool");
+        mempool
+            .insert_with_fee(stale_parent, 10_000)
+            .expect("insert stale parent");
+        mempool
+            .insert_with_fee(stale_child, 10_000)
+            .expect("insert stale child");
+        assert!(mempool.contains(&stale_parent_txid));
+        assert!(mempool.contains(&stale_child_txid));
+
+        let removed = super::cleanup_mempool_against_chain(&runtime, &mut mempool);
+        assert_eq!(
+            removed, 2,
+            "cleanup must report stale parent + child removal"
+        );
+        assert!(!mempool.contains(&stale_parent_txid));
+        assert!(!mempool.contains(&stale_child_txid));
+        assert!(mempool.is_empty());
+    }
+
     #[cfg(unix)]
     #[test]
     fn remove_confirmed_txids_existing_db_still_persists_when_removed_set_is_empty() {
