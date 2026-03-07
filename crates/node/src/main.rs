@@ -4581,7 +4581,9 @@ fn ensure_consensus_fingerprint_match(
 }
 
 fn submit_tx_retryable_lock_conflict(err: &NodeError) -> bool {
-    is_runtime_db_lock_conflict(err) || is_mempool_db_lock_conflict(err)
+    // Runtime and mempool DBs use the same redb lock error surface.
+    // Keep a single detector here to avoid equivalent-logic drift.
+    is_runtime_db_lock_conflict(err)
 }
 
 fn submit_tx_retry_has_remaining_attempts(idx: usize, tries: usize) -> bool {
