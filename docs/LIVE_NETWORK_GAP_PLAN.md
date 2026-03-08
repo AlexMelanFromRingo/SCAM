@@ -10,6 +10,7 @@
 - Peer management hardening: outbound selection now uses addrman-like `tried/new` quotas plus per-network secret-salted diversity buckets (`<network>.bucket.key`) to reduce predictable eclipse slot targeting.
 - Peer fanout hardening: outbound peer selection now applies per-node deterministic jitter (`bind_addr`-scoped) to equal-score candidates, reducing herd/hotspot dials to the same low-index peers in large local clusters.
 - Catch-up hardening: relay periodic sync loop now emits both `GetHeaders` and rate-limited `GetBlocks` catch-up probes when a peer reports a higher tip, accelerating recovery after missed inventory bursts.
+- Catch-up hardening: unknown block inventory and parent-gap header announcements now trigger immediate bounded `GetBlocks` catch-up alongside `GetHeaders`, reducing long-tail lag in dense local meshes.
 - Orphan tx hardening: relay now requests missing parent transactions from the source peer (`GetData`), de-duplicates parent requests with TTL, and penalizes oversized orphan-parent fanout.
 - Anti-fingerprinting hardening: async relay send path supports bounded tx inventory diffusion jitter (`SCAM_RELAY_TX_DIFFUSION_BASE_MS`, `SCAM_RELAY_TX_DIFFUSION_MAX_MS`).
 - Anonymity transport guards: outbound relay now supports policy-gated Tor/I2P SOCKS5 routing and CJDNS admission (`SCAM_P2P_ALLOW_ONION`, `SCAM_P2P_ALLOW_I2P`, `SCAM_P2P_ALLOW_CJDNS`, `SCAM_P2P_SOCKS5_PROXY`).

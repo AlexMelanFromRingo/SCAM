@@ -6681,6 +6681,26 @@ fn relay_maybe_request_headers_on_block_inv(
     Some(relay_build_headers_request(state, peer_id, now_unix_sec))
 }
 
+fn relay_maybe_request_blocks_on_block_inv(
+    state: &mut RelayServerState,
+    peer_id: u64,
+    items: &[InventoryItem],
+    now_unix_sec: u64,
+) -> Option<WireMessage> {
+    if !relay_inv_has_unknown_block(state, items) {
+        return None;
+    }
+    let last = state
+        .peer_last_blocks_request_sec
+        .get(&peer_id)
+        .copied()
+        .unwrap_or(0);
+    if now_unix_sec.saturating_sub(last) < relay_headers_inv_trigger_interval_sec() {
+        return None;
+    }
+    Some(relay_build_blocks_request(state, peer_id, now_unix_sec))
+}
+
 fn relay_server_snapshot(
     state: &RelayServerState,
     active_peers: usize,
@@ -7706,6 +7726,11 @@ fn process_relay_wire_message_inner(
                     relay_maybe_request_headers_catchup(state, peer_id, now_unix_sec)
             {
                 out.push(get_headers);
+                if let Some(get_blocks) =
+                    relay_maybe_request_blocks_catchup(state, peer_id, now_unix_sec)
+                {
+                    out.push(get_blocks);
+                }
             }
             Ok(out)
         }
@@ -7723,9 +7748,14 @@ fn process_relay_wire_message_inner(
         WireMessage::Inv { items } => {
             let maybe_headers =
                 relay_maybe_request_headers_on_block_inv(state, peer_id, &items, now_unix_sec);
+            let maybe_blocks =
+                relay_maybe_request_blocks_on_block_inv(state, peer_id, &items, now_unix_sec);
             let mut out = relay_handle_gossip_message(state, peer_id, WireMessage::Inv { items })?;
             if let Some(get_headers) = maybe_headers {
                 out.push(get_headers);
+            }
+            if let Some(get_blocks) = maybe_blocks {
+                out.push(get_blocks);
             }
             Ok(out)
         }
@@ -24507,6 +24537,12 @@ mod tests {
         assert!(
             first
                 .iter()
+                .any(|msg| matches!(msg, WireMessage::GetBlocks { stop: None, .. })),
+            "unknown block inv should trigger immediate blocks catchup"
+        );
+        assert!(
+            first
+                .iter()
                 .any(|msg| matches!(msg, WireMessage::GetData { items }
                 if items == &vec![InventoryItem::Block(unknown_block)])),
             "unknown block inv should still request block body via getdata"
@@ -24532,6 +24568,12 @@ mod tests {
                 .any(|msg| matches!(msg, WireMessage::GetHeaders { .. })),
             "headers catchup fast-path must not emit duplicate getheaders in the same second"
         );
+        assert!(
+            !second
+                .iter()
+                .any(|msg| matches!(msg, WireMessage::GetBlocks { .. })),
+            "blocks catchup fast-path must not emit duplicate getblocks in the same second"
+        );
 
         let third_unknown = Hash256([0x93; 32]);
         let third = super::process_relay_wire_message(
@@ -24548,6 +24590,12 @@ mod tests {
                 .iter()
                 .any(|msg| matches!(msg, WireMessage::GetHeaders { .. })),
             "headers catchup fast-path should reopen after one-second inv cooldown"
+        );
+        assert!(
+            third
+                .iter()
+                .any(|msg| matches!(msg, WireMessage::GetBlocks { .. })),
+            "blocks catchup fast-path should reopen after one-second inv cooldown"
         );
     }
 
@@ -24573,6 +24621,12 @@ mod tests {
                 .any(|msg| matches!(msg, WireMessage::GetHeaders { .. })),
             "known block inventory must not trigger headers catchup"
         );
+        assert!(
+            !known_block_out
+                .iter()
+                .any(|msg| matches!(msg, WireMessage::GetBlocks { .. })),
+            "known block inventory must not trigger blocks catchup"
+        );
 
         let txid = Hash256([0xA3; 32]);
         let tx_only_out = super::process_relay_wire_message(
@@ -24589,6 +24643,12 @@ mod tests {
                 .iter()
                 .any(|msg| matches!(msg, WireMessage::GetHeaders { .. })),
             "tx-only inventory must not trigger headers catchup"
+        );
+        assert!(
+            !tx_only_out
+                .iter()
+                .any(|msg| matches!(msg, WireMessage::GetBlocks { .. })),
+            "tx-only inventory must not trigger blocks catchup"
         );
     }
 
@@ -33835,6 +33895,11 @@ mod tests {
                 .any(|msg| matches!(msg, WireMessage::GetHeaders { stop: None, .. })),
             "peer with unknown-parent headers should receive a headers catchup request"
         );
+        assert!(
+            out.iter()
+                .any(|msg| matches!(msg, WireMessage::GetBlocks { stop: None, .. })),
+            "peer with unknown-parent headers should receive a blocks catchup request"
+        );
         assert_eq!(
             state.relay.gossip.peer_score(peer_id),
             Some(0),
@@ -33919,6 +33984,11 @@ mod tests {
             out.iter()
                 .any(|msg| matches!(msg, WireMessage::GetHeaders { stop: None, .. })),
             "parent gap should additionally trigger headers catchup"
+        );
+        assert!(
+            out.iter()
+                .any(|msg| matches!(msg, WireMessage::GetBlocks { stop: None, .. })),
+            "parent gap should additionally trigger blocks catchup"
         );
         assert_eq!(state.relay.gossip.peer_score(peer_id), Some(0));
     }
