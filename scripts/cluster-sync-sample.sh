@@ -22,6 +22,7 @@ set -euo pipefail
 #   INTERVAL_SEC=15
 #   HTTP_TIMEOUT_SEC=5.0
 #   KEEP_RUNNING=false
+#   CLEAN_CLUSTER_DIR=true
 #   BUILD=false
 #   CARGO_PROFILE=debug
 #   SCAM_NODE_BIN=target/debug/scam-node
@@ -41,6 +42,7 @@ DURATION_SEC="${DURATION_SEC:-600}"
 INTERVAL_SEC="${INTERVAL_SEC:-15}"
 HTTP_TIMEOUT_SEC="${HTTP_TIMEOUT_SEC:-5.0}"
 KEEP_RUNNING="${KEEP_RUNNING:-false}"
+CLEAN_CLUSTER_DIR="${CLEAN_CLUSTER_DIR:-true}"
 BUILD="${BUILD:-false}"
 CARGO_PROFILE="${CARGO_PROFILE:-debug}"
 SCAM_NODE_BIN="${SCAM_NODE_BIN:-target/debug/scam-node}"
@@ -75,6 +77,23 @@ cleanup() {
 trap cleanup EXIT
 
 mkdir -p "${CLUSTER_DIR}"
+
+if is_true "${CLEAN_CLUSTER_DIR}"; then
+  # Drop stale peer books/anchors/logs from previous topology sizes to avoid
+  # noisy dial loops and skewed sync-lag measurements.
+  CLUSTER_DIR="${CLUSTER_DIR}" \
+  NODE_COUNT="${NODE_COUNT}" \
+  BASE_P2P_PORT="${BASE_P2P_PORT}" \
+  BASE_RPC_PORT="${BASE_RPC_PORT}" \
+  BASE_STRATUM_PORT="${BASE_STRATUM_PORT}" \
+  RUN_STRATUM="${RUN_STRATUM}" \
+  BUILD="${BUILD}" \
+  CARGO_PROFILE="${CARGO_PROFILE}" \
+  SCAM_NODE_BIN="${SCAM_NODE_BIN}" \
+  ./scripts/local-multinode.sh down >/dev/null 2>&1 || true
+  rm -rf "${CLUSTER_DIR}"
+  mkdir -p "${CLUSTER_DIR}"
+fi
 
 if [[ -z "${MINER_A_ADDRESS}" || -z "${MINER_B_ADDRESS}" ]]; then
   mapfile -t generated < <(

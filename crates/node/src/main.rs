@@ -5347,6 +5347,7 @@ const RELAY_OUTBOUND_FEELER_TIMEOUT_SEC: u64 = 3;
 const RELAY_OUTBOUND_MAX_BACKOFF_SEC: u64 = 30;
 const RELAY_HEADERS_CATCHUP_INTERVAL_SEC: u64 = 2;
 const RELAY_HEADERS_PROBE_INTERVAL_SEC: u64 = 15;
+const RELAY_HEADERS_INV_TRIGGER_INTERVAL_SEC: u64 = 1;
 const RELAY_ASYNC_READ_POLL_INTERVAL_MS: u64 = 250;
 
 static RELAY_TX_DIFFUSION_BASE_MS: AtomicU64 = AtomicU64::new(0);
@@ -6488,9 +6489,9 @@ fn relay_should_request_headers_catchup(
         .unwrap_or(0);
     let elapsed = now_unix_sec.saturating_sub(last);
     if peer_tip > local_tip {
-        return elapsed >= RELAY_HEADERS_CATCHUP_INTERVAL_SEC;
+        return elapsed >= relay_headers_catchup_interval_sec();
     }
-    elapsed >= RELAY_HEADERS_PROBE_INTERVAL_SEC
+    elapsed >= relay_headers_probe_interval_sec()
 }
 
 fn relay_maybe_request_headers_catchup(
@@ -6501,14 +6502,57 @@ fn relay_maybe_request_headers_catchup(
     if !relay_should_request_headers_catchup(state, peer_id, now_unix_sec) {
         return None;
     }
+    Some(relay_build_headers_request(state, peer_id, now_unix_sec))
+}
+
+fn relay_build_headers_request(
+    state: &mut RelayServerState,
+    peer_id: u64,
+    now_unix_sec: u64,
+) -> WireMessage {
     let locator = build_block_locator(state.runtime.block_hashes());
     state
         .peer_last_headers_request_sec
         .insert(peer_id, now_unix_sec);
-    Some(WireMessage::GetHeaders {
+    WireMessage::GetHeaders {
         locator,
         stop: None,
+    }
+}
+
+fn relay_inv_has_unknown_block(state: &RelayServerState, items: &[InventoryItem]) -> bool {
+    items.iter().any(|item| match item {
+        InventoryItem::Block(hash) => {
+            state.runtime.header_by_hash(hash).is_none()
+                && !state.pending_block_orphans.contains_key(hash)
+                && !state.pending_compact_blocks.contains_key(hash)
+        }
+        InventoryItem::Tx(_) => false,
     })
+}
+
+fn relay_maybe_request_headers_on_block_inv(
+    state: &mut RelayServerState,
+    peer_id: u64,
+    items: &[InventoryItem],
+    now_unix_sec: u64,
+) -> Option<WireMessage> {
+    if !relay_inv_has_unknown_block(state, items) {
+        return None;
+    }
+    let local_tip = state.runtime.tip_height();
+    // Treat an unknown block inventory as "peer is at least one block ahead",
+    // then trigger accelerated headers catchup cadence.
+    relay_record_peer_tip_height(state, peer_id, local_tip.saturating_add(1));
+    let last = state
+        .peer_last_headers_request_sec
+        .get(&peer_id)
+        .copied()
+        .unwrap_or(0);
+    if now_unix_sec.saturating_sub(last) < relay_headers_inv_trigger_interval_sec() {
+        return None;
+    }
+    Some(relay_build_headers_request(state, peer_id, now_unix_sec))
 }
 
 fn relay_server_snapshot(
@@ -7539,7 +7583,13 @@ fn process_relay_wire_message_inner(
             Ok(out)
         }
         WireMessage::Inv { items } => {
-            relay_handle_gossip_message(state, peer_id, WireMessage::Inv { items })
+            let maybe_headers =
+                relay_maybe_request_headers_on_block_inv(state, peer_id, &items, now_unix_sec);
+            let mut out = relay_handle_gossip_message(state, peer_id, WireMessage::Inv { items })?;
+            if let Some(get_headers) = maybe_headers {
+                out.push(get_headers);
+            }
+            Ok(out)
         }
         WireMessage::SendRecon {
             enabled,
@@ -8659,6 +8709,21 @@ fn relay_outbound_max_peers() -> usize {
 
 fn relay_outbound_max_backoff_sec() -> u64 {
     env_nonzero_u64("SCAM_RELAY_OUTBOUND_MAX_BACKOFF_SEC").unwrap_or(RELAY_OUTBOUND_MAX_BACKOFF_SEC)
+}
+
+fn relay_headers_catchup_interval_sec() -> u64 {
+    env_nonzero_u64("SCAM_RELAY_HEADERS_CATCHUP_INTERVAL_SEC")
+        .unwrap_or(RELAY_HEADERS_CATCHUP_INTERVAL_SEC)
+}
+
+fn relay_headers_probe_interval_sec() -> u64 {
+    env_nonzero_u64("SCAM_RELAY_HEADERS_PROBE_INTERVAL_SEC")
+        .unwrap_or(RELAY_HEADERS_PROBE_INTERVAL_SEC)
+}
+
+fn relay_headers_inv_trigger_interval_sec() -> u64 {
+    env_nonzero_u64("SCAM_RELAY_HEADERS_INV_TRIGGER_INTERVAL_SEC")
+        .unwrap_or(RELAY_HEADERS_INV_TRIGGER_INTERVAL_SEC)
 }
 
 fn tokio_worker_threads_from_env(env_key: &str, default_cap: usize) -> usize {
@@ -24010,6 +24075,117 @@ mod tests {
     }
 
     #[test]
+    fn relay_inv_unknown_block_triggers_fast_headers_catchup() {
+        let mut state = relay_state_for_tests();
+        let peer_id = 9u64;
+        state.relay.gossip.connect_peer(peer_id);
+        let unknown_block = Hash256([0x91; 32]);
+
+        let first = super::process_relay_wire_message(
+            &mut state,
+            peer_id,
+            WireMessage::Inv {
+                items: vec![InventoryItem::Block(unknown_block)],
+            },
+            1_000,
+        )
+        .expect("inv handling");
+
+        assert!(
+            first
+                .iter()
+                .any(|msg| matches!(msg, WireMessage::GetHeaders { stop: None, .. })),
+            "unknown block inv should trigger immediate headers catchup"
+        );
+        assert!(
+            first
+                .iter()
+                .any(|msg| matches!(msg, WireMessage::GetData { items }
+                if items == &vec![InventoryItem::Block(unknown_block)])),
+            "unknown block inv should still request block body via getdata"
+        );
+        assert_eq!(
+            state.peer_last_headers_request_sec.get(&peer_id).copied(),
+            Some(1_000)
+        );
+
+        let second_unknown = Hash256([0x92; 32]);
+        let second = super::process_relay_wire_message(
+            &mut state,
+            peer_id,
+            WireMessage::Inv {
+                items: vec![InventoryItem::Block(second_unknown)],
+            },
+            1_000,
+        )
+        .expect("second inv handling");
+        assert!(
+            !second
+                .iter()
+                .any(|msg| matches!(msg, WireMessage::GetHeaders { .. })),
+            "headers catchup fast-path must not emit duplicate getheaders in the same second"
+        );
+
+        let third_unknown = Hash256([0x93; 32]);
+        let third = super::process_relay_wire_message(
+            &mut state,
+            peer_id,
+            WireMessage::Inv {
+                items: vec![InventoryItem::Block(third_unknown)],
+            },
+            1_001,
+        )
+        .expect("third inv handling");
+        assert!(
+            third
+                .iter()
+                .any(|msg| matches!(msg, WireMessage::GetHeaders { .. })),
+            "headers catchup fast-path should reopen after one-second inv cooldown"
+        );
+    }
+
+    #[test]
+    fn relay_inv_known_or_tx_only_inventory_does_not_trigger_headers_catchup() {
+        let mut state = relay_state_for_tests();
+        let peer_id = 10u64;
+        state.relay.gossip.connect_peer(peer_id);
+        let known_block = state.runtime.tip_hash();
+
+        let known_block_out = super::process_relay_wire_message(
+            &mut state,
+            peer_id,
+            WireMessage::Inv {
+                items: vec![InventoryItem::Block(known_block)],
+            },
+            2_000,
+        )
+        .expect("known block inv handling");
+        assert!(
+            !known_block_out
+                .iter()
+                .any(|msg| matches!(msg, WireMessage::GetHeaders { .. })),
+            "known block inventory must not trigger headers catchup"
+        );
+
+        let txid = Hash256([0xA3; 32]);
+        let tx_only_out = super::process_relay_wire_message(
+            &mut state,
+            peer_id,
+            WireMessage::Inv {
+                items: vec![InventoryItem::Tx(txid)],
+            },
+            2_001,
+        )
+        .expect("tx inv handling");
+        assert!(
+            !tx_only_out
+                .iter()
+                .any(|msg| matches!(msg, WireMessage::GetHeaders { .. })),
+            "tx-only inventory must not trigger headers catchup"
+        );
+    }
+
+    #[test]
     fn load_latest_jsonl_record_reads_last_non_empty_line() {
         let work_dir = temp_dir("test-load-latest-jsonl");
         fs::create_dir_all(&work_dir).expect("mkdir");
@@ -36093,6 +36269,9 @@ mod tests {
         const ROTATE_KEY: &str = "SCAM_RELAY_OUTBOUND_ROTATE_AFTER_SEC";
         const MAX_PEERS_KEY: &str = "SCAM_RELAY_OUTBOUND_MAX_PEERS";
         const MAX_BACKOFF_KEY: &str = "SCAM_RELAY_OUTBOUND_MAX_BACKOFF_SEC";
+        const HEADERS_CATCHUP_KEY: &str = "SCAM_RELAY_HEADERS_CATCHUP_INTERVAL_SEC";
+        const HEADERS_PROBE_KEY: &str = "SCAM_RELAY_HEADERS_PROBE_INTERVAL_SEC";
+        const HEADERS_INV_TRIGGER_KEY: &str = "SCAM_RELAY_HEADERS_INV_TRIGGER_INTERVAL_SEC";
         const INBOUND_WINDOW_KEY: &str = "SCAM_RELAY_INBOUND_ACCEPT_WINDOW_SEC";
         const INBOUND_MAX_PER_IP_KEY: &str = "SCAM_RELAY_INBOUND_ACCEPT_MAX_PER_IP";
         const INBOUND_LOOPBACK_MULT_KEY: &str = "SCAM_RELAY_INBOUND_ACCEPT_LOOPBACK_MULTIPLIER";
@@ -36101,6 +36280,9 @@ mod tests {
             ROTATE_KEY,
             MAX_PEERS_KEY,
             MAX_BACKOFF_KEY,
+            HEADERS_CATCHUP_KEY,
+            HEADERS_PROBE_KEY,
+            HEADERS_INV_TRIGGER_KEY,
             INBOUND_WINDOW_KEY,
             INBOUND_MAX_PER_IP_KEY,
             INBOUND_LOOPBACK_MULT_KEY,
@@ -36129,6 +36311,18 @@ mod tests {
             super::RELAY_OUTBOUND_MAX_BACKOFF_SEC
         );
         assert_eq!(
+            super::relay_headers_catchup_interval_sec(),
+            super::RELAY_HEADERS_CATCHUP_INTERVAL_SEC
+        );
+        assert_eq!(
+            super::relay_headers_probe_interval_sec(),
+            super::RELAY_HEADERS_PROBE_INTERVAL_SEC
+        );
+        assert_eq!(
+            super::relay_headers_inv_trigger_interval_sec(),
+            super::RELAY_HEADERS_INV_TRIGGER_INTERVAL_SEC
+        );
+        assert_eq!(
             super::relay_inbound_accept_window_sec(),
             super::RELAY_INBOUND_ACCEPT_WINDOW_SEC
         );
@@ -36145,6 +36339,9 @@ mod tests {
             std::env::set_var(ROTATE_KEY, "0");
             std::env::set_var(MAX_PEERS_KEY, "0");
             std::env::set_var(MAX_BACKOFF_KEY, "0");
+            std::env::set_var(HEADERS_CATCHUP_KEY, "0");
+            std::env::set_var(HEADERS_PROBE_KEY, "0");
+            std::env::set_var(HEADERS_INV_TRIGGER_KEY, "0");
             std::env::set_var(INBOUND_WINDOW_KEY, "0");
             std::env::set_var(INBOUND_MAX_PER_IP_KEY, "0");
             std::env::set_var(INBOUND_LOOPBACK_MULT_KEY, "0");
@@ -36161,6 +36358,18 @@ mod tests {
         assert_eq!(
             super::relay_outbound_max_backoff_sec(),
             super::RELAY_OUTBOUND_MAX_BACKOFF_SEC
+        );
+        assert_eq!(
+            super::relay_headers_catchup_interval_sec(),
+            super::RELAY_HEADERS_CATCHUP_INTERVAL_SEC
+        );
+        assert_eq!(
+            super::relay_headers_probe_interval_sec(),
+            super::RELAY_HEADERS_PROBE_INTERVAL_SEC
+        );
+        assert_eq!(
+            super::relay_headers_inv_trigger_interval_sec(),
+            super::RELAY_HEADERS_INV_TRIGGER_INTERVAL_SEC
         );
         assert_eq!(
             super::relay_inbound_accept_window_sec(),
@@ -36183,6 +36392,9 @@ mod tests {
             std::env::set_var(ROTATE_KEY, "17");
             std::env::set_var(MAX_PEERS_KEY, "11");
             std::env::set_var(MAX_BACKOFF_KEY, "23");
+            std::env::set_var(HEADERS_CATCHUP_KEY, "3");
+            std::env::set_var(HEADERS_PROBE_KEY, "9");
+            std::env::set_var(HEADERS_INV_TRIGGER_KEY, "2");
             std::env::set_var(INBOUND_WINDOW_KEY, "7");
             std::env::set_var(INBOUND_MAX_PER_IP_KEY, "13");
             std::env::set_var(INBOUND_LOOPBACK_MULT_KEY, "5");
@@ -36191,6 +36403,9 @@ mod tests {
         assert_eq!(super::relay_outbound_rotate_after_sec(), 17);
         assert_eq!(super::relay_outbound_max_peers(), 11);
         assert_eq!(super::relay_outbound_max_backoff_sec(), 23);
+        assert_eq!(super::relay_headers_catchup_interval_sec(), 3);
+        assert_eq!(super::relay_headers_probe_interval_sec(), 9);
+        assert_eq!(super::relay_headers_inv_trigger_interval_sec(), 2);
         assert_eq!(super::relay_inbound_accept_window_sec(), 7);
         assert_eq!(super::relay_inbound_accept_base_max_per_ip(8), 13);
         assert_eq!(super::relay_inbound_accept_loopback_multiplier(), 5);
