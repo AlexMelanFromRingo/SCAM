@@ -7379,7 +7379,7 @@ fn relay_protocol_violation(
 fn relay_missing_blocks_from_headers(
     state: &RelayServerState,
     headers: &[scam_core::BlockHeader],
-) -> Result<Vec<InventoryItem>, NodeError> {
+) -> Result<(Vec<InventoryItem>, bool), NodeError> {
     if headers.get(RELAY_MAX_HEADERS_PER_ANNOUNCEMENT).is_some() {
         return Err(NodeError::Runtime(format!(
             "headers announcement exceeds limit: got={}, limit={}",
@@ -7388,7 +7388,7 @@ fn relay_missing_blocks_from_headers(
         )));
     }
     if headers.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), false));
     }
 
     let mut seen = HashSet::<Hash256>::with_capacity(headers.len());
@@ -7412,10 +7412,7 @@ fn relay_missing_blocks_from_headers(
         if state.runtime.header_by_hash(&header.prev_block).is_none()
             && !announced.contains(&header.prev_block)
         {
-            return Err(NodeError::Runtime(format!(
-                "headers announcement contains unknown parent {} at index {}",
-                header.prev_block, index
-            )));
+            return Ok((missing, true));
         }
         announced.insert(hash);
         if state.runtime.block_by_hash(&hash).is_none() {
@@ -7423,7 +7420,7 @@ fn relay_missing_blocks_from_headers(
         }
     }
 
-    Ok(missing)
+    Ok((missing, false))
 }
 
 async fn process_relay_getdata_with_archive_async(
@@ -7561,36 +7558,35 @@ fn process_relay_wire_message_inner(
             Ok(vec![WireMessage::Inv { items }])
         }
         WireMessage::Headers { headers } => {
-            let missing = match relay_missing_blocks_from_headers(state, &headers) {
-                Ok(missing) => missing,
-                Err(err) => {
-                    let detail = err.to_string();
-                    if detail.contains("unknown parent") {
-                        // Do not disconnect on parent gaps: peers can be ahead or announcements
-                        // can race with blocks still in flight. Ask for headers catchup instead.
-                        return Ok(vec![relay_build_headers_request(
-                            state,
-                            peer_id,
-                            now_unix_sec,
-                        )]);
-                    }
-                    return Err(relay_protocol_violation(
+            let (missing, has_parent_gap) = relay_missing_blocks_from_headers(state, &headers)
+                .map_err(|err| {
+                    relay_protocol_violation(
                         state,
                         peer_id,
                         now_unix_sec,
-                        format!("invalid headers announcement: {detail}"),
-                    ));
-                }
-            };
+                        format!("invalid headers announcement: {err}"),
+                    )
+                })?;
             if let Some(announced_tip_height) =
                 relay_estimate_headers_tip_height(&state.runtime, &headers)
             {
                 relay_record_peer_tip_height(state, peer_id, announced_tip_height);
+            } else if has_parent_gap {
+                // Parent gap means peer is likely ahead of our local view.
+                let local_tip = state.runtime.tip_height();
+                relay_record_peer_tip_height(state, peer_id, local_tip.saturating_add(1));
             }
-            if missing.is_empty() {
-                return Ok(Vec::new());
+            let mut out = Vec::new();
+            if !missing.is_empty() {
+                out.push(WireMessage::GetData { items: missing });
             }
-            Ok(vec![WireMessage::GetData { items: missing }])
+            if has_parent_gap
+                && let Some(get_headers) =
+                    relay_maybe_request_headers_catchup(state, peer_id, now_unix_sec)
+            {
+                out.push(get_headers);
+            }
+            Ok(out)
         }
         WireMessage::GetData { items } => {
             let (mut out, missing_block_hashes, mut not_found) =
@@ -33150,6 +33146,87 @@ mod tests {
             Some(0),
             "unknown parent races are non-fatal and must not penalize peer score"
         );
+    }
+
+    #[test]
+    fn relay_headers_parent_gap_keeps_missing_prefix_getdata_and_requests_catchup() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let relay = RelayAdmissionState {
+            mempool: Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip: GossipEngine::new(64).expect("gossip"),
+        };
+        let mut state = RelayServerState::new(runtime, relay);
+        let peer_id = 84;
+        state.relay.gossip.connect_peer(peer_id);
+
+        let target = state
+            .runtime
+            .expected_target_for_next_block()
+            .expect("target");
+        let base_ts = state
+            .runtime
+            .tip_header()
+            .timestamp
+            .saturating_add(cfg.target_block_time_sec);
+        let reward = cfg.genesis_reward_key_hash20().expect("reward");
+
+        let known_template = BlockTemplate {
+            version: 1,
+            prev_block: state.runtime.tip_hash(),
+            timestamp: base_ts,
+            target,
+            transactions: vec![build_coinbase_tx(
+                "headers-prefix-known".to_owned(),
+                cfg.block_subsidy,
+                reward,
+            )],
+        };
+        let known = mine_block(&known_template, 500_000).expect("mine known");
+
+        let gap_template = BlockTemplate {
+            version: 1,
+            prev_block: Hash256([0x77; 32]),
+            timestamp: base_ts.saturating_add(cfg.target_block_time_sec),
+            target,
+            transactions: vec![build_coinbase_tx(
+                "headers-gap".to_owned(),
+                cfg.block_subsidy,
+                reward,
+            )],
+        };
+        let gap = mine_block(&gap_template, 500_000).expect("mine gap");
+
+        let out = process_relay_wire_message(
+            &mut state,
+            peer_id,
+            WireMessage::Headers {
+                headers: vec![known.header.clone(), gap.header.clone()],
+            },
+            2_300,
+        )
+        .expect("parent-gap announcement should not disconnect");
+
+        assert!(
+            out.iter().any(|msg| {
+                matches!(
+                    msg,
+                    WireMessage::GetData { items }
+                    if items == &vec![InventoryItem::Block(known.header.block_hash())]
+                )
+            }),
+            "known prefix missing block should still be requested via getdata"
+        );
+        assert!(
+            out.iter()
+                .any(|msg| matches!(msg, WireMessage::GetHeaders { stop: None, .. })),
+            "parent gap should additionally trigger headers catchup"
+        );
+        assert_eq!(state.relay.gossip.peer_score(peer_id), Some(0));
     }
 
     #[test]
