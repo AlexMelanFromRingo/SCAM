@@ -8618,11 +8618,18 @@ fn tokio_worker_threads_from_env(env_key: &str, default_cap: usize) -> usize {
 }
 
 fn relay_tokio_worker_threads() -> usize {
-    tokio_worker_threads_from_env("SCAM_RELAY_TOKIO_WORKER_THREADS", 4)
+    tokio_worker_threads_from_env("SCAM_RELAY_TOKIO_WORKER_THREADS", 2)
 }
 
 fn stratum_tokio_worker_threads() -> usize {
-    tokio_worker_threads_from_env("SCAM_STRATUM_TOKIO_WORKER_THREADS", 4)
+    tokio_worker_threads_from_env("SCAM_STRATUM_TOKIO_WORKER_THREADS", 2)
+}
+
+fn relay_handshake_timeout_sec(read_timeout_sec: u64) -> u64 {
+    env_opt("SCAM_RELAY_HANDSHAKE_TIMEOUT_SEC")
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(read_timeout_sec.max(10))
 }
 
 fn relay_outbound_backoff_delay(
@@ -9471,7 +9478,8 @@ async fn relay_handshake_async_with_timeout<S: AsyncRead + AsyncWrite + Unpin>(
     local_hello: &LocalHandshake,
     timeout_sec: u64,
 ) -> Result<RemoteHandshake, NodeError> {
-    let deadline = Duration::from_secs(timeout_sec.max(1));
+    let handshake_timeout_sec = relay_handshake_timeout_sec(timeout_sec).max(1);
+    let deadline = Duration::from_secs(handshake_timeout_sec);
     let handshake = async {
         match mode {
             RelayPeerSessionMode::Inbound => {
@@ -9488,7 +9496,7 @@ async fn relay_handshake_async_with_timeout<S: AsyncRead + AsyncWrite + Unpin>(
         Err(_) => Err(NodeError::Transport(TransportError::Io(
             std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
-                format!("relay handshake timed out after {}s", deadline.as_secs()),
+                format!("relay handshake timed out after {}s", handshake_timeout_sec),
             ),
         ))),
     }
@@ -18872,6 +18880,38 @@ mod tests {
         );
     }
 
+    fn read_until_pong_sync<R: Read>(
+        stream: &mut R,
+        framing: &FramingConfig,
+        nonce: u64,
+        max_reads: usize,
+    ) -> WireMessage {
+        for _ in 0..max_reads {
+            let msg = read_message(stream, framing).expect("read relay message");
+            if matches!(msg, WireMessage::Pong { nonce: got } if got == nonce) {
+                return msg;
+            }
+        }
+        panic!("did not observe Pong nonce={nonce} within {max_reads} reads");
+    }
+
+    async fn read_until_pong_async<S: tokio::io::AsyncRead + Unpin>(
+        stream: &mut S,
+        framing: &FramingConfig,
+        nonce: u64,
+        max_reads: usize,
+    ) -> WireMessage {
+        for _ in 0..max_reads {
+            let msg = read_message_async(stream, framing)
+                .await
+                .expect("read relay async message");
+            if matches!(msg, WireMessage::Pong { nonce: got } if got == nonce) {
+                return msg;
+            }
+        }
+        panic!("did not observe async Pong nonce={nonce} within {max_reads} reads");
+    }
+
     fn send_http_json_post(addr: &str, path: &str, body: &str) -> String {
         let request = format!(
             "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
@@ -19362,20 +19402,26 @@ mod tests {
         }
         const RELAY_THREADS_KEY: &str = "SCAM_RELAY_TOKIO_WORKER_THREADS";
         const STRATUM_THREADS_KEY: &str = "SCAM_STRATUM_TOKIO_WORKER_THREADS";
+        const RELAY_HANDSHAKE_TIMEOUT_KEY: &str = "SCAM_RELAY_HANDSHAKE_TIMEOUT_SEC";
         let saved_relay_threads = std::env::var(RELAY_THREADS_KEY).ok();
         let saved_stratum_threads = std::env::var(STRATUM_THREADS_KEY).ok();
+        let saved_relay_handshake_timeout = std::env::var(RELAY_HANDSHAKE_TIMEOUT_KEY).ok();
         unsafe {
             std::env::set_var(RELAY_THREADS_KEY, "3");
             std::env::set_var(STRATUM_THREADS_KEY, "5");
+            std::env::set_var(RELAY_HANDSHAKE_TIMEOUT_KEY, "17");
         }
         assert_eq!(super::relay_tokio_worker_threads(), 3);
         assert_eq!(super::stratum_tokio_worker_threads(), 5);
+        assert_eq!(super::relay_handshake_timeout_sec(2), 17);
         unsafe {
             std::env::set_var(RELAY_THREADS_KEY, "0");
             std::env::set_var(STRATUM_THREADS_KEY, "not-a-number");
+            std::env::set_var(RELAY_HANDSHAKE_TIMEOUT_KEY, "0");
         }
         assert!(super::relay_tokio_worker_threads() >= 2);
         assert!(super::stratum_tokio_worker_threads() >= 2);
+        assert_eq!(super::relay_handshake_timeout_sec(2), 10);
         if let Some(value) = saved_relay_threads {
             unsafe {
                 std::env::set_var(RELAY_THREADS_KEY, value);
@@ -19392,6 +19438,15 @@ mod tests {
         } else {
             unsafe {
                 std::env::remove_var(STRATUM_THREADS_KEY);
+            }
+        }
+        if let Some(value) = saved_relay_handshake_timeout {
+            unsafe {
+                std::env::set_var(RELAY_HANDSHAKE_TIMEOUT_KEY, value);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var(RELAY_HANDSHAKE_TIMEOUT_KEY);
             }
         }
         let lock_err = super::NodeError::Runtime("Database already open".to_owned());
@@ -24269,7 +24324,7 @@ mod tests {
         assert!(matches!(startup, WireMessage::SendRecon { .. }));
 
         send_message(&mut stream, &WireMessage::Ping { nonce: 1 }, &framing).expect("ping1");
-        let first = read_message(&mut stream, &framing).expect("pong1");
+        let first = read_until_pong_sync(&mut stream, &framing, 1, 8);
         assert!(matches!(first, WireMessage::Pong { nonce: 1 }));
 
         // The relay may close immediately after the quota is exceeded:
@@ -30585,7 +30640,7 @@ mod tests {
             &framing,
         )
         .expect("send ping1");
-        let pong1 = read_message(&mut remote_stream, &framing).expect("read pong1");
+        let pong1 = read_until_pong_sync(&mut remote_stream, &framing, 1, 8);
         assert!(matches!(pong1, WireMessage::Pong { nonce: 1 }));
 
         thread::sleep(Duration::from_millis(1_250));
@@ -30703,9 +30758,7 @@ mod tests {
             )
             .await
             .expect("send ping1");
-            let pong1 = read_message_async(&mut remote_stream, &framing)
-                .await
-                .expect("read pong1");
+            let pong1 = read_until_pong_async(&mut remote_stream, &framing, 1, 8).await;
             assert!(matches!(pong1, WireMessage::Pong { nonce: 1 }));
 
             tokio::time::sleep(Duration::from_millis(1_250)).await;
