@@ -5330,6 +5330,7 @@ const RELAY_OUTBOUND_FEELER_INTERVAL_SEC: u64 = 60;
 const RELAY_OUTBOUND_FEELER_TIMEOUT_SEC: u64 = 3;
 const RELAY_OUTBOUND_MAX_BACKOFF_SEC: u64 = 30;
 const RELAY_HEADERS_CATCHUP_INTERVAL_SEC: u64 = 2;
+const RELAY_HEADERS_PROBE_INTERVAL_SEC: u64 = 15;
 
 static RELAY_TX_DIFFUSION_BASE_MS: AtomicU64 = AtomicU64::new(0);
 static RELAY_TX_DIFFUSION_MAX_MS: AtomicU64 = AtomicU64::new(0);
@@ -6465,15 +6466,16 @@ fn relay_should_request_headers_catchup(
         .get(&peer_id)
         .copied()
         .unwrap_or(local_tip);
-    if peer_tip <= local_tip {
-        return false;
-    }
     let last = state
         .peer_last_headers_request_sec
         .get(&peer_id)
         .copied()
         .unwrap_or(0);
-    now_unix_sec.saturating_sub(last) >= RELAY_HEADERS_CATCHUP_INTERVAL_SEC
+    let elapsed = now_unix_sec.saturating_sub(last);
+    if peer_tip > local_tip {
+        return elapsed >= RELAY_HEADERS_CATCHUP_INTERVAL_SEC;
+    }
+    elapsed >= RELAY_HEADERS_PROBE_INTERVAL_SEC
 }
 
 fn relay_maybe_request_headers_catchup(
@@ -7167,6 +7169,57 @@ fn relay_collect_getdata_from_memory(
     (out, missing_block_hashes, not_found)
 }
 
+enum RelayArchiveLookup {
+    Found(scam_core::Block),
+    Missing,
+    Busy,
+}
+
+fn relay_archive_lookup_block(
+    archive_db_path: &Path,
+    hash: Hash256,
+) -> Result<RelayArchiveLookup, NodeError> {
+    let looked_up = load_with_retry(10, 10, is_runtime_db_lock_conflict, || {
+        load_block_by_hash_db(archive_db_path, hash).map_err(NodeError::from)
+    });
+    match looked_up {
+        Ok(Some(Some(block))) => Ok(RelayArchiveLookup::Found(block)),
+        Ok(Some(None)) | Ok(None) => Ok(RelayArchiveLookup::Missing),
+        Err(err) if is_runtime_db_lock_conflict(&err) => {
+            // Under relay/rpc concurrency this can be transient; don't poison the session
+            // and don't emit NotFound for a potentially existing block.
+            eprintln!(
+                "warning: relay archive lookup lock contention for block {} (serving soft-miss)",
+                hash
+            );
+            Ok(RelayArchiveLookup::Busy)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn relay_gossip_error_is_non_fatal(err: &GossipError) -> bool {
+    matches!(err, GossipError::Recon(detail)
+        if detail.contains("unknown reconciliation round salt=")
+            || detail.contains("received sketch for unknown round salt=")
+            || detail.contains("reqsketchext for non-responder round salt="))
+}
+
+fn relay_handle_gossip_message(
+    state: &mut RelayServerState,
+    peer_id: u64,
+    message: WireMessage,
+) -> Result<Vec<WireMessage>, NodeError> {
+    match state.relay.gossip.on_message(peer_id, message) {
+        Ok(outbound) => Ok(relay_gossip_outbound_for_peer(state, peer_id, outbound)),
+        Err(err) if relay_gossip_error_is_non_fatal(&err) => {
+            eprintln!("warning: ignoring non-fatal relay recon race for peer {peer_id}: {err}");
+            Ok(Vec::new())
+        }
+        Err(err) => Err(NodeError::Gossip(err)),
+    }
+}
+
 fn process_relay_wire_message_with_archive(
     state: &mut RelayServerState,
     peer_id: u64,
@@ -7179,14 +7232,14 @@ fn process_relay_wire_message_with_archive(
             let (mut out, missing_block_hashes, mut not_found) =
                 relay_collect_getdata_from_memory(state, items);
             for hash in missing_block_hashes {
-                let from_archive = match archive_db_path {
-                    Some(path) => load_block_by_hash_db(path, hash)?,
-                    None => None,
+                let archive_lookup = match archive_db_path {
+                    Some(path) => relay_archive_lookup_block(path, hash)?,
+                    None => RelayArchiveLookup::Missing,
                 };
-                if let Some(block) = from_archive {
-                    out.push(WireMessage::Block { block });
-                } else {
-                    not_found.push(InventoryItem::Block(hash));
+                match archive_lookup {
+                    RelayArchiveLookup::Found(block) => out.push(WireMessage::Block { block }),
+                    RelayArchiveLookup::Missing => not_found.push(InventoryItem::Block(hash)),
+                    RelayArchiveLookup::Busy => {}
                 }
             }
             if has_inventory_delta_changes(0, not_found.len()) {
@@ -7293,21 +7346,21 @@ async fn process_relay_getdata_with_archive_async(
     if !missing_block_hashes.is_empty() {
         let runtime_db_path = runtime_db_path.to_path_buf();
         let looked_up = tokio::task::spawn_blocking(move || {
-            let mut blocks = Vec::<(Hash256, Option<scam_core::Block>)>::new();
+            let mut blocks = Vec::<(Hash256, RelayArchiveLookup)>::new();
             for hash in missing_block_hashes {
-                let block = load_block_by_hash_db(&runtime_db_path, hash)?;
-                blocks.push((hash, block));
+                let lookup = relay_archive_lookup_block(&runtime_db_path, hash)?;
+                blocks.push((hash, lookup));
             }
-            Ok::<Vec<(Hash256, Option<scam_core::Block>)>, NodeError>(blocks)
+            Ok::<Vec<(Hash256, RelayArchiveLookup)>, NodeError>(blocks)
         })
         .await
         .map_err(|err| NodeError::Runtime(format!("relay archive lookup task failed: {err}")))??;
 
-        for (hash, block) in looked_up {
-            if let Some(block) = block {
-                out.push(WireMessage::Block { block });
-            } else {
-                not_found.push(InventoryItem::Block(hash));
+        for (hash, lookup) in looked_up {
+            match lookup {
+                RelayArchiveLookup::Found(block) => out.push(WireMessage::Block { block }),
+                RelayArchiveLookup::Missing => not_found.push(InventoryItem::Block(hash)),
+                RelayArchiveLookup::Busy => {}
             }
         }
     }
@@ -7443,11 +7496,7 @@ fn process_relay_wire_message_inner(
             Ok(out)
         }
         WireMessage::Inv { items } => {
-            let outbound = state
-                .relay
-                .gossip
-                .on_message(peer_id, WireMessage::Inv { items })?;
-            Ok(relay_gossip_outbound_for_peer(state, peer_id, outbound))
+            relay_handle_gossip_message(state, peer_id, WireMessage::Inv { items })
         }
         WireMessage::SendRecon {
             enabled,
@@ -7457,27 +7506,21 @@ fn process_relay_wire_message_inner(
             salt,
             max_sketch_items,
             max_diff_items,
-        } => {
-            let outbound = state.relay.gossip.on_message(
-                peer_id,
-                WireMessage::SendRecon {
-                    enabled,
-                    version,
-                    short_id_bits,
-                    implementation,
-                    salt,
-                    max_sketch_items,
-                    max_diff_items,
-                },
-            )?;
-            Ok(relay_gossip_outbound_for_peer(state, peer_id, outbound))
-        }
+        } => relay_handle_gossip_message(
+            state,
+            peer_id,
+            WireMessage::SendRecon {
+                enabled,
+                version,
+                short_id_bits,
+                implementation,
+                salt,
+                max_sketch_items,
+                max_diff_items,
+            },
+        ),
         WireMessage::ReqRecon { salt, set_size } => {
-            let outbound = state
-                .relay
-                .gossip
-                .on_message(peer_id, WireMessage::ReqRecon { salt, set_size })?;
-            Ok(relay_gossip_outbound_for_peer(state, peer_id, outbound))
+            relay_handle_gossip_message(state, peer_id, WireMessage::ReqRecon { salt, set_size })
         }
         WireMessage::Sketch {
             salt,
@@ -7485,48 +7528,38 @@ fn process_relay_wire_message_inner(
             capacity,
             implementation,
             bytes,
-        } => {
-            let outbound = state.relay.gossip.on_message(
-                peer_id,
-                WireMessage::Sketch {
-                    salt,
-                    bits,
-                    capacity,
-                    implementation,
-                    bytes,
-                },
-            )?;
-            Ok(relay_gossip_outbound_for_peer(state, peer_id, outbound))
-        }
-        WireMessage::ReqSketchExt { salt, capacity } => {
-            let outbound = state
-                .relay
-                .gossip
-                .on_message(peer_id, WireMessage::ReqSketchExt { salt, capacity })?;
-            Ok(relay_gossip_outbound_for_peer(state, peer_id, outbound))
-        }
+        } => relay_handle_gossip_message(
+            state,
+            peer_id,
+            WireMessage::Sketch {
+                salt,
+                bits,
+                capacity,
+                implementation,
+                bytes,
+            },
+        ),
+        WireMessage::ReqSketchExt { salt, capacity } => relay_handle_gossip_message(
+            state,
+            peer_id,
+            WireMessage::ReqSketchExt { salt, capacity },
+        ),
         WireMessage::ReqTx { salt, short_ids } => {
-            let outbound = state
-                .relay
-                .gossip
-                .on_message(peer_id, WireMessage::ReqTx { salt, short_ids })?;
-            Ok(relay_gossip_outbound_for_peer(state, peer_id, outbound))
+            relay_handle_gossip_message(state, peer_id, WireMessage::ReqTx { salt, short_ids })
         }
         WireMessage::ReconcileDiff {
             salt,
             announce_txids,
             request_txids,
-        } => {
-            let outbound = state.relay.gossip.on_message(
-                peer_id,
-                WireMessage::ReconcileDiff {
-                    salt,
-                    announce_txids,
-                    request_txids,
-                },
-            )?;
-            Ok(relay_gossip_outbound_for_peer(state, peer_id, outbound))
-        }
+        } => relay_handle_gossip_message(
+            state,
+            peer_id,
+            WireMessage::ReconcileDiff {
+                salt,
+                announce_txids,
+                request_txids,
+            },
+        ),
         WireMessage::Tx { tx } => {
             let txid = tx.txid();
             relay_parent_request_cache_cleanup(state, now_unix_sec);
@@ -8572,6 +8605,26 @@ fn relay_outbound_max_backoff_sec() -> u64 {
         .unwrap_or(RELAY_OUTBOUND_MAX_BACKOFF_SEC)
 }
 
+fn tokio_worker_threads_from_env(env_key: &str, default_cap: usize) -> usize {
+    if let Some(raw) = env_opt(env_key)
+        && let Ok(parsed) = raw.parse::<usize>()
+        && parsed > 0
+    {
+        return parsed;
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get().min(default_cap.max(2)).max(2))
+        .unwrap_or(2)
+}
+
+fn relay_tokio_worker_threads() -> usize {
+    tokio_worker_threads_from_env("SCAM_RELAY_TOKIO_WORKER_THREADS", 4)
+}
+
+fn stratum_tokio_worker_threads() -> usize {
+    tokio_worker_threads_from_env("SCAM_STRATUM_TOKIO_WORKER_THREADS", 4)
+}
+
 fn relay_outbound_backoff_delay(
     target: &str,
     redial_sec: u64,
@@ -9559,9 +9612,7 @@ fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
     let stop_flag = Arc::new(AtomicBool::new(false));
     let peer_reputation_store =
         PeerReputationStore::from_peers_dir(&args.peers_dir, &cfg.network_id);
-    let worker_threads = std::thread::available_parallelism()
-        .map(|n| n.get().max(2))
-        .unwrap_or(4);
+    let worker_threads = relay_tokio_worker_threads();
     let runtime = TokioRuntimeBuilder::new_multi_thread()
         .enable_all()
         .worker_threads(worker_threads)
@@ -9590,6 +9641,7 @@ fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
         inbound_accept_base_max_per_ip,
         relay_inbound_accept_loopback_multiplier()
     );
+    println!("Tokio worker threads: {}", worker_threads);
     if outbound_connect {
         println!(
             "Outbound relay dialer: enabled (redial={}s rotate={}s max_peers={} max_backoff={}s)",
@@ -13158,14 +13210,13 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
     {
         eprintln!("warning: failed to initialize pool ledger db: {err}");
     }
-    let worker_threads = std::thread::available_parallelism()
-        .map(|n| n.get().max(2))
-        .unwrap_or(4);
+    let worker_threads = stratum_tokio_worker_threads();
     let runtime = TokioRuntimeBuilder::new_multi_thread()
         .enable_all()
         .worker_threads(worker_threads)
         .build()
         .map_err(|e| NodeError::Runtime(format!("stratum async runtime init failed: {e}")))?;
+    println!("Tokio worker threads: {}", worker_threads);
 
     let bind = args.bind.clone();
     let max_clients = args.max_clients;
@@ -19309,6 +19360,40 @@ mod tests {
                 std::env::remove_var(RETRY_BACKOFF_KEY);
             }
         }
+        const RELAY_THREADS_KEY: &str = "SCAM_RELAY_TOKIO_WORKER_THREADS";
+        const STRATUM_THREADS_KEY: &str = "SCAM_STRATUM_TOKIO_WORKER_THREADS";
+        let saved_relay_threads = std::env::var(RELAY_THREADS_KEY).ok();
+        let saved_stratum_threads = std::env::var(STRATUM_THREADS_KEY).ok();
+        unsafe {
+            std::env::set_var(RELAY_THREADS_KEY, "3");
+            std::env::set_var(STRATUM_THREADS_KEY, "5");
+        }
+        assert_eq!(super::relay_tokio_worker_threads(), 3);
+        assert_eq!(super::stratum_tokio_worker_threads(), 5);
+        unsafe {
+            std::env::set_var(RELAY_THREADS_KEY, "0");
+            std::env::set_var(STRATUM_THREADS_KEY, "not-a-number");
+        }
+        assert!(super::relay_tokio_worker_threads() >= 2);
+        assert!(super::stratum_tokio_worker_threads() >= 2);
+        if let Some(value) = saved_relay_threads {
+            unsafe {
+                std::env::set_var(RELAY_THREADS_KEY, value);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var(RELAY_THREADS_KEY);
+            }
+        }
+        if let Some(value) = saved_stratum_threads {
+            unsafe {
+                std::env::set_var(STRATUM_THREADS_KEY, value);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var(STRATUM_THREADS_KEY);
+            }
+        }
         let lock_err = super::NodeError::Runtime("Database already open".to_owned());
         let other_err = super::NodeError::Runtime("other error".to_owned());
         assert!(super::mempool_summary_should_fallback_on_error(&lock_err));
@@ -19433,6 +19518,21 @@ mod tests {
         assert!(super::http_io_error_is_closed_like(&io_reset));
         assert!(super::http_io_error_is_closed_like(&io_broken_pipe));
         assert!(!super::http_io_error_is_closed_like(&io_denied));
+        assert!(super::relay_gossip_error_is_non_fatal(
+            &super::GossipError::Recon("received sketch for unknown round salt=7".to_owned())
+        ));
+        assert!(super::relay_gossip_error_is_non_fatal(
+            &super::GossipError::Recon("unknown reconciliation round salt=9".to_owned())
+        ));
+        assert!(super::relay_gossip_error_is_non_fatal(
+            &super::GossipError::Recon("reqsketchext for non-responder round salt=11".to_owned())
+        ));
+        assert!(!super::relay_gossip_error_is_non_fatal(
+            &super::GossipError::Recon("unsupported recon bits".to_owned())
+        ));
+        assert!(!super::relay_gossip_error_is_non_fatal(
+            &super::GossipError::UnknownPeer { peer_id: 1 }
+        ));
         assert!(super::rpc_accept_error_should_retry(
             true,
             std::io::ErrorKind::WouldBlock
@@ -23695,7 +23795,7 @@ mod tests {
     }
 
     #[test]
-    fn relay_headers_catchup_requests_only_when_peer_is_ahead_and_cooldown_elapsed() {
+    fn relay_headers_catchup_requests_use_probe_and_ahead_intervals() {
         let cfg: ChainConfig =
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
         let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
@@ -23709,16 +23809,29 @@ mod tests {
         let mut state = RelayServerState::new(runtime, relay);
         let peer_id = 17u64;
 
-        // Same height => no catchup request.
+        // Same height => periodic probe requests headers.
         state.peer_reported_tip_heights.insert(peer_id, 0);
+        let probe = super::relay_maybe_request_headers_catchup(&mut state, peer_id, 100)
+            .expect("equal height should trigger periodic probe");
+        assert!(matches!(
+            probe,
+            WireMessage::GetHeaders {
+                locator: _,
+                stop: None
+            }
+        ));
         assert!(
-            super::relay_maybe_request_headers_catchup(&mut state, peer_id, 100).is_none(),
-            "equal height must not trigger catchup"
+            super::relay_maybe_request_headers_catchup(&mut state, peer_id, 114).is_none(),
+            "probe cooldown must suppress early refreshes"
+        );
+        assert!(
+            super::relay_maybe_request_headers_catchup(&mut state, peer_id, 115).is_some(),
+            "probe should fire again after probe interval"
         );
 
-        // Peer ahead => request immediately.
+        // Peer ahead => request cadence tightens to catchup interval.
         state.peer_reported_tip_heights.insert(peer_id, 5);
-        let first = super::relay_maybe_request_headers_catchup(&mut state, peer_id, 100)
+        let first = super::relay_maybe_request_headers_catchup(&mut state, peer_id, 117)
             .expect("should request headers");
         assert!(matches!(
             first,
@@ -23730,11 +23843,11 @@ mod tests {
 
         // Cooldown applies.
         assert!(
-            super::relay_maybe_request_headers_catchup(&mut state, peer_id, 101).is_none(),
+            super::relay_maybe_request_headers_catchup(&mut state, peer_id, 118).is_none(),
             "cooldown must suppress rapid repeats"
         );
         assert!(
-            super::relay_maybe_request_headers_catchup(&mut state, peer_id, 102).is_some(),
+            super::relay_maybe_request_headers_catchup(&mut state, peer_id, 119).is_some(),
             "request should re-open after cooldown interval"
         );
     }
@@ -30194,17 +30307,20 @@ mod tests {
         let _remote = client_handshake(&mut client, &framing, &local_hello).expect("handshake");
         send_message(&mut client, &WireMessage::Tx { tx }, &framing).expect("send tx");
         let mut saw_tx_inv = false;
-        for _ in 0..3 {
-            let Ok(message) = read_message(&mut client, &framing) else {
-                break;
-            };
-            if let WireMessage::Inv { items } = message
-                && items
-                    .iter()
-                    .any(|item| matches!(item, InventoryItem::Tx(found) if *found == txid))
-            {
-                saw_tx_inv = true;
-                break;
+        for _ in 0..10 {
+            match read_message(&mut client, &framing) {
+                Ok(WireMessage::Inv { items })
+                    if items
+                        .iter()
+                        .any(|item| matches!(item, InventoryItem::Tx(found) if *found == txid)) =>
+                {
+                    saw_tx_inv = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(scam_p2p::TransportError::Io(err))
+                    if matches!(err.kind(), std::io::ErrorKind::TimedOut) => {}
+                Err(_) => break,
             }
         }
         drop(client);
@@ -34419,6 +34535,39 @@ mod tests {
         .expect("process inv");
         assert_eq!(out.len(), 1);
         assert!(matches!(out[0], WireMessage::GetData { .. }));
+    }
+
+    #[test]
+    fn relay_sketch_for_unknown_round_is_ignored_without_dropping_session() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        cfg.validate().expect("config validate");
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let mut gossip = GossipEngine::new(64).expect("gossip");
+        gossip.connect_peer(77);
+        let relay = RelayAdmissionState {
+            mempool: Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip,
+        };
+        let mut state = RelayServerState::new(runtime, relay);
+
+        let out = process_relay_wire_message(
+            &mut state,
+            77,
+            WireMessage::Sketch {
+                salt: 4242,
+                bits: 32,
+                capacity: 1,
+                implementation: 0,
+                bytes: vec![],
+            },
+            1_000,
+        )
+        .expect("unknown recon round should be non-fatal");
+        assert!(out.is_empty(), "stale recon message should be ignored");
     }
 
     #[test]
