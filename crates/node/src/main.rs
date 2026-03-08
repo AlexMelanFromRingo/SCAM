@@ -5348,6 +5348,8 @@ const RELAY_OUTBOUND_MAX_BACKOFF_SEC: u64 = 30;
 const RELAY_HEADERS_CATCHUP_INTERVAL_SEC: u64 = 2;
 const RELAY_HEADERS_PROBE_INTERVAL_SEC: u64 = 15;
 const RELAY_HEADERS_INV_TRIGGER_INTERVAL_SEC: u64 = 1;
+const RELAY_HEADERS_AGGRESSIVE_LAG_THRESHOLD: u64 = 4;
+const RELAY_HEADERS_AGGRESSIVE_INTERVAL_SEC: u64 = 1;
 const RELAY_ASYNC_READ_POLL_INTERVAL_MS: u64 = 250;
 
 static RELAY_TX_DIFFUSION_BASE_MS: AtomicU64 = AtomicU64::new(0);
@@ -6489,7 +6491,13 @@ fn relay_should_request_headers_catchup(
         .unwrap_or(0);
     let elapsed = now_unix_sec.saturating_sub(last);
     if peer_tip > local_tip {
-        return elapsed >= relay_headers_catchup_interval_sec();
+        let lag = peer_tip.saturating_sub(local_tip);
+        let interval = if lag >= relay_headers_aggressive_lag_threshold() {
+            relay_headers_aggressive_interval_sec()
+        } else {
+            relay_headers_catchup_interval_sec()
+        };
+        return elapsed >= interval;
     }
     elapsed >= relay_headers_probe_interval_sec()
 }
@@ -7553,14 +7561,27 @@ fn process_relay_wire_message_inner(
             Ok(vec![WireMessage::Inv { items }])
         }
         WireMessage::Headers { headers } => {
-            let missing = relay_missing_blocks_from_headers(state, &headers).map_err(|err| {
-                relay_protocol_violation(
-                    state,
-                    peer_id,
-                    now_unix_sec,
-                    format!("invalid headers announcement: {err}"),
-                )
-            })?;
+            let missing = match relay_missing_blocks_from_headers(state, &headers) {
+                Ok(missing) => missing,
+                Err(err) => {
+                    let detail = err.to_string();
+                    if detail.contains("unknown parent") {
+                        // Do not disconnect on parent gaps: peers can be ahead or announcements
+                        // can race with blocks still in flight. Ask for headers catchup instead.
+                        return Ok(vec![relay_build_headers_request(
+                            state,
+                            peer_id,
+                            now_unix_sec,
+                        )]);
+                    }
+                    return Err(relay_protocol_violation(
+                        state,
+                        peer_id,
+                        now_unix_sec,
+                        format!("invalid headers announcement: {detail}"),
+                    ));
+                }
+            };
             if let Some(announced_tip_height) =
                 relay_estimate_headers_tip_height(&state.runtime, &headers)
             {
@@ -8724,6 +8745,16 @@ fn relay_headers_probe_interval_sec() -> u64 {
 fn relay_headers_inv_trigger_interval_sec() -> u64 {
     env_nonzero_u64("SCAM_RELAY_HEADERS_INV_TRIGGER_INTERVAL_SEC")
         .unwrap_or(RELAY_HEADERS_INV_TRIGGER_INTERVAL_SEC)
+}
+
+fn relay_headers_aggressive_lag_threshold() -> u64 {
+    env_nonzero_u64("SCAM_RELAY_HEADERS_AGGRESSIVE_LAG_THRESHOLD")
+        .unwrap_or(RELAY_HEADERS_AGGRESSIVE_LAG_THRESHOLD)
+}
+
+fn relay_headers_aggressive_interval_sec() -> u64 {
+    env_nonzero_u64("SCAM_RELAY_HEADERS_AGGRESSIVE_INTERVAL_SEC")
+        .unwrap_or(RELAY_HEADERS_AGGRESSIVE_INTERVAL_SEC)
 }
 
 fn tokio_worker_threads_from_env(env_key: &str, default_cap: usize) -> usize {
@@ -24051,8 +24082,8 @@ mod tests {
             "probe should fire again after probe interval"
         );
 
-        // Peer ahead => request cadence tightens to catchup interval.
-        state.peer_reported_tip_heights.insert(peer_id, 5);
+        // Peer moderately ahead => request cadence uses normal catchup interval.
+        state.peer_reported_tip_heights.insert(peer_id, 3);
         let first = super::relay_maybe_request_headers_catchup(&mut state, peer_id, 117)
             .expect("should request headers");
         assert!(matches!(
@@ -24071,6 +24102,22 @@ mod tests {
         assert!(
             super::relay_maybe_request_headers_catchup(&mut state, peer_id, 119).is_some(),
             "request should re-open after cooldown interval"
+        );
+
+        // Peer far ahead => aggressive interval allows one-second cadence.
+        state.peer_reported_tip_heights.insert(peer_id, 10);
+        let aggressive = super::relay_maybe_request_headers_catchup(&mut state, peer_id, 120)
+            .expect("aggressive catchup should request immediately");
+        assert!(matches!(
+            aggressive,
+            WireMessage::GetHeaders {
+                locator: _,
+                stop: None
+            }
+        ));
+        assert!(
+            super::relay_maybe_request_headers_catchup(&mut state, peer_id, 121).is_some(),
+            "aggressive lag mode should allow one-second catchup cadence"
         );
     }
 
@@ -33002,7 +33049,7 @@ mod tests {
     }
 
     #[test]
-    fn relay_headers_announcement_requires_known_or_announced_parent() {
+    fn relay_headers_announcement_unknown_parent_triggers_headers_catchup_instead_of_disconnect() {
         let cfg: ChainConfig =
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
         let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
@@ -33084,7 +33131,7 @@ mod tests {
             target,
             nonce: 0,
         };
-        let err = process_relay_wire_message(
+        let out = process_relay_wire_message(
             &mut state,
             peer_id,
             WireMessage::Headers {
@@ -33092,8 +33139,17 @@ mod tests {
             },
             2_101,
         )
-        .expect_err("unknown parent outside announcement batch must fail");
-        assert!(err.to_string().contains("invalid headers announcement"));
+        .expect("unknown parent should trigger headers catchup request");
+        assert!(
+            out.iter()
+                .any(|msg| matches!(msg, WireMessage::GetHeaders { stop: None, .. })),
+            "peer with unknown-parent headers should receive a headers catchup request"
+        );
+        assert_eq!(
+            state.relay.gossip.peer_score(peer_id),
+            Some(0),
+            "unknown parent races are non-fatal and must not penalize peer score"
+        );
     }
 
     #[test]
@@ -36272,6 +36328,8 @@ mod tests {
         const HEADERS_CATCHUP_KEY: &str = "SCAM_RELAY_HEADERS_CATCHUP_INTERVAL_SEC";
         const HEADERS_PROBE_KEY: &str = "SCAM_RELAY_HEADERS_PROBE_INTERVAL_SEC";
         const HEADERS_INV_TRIGGER_KEY: &str = "SCAM_RELAY_HEADERS_INV_TRIGGER_INTERVAL_SEC";
+        const HEADERS_AGGR_THRESHOLD_KEY: &str = "SCAM_RELAY_HEADERS_AGGRESSIVE_LAG_THRESHOLD";
+        const HEADERS_AGGR_INTERVAL_KEY: &str = "SCAM_RELAY_HEADERS_AGGRESSIVE_INTERVAL_SEC";
         const INBOUND_WINDOW_KEY: &str = "SCAM_RELAY_INBOUND_ACCEPT_WINDOW_SEC";
         const INBOUND_MAX_PER_IP_KEY: &str = "SCAM_RELAY_INBOUND_ACCEPT_MAX_PER_IP";
         const INBOUND_LOOPBACK_MULT_KEY: &str = "SCAM_RELAY_INBOUND_ACCEPT_LOOPBACK_MULTIPLIER";
@@ -36283,6 +36341,8 @@ mod tests {
             HEADERS_CATCHUP_KEY,
             HEADERS_PROBE_KEY,
             HEADERS_INV_TRIGGER_KEY,
+            HEADERS_AGGR_THRESHOLD_KEY,
+            HEADERS_AGGR_INTERVAL_KEY,
             INBOUND_WINDOW_KEY,
             INBOUND_MAX_PER_IP_KEY,
             INBOUND_LOOPBACK_MULT_KEY,
@@ -36323,6 +36383,14 @@ mod tests {
             super::RELAY_HEADERS_INV_TRIGGER_INTERVAL_SEC
         );
         assert_eq!(
+            super::relay_headers_aggressive_lag_threshold(),
+            super::RELAY_HEADERS_AGGRESSIVE_LAG_THRESHOLD
+        );
+        assert_eq!(
+            super::relay_headers_aggressive_interval_sec(),
+            super::RELAY_HEADERS_AGGRESSIVE_INTERVAL_SEC
+        );
+        assert_eq!(
             super::relay_inbound_accept_window_sec(),
             super::RELAY_INBOUND_ACCEPT_WINDOW_SEC
         );
@@ -36342,6 +36410,8 @@ mod tests {
             std::env::set_var(HEADERS_CATCHUP_KEY, "0");
             std::env::set_var(HEADERS_PROBE_KEY, "0");
             std::env::set_var(HEADERS_INV_TRIGGER_KEY, "0");
+            std::env::set_var(HEADERS_AGGR_THRESHOLD_KEY, "0");
+            std::env::set_var(HEADERS_AGGR_INTERVAL_KEY, "0");
             std::env::set_var(INBOUND_WINDOW_KEY, "0");
             std::env::set_var(INBOUND_MAX_PER_IP_KEY, "0");
             std::env::set_var(INBOUND_LOOPBACK_MULT_KEY, "0");
@@ -36372,6 +36442,14 @@ mod tests {
             super::RELAY_HEADERS_INV_TRIGGER_INTERVAL_SEC
         );
         assert_eq!(
+            super::relay_headers_aggressive_lag_threshold(),
+            super::RELAY_HEADERS_AGGRESSIVE_LAG_THRESHOLD
+        );
+        assert_eq!(
+            super::relay_headers_aggressive_interval_sec(),
+            super::RELAY_HEADERS_AGGRESSIVE_INTERVAL_SEC
+        );
+        assert_eq!(
             super::relay_inbound_accept_window_sec(),
             super::RELAY_INBOUND_ACCEPT_WINDOW_SEC
         );
@@ -36395,6 +36473,8 @@ mod tests {
             std::env::set_var(HEADERS_CATCHUP_KEY, "3");
             std::env::set_var(HEADERS_PROBE_KEY, "9");
             std::env::set_var(HEADERS_INV_TRIGGER_KEY, "2");
+            std::env::set_var(HEADERS_AGGR_THRESHOLD_KEY, "8");
+            std::env::set_var(HEADERS_AGGR_INTERVAL_KEY, "4");
             std::env::set_var(INBOUND_WINDOW_KEY, "7");
             std::env::set_var(INBOUND_MAX_PER_IP_KEY, "13");
             std::env::set_var(INBOUND_LOOPBACK_MULT_KEY, "5");
@@ -36406,6 +36486,8 @@ mod tests {
         assert_eq!(super::relay_headers_catchup_interval_sec(), 3);
         assert_eq!(super::relay_headers_probe_interval_sec(), 9);
         assert_eq!(super::relay_headers_inv_trigger_interval_sec(), 2);
+        assert_eq!(super::relay_headers_aggressive_lag_threshold(), 8);
+        assert_eq!(super::relay_headers_aggressive_interval_sec(), 4);
         assert_eq!(super::relay_inbound_accept_window_sec(), 7);
         assert_eq!(super::relay_inbound_accept_base_max_per_ip(8), 13);
         assert_eq!(super::relay_inbound_accept_loopback_multiplier(), 5);
