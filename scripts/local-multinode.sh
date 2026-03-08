@@ -403,42 +403,50 @@ start_cluster() {
     echo "[cluster] wiring peer books"
     local peers_per_node="${WIRE_PEERS_PER_NODE}"
     local full_mesh_threshold=$((NODE_COUNT - 1))
+    local use_full_mesh="false"
     if [[ "${peers_per_node}" == "0" ]] || (( peers_per_node >= full_mesh_threshold )); then
+      use_full_mesh="true"
       echo "[cluster] peer topology: full-mesh"
-      for ((i = 0; i < NODE_COUNT; i++)); do
-        local peersdir
-        peersdir="$(peers_dir_path "${i}")"
-        for ((j = 0; j < NODE_COUNT; j++)); do
-          if [[ "${i}" == "${j}" ]]; then
-            continue
-          fi
-          if ! add_peer_with_retry \
-            "${bin}" \
-            "${NETWORK}" \
-            "127.0.0.1:$(p2p_port_for "${j}")" \
-            "${peersdir}"; then
-            echo "[cluster] warning: add-peer failed for node-${i} -> node-${j}" >&2
-          fi
-        done
-      done
     else
       echo "[cluster] peer topology: ring neighbors (${peers_per_node} outbound peers/node)"
-      for ((i = 0; i < NODE_COUNT; i++)); do
+    fi
+    local -a wiring_pids=()
+    for ((i = 0; i < NODE_COUNT; i++)); do
+      (
         local peersdir
         peersdir="$(peers_dir_path "${i}")"
-        for ((offset = 1; offset <= peers_per_node; offset++)); do
-          local j
-          j=$(((i + offset) % NODE_COUNT))
-          if ! add_peer_with_retry \
-            "${bin}" \
-            "${NETWORK}" \
-            "127.0.0.1:$(p2p_port_for "${j}")" \
-            "${peersdir}"; then
-            echo "[cluster] warning: add-peer failed for node-${i} -> node-${j}" >&2
-          fi
-        done
-      done
-    fi
+        if [[ "${use_full_mesh}" == "true" ]]; then
+          for ((j = 0; j < NODE_COUNT; j++)); do
+            if [[ "${i}" == "${j}" ]]; then
+              continue
+            fi
+            if ! add_peer_with_retry \
+              "${bin}" \
+              "${NETWORK}" \
+              "127.0.0.1:$(p2p_port_for "${j}")" \
+              "${peersdir}"; then
+              echo "[cluster] warning: add-peer failed for node-${i} -> node-${j}" >&2
+            fi
+          done
+        else
+          for ((offset = 1; offset <= peers_per_node; offset++)); do
+            local j
+            j=$(((i + offset) % NODE_COUNT))
+            if ! add_peer_with_retry \
+              "${bin}" \
+              "${NETWORK}" \
+              "127.0.0.1:$(p2p_port_for "${j}")" \
+              "${peersdir}"; then
+              echo "[cluster] warning: add-peer failed for node-${i} -> node-${j}" >&2
+            fi
+          done
+        fi
+      ) &
+      wiring_pids+=("$!")
+    done
+    for pid in "${wiring_pids[@]}"; do
+      wait "${pid}"
+    done
   else
     echo "[cluster] skipping peer-book wiring (WIRE_PEERS=false)"
   fi
