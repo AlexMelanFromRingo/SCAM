@@ -5352,6 +5352,7 @@ const RELAY_HEADERS_INV_TRIGGER_INTERVAL_SEC: u64 = 1;
 const RELAY_HEADERS_AGGRESSIVE_LAG_THRESHOLD: u64 = 4;
 const RELAY_HEADERS_AGGRESSIVE_INTERVAL_SEC: u64 = 1;
 const RELAY_DISCOVERY_REFRESH_SEC: u64 = 30;
+const RELAY_DISCOVERY_REFRESH_JITTER_SEC: u64 = 5;
 const RELAY_ASYNC_READ_POLL_INTERVAL_MS: u64 = 250;
 
 static RELAY_TX_DIFFUSION_BASE_MS: AtomicU64 = AtomicU64::new(0);
@@ -8785,8 +8786,26 @@ fn relay_discovery_refresh_sec() -> u64 {
     env_nonzero_u64("SCAM_RELAY_DISCOVERY_REFRESH_SEC").unwrap_or(RELAY_DISCOVERY_REFRESH_SEC)
 }
 
-fn relay_discovery_refresh_due(now_unix_sec: u64, last_discovery_request_unix_sec: u64) -> bool {
-    now_unix_sec.saturating_sub(last_discovery_request_unix_sec) >= relay_discovery_refresh_sec()
+fn relay_discovery_refresh_jitter_sec() -> u64 {
+    env_opt("SCAM_RELAY_DISCOVERY_REFRESH_JITTER_SEC")
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(RELAY_DISCOVERY_REFRESH_JITTER_SEC)
+        .min(300)
+}
+
+fn relay_discovery_refresh_due(
+    now_unix_sec: u64,
+    last_discovery_request_unix_sec: u64,
+    peer_id: u64,
+) -> bool {
+    let base = relay_discovery_refresh_sec();
+    let jitter_cap = relay_discovery_refresh_jitter_sec();
+    let jitter = if jitter_cap == 0 {
+        0
+    } else {
+        peer_id % jitter_cap.saturating_add(1)
+    };
+    now_unix_sec.saturating_sub(last_discovery_request_unix_sec) >= base.saturating_add(jitter)
 }
 
 fn tokio_worker_threads_from_env(env_key: &str, default_cap: usize) -> usize {
@@ -9231,6 +9250,7 @@ fn run_relay_peer_session<IO: Read + Write>(
                     && relay_discovery_refresh_due(
                         now_for_periodic,
                         last_discovery_request_unix_sec,
+                        peer_id,
                     )
                 {
                     periodic.push(WireMessage::GetAddr);
@@ -9524,6 +9544,7 @@ async fn run_relay_peer_session_async<S: AsyncRead + AsyncWrite + Unpin>(
                     && relay_discovery_refresh_due(
                         now_for_periodic,
                         last_discovery_request_unix_sec,
+                        peer_id,
                     )
                 {
                     periodic.push(WireMessage::GetAddr);
@@ -30519,18 +30540,33 @@ mod tests {
 
     #[test]
     fn relay_discovery_refresh_due_enforces_interval_boundary() {
-        assert!(!super::relay_discovery_refresh_due(10, 10));
+        assert!(!super::relay_discovery_refresh_due(10, 10, 0));
         assert!(!super::relay_discovery_refresh_due(
             super::RELAY_DISCOVERY_REFRESH_SEC - 1,
+            0,
             0
         ));
         assert!(super::relay_discovery_refresh_due(
             super::RELAY_DISCOVERY_REFRESH_SEC,
+            0,
             0
         ));
         assert!(super::relay_discovery_refresh_due(
             super::RELAY_DISCOVERY_REFRESH_SEC + 1,
+            0,
             0
+        ));
+
+        let jitter_peer_id = super::RELAY_DISCOVERY_REFRESH_JITTER_SEC;
+        assert!(!super::relay_discovery_refresh_due(
+            super::RELAY_DISCOVERY_REFRESH_SEC + super::RELAY_DISCOVERY_REFRESH_JITTER_SEC - 1,
+            0,
+            jitter_peer_id
+        ));
+        assert!(super::relay_discovery_refresh_due(
+            super::RELAY_DISCOVERY_REFRESH_SEC + super::RELAY_DISCOVERY_REFRESH_JITTER_SEC,
+            0,
+            jitter_peer_id
         ));
     }
 
@@ -36508,6 +36544,7 @@ mod tests {
         const HEADERS_AGGR_THRESHOLD_KEY: &str = "SCAM_RELAY_HEADERS_AGGRESSIVE_LAG_THRESHOLD";
         const HEADERS_AGGR_INTERVAL_KEY: &str = "SCAM_RELAY_HEADERS_AGGRESSIVE_INTERVAL_SEC";
         const DISCOVERY_REFRESH_KEY: &str = "SCAM_RELAY_DISCOVERY_REFRESH_SEC";
+        const DISCOVERY_REFRESH_JITTER_KEY: &str = "SCAM_RELAY_DISCOVERY_REFRESH_JITTER_SEC";
         const INBOUND_WINDOW_KEY: &str = "SCAM_RELAY_INBOUND_ACCEPT_WINDOW_SEC";
         const INBOUND_MAX_PER_IP_KEY: &str = "SCAM_RELAY_INBOUND_ACCEPT_MAX_PER_IP";
         const INBOUND_LOOPBACK_MULT_KEY: &str = "SCAM_RELAY_INBOUND_ACCEPT_LOOPBACK_MULTIPLIER";
@@ -36523,6 +36560,7 @@ mod tests {
             HEADERS_AGGR_THRESHOLD_KEY,
             HEADERS_AGGR_INTERVAL_KEY,
             DISCOVERY_REFRESH_KEY,
+            DISCOVERY_REFRESH_JITTER_KEY,
             INBOUND_WINDOW_KEY,
             INBOUND_MAX_PER_IP_KEY,
             INBOUND_LOOPBACK_MULT_KEY,
@@ -36579,6 +36617,10 @@ mod tests {
             super::RELAY_DISCOVERY_REFRESH_SEC
         );
         assert_eq!(
+            super::relay_discovery_refresh_jitter_sec(),
+            super::RELAY_DISCOVERY_REFRESH_JITTER_SEC
+        );
+        assert_eq!(
             super::relay_inbound_accept_window_sec(),
             super::RELAY_INBOUND_ACCEPT_WINDOW_SEC
         );
@@ -36602,6 +36644,7 @@ mod tests {
             std::env::set_var(HEADERS_AGGR_THRESHOLD_KEY, "0");
             std::env::set_var(HEADERS_AGGR_INTERVAL_KEY, "0");
             std::env::set_var(DISCOVERY_REFRESH_KEY, "0");
+            std::env::set_var(DISCOVERY_REFRESH_JITTER_KEY, "999999");
             std::env::set_var(INBOUND_WINDOW_KEY, "0");
             std::env::set_var(INBOUND_MAX_PER_IP_KEY, "0");
             std::env::set_var(INBOUND_LOOPBACK_MULT_KEY, "0");
@@ -36644,6 +36687,7 @@ mod tests {
             super::relay_discovery_refresh_sec(),
             super::RELAY_DISCOVERY_REFRESH_SEC
         );
+        assert_eq!(super::relay_discovery_refresh_jitter_sec(), 300);
         assert_eq!(
             super::relay_inbound_accept_window_sec(),
             super::RELAY_INBOUND_ACCEPT_WINDOW_SEC
@@ -36672,6 +36716,7 @@ mod tests {
             std::env::set_var(HEADERS_AGGR_THRESHOLD_KEY, "8");
             std::env::set_var(HEADERS_AGGR_INTERVAL_KEY, "4");
             std::env::set_var(DISCOVERY_REFRESH_KEY, "11");
+            std::env::set_var(DISCOVERY_REFRESH_JITTER_KEY, "3");
             std::env::set_var(INBOUND_WINDOW_KEY, "7");
             std::env::set_var(INBOUND_MAX_PER_IP_KEY, "13");
             std::env::set_var(INBOUND_LOOPBACK_MULT_KEY, "5");
@@ -36687,6 +36732,7 @@ mod tests {
         assert_eq!(super::relay_headers_aggressive_lag_threshold(), 8);
         assert_eq!(super::relay_headers_aggressive_interval_sec(), 4);
         assert_eq!(super::relay_discovery_refresh_sec(), 11);
+        assert_eq!(super::relay_discovery_refresh_jitter_sec(), 3);
         assert_eq!(super::relay_inbound_accept_window_sec(), 7);
         assert_eq!(super::relay_inbound_accept_base_max_per_ip(8), 13);
         assert_eq!(super::relay_inbound_accept_loopback_multiplier(), 5);
