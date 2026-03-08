@@ -21,6 +21,7 @@ set -euo pipefail
 #   RUN_STRATUM=false
 #   STRATUM_NODE_INDEXES=""     # optional CSV list, e.g. "0,1" to run Stratum only on selected nodes
 #   WIRE_PEERS=true
+#   WIRE_PEERS_PER_NODE=8       # 0 = full mesh, N > 0 = next-N ring neighbors per node
 #   BUILD=true
 #   CARGO_PROFILE=debug   # debug|release
 #   SYNC_BOOK=true
@@ -53,6 +54,7 @@ RUN_RPC="${RUN_RPC:-true}"
 RUN_STRATUM="${RUN_STRATUM:-false}"
 STRATUM_NODE_INDEXES="${STRATUM_NODE_INDEXES:-}"
 WIRE_PEERS="${WIRE_PEERS:-true}"
+WIRE_PEERS_PER_NODE="${WIRE_PEERS_PER_NODE:-8}"
 BUILD="${BUILD:-true}"
 CARGO_PROFILE="${CARGO_PROFILE:-debug}"
 SYNC_BOOK="${SYNC_BOOK:-true}"
@@ -88,6 +90,15 @@ require_positive_int() {
   local value="$2"
   if ! [[ "${value}" =~ ^[0-9]+$ ]] || [[ "${value}" == "0" ]]; then
     echo "[cluster] ${name} must be a positive integer, got '${value}'" >&2
+    exit 2
+  fi
+}
+
+require_non_negative_int() {
+  local name="$1"
+  local value="$2"
+  if ! [[ "${value}" =~ ^[0-9]+$ ]]; then
+    echo "[cluster] ${name} must be a non-negative integer, got '${value}'" >&2
     exit 2
   fi
 }
@@ -296,6 +307,7 @@ start_cluster() {
   require_positive_int "RELAY_OUTBOUND_REDIAL_SEC" "${RELAY_OUTBOUND_REDIAL_SEC}"
   require_positive_int "STRATUM_READ_TIMEOUT_SEC" "${STRATUM_READ_TIMEOUT_SEC}"
   require_positive_int "STRATUM_TELEMETRY_EVERY_SEC" "${STRATUM_TELEMETRY_EVERY_SEC}"
+  require_non_negative_int "WIRE_PEERS_PER_NODE" "${WIRE_PEERS_PER_NODE}"
 
   mkdir -p "${CLUSTER_DIR}"
   local bin
@@ -389,22 +401,44 @@ start_cluster() {
 
   if is_true "${WIRE_PEERS}"; then
     echo "[cluster] wiring peer books"
-    for ((i = 0; i < NODE_COUNT; i++)); do
-      local peersdir
-      peersdir="$(peers_dir_path "${i}")"
-      for ((j = 0; j < NODE_COUNT; j++)); do
-        if [[ "${i}" == "${j}" ]]; then
-          continue
-        fi
-        if ! add_peer_with_retry \
-          "${bin}" \
-          "${NETWORK}" \
-          "127.0.0.1:$(p2p_port_for "${j}")" \
-          "${peersdir}"; then
-          echo "[cluster] warning: add-peer failed for node-${i} -> node-${j}" >&2
-        fi
+    local peers_per_node="${WIRE_PEERS_PER_NODE}"
+    local full_mesh_threshold=$((NODE_COUNT - 1))
+    if [[ "${peers_per_node}" == "0" ]] || (( peers_per_node >= full_mesh_threshold )); then
+      echo "[cluster] peer topology: full-mesh"
+      for ((i = 0; i < NODE_COUNT; i++)); do
+        local peersdir
+        peersdir="$(peers_dir_path "${i}")"
+        for ((j = 0; j < NODE_COUNT; j++)); do
+          if [[ "${i}" == "${j}" ]]; then
+            continue
+          fi
+          if ! add_peer_with_retry \
+            "${bin}" \
+            "${NETWORK}" \
+            "127.0.0.1:$(p2p_port_for "${j}")" \
+            "${peersdir}"; then
+            echo "[cluster] warning: add-peer failed for node-${i} -> node-${j}" >&2
+          fi
+        done
       done
-    done
+    else
+      echo "[cluster] peer topology: ring neighbors (${peers_per_node} outbound peers/node)"
+      for ((i = 0; i < NODE_COUNT; i++)); do
+        local peersdir
+        peersdir="$(peers_dir_path "${i}")"
+        for ((offset = 1; offset <= peers_per_node; offset++)); do
+          local j
+          j=$(((i + offset) % NODE_COUNT))
+          if ! add_peer_with_retry \
+            "${bin}" \
+            "${NETWORK}" \
+            "127.0.0.1:$(p2p_port_for "${j}")" \
+            "${peersdir}"; then
+            echo "[cluster] warning: add-peer failed for node-${i} -> node-${j}" >&2
+          fi
+        done
+      done
+    fi
   else
     echo "[cluster] skipping peer-book wiring (WIRE_PEERS=false)"
   fi

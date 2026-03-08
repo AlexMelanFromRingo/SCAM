@@ -175,10 +175,23 @@ NODE_COUNT=50 RUN_STRATUM=true STRATUM_NODE_INDEXES=0,1 \
   scripts/local-multinode.sh up
 ```
 
+For large clusters the launcher uses bounded peer wiring (`WIRE_PEERS_PER_NODE=8`) to avoid long startup delays.
+Use `WIRE_PEERS_PER_NODE=0` only when you need explicit full-mesh peer books.
+Relay sessions use async read polling (`SCAM_RELAY_ASYNC_READ_POLL_MS`, default `250`) so block/header propagation is not gated by long socket read timeouts.
+
 Binary-only mode (outside repo, no cargo):
 
 ```bash
 SCAM_NODE_BIN=./scam-node BUILD=false scripts/local-multinode.sh up
+```
+
+Optional sync-spread sampler for large local clusters:
+
+```bash
+CLUSTER_DIR=target/local-cluster50 NODE_COUNT=50 RUN_STRATUM=true STRATUM_NODE_INDEXES=0,1 \
+BASE_P2P_PORT=44400 BASE_RPC_PORT=44000 BASE_STRATUM_PORT=45000 \
+SCAM_NODE_BIN=target/release/scam-node BUILD=false \
+scripts/cluster-sync-sample.sh
 ```
 
 ### 5.3 End-to-End Local Lab (2+ nodes + miner + wallets + UI)

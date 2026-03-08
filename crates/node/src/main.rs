@@ -5331,6 +5331,7 @@ const RELAY_OUTBOUND_FEELER_TIMEOUT_SEC: u64 = 3;
 const RELAY_OUTBOUND_MAX_BACKOFF_SEC: u64 = 30;
 const RELAY_HEADERS_CATCHUP_INTERVAL_SEC: u64 = 2;
 const RELAY_HEADERS_PROBE_INTERVAL_SEC: u64 = 15;
+const RELAY_ASYNC_READ_POLL_INTERVAL_MS: u64 = 250;
 
 static RELAY_TX_DIFFUSION_BASE_MS: AtomicU64 = AtomicU64::new(0);
 static RELAY_TX_DIFFUSION_MAX_MS: AtomicU64 = AtomicU64::new(0);
@@ -6819,6 +6820,23 @@ fn relay_timeout_streak_reached_limit(timeout_streak: u32) -> bool {
     timeout_streak >= RELAY_MAX_CONSECUTIVE_READ_TIMEOUTS.max(1)
 }
 
+fn relay_async_read_poll_interval_ms(read_timeout_sec: u64) -> u64 {
+    let total_ms = read_timeout_sec.max(1).saturating_mul(1_000);
+    let poll_ms = env_opt("SCAM_RELAY_ASYNC_READ_POLL_MS")
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(RELAY_ASYNC_READ_POLL_INTERVAL_MS);
+    poll_ms.min(total_ms).max(1)
+}
+
+fn relay_async_timeout_streak_limit(read_timeout_sec: u64, poll_interval_ms: u64) -> u32 {
+    let total_ms = read_timeout_sec.max(1).saturating_mul(1_000);
+    let legacy_budget_ms = total_ms.saturating_mul(RELAY_MAX_CONSECUTIVE_READ_TIMEOUTS as u64);
+    let per_poll = poll_interval_ms.max(1);
+    let limit = (legacy_budget_ms.saturating_add(per_poll).saturating_sub(1)) / per_poll;
+    limit.clamp(1, u32::MAX as u64) as u32
+}
+
 fn relay_startup_send_failed(startup_sent: bool) -> bool {
     !startup_sent
 }
@@ -7750,6 +7768,27 @@ fn relay_proactive_inventory_messages(
     let mut out = Vec::<WireMessage>::new();
     let tip = state.runtime.tip_hash();
     if *last_tip_announced != Some(tip) {
+        if let Some(previous_tip) = *last_tip_announced
+            && previous_tip != tip
+        {
+            let locator = [previous_tip];
+            let mut headers_by_hash = HashMap::new();
+            for hash in state.runtime.block_hashes() {
+                if let Some(header) = state.runtime.header_by_hash(hash) {
+                    headers_by_hash.insert(*hash, header.clone());
+                }
+            }
+            let headers = select_headers_for_peer(
+                state.runtime.block_hashes(),
+                &headers_by_hash,
+                &locator,
+                None,
+                RELAY_MAX_HEADERS_PER_ANNOUNCEMENT,
+            );
+            if !headers.is_empty() {
+                out.push(WireMessage::Headers { headers });
+            }
+        }
         push_inv_batches(&mut out, vec![InventoryItem::Block(tip)], max_inv_items);
         *last_tip_announced = Some(tip);
     }
@@ -9280,6 +9319,9 @@ async fn run_relay_peer_session_async<S: AsyncRead + AsyncWrite + Unpin>(
         let mut last_tip_announced = None::<Hash256>;
         let mut announced_txids = HashSet::<Hash256>::new();
         let mut timeout_streak = 0u32;
+        let read_poll_interval_ms = relay_async_read_poll_interval_ms(read_timeout_sec);
+        let timeout_streak_limit =
+            relay_async_timeout_streak_limit(read_timeout_sec, read_poll_interval_ms);
         loop {
             if stop_flag.load(Ordering::Relaxed) {
                 break;
@@ -9335,24 +9377,30 @@ async fn run_relay_peer_session_async<S: AsyncRead + AsyncWrite + Unpin>(
                 break;
             }
 
-            let inbound =
-                match relay_read_with_timeout_async(stream, &framing, read_timeout_sec).await? {
-                    RelayReadOutcome::Timeout => {
-                        timeout_streak = timeout_streak.saturating_add(1);
-                        if relay_timeout_streak_reached_limit(timeout_streak) {
-                            break;
-                        }
-                        if stop_flag.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        continue;
+            let inbound = match relay_read_with_timeout_async(
+                stream,
+                &framing,
+                read_timeout_sec,
+                read_poll_interval_ms,
+            )
+            .await?
+            {
+                RelayReadOutcome::Timeout => {
+                    timeout_streak = timeout_streak.saturating_add(1);
+                    if timeout_streak >= timeout_streak_limit {
+                        break;
                     }
-                    RelayReadOutcome::Closed => break,
-                    RelayReadOutcome::Message(message) => {
-                        timeout_streak = 0;
-                        message
+                    if stop_flag.load(Ordering::Relaxed) {
+                        break;
                     }
-                };
+                    continue;
+                }
+                RelayReadOutcome::Closed => break,
+                RelayReadOutcome::Message(message) => {
+                    timeout_streak = 0;
+                    message
+                }
+            };
 
             seen = seen.saturating_add(1);
             let now = current_unix_sec()?;
@@ -11819,9 +11867,12 @@ async fn relay_read_with_timeout_async<S: AsyncRead + Unpin>(
     stream: &mut S,
     framing: &FramingConfig,
     read_timeout_sec: u64,
+    poll_interval_ms: u64,
 ) -> Result<RelayReadOutcome, NodeError> {
+    let read_timeout_ms = read_timeout_sec.max(1).saturating_mul(1_000);
+    let wait_ms = poll_interval_ms.max(1).min(read_timeout_ms);
     match timeout(
-        Duration::from_secs(read_timeout_sec.max(1)),
+        Duration::from_millis(wait_ms),
         read_message_async(stream, framing),
     )
     .await
@@ -19323,6 +19374,11 @@ mod tests {
         assert_eq!(super::relay_max_active_sessions(0), 512);
         assert_eq!(super::relay_max_active_sessions(1), 1);
         assert_eq!(super::relay_max_active_sessions(7), 7);
+        const ASYNC_READ_POLL_KEY: &str = "SCAM_RELAY_ASYNC_READ_POLL_MS";
+        let saved_async_poll = std::env::var(ASYNC_READ_POLL_KEY).ok();
+        unsafe {
+            std::env::remove_var(ASYNC_READ_POLL_KEY);
+        }
         assert!(!super::relay_timeout_streak_reached_limit(0));
         assert!(!super::relay_timeout_streak_reached_limit(
             super::RELAY_MAX_CONSECUTIVE_READ_TIMEOUTS.saturating_sub(1),
@@ -19330,6 +19386,28 @@ mod tests {
         assert!(super::relay_timeout_streak_reached_limit(
             super::RELAY_MAX_CONSECUTIVE_READ_TIMEOUTS
         ));
+        assert_eq!(super::relay_async_read_poll_interval_ms(5), 250);
+        assert_eq!(super::relay_async_read_poll_interval_ms(1), 250);
+        assert_eq!(super::relay_async_read_poll_interval_ms(0), 250);
+        assert_eq!(super::relay_async_timeout_streak_limit(5, 250), 320);
+        assert_eq!(super::relay_async_timeout_streak_limit(1, 250), 64);
+        assert_eq!(
+            super::relay_async_timeout_streak_limit(5, 5_000),
+            super::RELAY_MAX_CONSECUTIVE_READ_TIMEOUTS
+        );
+        unsafe {
+            std::env::set_var(ASYNC_READ_POLL_KEY, "1000");
+        }
+        assert_eq!(super::relay_async_read_poll_interval_ms(5), 1_000);
+        if let Some(value) = saved_async_poll {
+            unsafe {
+                std::env::set_var(ASYNC_READ_POLL_KEY, value);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var(ASYNC_READ_POLL_KEY);
+            }
+        }
 
         assert!(!super::nonzero_limit_reached(0, 10));
         assert!(!super::nonzero_limit_reached(5, 4));
@@ -32477,6 +32555,56 @@ mod tests {
             second.is_empty(),
             "second proactive pass must not re-announce unchanged inventory"
         );
+    }
+
+    #[test]
+    fn relay_proactive_inventory_messages_include_headers_when_tip_advances() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let reward_key = cfg.genesis_reward_key_hash20().expect("reward key");
+        let mut runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        super::mine_blocks_on_runtime(
+            &mut runtime,
+            &super::MiningLoopParams {
+                count: 2,
+                interval_sec: cfg.target_block_time_sec,
+                max_nonce: 500_000,
+                subsidy: cfg.block_subsidy,
+                miner_key_hash: reward_key,
+                label_prefix: "relay-proactive-headers",
+                print_each: false,
+            },
+        )
+        .expect("mine");
+        let previous_tip = runtime
+            .block_hash_at_height(runtime.tip_height().saturating_sub(1))
+            .expect("previous tip");
+
+        let relay = RelayAdmissionState {
+            mempool: Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip: GossipEngine::new(128).expect("gossip"),
+        };
+        let state = RelayServerState::new(runtime, relay);
+        let mut announced_txids = std::collections::HashSet::<Hash256>::new();
+        let mut last_tip_announced = Some(previous_tip);
+        let messages = super::relay_proactive_inventory_messages(
+            &state,
+            &mut last_tip_announced,
+            &mut announced_txids,
+            128,
+        );
+        let headers = messages
+            .iter()
+            .find_map(|message| match message {
+                WireMessage::Headers { headers } => Some(headers),
+                _ => None,
+            })
+            .expect("headers announcement");
+        let announced_tip = headers.last().expect("headers non-empty").block_hash();
+        assert_eq!(announced_tip, state.runtime.tip_hash());
     }
 
     #[test]

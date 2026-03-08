@@ -258,6 +258,10 @@ NODE_COUNT=50 RUN_STRATUM=true STRATUM_NODE_INDEXES=0,1 \
   scripts/local-multinode.sh up
 ```
 
+By default `local-multinode` wires a bounded topology (`WIRE_PEERS_PER_NODE=8`) for faster startup on large clusters.
+Set `WIRE_PEERS_PER_NODE=0` if you explicitly need full-mesh wiring.
+Relay sessions run async read polling (`SCAM_RELAY_ASYNC_READ_POLL_MS`, default `250`) so tip/header propagation does not wait for long socket timeouts.
+
 Binary-only run (outside repo, no cargo build step):
 
 ```bash
@@ -279,6 +283,15 @@ scripts/run-preset.sh list
 scripts/run-preset.sh lab-solo-local up
 scripts/run-preset.sh lab-solo-local status
 scripts/run-preset.sh lab-solo-local down
+```
+
+For quick sync-spread measurements on larger clusters:
+
+```bash
+CLUSTER_DIR=target/local-cluster50 NODE_COUNT=50 RUN_STRATUM=true STRATUM_NODE_INDEXES=0,1 \
+  BASE_P2P_PORT=44400 BASE_RPC_PORT=44000 BASE_STRATUM_PORT=45000 \
+  SCAM_NODE_BIN=target/release/scam-node BUILD=false \
+  scripts/cluster-sync-sample.sh
 ```
 
 Available preset files live in `scripts/presets/*.env` and can be copied/edited for custom operator flows.
