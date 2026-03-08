@@ -1,3 +1,4 @@
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
 pub mod discovery;
 pub mod gossip;
 pub mod sync;

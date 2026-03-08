@@ -1,8 +1,10 @@
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::Infallible;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -3125,6 +3127,20 @@ fn env_opt(key: &str) -> Option<String> {
         .ok()
         .map(|raw| raw.trim().to_owned())
         .filter(|raw| !raw.is_empty())
+}
+
+fn env_nonzero_u64(key: &str) -> Option<u64> {
+    env_opt(key)
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .and_then(NonZeroU64::new)
+        .map(NonZeroU64::get)
+}
+
+fn env_nonzero_usize(key: &str) -> Option<usize> {
+    env_opt(key)
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .and_then(NonZeroUsize::new)
+        .map(NonZeroUsize::get)
 }
 
 fn parse_relay_target_endpoint(target: &str) -> Option<RelayTargetEndpoint> {
@@ -6412,9 +6428,7 @@ fn relay_record_peer_tip_height(state: &mut RelayServerState, peer_id: u64, tip_
         .peer_reported_tip_heights
         .entry(peer_id)
         .or_insert(tip_height);
-    if tip_height > *entry {
-        *entry = tip_height;
-    }
+    *entry = (*entry).max(tip_height);
 }
 
 fn relay_forget_peer_tip_height(state: &mut RelayServerState, peer_id: u64) {
@@ -6822,9 +6836,7 @@ fn relay_timeout_streak_reached_limit(timeout_streak: u32) -> bool {
 
 fn relay_async_read_poll_interval_ms(read_timeout_sec: u64) -> u64 {
     let total_ms = read_timeout_sec.max(1).saturating_mul(1_000);
-    let poll_ms = env_opt("SCAM_RELAY_ASYNC_READ_POLL_MS")
-        .and_then(|raw| raw.parse::<u64>().ok())
-        .filter(|value| *value > 0)
+    let poll_ms = env_nonzero_u64("SCAM_RELAY_ASYNC_READ_POLL_MS")
         .unwrap_or(RELAY_ASYNC_READ_POLL_INTERVAL_MS);
     poll_ms.min(total_ms).max(1)
 }
@@ -6839,6 +6851,10 @@ fn relay_async_timeout_streak_limit(read_timeout_sec: u64, poll_interval_ms: u64
 
 fn relay_startup_send_failed(startup_sent: bool) -> bool {
     !startup_sent
+}
+
+fn relay_has_periodic_outbound(periodic_outbound: &[WireMessage]) -> bool {
+    !periodic_outbound.is_empty()
 }
 
 fn relay_should_abort_after_startup_send(mode: RelayPeerSessionMode, startup_sent: bool) -> bool {
@@ -6969,21 +6985,23 @@ fn relay_queue_peer_book_update(state: &mut RelayServerState, entry: PeerAddress
         return;
     }
     state.pending_peer_book_updates.push(entry);
-    if state.pending_peer_book_updates.len() > RELAY_MAX_PENDING_PEER_BOOK_UPDATES {
-        state
-            .pending_peer_book_updates
-            .sort_unstable_by(|a, b| a.address.cmp(&b.address));
-        state
-            .pending_peer_book_updates
-            .dedup_by(|a, b| a.address == b.address);
-        let overflow = state
-            .pending_peer_book_updates
-            .len()
-            .saturating_sub(RELAY_MAX_PENDING_PEER_BOOK_UPDATES);
-        if overflow > 0 {
-            state.pending_peer_book_updates.drain(0..overflow);
-        }
+    if state.pending_peer_book_updates.len() <= RELAY_MAX_PENDING_PEER_BOOK_UPDATES {
+        return;
     }
+    state
+        .pending_peer_book_updates
+        .sort_unstable_by(|a, b| a.address.cmp(&b.address));
+    state
+        .pending_peer_book_updates
+        .dedup_by(|a, b| a.address == b.address);
+    let overflow = state
+        .pending_peer_book_updates
+        .len()
+        .saturating_sub(RELAY_MAX_PENDING_PEER_BOOK_UPDATES);
+    if overflow == 0 {
+        return;
+    }
+    state.pending_peer_book_updates.drain(0..overflow);
 }
 
 fn relay_merge_known_peer_addresses(state: &mut RelayServerState, incoming: &[PeerAddress]) {
@@ -7193,13 +7211,10 @@ enum RelayArchiveLookup {
     Busy,
 }
 
-fn relay_archive_lookup_block(
-    archive_db_path: &Path,
+fn relay_archive_lookup_from_result(
     hash: Hash256,
+    looked_up: Result<Option<Option<scam_core::Block>>, NodeError>,
 ) -> Result<RelayArchiveLookup, NodeError> {
-    let looked_up = load_with_retry(10, 10, is_runtime_db_lock_conflict, || {
-        load_block_by_hash_db(archive_db_path, hash).map_err(NodeError::from)
-    });
     match looked_up {
         Ok(Some(Some(block))) => Ok(RelayArchiveLookup::Found(block)),
         Ok(Some(None)) | Ok(None) => Ok(RelayArchiveLookup::Missing),
@@ -7214,6 +7229,16 @@ fn relay_archive_lookup_block(
         }
         Err(err) => Err(err),
     }
+}
+
+fn relay_archive_lookup_block(
+    archive_db_path: &Path,
+    hash: Hash256,
+) -> Result<RelayArchiveLookup, NodeError> {
+    let looked_up = load_with_retry(10, 10, is_runtime_db_lock_conflict, || {
+        load_block_by_hash_db(archive_db_path, hash).map_err(NodeError::from)
+    });
+    relay_archive_lookup_from_result(hash, looked_up)
 }
 
 fn relay_gossip_error_is_non_fatal(err: &GossipError) -> bool {
@@ -8624,24 +8649,16 @@ fn relay_outbound_feeler_due(now_unix_sec: u64, last_feeler_unix_sec: u64) -> bo
 }
 
 fn relay_outbound_rotate_after_sec() -> u64 {
-    env_opt("SCAM_RELAY_OUTBOUND_ROTATE_AFTER_SEC")
-        .and_then(|raw| raw.parse::<u64>().ok())
-        .filter(|value| *value > 0)
+    env_nonzero_u64("SCAM_RELAY_OUTBOUND_ROTATE_AFTER_SEC")
         .unwrap_or(RELAY_OUTBOUND_ROTATE_AFTER_SEC)
 }
 
 fn relay_outbound_max_peers() -> usize {
-    env_opt("SCAM_RELAY_OUTBOUND_MAX_PEERS")
-        .and_then(|raw| raw.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(RELAY_OUTBOUND_MAX_PEERS)
+    env_nonzero_usize("SCAM_RELAY_OUTBOUND_MAX_PEERS").unwrap_or(RELAY_OUTBOUND_MAX_PEERS)
 }
 
 fn relay_outbound_max_backoff_sec() -> u64 {
-    env_opt("SCAM_RELAY_OUTBOUND_MAX_BACKOFF_SEC")
-        .and_then(|raw| raw.parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(RELAY_OUTBOUND_MAX_BACKOFF_SEC)
+    env_nonzero_u64("SCAM_RELAY_OUTBOUND_MAX_BACKOFF_SEC").unwrap_or(RELAY_OUTBOUND_MAX_BACKOFF_SEC)
 }
 
 fn tokio_worker_threads_from_env(env_key: &str, default_cap: usize) -> usize {
@@ -8691,27 +8708,20 @@ fn relay_outbound_backoff_delay(
 }
 
 fn relay_inbound_accept_window_sec() -> u64 {
-    env_opt("SCAM_RELAY_INBOUND_ACCEPT_WINDOW_SEC")
-        .and_then(|raw| raw.parse::<u64>().ok())
-        .filter(|value| *value > 0)
+    env_nonzero_u64("SCAM_RELAY_INBOUND_ACCEPT_WINDOW_SEC")
         .unwrap_or(RELAY_INBOUND_ACCEPT_WINDOW_SEC)
 }
 
 fn relay_inbound_accept_base_max_per_ip(max_active_sessions: usize) -> usize {
-    env_opt("SCAM_RELAY_INBOUND_ACCEPT_MAX_PER_IP")
-        .and_then(|raw| raw.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or_else(|| {
-            RELAY_INBOUND_ACCEPT_MAX_PER_IP
-                .max(max_active_sessions.saturating_mul(4))
-                .max(64)
-        })
+    env_nonzero_usize("SCAM_RELAY_INBOUND_ACCEPT_MAX_PER_IP").unwrap_or_else(|| {
+        RELAY_INBOUND_ACCEPT_MAX_PER_IP
+            .max(max_active_sessions.saturating_mul(4))
+            .max(64)
+    })
 }
 
 fn relay_inbound_accept_loopback_multiplier() -> usize {
-    env_opt("SCAM_RELAY_INBOUND_ACCEPT_LOOPBACK_MULTIPLIER")
-        .and_then(|raw| raw.parse::<usize>().ok())
-        .filter(|value| *value > 0)
+    env_nonzero_usize("SCAM_RELAY_INBOUND_ACCEPT_LOOPBACK_MULTIPLIER")
         .unwrap_or(RELAY_INBOUND_ACCEPT_LOOPBACK_MULTIPLIER)
 }
 
@@ -9086,7 +9096,7 @@ fn run_relay_peer_session<IO: Read + Write>(
                 }
                 relay_messages_for_peer(&guard, peer_id, periodic)
             };
-            if !periodic_outbound.is_empty()
+            if relay_has_periodic_outbound(&periodic_outbound)
                 && !relay_send_messages_until_closed(stream, &periodic_outbound, &framing)?
             {
                 break;
@@ -9365,7 +9375,7 @@ async fn run_relay_peer_session_async<S: AsyncRead + AsyncWrite + Unpin>(
                 }
                 relay_messages_for_peer(&guard, peer_id, periodic)
             };
-            if !periodic_outbound.is_empty()
+            if relay_has_periodic_outbound(&periodic_outbound)
                 && !relay_send_messages_until_closed_async(
                     stream,
                     &periodic_outbound,
@@ -18716,6 +18726,20 @@ mod tests {
             .expect("time")
             .as_nanos();
         PathBuf::from(format!("target/{prefix}-{ts}"))
+    }
+
+    fn relay_state_for_tests() -> RelayServerState {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let relay = RelayAdmissionState {
+            mempool: Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip: GossipEngine::new(64).expect("gossip"),
+        };
+        RelayServerState::new(runtime, relay)
     }
 
     fn network_test_guard() -> std::sync::MutexGuard<'static, ()> {
@@ -35723,6 +35747,491 @@ mod tests {
                 .to_string()
                 .contains("invalid setup version range")
         );
+    }
+
+    #[test]
+    fn relay_apply_main_chain_transition_connected_only_runs_mempool_cleanup() {
+        let mut state = relay_state_for_tests();
+        let stale_tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: OutPoint {
+                    txid: Hash256([0xAB; 32]),
+                    vout: 0,
+                },
+                signature: vec![0x01],
+                pubkey_compressed: vec![0x02; 33],
+                sequence: u32::MAX,
+            }],
+            outputs: vec![TxOut {
+                value: 1,
+                key_hash20: [0x11; 20],
+            }],
+            lock_time: 0,
+        };
+        let txid = stale_tx.txid();
+        state
+            .relay
+            .mempool
+            .insert_with_fee(stale_tx, 50_000)
+            .expect("insert stale tx");
+        assert!(state.relay.mempool.contains(&txid));
+
+        let tip_hash = state.runtime.tip_hash();
+        let mut connected_hash = Hash256([0xCD; 32]);
+        if connected_hash == tip_hash {
+            connected_hash = Hash256([0xCE; 32]);
+        }
+        super::relay_apply_main_chain_transition(
+            &mut state,
+            &[tip_hash],
+            &[tip_hash, connected_hash],
+            10_000,
+        );
+        assert!(
+            !state.relay.mempool.contains(&txid),
+            "connected-only transition must still clean stale mempool transactions"
+        );
+    }
+
+    #[test]
+    fn relay_peer_tip_height_tracking_prefers_max_and_forget_clears_both_maps() {
+        let mut state = relay_state_for_tests();
+        let peer_id = 77u64;
+        state.peer_last_headers_request_sec.insert(peer_id, 123);
+
+        super::relay_record_peer_tip_height(&mut state, peer_id, 7);
+        assert_eq!(
+            state.peer_reported_tip_heights.get(&peer_id).copied(),
+            Some(7)
+        );
+        super::relay_record_peer_tip_height(&mut state, peer_id, 3);
+        assert_eq!(
+            state.peer_reported_tip_heights.get(&peer_id).copied(),
+            Some(7)
+        );
+        super::relay_record_peer_tip_height(&mut state, peer_id, 7);
+        assert_eq!(
+            state.peer_reported_tip_heights.get(&peer_id).copied(),
+            Some(7)
+        );
+        super::relay_record_peer_tip_height(&mut state, peer_id, 11);
+        assert_eq!(
+            state.peer_reported_tip_heights.get(&peer_id).copied(),
+            Some(11)
+        );
+
+        super::relay_forget_peer_tip_height(&mut state, peer_id);
+        assert!(!state.peer_reported_tip_heights.contains_key(&peer_id));
+        assert!(!state.peer_last_headers_request_sec.contains_key(&peer_id));
+    }
+
+    #[test]
+    fn relay_queue_peer_book_update_enforces_merge_and_capacity_boundaries() {
+        let mut state = relay_state_for_tests();
+        let mk = |port: u16, services: u64, seen: u64| super::PeerAddress {
+            address: format!("127.0.0.1:{port}"),
+            services,
+            last_seen_unix_sec: seen,
+        };
+
+        super::relay_queue_peer_book_update(&mut state, mk(19_000, 0b001, 10));
+        super::relay_queue_peer_book_update(&mut state, mk(19_000, 0b010, 20));
+        assert_eq!(state.pending_peer_book_updates.len(), 1);
+        assert_eq!(state.pending_peer_book_updates[0].services, 0b011);
+        assert_eq!(state.pending_peer_book_updates[0].last_seen_unix_sec, 20);
+
+        state.pending_peer_book_updates.clear();
+        state.pending_peer_book_updates.push(mk(19_002, 1, 1));
+        super::relay_queue_peer_book_update(&mut state, mk(19_001, 1, 1));
+        assert_eq!(
+            state
+                .pending_peer_book_updates
+                .iter()
+                .map(|entry| entry.address.clone())
+                .collect::<Vec<_>>(),
+            vec!["127.0.0.1:19002".to_owned(), "127.0.0.1:19001".to_owned()],
+            "below limit queue updates must preserve insertion order"
+        );
+
+        state.pending_peer_book_updates.clear();
+        for idx in (0..(super::RELAY_MAX_PENDING_PEER_BOOK_UPDATES - 1)).rev() {
+            state.pending_peer_book_updates.push(super::PeerAddress {
+                address: format!("127.0.0.1:{}", 20_000 + idx),
+                services: 1,
+                last_seen_unix_sec: idx as u64,
+            });
+        }
+        let first_before = state.pending_peer_book_updates[0].address.clone();
+        super::relay_queue_peer_book_update(
+            &mut state,
+            super::PeerAddress {
+                address: "127.0.0.1:29999".to_owned(),
+                services: 1,
+                last_seen_unix_sec: 9_999,
+            },
+        );
+        assert_eq!(
+            state.pending_peer_book_updates.len(),
+            super::RELAY_MAX_PENDING_PEER_BOOK_UPDATES
+        );
+        assert_eq!(
+            state.pending_peer_book_updates[0].address, first_before,
+            "exact limit must not trigger sorting/rebalancing"
+        );
+
+        state.pending_peer_book_updates.clear();
+        for idx in 0..(super::RELAY_MAX_PENDING_PEER_BOOK_UPDATES - 1) {
+            state.pending_peer_book_updates.push(super::PeerAddress {
+                address: format!("127.0.0.1:{}", 30_000 + idx),
+                services: 1,
+                last_seen_unix_sec: idx as u64,
+            });
+        }
+        state.pending_peer_book_updates.push(super::PeerAddress {
+            address: "127.0.0.1:35555".to_owned(),
+            services: 1,
+            last_seen_unix_sec: 1,
+        });
+        state.pending_peer_book_updates.push(super::PeerAddress {
+            address: "127.0.0.1:35555".to_owned(),
+            services: 1,
+            last_seen_unix_sec: 2,
+        });
+        super::relay_queue_peer_book_update(
+            &mut state,
+            super::PeerAddress {
+                address: "127.0.0.1:39999".to_owned(),
+                services: 1,
+                last_seen_unix_sec: 12_345,
+            },
+        );
+        assert_eq!(
+            state.pending_peer_book_updates.len(),
+            super::RELAY_MAX_PENDING_PEER_BOOK_UPDATES
+        );
+        assert_eq!(
+            state
+                .pending_peer_book_updates
+                .iter()
+                .filter(|entry| entry.address == "127.0.0.1:35555")
+                .count(),
+            1,
+            "overflow cleanup must dedup duplicate addresses"
+        );
+        assert!(
+            state
+                .pending_peer_book_updates
+                .iter()
+                .any(|entry| entry.address == "127.0.0.1:39999"),
+            "new overflow entry should be retained after rebalance"
+        );
+    }
+
+    #[test]
+    fn relay_merge_known_peer_addresses_queues_updates_when_each_field_changes() {
+        let mut state = relay_state_for_tests();
+        state.known_peer_addresses = vec![super::PeerAddress {
+            address: "127.0.0.1:2000".to_owned(),
+            services: 0b001,
+            last_seen_unix_sec: 10,
+        }];
+
+        super::relay_merge_known_peer_addresses(
+            &mut state,
+            &[super::PeerAddress {
+                address: "127.0.0.1:2000".to_owned(),
+                services: 0b001,
+                last_seen_unix_sec: 20,
+            }],
+        );
+        assert_eq!(state.pending_peer_book_updates.len(), 1);
+        assert_eq!(state.pending_peer_book_updates[0].services, 0b001);
+        assert_eq!(state.pending_peer_book_updates[0].last_seen_unix_sec, 20);
+
+        state.pending_peer_book_updates.clear();
+        super::relay_merge_known_peer_addresses(
+            &mut state,
+            &[super::PeerAddress {
+                address: "127.0.0.1:2000".to_owned(),
+                services: 0b101,
+                last_seen_unix_sec: 20,
+            }],
+        );
+        assert_eq!(state.pending_peer_book_updates.len(), 1);
+        assert_eq!(state.pending_peer_book_updates[0].services, 0b101);
+        assert_eq!(state.pending_peer_book_updates[0].last_seen_unix_sec, 20);
+    }
+
+    #[test]
+    fn relay_persist_peer_book_updates_updates_last_seen_and_decay_paths() {
+        let peers_dir = temp_dir("test-relay-persist-peer-book-updates");
+        fs::create_dir_all(&peers_dir).expect("mkdir peers dir");
+        let store = super::PeerBookStore::from_peers_dir(&peers_dir, "devnet");
+
+        super::save_peer_book_db(
+            &store.peers_db_path,
+            &PeerAddressBook {
+                network_id: "devnet".to_owned(),
+                peers: vec![PeerAddressRecord {
+                    address: "127.0.0.1:21000".to_owned(),
+                    last_seen_unix_sec: 10,
+                    ban_score: 0,
+                }],
+            },
+        )
+        .expect("save seed peer book");
+        super::relay_persist_peer_book_updates(
+            &store,
+            &[super::PeerAddress {
+                address: "127.0.0.1:21000".to_owned(),
+                services: 1,
+                last_seen_unix_sec: 20,
+            }],
+        )
+        .expect("persist updates");
+        let book = load_peer_book_db(&store.peers_db_path).expect("load updated peer book");
+        let peer = book
+            .peers
+            .iter()
+            .find(|entry| entry.address == "127.0.0.1:21000")
+            .expect("updated peer");
+        assert!(peer.last_seen_unix_sec >= 20);
+        assert_eq!(peer.ban_score, 0);
+
+        super::save_peer_book_db(
+            &store.peers_db_path,
+            &PeerAddressBook {
+                network_id: "devnet".to_owned(),
+                peers: vec![PeerAddressRecord {
+                    address: "127.0.0.1:21001".to_owned(),
+                    last_seen_unix_sec: u64::MAX - 1,
+                    ban_score: 5,
+                }],
+            },
+        )
+        .expect("save high-seen peer book");
+        super::relay_persist_peer_book_updates(
+            &store,
+            &[super::PeerAddress {
+                address: "127.0.0.1:21001".to_owned(),
+                services: 1,
+                last_seen_unix_sec: 1,
+            }],
+        )
+        .expect("persist decay updates");
+        let decayed = load_peer_book_db(&store.peers_db_path)
+            .expect("load decayed peer book")
+            .peers
+            .into_iter()
+            .find(|entry| entry.address == "127.0.0.1:21001")
+            .expect("decayed peer");
+        assert_eq!(decayed.last_seen_unix_sec, u64::MAX - 1);
+        assert_eq!(decayed.ban_score, 4);
+
+        let _ = fs::remove_dir_all(peers_dir);
+    }
+
+    #[test]
+    fn relay_archive_lookup_and_gossip_error_paths_are_strict() {
+        let state = relay_state_for_tests();
+        let tip_hash = state.runtime.tip_hash();
+        let tip_block = state
+            .runtime
+            .block_by_hash(&tip_hash)
+            .cloned()
+            .expect("tip block");
+        let found = super::relay_archive_lookup_from_result(tip_hash, Ok(Some(Some(tip_block))))
+            .expect("found lookup");
+        assert!(matches!(found, super::RelayArchiveLookup::Found(_)));
+        let missing =
+            super::relay_archive_lookup_from_result(tip_hash, Ok(Some(None))).expect("missing");
+        assert!(matches!(missing, super::RelayArchiveLookup::Missing));
+        let busy = super::relay_archive_lookup_from_result(
+            tip_hash,
+            Err(super::NodeError::Runtime(
+                "Database already open".to_owned(),
+            )),
+        )
+        .expect("busy");
+        assert!(matches!(busy, super::RelayArchiveLookup::Busy));
+        let fatal = super::relay_archive_lookup_from_result(
+            tip_hash,
+            Err(super::NodeError::Runtime("permission denied".to_owned())),
+        );
+        assert!(fatal.is_err(), "non-lock archive errors must be fatal");
+
+        let mut state = relay_state_for_tests();
+        let fatal_gossip = super::relay_handle_gossip_message(
+            &mut state,
+            999,
+            WireMessage::Inv {
+                items: vec![InventoryItem::Tx(Hash256([0x77; 32]))],
+            },
+        )
+        .expect_err("unknown peer gossip must be fatal");
+        assert!(matches!(
+            fatal_gossip,
+            super::NodeError::Gossip(super::GossipError::UnknownPeer { peer_id: 999 })
+        ));
+
+        state.relay.gossip.connect_peer(7);
+        let soft = super::relay_handle_gossip_message(
+            &mut state,
+            7,
+            WireMessage::ReqSketchExt {
+                salt: 42,
+                capacity: 32,
+            },
+        )
+        .expect("non-fatal recon race should be ignored");
+        assert!(soft.is_empty());
+    }
+
+    #[test]
+    fn relay_config_env_helpers_and_backoff_jitter_enforce_boundaries() {
+        const ROTATE_KEY: &str = "SCAM_RELAY_OUTBOUND_ROTATE_AFTER_SEC";
+        const MAX_PEERS_KEY: &str = "SCAM_RELAY_OUTBOUND_MAX_PEERS";
+        const MAX_BACKOFF_KEY: &str = "SCAM_RELAY_OUTBOUND_MAX_BACKOFF_SEC";
+        const INBOUND_WINDOW_KEY: &str = "SCAM_RELAY_INBOUND_ACCEPT_WINDOW_SEC";
+        const INBOUND_MAX_PER_IP_KEY: &str = "SCAM_RELAY_INBOUND_ACCEPT_MAX_PER_IP";
+        const INBOUND_LOOPBACK_MULT_KEY: &str = "SCAM_RELAY_INBOUND_ACCEPT_LOOPBACK_MULTIPLIER";
+        const ASYNC_POLL_KEY: &str = "SCAM_RELAY_ASYNC_READ_POLL_MS";
+        let keys = [
+            ROTATE_KEY,
+            MAX_PEERS_KEY,
+            MAX_BACKOFF_KEY,
+            INBOUND_WINDOW_KEY,
+            INBOUND_MAX_PER_IP_KEY,
+            INBOUND_LOOPBACK_MULT_KEY,
+            ASYNC_POLL_KEY,
+        ];
+        let saved = keys
+            .iter()
+            .map(|key| (*key, std::env::var(key).ok()))
+            .collect::<Vec<_>>();
+
+        for key in keys {
+            unsafe {
+                std::env::remove_var(key);
+            }
+        }
+        assert_eq!(
+            super::relay_outbound_rotate_after_sec(),
+            super::RELAY_OUTBOUND_ROTATE_AFTER_SEC
+        );
+        assert_eq!(
+            super::relay_outbound_max_peers(),
+            super::RELAY_OUTBOUND_MAX_PEERS
+        );
+        assert_eq!(
+            super::relay_outbound_max_backoff_sec(),
+            super::RELAY_OUTBOUND_MAX_BACKOFF_SEC
+        );
+        assert_eq!(
+            super::relay_inbound_accept_window_sec(),
+            super::RELAY_INBOUND_ACCEPT_WINDOW_SEC
+        );
+        assert_eq!(
+            super::relay_inbound_accept_base_max_per_ip(8),
+            super::RELAY_INBOUND_ACCEPT_MAX_PER_IP.max(8 * 4).max(64)
+        );
+        assert_eq!(
+            super::relay_inbound_accept_loopback_multiplier(),
+            super::RELAY_INBOUND_ACCEPT_LOOPBACK_MULTIPLIER
+        );
+
+        unsafe {
+            std::env::set_var(ROTATE_KEY, "0");
+            std::env::set_var(MAX_PEERS_KEY, "0");
+            std::env::set_var(MAX_BACKOFF_KEY, "0");
+            std::env::set_var(INBOUND_WINDOW_KEY, "0");
+            std::env::set_var(INBOUND_MAX_PER_IP_KEY, "0");
+            std::env::set_var(INBOUND_LOOPBACK_MULT_KEY, "0");
+            std::env::set_var(ASYNC_POLL_KEY, "0");
+        }
+        assert_eq!(
+            super::relay_outbound_rotate_after_sec(),
+            super::RELAY_OUTBOUND_ROTATE_AFTER_SEC
+        );
+        assert_eq!(
+            super::relay_outbound_max_peers(),
+            super::RELAY_OUTBOUND_MAX_PEERS
+        );
+        assert_eq!(
+            super::relay_outbound_max_backoff_sec(),
+            super::RELAY_OUTBOUND_MAX_BACKOFF_SEC
+        );
+        assert_eq!(
+            super::relay_inbound_accept_window_sec(),
+            super::RELAY_INBOUND_ACCEPT_WINDOW_SEC
+        );
+        assert_eq!(
+            super::relay_inbound_accept_base_max_per_ip(8),
+            super::RELAY_INBOUND_ACCEPT_MAX_PER_IP.max(8 * 4).max(64)
+        );
+        assert_eq!(
+            super::relay_inbound_accept_loopback_multiplier(),
+            super::RELAY_INBOUND_ACCEPT_LOOPBACK_MULTIPLIER
+        );
+        assert_eq!(
+            super::relay_async_read_poll_interval_ms(5),
+            super::RELAY_ASYNC_READ_POLL_INTERVAL_MS
+        );
+
+        unsafe {
+            std::env::set_var(ROTATE_KEY, "17");
+            std::env::set_var(MAX_PEERS_KEY, "11");
+            std::env::set_var(MAX_BACKOFF_KEY, "23");
+            std::env::set_var(INBOUND_WINDOW_KEY, "7");
+            std::env::set_var(INBOUND_MAX_PER_IP_KEY, "13");
+            std::env::set_var(INBOUND_LOOPBACK_MULT_KEY, "5");
+            std::env::set_var(ASYNC_POLL_KEY, "3000");
+        }
+        assert_eq!(super::relay_outbound_rotate_after_sec(), 17);
+        assert_eq!(super::relay_outbound_max_peers(), 11);
+        assert_eq!(super::relay_outbound_max_backoff_sec(), 23);
+        assert_eq!(super::relay_inbound_accept_window_sec(), 7);
+        assert_eq!(super::relay_inbound_accept_base_max_per_ip(8), 13);
+        assert_eq!(super::relay_inbound_accept_loopback_multiplier(), 5);
+        assert_eq!(super::relay_async_read_poll_interval_ms(5), 3_000);
+
+        unsafe {
+            std::env::set_var(MAX_BACKOFF_KEY, "5");
+        }
+        let backoff_initial = super::relay_outbound_backoff_delay("127.0.0.1:18444", 2, 1, 1_234);
+        let backoff_capped = super::relay_outbound_backoff_delay("127.0.0.1:18444", 2, 16, 1_235);
+        assert!(
+            backoff_initial >= Duration::from_secs(2)
+                && backoff_initial < Duration::from_millis(2_300),
+            "initial backoff must include jitter in [0,300)ms window"
+        );
+        assert!(
+            backoff_capped >= Duration::from_secs(5)
+                && backoff_capped < Duration::from_millis(5_300),
+            "capped backoff must include jitter in [0,300)ms window"
+        );
+        assert!(
+            backoff_capped >= backoff_initial,
+            "backoff should not shrink with higher failure streak"
+        );
+
+        assert!(!super::relay_has_periodic_outbound(&[]));
+        assert!(super::relay_has_periodic_outbound(&[WireMessage::Ping {
+            nonce: 1
+        }]));
+
+        for (key, value) in saved {
+            if let Some(raw) = value {
+                unsafe {
+                    std::env::set_var(key, raw);
+                }
+            } else {
+                unsafe {
+                    std::env::remove_var(key);
+                }
+            }
+        }
     }
 
     #[test]

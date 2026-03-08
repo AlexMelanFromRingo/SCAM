@@ -1,3 +1,4 @@
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
 pub mod difficulty;
 pub mod utxo;
 pub mod validate;

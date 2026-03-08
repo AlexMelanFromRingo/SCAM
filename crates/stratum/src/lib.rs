@@ -1,3 +1,4 @@
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::time::{SystemTime, UNIX_EPOCH};

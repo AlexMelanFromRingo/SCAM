@@ -1,3 +1,4 @@
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
 use scam_core::{Block, BlockHeader, Transaction};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

@@ -1,3 +1,4 @@
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
 use std::collections::{HashMap, HashSet};
 
 use scam_core::{
