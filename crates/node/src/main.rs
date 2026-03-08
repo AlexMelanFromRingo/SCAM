@@ -5327,7 +5327,7 @@ struct PendingCompactBlock {
 
 const RELAY_MAX_PENDING_BLOCK_ORPHANS: usize = 512;
 const RELAY_PARENT_RESYNC_COOLDOWN_SEC: u64 = 2;
-const RELAY_OUTBOUND_MAX_PEERS: usize = 8;
+const RELAY_OUTBOUND_MAX_PEERS: usize = 16;
 const RELAY_OUTBOUND_ROTATE_AFTER_SEC: u64 = 6 * 60 * 60;
 const RELAY_INBOUND_ACCEPT_WINDOW_SEC: u64 = 5;
 const RELAY_INBOUND_ACCEPT_MAX_PER_IP: usize = 64;
@@ -5345,11 +5345,13 @@ const RELAY_OUTBOUND_ANCHOR_TARGETS: usize = 2;
 const RELAY_OUTBOUND_FEELER_INTERVAL_SEC: u64 = 60;
 const RELAY_OUTBOUND_FEELER_TIMEOUT_SEC: u64 = 3;
 const RELAY_OUTBOUND_MAX_BACKOFF_SEC: u64 = 30;
+const RELAY_OUTBOUND_INITIAL_JITTER_MS: u64 = 500;
 const RELAY_HEADERS_CATCHUP_INTERVAL_SEC: u64 = 2;
 const RELAY_HEADERS_PROBE_INTERVAL_SEC: u64 = 15;
 const RELAY_HEADERS_INV_TRIGGER_INTERVAL_SEC: u64 = 1;
 const RELAY_HEADERS_AGGRESSIVE_LAG_THRESHOLD: u64 = 4;
 const RELAY_HEADERS_AGGRESSIVE_INTERVAL_SEC: u64 = 1;
+const RELAY_DISCOVERY_REFRESH_SEC: u64 = 30;
 const RELAY_ASYNC_READ_POLL_INTERVAL_MS: u64 = 250;
 
 static RELAY_TX_DIFFUSION_BASE_MS: AtomicU64 = AtomicU64::new(0);
@@ -8151,6 +8153,10 @@ fn run_relay_outbound_worker(
     let redial_sec = redial_sec.max(1);
     let mut failure_streak = 0u32;
     relay_mark_outbound_worker_start(&state);
+    let initial_delay = relay_outbound_initial_delay(&target);
+    if initial_delay > Duration::from_millis(0) {
+        thread::sleep(initial_delay);
+    }
     loop {
         if stop_flag.load(Ordering::Relaxed) {
             break;
@@ -8379,6 +8385,10 @@ async fn run_relay_outbound_worker_async(
     }
     let redial_sec = redial_sec.max(1);
     let mut failure_streak = 0u32;
+    let initial_delay = relay_outbound_initial_delay(&target);
+    if initial_delay > Duration::from_millis(0) {
+        sleep(initial_delay).await;
+    }
     loop {
         if stop_flag.load(Ordering::Relaxed) {
             break;
@@ -8728,6 +8738,24 @@ fn relay_outbound_max_backoff_sec() -> u64 {
     env_nonzero_u64("SCAM_RELAY_OUTBOUND_MAX_BACKOFF_SEC").unwrap_or(RELAY_OUTBOUND_MAX_BACKOFF_SEC)
 }
 
+fn relay_outbound_initial_jitter_ms() -> u64 {
+    env_opt("SCAM_RELAY_OUTBOUND_INITIAL_JITTER_MS")
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(RELAY_OUTBOUND_INITIAL_JITTER_MS)
+        .min(60_000)
+}
+
+fn relay_outbound_initial_delay(target: &str) -> Duration {
+    let max_jitter_ms = relay_outbound_initial_jitter_ms();
+    if max_jitter_ms == 0 {
+        return Duration::from_millis(0);
+    }
+    let mixed = scam_core::hash::hash256(target.as_bytes());
+    let jitter_ms =
+        u16::from_be_bytes([mixed.0[0], mixed.0[1]]) as u64 % max_jitter_ms.saturating_add(1);
+    Duration::from_millis(jitter_ms)
+}
+
 fn relay_headers_catchup_interval_sec() -> u64 {
     env_nonzero_u64("SCAM_RELAY_HEADERS_CATCHUP_INTERVAL_SEC")
         .unwrap_or(RELAY_HEADERS_CATCHUP_INTERVAL_SEC)
@@ -8751,6 +8779,14 @@ fn relay_headers_aggressive_lag_threshold() -> u64 {
 fn relay_headers_aggressive_interval_sec() -> u64 {
     env_nonzero_u64("SCAM_RELAY_HEADERS_AGGRESSIVE_INTERVAL_SEC")
         .unwrap_or(RELAY_HEADERS_AGGRESSIVE_INTERVAL_SEC)
+}
+
+fn relay_discovery_refresh_sec() -> u64 {
+    env_nonzero_u64("SCAM_RELAY_DISCOVERY_REFRESH_SEC").unwrap_or(RELAY_DISCOVERY_REFRESH_SEC)
+}
+
+fn relay_discovery_refresh_due(now_unix_sec: u64, last_discovery_request_unix_sec: u64) -> bool {
+    now_unix_sec.saturating_sub(last_discovery_request_unix_sec) >= relay_discovery_refresh_sec()
 }
 
 fn tokio_worker_threads_from_env(env_key: &str, default_cap: usize) -> usize {
@@ -9128,6 +9164,10 @@ fn run_relay_peer_session<IO: Read + Write>(
                     version: 1,
                 },
                 WireMessage::GetAddr,
+                WireMessage::GetHeaders {
+                    locator: locator.clone(),
+                    stop: None,
+                },
                 WireMessage::GetBlocks {
                     locator,
                     stop: None,
@@ -9145,6 +9185,7 @@ fn run_relay_peer_session<IO: Read + Write>(
         let mut last_tip_announced = None::<Hash256>;
         let mut announced_txids = HashSet::<Hash256>::new();
         let mut timeout_streak = 0u32;
+        let mut last_discovery_request_unix_sec = current_unix_sec().unwrap_or(0);
         loop {
             if stop_flag.load(Ordering::Relaxed) {
                 break;
@@ -9185,6 +9226,15 @@ fn run_relay_peer_session<IO: Read + Write>(
                     relay_maybe_request_headers_catchup(&mut guard, peer_id, now_for_periodic)
                 {
                     periodic.push(get_headers);
+                }
+                if matches!(mode, RelayPeerSessionMode::Outbound)
+                    && relay_discovery_refresh_due(
+                        now_for_periodic,
+                        last_discovery_request_unix_sec,
+                    )
+                {
+                    periodic.push(WireMessage::GetAddr);
+                    last_discovery_request_unix_sec = now_for_periodic;
                 }
                 relay_messages_for_peer(&guard, peer_id, periodic)
             };
@@ -9398,6 +9448,10 @@ async fn run_relay_peer_session_async<S: AsyncRead + AsyncWrite + Unpin>(
                     version: 1,
                 },
                 WireMessage::GetAddr,
+                WireMessage::GetHeaders {
+                    locator: locator.clone(),
+                    stop: None,
+                },
                 WireMessage::GetBlocks {
                     locator,
                     stop: None,
@@ -9424,6 +9478,7 @@ async fn run_relay_peer_session_async<S: AsyncRead + AsyncWrite + Unpin>(
         let read_poll_interval_ms = relay_async_read_poll_interval_ms(read_timeout_sec);
         let timeout_streak_limit =
             relay_async_timeout_streak_limit(read_timeout_sec, read_poll_interval_ms);
+        let mut last_discovery_request_unix_sec = current_unix_sec().unwrap_or(0);
         loop {
             if stop_flag.load(Ordering::Relaxed) {
                 break;
@@ -9464,6 +9519,15 @@ async fn run_relay_peer_session_async<S: AsyncRead + AsyncWrite + Unpin>(
                     relay_maybe_request_headers_catchup(&mut guard, peer_id, now_for_periodic)
                 {
                     periodic.push(get_headers);
+                }
+                if matches!(mode, RelayPeerSessionMode::Outbound)
+                    && relay_discovery_refresh_due(
+                        now_for_periodic,
+                        last_discovery_request_unix_sec,
+                    )
+                {
+                    periodic.push(WireMessage::GetAddr);
+                    last_discovery_request_unix_sec = now_for_periodic;
                 }
                 relay_messages_for_peer(&guard, peer_id, periodic)
             };
@@ -30454,6 +30518,23 @@ mod tests {
     }
 
     #[test]
+    fn relay_discovery_refresh_due_enforces_interval_boundary() {
+        assert!(!super::relay_discovery_refresh_due(10, 10));
+        assert!(!super::relay_discovery_refresh_due(
+            super::RELAY_DISCOVERY_REFRESH_SEC - 1,
+            0
+        ));
+        assert!(super::relay_discovery_refresh_due(
+            super::RELAY_DISCOVERY_REFRESH_SEC,
+            0
+        ));
+        assert!(super::relay_discovery_refresh_due(
+            super::RELAY_DISCOVERY_REFRESH_SEC + 1,
+            0
+        ));
+    }
+
+    #[test]
     fn relay_outbound_worker_rotation_due_enforces_boundary() {
         assert!(!super::relay_outbound_worker_rotation_due(10, 10, 60));
         assert!(!super::relay_outbound_worker_rotation_due(69, 10, 60));
@@ -30951,9 +31032,18 @@ mod tests {
         let remote =
             server_handshake(&mut remote_stream, &framing, &local_hello).expect("server handshake");
         assert_eq!(remote.network_id, "devnet");
-        for _ in 0..4 {
-            read_message(&mut remote_stream, &framing).expect("outbound startup message");
+        let mut startup = Vec::with_capacity(5);
+        for _ in 0..5 {
+            startup.push(
+                read_message(&mut remote_stream, &framing).expect("outbound startup message"),
+            );
         }
+        assert!(
+            startup
+                .iter()
+                .any(|msg| matches!(msg, WireMessage::GetHeaders { .. })),
+            "outbound startup must request headers-first catchup"
+        );
 
         send_message(
             &mut remote_stream,
@@ -31066,11 +31156,20 @@ mod tests {
                 .await
                 .expect("server handshake async");
             assert_eq!(remote.network_id, "devnet");
-            for _ in 0..4 {
-                read_message_async(&mut remote_stream, &framing)
-                    .await
-                    .expect("outbound startup message");
+            let mut startup = Vec::with_capacity(5);
+            for _ in 0..5 {
+                startup.push(
+                    read_message_async(&mut remote_stream, &framing)
+                        .await
+                        .expect("outbound startup message"),
+                );
             }
+            assert!(
+                startup
+                    .iter()
+                    .any(|msg| matches!(msg, WireMessage::GetHeaders { .. })),
+                "async outbound startup must request headers-first catchup"
+            );
 
             send_message_async(
                 &mut remote_stream,
@@ -36402,11 +36501,13 @@ mod tests {
         const ROTATE_KEY: &str = "SCAM_RELAY_OUTBOUND_ROTATE_AFTER_SEC";
         const MAX_PEERS_KEY: &str = "SCAM_RELAY_OUTBOUND_MAX_PEERS";
         const MAX_BACKOFF_KEY: &str = "SCAM_RELAY_OUTBOUND_MAX_BACKOFF_SEC";
+        const INITIAL_JITTER_KEY: &str = "SCAM_RELAY_OUTBOUND_INITIAL_JITTER_MS";
         const HEADERS_CATCHUP_KEY: &str = "SCAM_RELAY_HEADERS_CATCHUP_INTERVAL_SEC";
         const HEADERS_PROBE_KEY: &str = "SCAM_RELAY_HEADERS_PROBE_INTERVAL_SEC";
         const HEADERS_INV_TRIGGER_KEY: &str = "SCAM_RELAY_HEADERS_INV_TRIGGER_INTERVAL_SEC";
         const HEADERS_AGGR_THRESHOLD_KEY: &str = "SCAM_RELAY_HEADERS_AGGRESSIVE_LAG_THRESHOLD";
         const HEADERS_AGGR_INTERVAL_KEY: &str = "SCAM_RELAY_HEADERS_AGGRESSIVE_INTERVAL_SEC";
+        const DISCOVERY_REFRESH_KEY: &str = "SCAM_RELAY_DISCOVERY_REFRESH_SEC";
         const INBOUND_WINDOW_KEY: &str = "SCAM_RELAY_INBOUND_ACCEPT_WINDOW_SEC";
         const INBOUND_MAX_PER_IP_KEY: &str = "SCAM_RELAY_INBOUND_ACCEPT_MAX_PER_IP";
         const INBOUND_LOOPBACK_MULT_KEY: &str = "SCAM_RELAY_INBOUND_ACCEPT_LOOPBACK_MULTIPLIER";
@@ -36415,11 +36516,13 @@ mod tests {
             ROTATE_KEY,
             MAX_PEERS_KEY,
             MAX_BACKOFF_KEY,
+            INITIAL_JITTER_KEY,
             HEADERS_CATCHUP_KEY,
             HEADERS_PROBE_KEY,
             HEADERS_INV_TRIGGER_KEY,
             HEADERS_AGGR_THRESHOLD_KEY,
             HEADERS_AGGR_INTERVAL_KEY,
+            DISCOVERY_REFRESH_KEY,
             INBOUND_WINDOW_KEY,
             INBOUND_MAX_PER_IP_KEY,
             INBOUND_LOOPBACK_MULT_KEY,
@@ -36448,6 +36551,10 @@ mod tests {
             super::RELAY_OUTBOUND_MAX_BACKOFF_SEC
         );
         assert_eq!(
+            super::relay_outbound_initial_jitter_ms(),
+            super::RELAY_OUTBOUND_INITIAL_JITTER_MS
+        );
+        assert_eq!(
             super::relay_headers_catchup_interval_sec(),
             super::RELAY_HEADERS_CATCHUP_INTERVAL_SEC
         );
@@ -36466,6 +36573,10 @@ mod tests {
         assert_eq!(
             super::relay_headers_aggressive_interval_sec(),
             super::RELAY_HEADERS_AGGRESSIVE_INTERVAL_SEC
+        );
+        assert_eq!(
+            super::relay_discovery_refresh_sec(),
+            super::RELAY_DISCOVERY_REFRESH_SEC
         );
         assert_eq!(
             super::relay_inbound_accept_window_sec(),
@@ -36484,11 +36595,13 @@ mod tests {
             std::env::set_var(ROTATE_KEY, "0");
             std::env::set_var(MAX_PEERS_KEY, "0");
             std::env::set_var(MAX_BACKOFF_KEY, "0");
+            std::env::set_var(INITIAL_JITTER_KEY, "999999999");
             std::env::set_var(HEADERS_CATCHUP_KEY, "0");
             std::env::set_var(HEADERS_PROBE_KEY, "0");
             std::env::set_var(HEADERS_INV_TRIGGER_KEY, "0");
             std::env::set_var(HEADERS_AGGR_THRESHOLD_KEY, "0");
             std::env::set_var(HEADERS_AGGR_INTERVAL_KEY, "0");
+            std::env::set_var(DISCOVERY_REFRESH_KEY, "0");
             std::env::set_var(INBOUND_WINDOW_KEY, "0");
             std::env::set_var(INBOUND_MAX_PER_IP_KEY, "0");
             std::env::set_var(INBOUND_LOOPBACK_MULT_KEY, "0");
@@ -36506,6 +36619,7 @@ mod tests {
             super::relay_outbound_max_backoff_sec(),
             super::RELAY_OUTBOUND_MAX_BACKOFF_SEC
         );
+        assert_eq!(super::relay_outbound_initial_jitter_ms(), 60_000);
         assert_eq!(
             super::relay_headers_catchup_interval_sec(),
             super::RELAY_HEADERS_CATCHUP_INTERVAL_SEC
@@ -36525,6 +36639,10 @@ mod tests {
         assert_eq!(
             super::relay_headers_aggressive_interval_sec(),
             super::RELAY_HEADERS_AGGRESSIVE_INTERVAL_SEC
+        );
+        assert_eq!(
+            super::relay_discovery_refresh_sec(),
+            super::RELAY_DISCOVERY_REFRESH_SEC
         );
         assert_eq!(
             super::relay_inbound_accept_window_sec(),
@@ -36547,11 +36665,13 @@ mod tests {
             std::env::set_var(ROTATE_KEY, "17");
             std::env::set_var(MAX_PEERS_KEY, "11");
             std::env::set_var(MAX_BACKOFF_KEY, "23");
+            std::env::set_var(INITIAL_JITTER_KEY, "275");
             std::env::set_var(HEADERS_CATCHUP_KEY, "3");
             std::env::set_var(HEADERS_PROBE_KEY, "9");
             std::env::set_var(HEADERS_INV_TRIGGER_KEY, "2");
             std::env::set_var(HEADERS_AGGR_THRESHOLD_KEY, "8");
             std::env::set_var(HEADERS_AGGR_INTERVAL_KEY, "4");
+            std::env::set_var(DISCOVERY_REFRESH_KEY, "11");
             std::env::set_var(INBOUND_WINDOW_KEY, "7");
             std::env::set_var(INBOUND_MAX_PER_IP_KEY, "13");
             std::env::set_var(INBOUND_LOOPBACK_MULT_KEY, "5");
@@ -36560,11 +36680,13 @@ mod tests {
         assert_eq!(super::relay_outbound_rotate_after_sec(), 17);
         assert_eq!(super::relay_outbound_max_peers(), 11);
         assert_eq!(super::relay_outbound_max_backoff_sec(), 23);
+        assert_eq!(super::relay_outbound_initial_jitter_ms(), 275);
         assert_eq!(super::relay_headers_catchup_interval_sec(), 3);
         assert_eq!(super::relay_headers_probe_interval_sec(), 9);
         assert_eq!(super::relay_headers_inv_trigger_interval_sec(), 2);
         assert_eq!(super::relay_headers_aggressive_lag_threshold(), 8);
         assert_eq!(super::relay_headers_aggressive_interval_sec(), 4);
+        assert_eq!(super::relay_discovery_refresh_sec(), 11);
         assert_eq!(super::relay_inbound_accept_window_sec(), 7);
         assert_eq!(super::relay_inbound_accept_base_max_per_ip(8), 13);
         assert_eq!(super::relay_inbound_accept_loopback_multiplier(), 5);
@@ -36629,6 +36751,50 @@ mod tests {
             delay, expected,
             "backoff jitter must follow modulo-based deterministic formula"
         );
+    }
+
+    #[test]
+    fn relay_outbound_initial_delay_is_deterministic_and_bounded() {
+        const INITIAL_JITTER_KEY: &str = "SCAM_RELAY_OUTBOUND_INITIAL_JITTER_MS";
+        let saved = std::env::var(INITIAL_JITTER_KEY).ok();
+        unsafe {
+            std::env::set_var(INITIAL_JITTER_KEY, "250");
+        }
+
+        let target = "127.0.0.1:18444";
+        let delay_a = super::relay_outbound_initial_delay(target);
+        let delay_b = super::relay_outbound_initial_delay(target);
+        assert_eq!(
+            delay_a, delay_b,
+            "initial connect delay must be stable for a given target"
+        );
+        assert!(
+            delay_a <= Duration::from_millis(250),
+            "initial connect delay must stay within configured jitter bound"
+        );
+
+        let mixed = scam_core::hash::hash256(target.as_bytes());
+        let expected_ms = u16::from_be_bytes([mixed.0[0], mixed.0[1]]) as u64 % 251;
+        assert_eq!(delay_a, Duration::from_millis(expected_ms));
+
+        unsafe {
+            std::env::set_var(INITIAL_JITTER_KEY, "0");
+        }
+        assert_eq!(
+            super::relay_outbound_initial_delay(target),
+            Duration::from_millis(0),
+            "zero jitter should disable startup delay"
+        );
+
+        if let Some(value) = saved {
+            unsafe {
+                std::env::set_var(INITIAL_JITTER_KEY, value);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var(INITIAL_JITTER_KEY);
+            }
+        }
     }
 
     #[test]
