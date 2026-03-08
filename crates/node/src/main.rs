@@ -5328,6 +5328,7 @@ struct PendingCompactBlock {
 const RELAY_MAX_PENDING_BLOCK_ORPHANS: usize = 512;
 const RELAY_PARENT_RESYNC_COOLDOWN_SEC: u64 = 2;
 const RELAY_OUTBOUND_MAX_PEERS: usize = 16;
+const RELAY_OUTBOUND_SPAWN_BURST: usize = 4;
 const RELAY_OUTBOUND_ROTATE_AFTER_SEC: u64 = 6 * 60 * 60;
 const RELAY_INBOUND_ACCEPT_WINDOW_SEC: u64 = 5;
 const RELAY_INBOUND_ACCEPT_MAX_PER_IP: usize = 64;
@@ -8272,6 +8273,7 @@ fn run_relay_outbound_supervisor(
 ) {
     let redial_delay = Duration::from_secs(redial_sec.max(1));
     let max_outbound_peers = relay_outbound_max_peers();
+    let spawn_burst = relay_outbound_spawn_burst();
     let mut workers = HashMap::<String, thread::JoinHandle<()>>::new();
 
     loop {
@@ -8299,12 +8301,16 @@ fn run_relay_outbound_supervisor(
             rotate_after_sec,
         ) {
             Ok(targets) => {
+                let mut spawned_this_round = 0usize;
                 for target in targets {
                     if workers.contains_key(&target) {
                         continue;
                     }
                     if relay_target_matches_bind(&bind_addr, &target) {
                         continue;
+                    }
+                    if spawned_this_round >= spawn_burst {
+                        break;
                     }
                     let stop_clone = stop_flag.clone();
                     let next_peer_clone = next_peer_id.clone();
@@ -8338,6 +8344,7 @@ fn run_relay_outbound_supervisor(
                             );
                         }),
                     );
+                    spawned_this_round = spawned_this_round.saturating_add(1);
                 }
             }
             Err(err) => eprintln!(
@@ -8735,6 +8742,12 @@ fn relay_outbound_max_peers() -> usize {
     env_nonzero_usize("SCAM_RELAY_OUTBOUND_MAX_PEERS").unwrap_or(RELAY_OUTBOUND_MAX_PEERS)
 }
 
+fn relay_outbound_spawn_burst() -> usize {
+    env_nonzero_usize("SCAM_RELAY_OUTBOUND_SPAWN_BURST")
+        .unwrap_or(RELAY_OUTBOUND_SPAWN_BURST)
+        .min(256)
+}
+
 fn relay_outbound_max_backoff_sec() -> u64 {
     env_nonzero_u64("SCAM_RELAY_OUTBOUND_MAX_BACKOFF_SEC").unwrap_or(RELAY_OUTBOUND_MAX_BACKOFF_SEC)
 }
@@ -8919,6 +8932,7 @@ async fn run_relay_outbound_supervisor_async(
 ) {
     let redial_delay = Duration::from_secs(redial_sec.max(1));
     let max_outbound_peers = relay_outbound_max_peers();
+    let spawn_burst = relay_outbound_spawn_burst();
     relay_mark_outbound_supervisor_start(&state);
     let mut workers = HashMap::<String, tokio::task::JoinHandle<()>>::new();
     let mut worker_targets = HashSet::<String>::new();
@@ -8996,12 +9010,16 @@ async fn run_relay_outbound_supervisor_async(
             worker_started_unix_sec.remove(&stale_target);
         }
 
+        let mut spawned_this_round = 0usize;
         for target in targets {
             if worker_targets.contains(&target) {
                 continue;
             }
             if relay_target_matches_bind(&bind_addr, &target) {
                 continue;
+            }
+            if spawned_this_round >= spawn_burst {
+                break;
             }
             let target_key = target.clone();
             worker_targets.insert(target_key.clone());
@@ -9038,6 +9056,7 @@ async fn run_relay_outbound_supervisor_async(
                 }),
             );
             worker_started_unix_sec.insert(target_key, now_unix_sec);
+            spawned_this_round = spawned_this_round.saturating_add(1);
         }
 
         if relay_outbound_feeler_due(now_unix_sec, last_feeler_unix_sec) {
@@ -36536,6 +36555,7 @@ mod tests {
     fn relay_config_env_helpers_and_backoff_jitter_enforce_boundaries() {
         const ROTATE_KEY: &str = "SCAM_RELAY_OUTBOUND_ROTATE_AFTER_SEC";
         const MAX_PEERS_KEY: &str = "SCAM_RELAY_OUTBOUND_MAX_PEERS";
+        const SPAWN_BURST_KEY: &str = "SCAM_RELAY_OUTBOUND_SPAWN_BURST";
         const MAX_BACKOFF_KEY: &str = "SCAM_RELAY_OUTBOUND_MAX_BACKOFF_SEC";
         const INITIAL_JITTER_KEY: &str = "SCAM_RELAY_OUTBOUND_INITIAL_JITTER_MS";
         const HEADERS_CATCHUP_KEY: &str = "SCAM_RELAY_HEADERS_CATCHUP_INTERVAL_SEC";
@@ -36552,6 +36572,7 @@ mod tests {
         let keys = [
             ROTATE_KEY,
             MAX_PEERS_KEY,
+            SPAWN_BURST_KEY,
             MAX_BACKOFF_KEY,
             INITIAL_JITTER_KEY,
             HEADERS_CATCHUP_KEY,
@@ -36583,6 +36604,10 @@ mod tests {
         assert_eq!(
             super::relay_outbound_max_peers(),
             super::RELAY_OUTBOUND_MAX_PEERS
+        );
+        assert_eq!(
+            super::relay_outbound_spawn_burst(),
+            super::RELAY_OUTBOUND_SPAWN_BURST
         );
         assert_eq!(
             super::relay_outbound_max_backoff_sec(),
@@ -36636,6 +36661,7 @@ mod tests {
         unsafe {
             std::env::set_var(ROTATE_KEY, "0");
             std::env::set_var(MAX_PEERS_KEY, "0");
+            std::env::set_var(SPAWN_BURST_KEY, "999999");
             std::env::set_var(MAX_BACKOFF_KEY, "0");
             std::env::set_var(INITIAL_JITTER_KEY, "999999999");
             std::env::set_var(HEADERS_CATCHUP_KEY, "0");
@@ -36658,6 +36684,7 @@ mod tests {
             super::relay_outbound_max_peers(),
             super::RELAY_OUTBOUND_MAX_PEERS
         );
+        assert_eq!(super::relay_outbound_spawn_burst(), 256);
         assert_eq!(
             super::relay_outbound_max_backoff_sec(),
             super::RELAY_OUTBOUND_MAX_BACKOFF_SEC
@@ -36708,6 +36735,7 @@ mod tests {
         unsafe {
             std::env::set_var(ROTATE_KEY, "17");
             std::env::set_var(MAX_PEERS_KEY, "11");
+            std::env::set_var(SPAWN_BURST_KEY, "9");
             std::env::set_var(MAX_BACKOFF_KEY, "23");
             std::env::set_var(INITIAL_JITTER_KEY, "275");
             std::env::set_var(HEADERS_CATCHUP_KEY, "3");
@@ -36724,6 +36752,7 @@ mod tests {
         }
         assert_eq!(super::relay_outbound_rotate_after_sec(), 17);
         assert_eq!(super::relay_outbound_max_peers(), 11);
+        assert_eq!(super::relay_outbound_spawn_burst(), 9);
         assert_eq!(super::relay_outbound_max_backoff_sec(), 23);
         assert_eq!(super::relay_outbound_initial_jitter_ms(), 275);
         assert_eq!(super::relay_headers_catchup_interval_sec(), 3);
