@@ -36235,6 +36235,29 @@ mod tests {
     }
 
     #[test]
+    fn relay_outbound_backoff_delay_uses_modulo_jitter_formula() {
+        let target = "127.0.0.1:18444";
+        let redial_sec = 2;
+        let failure_streak = 1;
+        let now_nanos = 1_234_u64;
+        let delay =
+            super::relay_outbound_backoff_delay(target, redial_sec, failure_streak, now_nanos);
+
+        let mut entropy = Vec::with_capacity(target.len() + 8);
+        entropy.extend_from_slice(target.as_bytes());
+        entropy.extend_from_slice(&now_nanos.to_be_bytes());
+        let mixed = scam_core::hash::hash256(&entropy);
+        let jitter_ms = u16::from_be_bytes([mixed.0[0], mixed.0[1]]) as u64 % 300;
+        let expected =
+            Duration::from_millis(redial_sec.saturating_mul(1_000).saturating_add(jitter_ms));
+
+        assert_eq!(
+            delay, expected,
+            "backoff jitter must follow modulo-based deterministic formula"
+        );
+    }
+
+    #[test]
     fn run_from_args_reports_parse_errors() {
         let err = super::run_from_args(["scam-node", "--definitely-invalid-flag"])
             .expect_err("invalid args must fail parse");
