@@ -19,6 +19,7 @@ set -euo pipefail
 #   BASE_STRATUM_PORT=19347
 #   RUN_RPC=true
 #   RUN_STRATUM=false
+#   STRATUM_NODE_INDEXES=""     # optional CSV list, e.g. "0,1" to run Stratum only on selected nodes
 #   WIRE_PEERS=true
 #   BUILD=true
 #   CARGO_PROFILE=debug   # debug|release
@@ -50,6 +51,7 @@ BASE_RPC_PORT="${BASE_RPC_PORT:-19080}"
 BASE_STRATUM_PORT="${BASE_STRATUM_PORT:-19347}"
 RUN_RPC="${RUN_RPC:-true}"
 RUN_STRATUM="${RUN_STRATUM:-false}"
+STRATUM_NODE_INDEXES="${STRATUM_NODE_INDEXES:-}"
 WIRE_PEERS="${WIRE_PEERS:-true}"
 BUILD="${BUILD:-true}"
 CARGO_PROFILE="${CARGO_PROFILE:-debug}"
@@ -88,6 +90,25 @@ require_positive_int() {
     echo "[cluster] ${name} must be a positive integer, got '${value}'" >&2
     exit 2
   fi
+}
+
+csv_contains_index() {
+  local csv="$1"
+  local needle="$2"
+  local compact
+  compact="$(echo "${csv}" | tr -d '[:space:]')"
+  [[ ",${compact}," == *",${needle},"* ]]
+}
+
+should_run_stratum_for_idx() {
+  local idx="$1"
+  if ! is_true "${RUN_STRATUM}"; then
+    return 1
+  fi
+  if [[ -z "${STRATUM_NODE_INDEXES}" ]]; then
+    return 0
+  fi
+  csv_contains_index "${STRATUM_NODE_INDEXES}" "${idx}"
 }
 
 node_dir() {
@@ -129,6 +150,16 @@ write_pid() {
   local pid_file="$1"
   local pid="$2"
   printf "%s\n" "${pid}" > "${pid_file}"
+}
+
+spawn_detached() {
+  local pid_file="$1"
+  local service_name="$2"
+  local log_file="$3"
+  shift 3
+  nohup "$@" > "${log_file}" 2>&1 < /dev/null &
+  write_pid "${pid_file}" "$!"
+  ensure_pid_started "${pid_file}" "${service_name}" "${log_file}"
 }
 
 ensure_pid_started() {
@@ -295,10 +326,15 @@ start_cluster() {
       --runtime-db "${runtime_db}" \
       > "${logsdir}/bootstrap.log" 2>&1
 
-    SCAM_RELAY_HANDSHAKE_TIMEOUT_SEC="${RELAY_HANDSHAKE_TIMEOUT_SEC}" \
-    SCAM_RELAY_TOKIO_WORKER_THREADS="${RELAY_TOKIO_WORKER_THREADS}" \
-    SCAM_RELAY_OUTBOUND_MAX_PEERS="${RELAY_OUTBOUND_MAX_PEERS}" \
-    "${bin}" relay-serve \
+    spawn_detached \
+      "${nodedir}/relay.pid" \
+      "node-${idx} relay-serve" \
+      "${logsdir}/relay.log" \
+      env \
+      SCAM_RELAY_HANDSHAKE_TIMEOUT_SEC="${RELAY_HANDSHAKE_TIMEOUT_SEC}" \
+      SCAM_RELAY_TOKIO_WORKER_THREADS="${RELAY_TOKIO_WORKER_THREADS}" \
+      SCAM_RELAY_OUTBOUND_MAX_PEERS="${RELAY_OUTBOUND_MAX_PEERS}" \
+      "${bin}" relay-serve \
       --network "${NETWORK}" \
       --config "${CONFIG}" \
       --runtime-db "${runtime_db}" \
@@ -308,41 +344,41 @@ start_cluster() {
       --write-timeout-sec "${P2P_WRITE_TIMEOUT_SEC}" \
       "${relay_extra_args[@]}" \
       --telemetry-out "${nodedir}/relay.telemetry.jsonl" \
-      --telemetry-every-sec 5 \
-      > "${logsdir}/relay.log" 2>&1 &
-    write_pid "${nodedir}/relay.pid" "$!"
-    ensure_pid_started "${nodedir}/relay.pid" "node-${idx} relay-serve" "${logsdir}/relay.log"
+      --telemetry-every-sec 5
 
     local rpc_value="-"
     if is_true "${RUN_RPC}"; then
-      "${bin}" rpc-serve \
+      spawn_detached \
+        "${nodedir}/rpc.pid" \
+        "node-${idx} rpc-serve" \
+        "${logsdir}/rpc.log" \
+        "${bin}" rpc-serve \
         --network "${NETWORK}" \
         --config "${CONFIG}" \
         --runtime-db "${runtime_db}" \
         --bind "127.0.0.1:${rpc_port}" \
         --ui-dir "${UI_DIR}" \
         --relay-telemetry "${nodedir}/relay.telemetry.jsonl" \
-        --stratum-telemetry "${nodedir}/stratum.telemetry.jsonl" \
-        > "${logsdir}/rpc.log" 2>&1 &
-      write_pid "${nodedir}/rpc.pid" "$!"
-      ensure_pid_started "${nodedir}/rpc.pid" "node-${idx} rpc-serve" "${logsdir}/rpc.log"
+        --stratum-telemetry "${nodedir}/stratum.telemetry.jsonl"
       rpc_value="${rpc_port}"
     fi
 
     local stratum_value="-"
-    if is_true "${RUN_STRATUM}"; then
-      SCAM_STRATUM_TOKIO_WORKER_THREADS="${STRATUM_TOKIO_WORKER_THREADS}" \
-      "${bin}" stratum-serve \
+    if should_run_stratum_for_idx "${idx}"; then
+      spawn_detached \
+        "${nodedir}/stratum.pid" \
+        "node-${idx} stratum-serve" \
+        "${logsdir}/stratum.log" \
+        env \
+        SCAM_STRATUM_TOKIO_WORKER_THREADS="${STRATUM_TOKIO_WORKER_THREADS}" \
+        "${bin}" stratum-serve \
         --network "${NETWORK}" \
         --config "${CONFIG}" \
         --runtime-db "${runtime_db}" \
         --bind "127.0.0.1:${stratum_port}" \
         --read-timeout-sec "${STRATUM_READ_TIMEOUT_SEC}" \
         --telemetry-out "${nodedir}/stratum.telemetry.jsonl" \
-        --telemetry-every-sec "${STRATUM_TELEMETRY_EVERY_SEC}" \
-        > "${logsdir}/stratum.log" 2>&1 &
-      write_pid "${nodedir}/stratum.pid" "$!"
-      ensure_pid_started "${nodedir}/stratum.pid" "node-${idx} stratum-serve" "${logsdir}/stratum.log"
+        --telemetry-every-sec "${STRATUM_TELEMETRY_EVERY_SEC}"
       stratum_value="${stratum_port}"
     fi
 
