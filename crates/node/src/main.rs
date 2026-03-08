@@ -5332,6 +5332,7 @@ struct RelayServerState {
     pending_compact_blocks: HashMap<Hash256, PendingCompactBlock>,
     peer_reported_tip_heights: HashMap<u64, u64>,
     peer_last_headers_request_sec: HashMap<u64, u64>,
+    peer_last_blocks_request_sec: HashMap<u64, u64>,
     known_peer_addresses: Vec<PeerAddress>,
     pending_peer_book_updates: Vec<PeerAddress>,
     outbound_worker_starts_total: u64,
@@ -5353,6 +5354,7 @@ impl RelayServerState {
             pending_compact_blocks: HashMap::new(),
             peer_reported_tip_heights: HashMap::new(),
             peer_last_headers_request_sec: HashMap::new(),
+            peer_last_blocks_request_sec: HashMap::new(),
             known_peer_addresses: Vec::new(),
             pending_peer_book_updates: Vec::new(),
             outbound_worker_starts_total: 0,
@@ -5401,6 +5403,8 @@ const RELAY_HEADERS_PROBE_INTERVAL_SEC: u64 = 15;
 const RELAY_HEADERS_INV_TRIGGER_INTERVAL_SEC: u64 = 1;
 const RELAY_HEADERS_AGGRESSIVE_LAG_THRESHOLD: u64 = 4;
 const RELAY_HEADERS_AGGRESSIVE_INTERVAL_SEC: u64 = 1;
+const RELAY_BLOCKS_CATCHUP_INTERVAL_SEC: u64 = 4;
+const RELAY_BLOCKS_AGGRESSIVE_INTERVAL_SEC: u64 = 2;
 const RELAY_DISCOVERY_REFRESH_SEC: u64 = 30;
 const RELAY_DISCOVERY_REFRESH_JITTER_SEC: u64 = 5;
 const RELAY_ASYNC_READ_POLL_INTERVAL_MS: u64 = 250;
@@ -6490,6 +6494,7 @@ fn relay_record_peer_tip_height(state: &mut RelayServerState, peer_id: u64, tip_
 fn relay_forget_peer_tip_height(state: &mut RelayServerState, peer_id: u64) {
     state.peer_reported_tip_heights.remove(&peer_id);
     state.peer_last_headers_request_sec.remove(&peer_id);
+    state.peer_last_blocks_request_sec.remove(&peer_id);
 }
 
 fn relay_max_known_tip_height(state: &RelayServerState) -> u64 {
@@ -6566,6 +6571,45 @@ fn relay_maybe_request_headers_catchup(
     Some(relay_build_headers_request(state, peer_id, now_unix_sec))
 }
 
+fn relay_should_request_blocks_catchup(
+    state: &RelayServerState,
+    peer_id: u64,
+    now_unix_sec: u64,
+) -> bool {
+    let local_tip = state.runtime.tip_height();
+    let peer_tip = state
+        .peer_reported_tip_heights
+        .get(&peer_id)
+        .copied()
+        .unwrap_or(local_tip);
+    if peer_tip <= local_tip {
+        return false;
+    }
+    let last = state
+        .peer_last_blocks_request_sec
+        .get(&peer_id)
+        .copied()
+        .unwrap_or(0);
+    let lag = peer_tip.saturating_sub(local_tip);
+    let interval = if lag >= relay_headers_aggressive_lag_threshold() {
+        relay_blocks_aggressive_interval_sec()
+    } else {
+        relay_blocks_catchup_interval_sec()
+    };
+    now_unix_sec.saturating_sub(last) >= interval
+}
+
+fn relay_maybe_request_blocks_catchup(
+    state: &mut RelayServerState,
+    peer_id: u64,
+    now_unix_sec: u64,
+) -> Option<WireMessage> {
+    if !relay_should_request_blocks_catchup(state, peer_id, now_unix_sec) {
+        return None;
+    }
+    Some(relay_build_blocks_request(state, peer_id, now_unix_sec))
+}
+
 fn relay_build_headers_request(
     state: &mut RelayServerState,
     peer_id: u64,
@@ -6576,6 +6620,21 @@ fn relay_build_headers_request(
         .peer_last_headers_request_sec
         .insert(peer_id, now_unix_sec);
     WireMessage::GetHeaders {
+        locator,
+        stop: None,
+    }
+}
+
+fn relay_build_blocks_request(
+    state: &mut RelayServerState,
+    peer_id: u64,
+    now_unix_sec: u64,
+) -> WireMessage {
+    let locator = build_block_locator(state.runtime.block_hashes());
+    state
+        .peer_last_blocks_request_sec
+        .insert(peer_id, now_unix_sec);
+    WireMessage::GetBlocks {
         locator,
         stop: None,
     }
@@ -8029,6 +8088,7 @@ fn load_relay_outbound_targets_selected(
     cfg: &ChainConfig,
     max_peers: usize,
     rotate_after_sec: u64,
+    selector_identity: &str,
 ) -> Result<Vec<String>, NodeError> {
     let (peers_db_path, legacy_txt_path) = peer_book_paths(peers_dir, &cfg.network_id);
     let mut peer_book = match load_with_retry(10, 15, is_peer_book_db_lock_conflict, || {
@@ -8056,7 +8116,14 @@ fn load_relay_outbound_targets_selected(
             continue;
         }
         let reputation_penalty = reputation_weights.get(&peer.address).copied().unwrap_or(0);
-        let failure_count = peer.ban_score.saturating_add(reputation_penalty);
+        let failure_count = peer
+            .ban_score
+            .saturating_add(reputation_penalty)
+            .saturating_mul(32)
+            .saturating_add(relay_outbound_selector_jitter(
+                selector_identity,
+                &peer.address,
+            ));
         if let Ok(addr) = peer.address.parse::<SocketAddr>() {
             candidates.push(PeerCandidate {
                 addr,
@@ -8110,6 +8177,15 @@ fn load_relay_outbound_targets_selected(
     }
 
     Ok(selected)
+}
+
+fn relay_outbound_selector_jitter(selector_identity: &str, candidate: &str) -> u32 {
+    let mut mixed = String::with_capacity(selector_identity.len() + candidate.len() + 1);
+    mixed.push_str(selector_identity);
+    mixed.push('|');
+    mixed.push_str(candidate);
+    let hash = scam_core::hash::hash256(mixed.as_bytes());
+    (u16::from_be_bytes([hash.0[0], hash.0[1]]) % 31) as u32
 }
 
 fn relay_target_matches_bind(bind_addr: &str, target: &str) -> bool {
@@ -8348,6 +8424,7 @@ fn run_relay_outbound_supervisor(
             &cfg,
             max_outbound_peers,
             rotate_after_sec,
+            &bind_addr,
         ) {
             Ok(targets) => {
                 let mut spawned_this_round = 0usize;
@@ -8844,6 +8921,16 @@ fn relay_headers_aggressive_interval_sec() -> u64 {
         .unwrap_or(RELAY_HEADERS_AGGRESSIVE_INTERVAL_SEC)
 }
 
+fn relay_blocks_catchup_interval_sec() -> u64 {
+    env_nonzero_u64("SCAM_RELAY_BLOCKS_CATCHUP_INTERVAL_SEC")
+        .unwrap_or(RELAY_BLOCKS_CATCHUP_INTERVAL_SEC)
+}
+
+fn relay_blocks_aggressive_interval_sec() -> u64 {
+    env_nonzero_u64("SCAM_RELAY_BLOCKS_AGGRESSIVE_INTERVAL_SEC")
+        .unwrap_or(RELAY_BLOCKS_AGGRESSIVE_INTERVAL_SEC)
+}
+
 fn relay_discovery_refresh_sec() -> u64 {
     env_nonzero_u64("SCAM_RELAY_DISCOVERY_REFRESH_SEC").unwrap_or(RELAY_DISCOVERY_REFRESH_SEC)
 }
@@ -9018,6 +9105,7 @@ async fn run_relay_outbound_supervisor_async(
             &cfg,
             max_outbound_peers,
             rotate_after_sec,
+            &bind_addr,
         ) {
             Ok(targets) => targets,
             Err(err) => {
@@ -9314,6 +9402,11 @@ fn run_relay_peer_session<IO: Read + Write>(
                 {
                     periodic.push(get_headers);
                 }
+                if let Some(get_blocks) =
+                    relay_maybe_request_blocks_catchup(&mut guard, peer_id, now_for_periodic)
+                {
+                    periodic.push(get_blocks);
+                }
                 if matches!(mode, RelayPeerSessionMode::Outbound)
                     && relay_discovery_refresh_due(
                         now_for_periodic,
@@ -9607,6 +9700,11 @@ async fn run_relay_peer_session_async<S: AsyncRead + AsyncWrite + Unpin>(
                     relay_maybe_request_headers_catchup(&mut guard, peer_id, now_for_periodic)
                 {
                     periodic.push(get_headers);
+                }
+                if let Some(get_blocks) =
+                    relay_maybe_request_blocks_catchup(&mut guard, peer_id, now_for_periodic)
+                {
+                    periodic.push(get_blocks);
                 }
                 if matches!(mode, RelayPeerSessionMode::Outbound)
                     && relay_discovery_refresh_due(
@@ -23972,8 +24070,9 @@ mod tests {
 
         let cfg: ChainConfig =
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
-        let selected = super::load_relay_outbound_targets_selected(&peers_dir, &cfg, 1, 60)
-            .expect("selected peers");
+        let selected =
+            super::load_relay_outbound_targets_selected(&peers_dir, &cfg, 1, 60, "127.0.0.1:19444")
+                .expect("selected peers");
         assert_eq!(selected, vec!["11.1.1.1:19444".to_owned()]);
 
         let _ = std::fs::remove_dir_all(peers_dir);
@@ -24268,6 +24367,74 @@ mod tests {
         assert!(
             super::relay_maybe_request_headers_catchup(&mut state, peer_id, 121).is_some(),
             "aggressive lag mode should allow one-second catchup cadence"
+        );
+    }
+
+    #[test]
+    fn relay_blocks_catchup_requests_only_when_peer_is_ahead() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let relay = RelayAdmissionState {
+            mempool: Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip: GossipEngine::new(64).expect("gossip"),
+        };
+        let mut state = RelayServerState::new(runtime, relay);
+        let peer_id = 33u64;
+
+        state.peer_reported_tip_heights.insert(peer_id, 0);
+        assert!(
+            super::relay_maybe_request_blocks_catchup(&mut state, peer_id, 100).is_none(),
+            "equal tip height must not trigger periodic getblocks"
+        );
+
+        state.peer_reported_tip_heights.insert(peer_id, 2);
+        let first = super::relay_maybe_request_blocks_catchup(&mut state, peer_id, 101)
+            .expect("lagging node should request blocks");
+        assert!(matches!(
+            first,
+            WireMessage::GetBlocks {
+                locator: _,
+                stop: None
+            }
+        ));
+        assert_eq!(
+            state.peer_last_blocks_request_sec.get(&peer_id).copied(),
+            Some(101)
+        );
+        assert!(
+            super::relay_maybe_request_blocks_catchup(&mut state, peer_id, 104).is_none(),
+            "normal blocks catchup interval must rate-limit requests"
+        );
+        assert!(
+            super::relay_maybe_request_blocks_catchup(&mut state, peer_id, 105).is_some(),
+            "normal interval should allow another request at boundary"
+        );
+
+        state.peer_reported_tip_heights.insert(peer_id, 10);
+        assert!(
+            super::relay_maybe_request_blocks_catchup(&mut state, peer_id, 106).is_none(),
+            "aggressive cadence still honors latest request timestamp"
+        );
+        let aggressive = super::relay_maybe_request_blocks_catchup(&mut state, peer_id, 107)
+            .expect("large lag should use aggressive blocks cadence");
+        assert!(matches!(
+            aggressive,
+            WireMessage::GetBlocks {
+                locator: _,
+                stop: None
+            }
+        ));
+        assert!(
+            super::relay_maybe_request_blocks_catchup(&mut state, peer_id, 108).is_none(),
+            "aggressive cadence still enforces one-cycle cooldown"
+        );
+        assert!(
+            super::relay_maybe_request_blocks_catchup(&mut state, peer_id, 109).is_some(),
+            "aggressive interval should re-open quickly for large lag"
         );
     }
 
@@ -29782,8 +29949,9 @@ mod tests {
 
         let cfg: ChainConfig =
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
-        let targets = super::load_relay_outbound_targets_selected(&peers_dir, &cfg, 8, 60)
-            .expect("load selected targets");
+        let targets =
+            super::load_relay_outbound_targets_selected(&peers_dir, &cfg, 8, 60, "127.0.0.1:19444")
+                .expect("load selected targets");
         assert_eq!(targets, vec!["127.0.0.1:19444".to_owned()]);
 
         let _ = fs::remove_dir_all(peers_dir);
@@ -29816,8 +29984,9 @@ mod tests {
 
         let cfg: ChainConfig =
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
-        let targets = super::load_relay_outbound_targets_selected(&peers_dir, &cfg, 0, 60)
-            .expect("load selected targets");
+        let targets =
+            super::load_relay_outbound_targets_selected(&peers_dir, &cfg, 0, 60, "127.0.0.1:19444")
+                .expect("load selected targets");
         assert!(targets.is_empty(), "zero max_peers must select nothing");
 
         let _ = fs::remove_dir_all(peers_dir);
@@ -29850,16 +30019,18 @@ mod tests {
 
         let cfg: ChainConfig =
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
-        let one = super::load_relay_outbound_targets_selected(&peers_dir, &cfg, 1, 60)
-            .expect("load selected targets (one)");
+        let one =
+            super::load_relay_outbound_targets_selected(&peers_dir, &cfg, 1, 60, "127.0.0.1:19444")
+                .expect("load selected targets (one)");
         assert_eq!(
             one,
             vec!["127.0.0.1:19444".to_owned()],
             "domain candidate must not exceed max_peers"
         );
 
-        let two = super::load_relay_outbound_targets_selected(&peers_dir, &cfg, 2, 60)
-            .expect("load selected targets (two)");
+        let two =
+            super::load_relay_outbound_targets_selected(&peers_dir, &cfg, 2, 60, "127.0.0.1:19444")
+                .expect("load selected targets (two)");
         assert_eq!(
             two,
             vec![
@@ -36343,10 +36514,11 @@ mod tests {
     }
 
     #[test]
-    fn relay_peer_tip_height_tracking_prefers_max_and_forget_clears_both_maps() {
+    fn relay_peer_tip_height_tracking_prefers_max_and_forget_clears_request_maps() {
         let mut state = relay_state_for_tests();
         let peer_id = 77u64;
         state.peer_last_headers_request_sec.insert(peer_id, 123);
+        state.peer_last_blocks_request_sec.insert(peer_id, 321);
 
         super::relay_record_peer_tip_height(&mut state, peer_id, 7);
         assert_eq!(
@@ -36372,6 +36544,7 @@ mod tests {
         super::relay_forget_peer_tip_height(&mut state, peer_id);
         assert!(!state.peer_reported_tip_heights.contains_key(&peer_id));
         assert!(!state.peer_last_headers_request_sec.contains_key(&peer_id));
+        assert!(!state.peer_last_blocks_request_sec.contains_key(&peer_id));
     }
 
     #[test]
@@ -36648,6 +36821,8 @@ mod tests {
         const HEADERS_INV_TRIGGER_KEY: &str = "SCAM_RELAY_HEADERS_INV_TRIGGER_INTERVAL_SEC";
         const HEADERS_AGGR_THRESHOLD_KEY: &str = "SCAM_RELAY_HEADERS_AGGRESSIVE_LAG_THRESHOLD";
         const HEADERS_AGGR_INTERVAL_KEY: &str = "SCAM_RELAY_HEADERS_AGGRESSIVE_INTERVAL_SEC";
+        const BLOCKS_CATCHUP_KEY: &str = "SCAM_RELAY_BLOCKS_CATCHUP_INTERVAL_SEC";
+        const BLOCKS_AGGR_INTERVAL_KEY: &str = "SCAM_RELAY_BLOCKS_AGGRESSIVE_INTERVAL_SEC";
         const DISCOVERY_REFRESH_KEY: &str = "SCAM_RELAY_DISCOVERY_REFRESH_SEC";
         const DISCOVERY_REFRESH_JITTER_KEY: &str = "SCAM_RELAY_DISCOVERY_REFRESH_JITTER_SEC";
         const INBOUND_WINDOW_KEY: &str = "SCAM_RELAY_INBOUND_ACCEPT_WINDOW_SEC";
@@ -36665,6 +36840,8 @@ mod tests {
             HEADERS_INV_TRIGGER_KEY,
             HEADERS_AGGR_THRESHOLD_KEY,
             HEADERS_AGGR_INTERVAL_KEY,
+            BLOCKS_CATCHUP_KEY,
+            BLOCKS_AGGR_INTERVAL_KEY,
             DISCOVERY_REFRESH_KEY,
             DISCOVERY_REFRESH_JITTER_KEY,
             INBOUND_WINDOW_KEY,
@@ -36723,6 +36900,14 @@ mod tests {
             super::RELAY_HEADERS_AGGRESSIVE_INTERVAL_SEC
         );
         assert_eq!(
+            super::relay_blocks_catchup_interval_sec(),
+            super::RELAY_BLOCKS_CATCHUP_INTERVAL_SEC
+        );
+        assert_eq!(
+            super::relay_blocks_aggressive_interval_sec(),
+            super::RELAY_BLOCKS_AGGRESSIVE_INTERVAL_SEC
+        );
+        assert_eq!(
             super::relay_discovery_refresh_sec(),
             super::RELAY_DISCOVERY_REFRESH_SEC
         );
@@ -36754,6 +36939,8 @@ mod tests {
             std::env::set_var(HEADERS_INV_TRIGGER_KEY, "0");
             std::env::set_var(HEADERS_AGGR_THRESHOLD_KEY, "0");
             std::env::set_var(HEADERS_AGGR_INTERVAL_KEY, "0");
+            std::env::set_var(BLOCKS_CATCHUP_KEY, "0");
+            std::env::set_var(BLOCKS_AGGR_INTERVAL_KEY, "0");
             std::env::set_var(DISCOVERY_REFRESH_KEY, "0");
             std::env::set_var(DISCOVERY_REFRESH_JITTER_KEY, "999999");
             std::env::set_var(INBOUND_WINDOW_KEY, "0");
@@ -36796,6 +36983,14 @@ mod tests {
             super::RELAY_HEADERS_AGGRESSIVE_INTERVAL_SEC
         );
         assert_eq!(
+            super::relay_blocks_catchup_interval_sec(),
+            super::RELAY_BLOCKS_CATCHUP_INTERVAL_SEC
+        );
+        assert_eq!(
+            super::relay_blocks_aggressive_interval_sec(),
+            super::RELAY_BLOCKS_AGGRESSIVE_INTERVAL_SEC
+        );
+        assert_eq!(
             super::relay_discovery_refresh_sec(),
             super::RELAY_DISCOVERY_REFRESH_SEC
         );
@@ -36828,6 +37023,8 @@ mod tests {
             std::env::set_var(HEADERS_INV_TRIGGER_KEY, "2");
             std::env::set_var(HEADERS_AGGR_THRESHOLD_KEY, "8");
             std::env::set_var(HEADERS_AGGR_INTERVAL_KEY, "4");
+            std::env::set_var(BLOCKS_CATCHUP_KEY, "6");
+            std::env::set_var(BLOCKS_AGGR_INTERVAL_KEY, "3");
             std::env::set_var(DISCOVERY_REFRESH_KEY, "11");
             std::env::set_var(DISCOVERY_REFRESH_JITTER_KEY, "3");
             std::env::set_var(INBOUND_WINDOW_KEY, "7");
@@ -36845,6 +37042,8 @@ mod tests {
         assert_eq!(super::relay_headers_inv_trigger_interval_sec(), 2);
         assert_eq!(super::relay_headers_aggressive_lag_threshold(), 8);
         assert_eq!(super::relay_headers_aggressive_interval_sec(), 4);
+        assert_eq!(super::relay_blocks_catchup_interval_sec(), 6);
+        assert_eq!(super::relay_blocks_aggressive_interval_sec(), 3);
         assert_eq!(super::relay_discovery_refresh_sec(), 11);
         assert_eq!(super::relay_discovery_refresh_jitter_sec(), 3);
         assert_eq!(super::relay_inbound_accept_window_sec(), 7);
@@ -36955,6 +37154,23 @@ mod tests {
                 std::env::remove_var(INITIAL_JITTER_KEY);
             }
         }
+    }
+
+    #[test]
+    fn relay_outbound_selector_jitter_is_deterministic_and_identity_scoped() {
+        let candidate = "127.0.0.1:19444";
+        let first = super::relay_outbound_selector_jitter("127.0.0.1:19440", candidate);
+        let second = super::relay_outbound_selector_jitter("127.0.0.1:19440", candidate);
+        let different = super::relay_outbound_selector_jitter("127.0.0.1:19441", candidate);
+        assert_eq!(first, second, "selector jitter must be deterministic");
+        assert!(
+            first < 31 && different < 31,
+            "selector jitter must stay within [0,31)"
+        );
+        assert_ne!(
+            first, different,
+            "different node identities should reshuffle equal-score peers"
+        );
     }
 
     #[test]

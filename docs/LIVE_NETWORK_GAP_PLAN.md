@@ -8,6 +8,8 @@
 - P2P protocol baseline: now includes `getaddr/addr` exchange and compact-block negotiation/recovery (`sendcmpct/cmpctblock/getblocktxn/blocktxn`) in addition to legacy `inv/getdata`.
 - Peer management hardening: outbound dialer now supports persisted anchor targets (`<network>.anchors.json`) and periodic feeler probes for liveness sampling without opening full long-lived sessions.
 - Peer management hardening: outbound selection now uses addrman-like `tried/new` quotas plus per-network secret-salted diversity buckets (`<network>.bucket.key`) to reduce predictable eclipse slot targeting.
+- Peer fanout hardening: outbound peer selection now applies per-node deterministic jitter (`bind_addr`-scoped) to equal-score candidates, reducing herd/hotspot dials to the same low-index peers in large local clusters.
+- Catch-up hardening: relay periodic sync loop now emits both `GetHeaders` and rate-limited `GetBlocks` catch-up probes when a peer reports a higher tip, accelerating recovery after missed inventory bursts.
 - Orphan tx hardening: relay now requests missing parent transactions from the source peer (`GetData`), de-duplicates parent requests with TTL, and penalizes oversized orphan-parent fanout.
 - Anti-fingerprinting hardening: async relay send path supports bounded tx inventory diffusion jitter (`SCAM_RELAY_TX_DIFFUSION_BASE_MS`, `SCAM_RELAY_TX_DIFFUSION_MAX_MS`).
 - Anonymity transport guards: outbound relay now supports policy-gated Tor/I2P SOCKS5 routing and CJDNS admission (`SCAM_P2P_ALLOW_ONION`, `SCAM_P2P_ALLOW_I2P`, `SCAM_P2P_ALLOW_CJDNS`, `SCAM_P2P_SOCKS5_PROXY`).
@@ -50,6 +52,8 @@
 - [x] Remove runtime thread-per-connection in `relay-serve` by migrating to async tokio socket handling.
 - [x] Add compact-block fallback path (request missing txs by index and reconstruct block before apply).
 - [x] Add addr exchange path (`getaddr/addr`) for live peer discovery enrichment.
+- [x] Add periodic `GetBlocks` catch-up requests alongside `GetHeaders` when peer tip is ahead (rate-limited, aggressive mode for large lag).
+- [x] Add per-node outbound candidate jitter to avoid synchronized dial hotspots under high node counts.
 - [x] Add Erlay/Minisketch mempool set-reconciliation path to reduce inv/getdata overhead at high peer counts.
   - Closure (`2026-03-01`): `SendRecon/ReqRecon/Sketch/ReqSketchExt/ReqTx/ReconcileDiff` wired through relay runtime; short-id reconciliation now uses negotiated capability (`version/bits/implementation/salt`) with `minisketch-rs`, collision fallback, and bounded per-peer round tracking.
 
