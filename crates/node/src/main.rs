@@ -111,6 +111,7 @@ enum Command {
     GetTx(GetTxArgs),
     ConfigScaffold(ConfigScaffoldArgs),
     AddPeer(AddPeerArgs),
+    AddPeers(AddPeersArgs),
     HashVisual(HashVisualArgs),
     Wallet(WalletArgs),
     MineOnce(MineOnceArgs),
@@ -377,6 +378,16 @@ struct AddPeerArgs {
     network: Network,
     #[arg(long)]
     peer: String,
+    #[arg(long, default_value = "data/peers")]
+    peers_dir: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct AddPeersArgs {
+    #[arg(long, value_enum, default_value_t = Network::Devnet)]
+    network: Network,
+    #[arg(long = "peer", required = true)]
+    peers: Vec<String>,
     #[arg(long, default_value = "data/peers")]
     peers_dir: PathBuf,
 }
@@ -3334,6 +3345,44 @@ fn run_add_peer(args: AddPeerArgs) -> Result<(), NodeError> {
     }
     println!("Peer book: {}", peers_db_path.display());
     println!("Total peers: {}", peer_book.peers.len());
+    Ok(())
+}
+
+fn run_add_peers(args: AddPeersArgs) -> Result<(), NodeError> {
+    let network_name = args.network.as_str();
+    let (peers_db_path, legacy_txt_path) = peer_book_paths(&args.peers_dir, network_name);
+    if let Some(parent) = peers_db_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| NodeError::Runtime(e.to_string()))?;
+    }
+
+    let mut peer_book = load_or_init_peer_book(network_name, &peers_db_path, &legacy_txt_path)?;
+    let mut added = 0usize;
+    for peer in args.peers {
+        let peer = peer.trim();
+        if peer.is_empty() {
+            continue;
+        }
+        if peer_book.peers.iter().any(|entry| entry.address == peer) {
+            continue;
+        }
+        peer_book.peers.push(PeerAddressRecord {
+            address: peer.to_owned(),
+            last_seen_unix_sec: 0,
+            ban_score: 0,
+        });
+        added = added.saturating_add(1);
+    }
+
+    peer_book.peers.sort_by(|a, b| a.address.cmp(&b.address));
+    peer_book.peers.dedup_by(|a, b| a.address == b.address);
+    save_peer_book_db(&peers_db_path, &peer_book)?;
+    println!(
+        "Peers processed for {}: {}",
+        network_name,
+        peer_book.peers.len()
+    );
+    println!("Peers added: {added}");
+    println!("Peer book: {}", peers_db_path.display());
     Ok(())
 }
 
@@ -18594,6 +18643,7 @@ fn run_command(cli: Cli) -> Result<(), NodeError> {
         }
         Some(Command::ConfigScaffold(args)) => run_config_scaffold(args),
         Some(Command::AddPeer(args)) => run_add_peer(args),
+        Some(Command::AddPeers(args)) => run_add_peers(args),
         Some(Command::HashVisual(args)) => run_hash_visual(args),
         Some(Command::Wallet(args)) => {
             run_wallet_with_seed_mode(args.command, args.seed_mode.map(Into::into))
@@ -18676,16 +18726,16 @@ mod tests {
     use scam_wallet::{WalletMnemonic, WalletSeedMode, derive_wallet_key};
 
     use super::{
-        AddPeerArgs, ConfigScaffoldArgs, DifficultyAlgoArg, Network, ReindexRuntimeArgs,
-        RelayAdmissionState, RelayServerState, RpcServeArgs, SOAK_FLOW_MNEMONIC, SpendableUtxo,
-        StratumMineArgs, StratumServeArgs, Sv2ConformanceArgs, Sv2JobDeclaratorArgs,
-        Sv2TemplateProviderArgs, Sv2TranslatorArgs, SyncBookArgs, TemplateProviderRequest,
-        accepted_hrps_for_network, admit_peer_tx_into_relay, build_coinbase_tx,
-        build_signed_transfer_tx, execute_soak_rounds, load_chain_config,
+        AddPeerArgs, AddPeersArgs, ConfigScaffoldArgs, DifficultyAlgoArg, Network,
+        ReindexRuntimeArgs, RelayAdmissionState, RelayServerState, RpcServeArgs,
+        SOAK_FLOW_MNEMONIC, SpendableUtxo, StratumMineArgs, StratumServeArgs, Sv2ConformanceArgs,
+        Sv2JobDeclaratorArgs, Sv2TemplateProviderArgs, Sv2TranslatorArgs, SyncBookArgs,
+        TemplateProviderRequest, accepted_hrps_for_network, admit_peer_tx_into_relay,
+        build_coinbase_tx, build_signed_transfer_tx, execute_soak_rounds, load_chain_config,
         mine_block_with_transactions, mine_blocks_on_runtime, persist_runtime_db,
         process_relay_getdata_with_archive_async, process_relay_wire_message,
         process_relay_wire_message_with_archive, request_template_from_provider, run_add_peer,
-        run_config_scaffold, run_reindex_runtime, run_rpc_serve, run_stratum_mine,
+        run_add_peers, run_config_scaffold, run_reindex_runtime, run_rpc_serve, run_stratum_mine,
         run_stratum_serve, run_sv2_conformance, run_sv2_job_declarator, run_sv2_template_provider,
         run_sv2_translator, run_sync_book, run_wallet, select_utxos_for_amount,
         translate_remote_job_with_service, try_find_share_for_job, wallet_seed_from_mnemonic,
@@ -29097,6 +29147,41 @@ mod tests {
                 .iter()
                 .any(|peer| peer.address == "127.0.0.1:8333")
         );
+
+        let _ = fs::remove_dir_all(peers_dir);
+    }
+
+    #[test]
+    fn add_peers_batch_adds_multiple_and_deduplicates() {
+        let peers_dir = temp_dir("test-peer-book-batch");
+        fs::create_dir_all(&peers_dir).expect("mkdir");
+
+        run_add_peers(AddPeersArgs {
+            network: Network::Devnet,
+            peers: vec![
+                "127.0.0.1:8333".to_owned(),
+                "127.0.0.1:8334".to_owned(),
+                "127.0.0.1:8334".to_owned(),
+                "   ".to_owned(),
+            ],
+            peers_dir: peers_dir.clone(),
+        })
+        .expect("batch add");
+
+        run_add_peer(AddPeerArgs {
+            network: Network::Devnet,
+            peer: "127.0.0.1:8335".to_owned(),
+            peers_dir: peers_dir.clone(),
+        })
+        .expect("single add");
+
+        let peer_book_path = peers_dir.join("devnet.redb");
+        let book = load_peer_book_db(&peer_book_path).expect("load peer book");
+        assert_eq!(book.network_id, "devnet");
+        assert_eq!(book.peers.len(), 3);
+        assert_eq!(book.peers[0].address, "127.0.0.1:8333");
+        assert_eq!(book.peers[1].address, "127.0.0.1:8334");
+        assert_eq!(book.peers[2].address, "127.0.0.1:8335");
 
         let _ = fs::remove_dir_all(peers_dir);
     }

@@ -211,20 +211,30 @@ peer_book_lock_conflict() {
   [[ "${raw}" == *"Database already open"* || "${raw}" == *"Cannot acquire lock"* || "${raw}" == *"lock-contended"* ]]
 }
 
-add_peer_with_retry() {
+add_peers_with_retry() {
   local bin="$1"
   local network="$2"
-  local peer="$3"
-  local peersdir="$4"
-  local max_attempts="${5:-25}"
-  local delay_sec="${6:-0.05}"
+  local peersdir="$3"
+  local max_attempts="${4:-25}"
+  local delay_sec="${5:-0.05}"
+  shift 5
+  local peers=("$@")
+  if (( ${#peers[@]} == 0 )); then
+    return 0
+  fi
   local attempt
   for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+    local cmd=(
+      "${bin}" add-peers
+      --network "${network}"
+      --peers-dir "${peersdir}"
+    )
+    local peer
+    for peer in "${peers[@]}"; do
+      cmd+=(--peer "${peer}")
+    done
     local output
-    if output="$("${bin}" add-peer \
-      --network "${network}" \
-      --peer "${peer}" \
-      --peers-dir "${peersdir}" 2>&1)"; then
+    if output="$("${cmd[@]}" 2>&1)"; then
       return 0
     fi
     if peer_book_lock_conflict "${output}"; then
@@ -422,30 +432,38 @@ start_cluster() {
         local peersdir
         peersdir="$(peers_dir_path "${i}")"
         if [[ "${use_full_mesh}" == "true" ]]; then
+          local -a batch_peers=()
           for ((j = 0; j < NODE_COUNT; j++)); do
             if [[ "${i}" == "${j}" ]]; then
               continue
             fi
-            if ! add_peer_with_retry \
-              "${bin}" \
-              "${NETWORK}" \
-              "127.0.0.1:$(p2p_port_for "${j}")" \
-              "${peersdir}"; then
-              echo "[cluster] warning: add-peer failed for node-${i} -> node-${j}" >&2
-            fi
+            batch_peers+=("127.0.0.1:$(p2p_port_for "${j}")")
           done
+          if ! add_peers_with_retry \
+            "${bin}" \
+            "${NETWORK}" \
+            "${peersdir}" \
+            25 \
+            0.05 \
+            "${batch_peers[@]}"; then
+            echo "[cluster] warning: add-peers failed for node-${i} (full-mesh batch)" >&2
+          fi
         else
+          local -a batch_peers=()
           for ((offset = 1; offset <= peers_per_node; offset++)); do
             local j
             j=$(((i + offset) % NODE_COUNT))
-            if ! add_peer_with_retry \
-              "${bin}" \
-              "${NETWORK}" \
-              "127.0.0.1:$(p2p_port_for "${j}")" \
-              "${peersdir}"; then
-              echo "[cluster] warning: add-peer failed for node-${i} -> node-${j}" >&2
-            fi
+            batch_peers+=("127.0.0.1:$(p2p_port_for "${j}")")
           done
+          if ! add_peers_with_retry \
+            "${bin}" \
+            "${NETWORK}" \
+            "${peersdir}" \
+            25 \
+            0.05 \
+            "${batch_peers[@]}"; then
+            echo "[cluster] warning: add-peers failed for node-${i} (ring batch)" >&2
+          fi
         fi
       ) &
       wiring_pids+=("$!")
