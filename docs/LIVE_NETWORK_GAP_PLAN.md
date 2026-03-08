@@ -15,6 +15,7 @@
 - Anonymity transport guards: outbound relay now supports policy-gated Tor/I2P SOCKS5 routing and CJDNS admission (`SCAM_P2P_ALLOW_ONION`, `SCAM_P2P_ALLOW_I2P`, `SCAM_P2P_ALLOW_CJDNS`, `SCAM_P2P_SOCKS5_PROXY`).
 - Wallet UX transfer pipeline: live submit path (`wallet/send`, `tx/submit`) is wired to mempool DB admission and mined confirmation flow.
 - UI: SSE push stream (`/events`) with polling fallback (5s) is active; dashboard now shows relay peers, relay mempool, sync lag, and last-block age.
+- RPC lock-contended status fallback: `/status` now uses relay telemetry snapshots (tip/utxo/work/hashrate) when runtime DB refresh is blocked by redb lock contention, reducing stale-genesis readouts under relay+rpx concurrency.
 
 ## Why blocks often have `tx_count = 1`
 - Blocks include only coinbase unless mempool has user transactions.

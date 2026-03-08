@@ -5418,6 +5418,12 @@ struct RelayServerTelemetrySnapshot {
     active_peers: usize,
     tip_height: u64,
     #[serde(default)]
+    utxo_count: usize,
+    #[serde(default)]
+    cumulative_work: String,
+    #[serde(default)]
+    network_hashrate_hps: f64,
+    #[serde(default)]
     max_known_tip_height: u64,
     #[serde(default)]
     global_sync_lag_blocks: u64,
@@ -6689,6 +6695,9 @@ fn relay_server_snapshot(
         timestamp_unix_sec: now_unix_sec,
         active_peers,
         tip_height: local_tip_height,
+        utxo_count: state.runtime.utxo_len(),
+        cumulative_work: state.runtime.cumulative_work().to_str_radix(10),
+        network_hashrate_hps: estimate_network_hashrate_hps(&state.runtime),
         max_known_tip_height,
         global_sync_lag_blocks: max_known_tip_height.saturating_sub(local_tip_height),
         tip_hash: state.runtime.tip_hash().to_hex(),
@@ -16412,16 +16421,47 @@ where
 }
 
 fn axum_status_payload(state: &AxumRpcState) -> Result<StatusResponse, NodeError> {
-    let (tip_height, tip_hash, utxo_count, cumulative_work, network_hashrate_hps) =
-        axum_runtime_for_query(state, |runtime| {
-            Ok((
-                runtime.tip_height(),
-                runtime.tip_hash(),
-                runtime.utxo_len(),
-                runtime.cumulative_work().to_str_radix(10),
-                estimate_network_hashrate_hps(runtime),
-            ))
-        })?;
+    let mut runtime_cache = state
+        .runtime_cache
+        .lock()
+        .map_err(|_| NodeError::Runtime("axum runtime cache mutex poisoned".to_owned()))?;
+    let AxumRuntimeCache {
+        runtime,
+        last_seen_mtime,
+    } = &mut *runtime_cache;
+    let current_mtime = runtime_db_mtime(&state.runtime_db_path);
+    let seen_before_refresh = *last_seen_mtime;
+    refresh_runtime_from_db_if_changed(
+        &state.cfg,
+        runtime,
+        &state.runtime_db_path,
+        last_seen_mtime,
+    )?;
+    let refresh_used_cached_runtime = current_mtime.is_some()
+        && current_mtime != seen_before_refresh
+        && *last_seen_mtime != current_mtime;
+
+    let mut tip_height = runtime.tip_height();
+    let mut tip_hash = runtime.tip_hash().to_hex();
+    let mut utxo_count = runtime.utxo_len();
+    let mut cumulative_work = runtime.cumulative_work().to_str_radix(10);
+    let mut network_hashrate_hps = estimate_network_hashrate_hps(runtime);
+    drop(runtime_cache);
+
+    if refresh_used_cached_runtime
+        && let Some(path) = state.relay_telemetry.as_ref()
+        && let Some(snapshot) = load_latest_jsonl_record::<RelayServerTelemetrySnapshot>(path)?
+    {
+        tip_height = snapshot.tip_height;
+        tip_hash = snapshot.tip_hash;
+        utxo_count = snapshot.utxo_count.max(utxo_count);
+        if !snapshot.cumulative_work.trim().is_empty() {
+            cumulative_work = snapshot.cumulative_work;
+        }
+        if snapshot.network_hashrate_hps > 0.0 {
+            network_hashrate_hps = snapshot.network_hashrate_hps;
+        }
+    }
     let (stratum_active_clients, stratum_workers_active, stratum_pool_hashrate_hps) =
         match state.stratum_telemetry.as_ref() {
             Some(path) => match load_latest_jsonl_record::<StratumServerTelemetrySnapshot>(path)? {
@@ -16437,7 +16477,7 @@ fn axum_status_payload(state: &AxumRpcState) -> Result<StatusResponse, NodeError
     Ok(StatusResponse {
         network_id: state.cfg.network_id.clone(),
         tip_height,
-        tip_hash: tip_hash.to_hex(),
+        tip_hash,
         utxo_count,
         cumulative_work,
         network_hashrate_hps,
@@ -24198,6 +24238,9 @@ mod tests {
             timestamp_unix_sec: 1,
             active_peers: 2,
             tip_height: 3,
+            utxo_count: 0,
+            cumulative_work: "7".to_owned(),
+            network_hashrate_hps: 0.01,
             max_known_tip_height: 4,
             global_sync_lag_blocks: 1,
             tip_hash: "abcd".to_owned(),
@@ -29621,6 +29664,247 @@ mod tests {
             "db lock conflict should keep serving cached runtime snapshot"
         );
         assert_eq!(payload.tip_height, expected_cached_tip_height);
+
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
+    fn axum_status_payload_uses_relay_telemetry_when_runtime_db_is_locked() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let work_dir = temp_dir("test-axum-status-telemetry-fallback");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let runtime_db_path = work_dir.join("runtime.redb");
+        let telemetry_path = work_dir.join("relay.telemetry.jsonl");
+
+        let mut persisted_runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        mine_blocks_on_runtime(
+            &mut persisted_runtime,
+            &super::MiningLoopParams {
+                count: 1,
+                interval_sec: cfg.target_block_time_sec,
+                max_nonce: 500_000,
+                subsidy: cfg.block_subsidy,
+                miner_key_hash: cfg.genesis_reward_key_hash20().expect("reward key"),
+                label_prefix: "axum-status-telemetry-lock",
+                print_each: false,
+            },
+        )
+        .expect("mine persisted runtime");
+        persist_runtime_db(&persisted_runtime, &runtime_db_path).expect("persist runtime");
+        let cached_runtime = ChainRuntime::from_config(cfg.clone()).expect("cached runtime");
+
+        let telemetry_snapshot = super::RelayServerTelemetrySnapshot {
+            timestamp_unix_sec: 77,
+            active_peers: 5,
+            tip_height: 42,
+            utxo_count: 128,
+            cumulative_work: "4096".to_owned(),
+            network_hashrate_hps: 12.5,
+            max_known_tip_height: 43,
+            global_sync_lag_blocks: 1,
+            tip_hash: "11".repeat(32),
+            mempool_len: 0,
+            orphan_pool_len: 0,
+            mempool_inserted_total: 0,
+            mempool_replaced_total: 0,
+            mempool_removed_by_replacement_total: 0,
+            mempool_rejected_conflict_total: 0,
+            orphan_accepted_total: 0,
+            orphan_evicted_total: 0,
+            orphan_expired_total: 0,
+            orphan_promoted_total: 0,
+            gossip_replacement_rate_limited_total: 0,
+        };
+        super::append_relay_telemetry_snapshot(&telemetry_path, &telemetry_snapshot)
+            .expect("append telemetry");
+
+        let _runtime_db_lock = redb::Database::open(&runtime_db_path).expect("open db lock");
+        let state = super::AxumRpcState {
+            network: Network::Devnet,
+            cfg: cfg.clone(),
+            runtime_db_path: runtime_db_path.clone(),
+            runtime_cache: Arc::new(std::sync::Mutex::new(super::AxumRuntimeCache {
+                runtime: cached_runtime,
+                last_seen_mtime: None,
+            })),
+            mempool_db_path: work_dir.join("mempool.redb"),
+            relay_telemetry: Some(telemetry_path.clone()),
+            stratum_telemetry: None,
+            pool_ledger_db_path: work_dir.join("pool-ledger.redb"),
+            ui_dir: work_dir.join("ui"),
+        };
+
+        let payload = super::axum_status_payload(&state).expect("status payload");
+        assert_eq!(payload.tip_height, telemetry_snapshot.tip_height);
+        assert_eq!(payload.tip_hash, telemetry_snapshot.tip_hash);
+        assert_eq!(payload.utxo_count, telemetry_snapshot.utxo_count);
+        assert_eq!(payload.cumulative_work, telemetry_snapshot.cumulative_work);
+        assert_eq!(
+            payload.network_hashrate_hps, telemetry_snapshot.network_hashrate_hps,
+            "telemetry fallback should override stale cached hashrate when DB is locked"
+        );
+
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
+    fn axum_status_payload_keeps_cached_hashrate_when_telemetry_hashrate_is_zero() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let work_dir = temp_dir("test-axum-status-telemetry-zero-hashrate");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let runtime_db_path = work_dir.join("runtime.redb");
+        let telemetry_path = work_dir.join("relay.telemetry.jsonl");
+
+        let mut persisted_runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        mine_blocks_on_runtime(
+            &mut persisted_runtime,
+            &super::MiningLoopParams {
+                count: 1,
+                interval_sec: cfg.target_block_time_sec,
+                max_nonce: 500_000,
+                subsidy: cfg.block_subsidy,
+                miner_key_hash: cfg.genesis_reward_key_hash20().expect("reward key"),
+                label_prefix: "axum-status-zero-hashrate-lock",
+                print_each: false,
+            },
+        )
+        .expect("mine persisted runtime");
+        persist_runtime_db(&persisted_runtime, &runtime_db_path).expect("persist runtime");
+        let cached_runtime = ChainRuntime::from_config(cfg.clone()).expect("cached runtime");
+        let cached_hashrate = super::estimate_network_hashrate_hps(&cached_runtime);
+
+        let telemetry_snapshot = super::RelayServerTelemetrySnapshot {
+            timestamp_unix_sec: 88,
+            active_peers: 7,
+            tip_height: 64,
+            utxo_count: 256,
+            cumulative_work: "8192".to_owned(),
+            network_hashrate_hps: 0.0,
+            max_known_tip_height: 65,
+            global_sync_lag_blocks: 1,
+            tip_hash: "22".repeat(32),
+            mempool_len: 0,
+            orphan_pool_len: 0,
+            mempool_inserted_total: 0,
+            mempool_replaced_total: 0,
+            mempool_removed_by_replacement_total: 0,
+            mempool_rejected_conflict_total: 0,
+            orphan_accepted_total: 0,
+            orphan_evicted_total: 0,
+            orphan_expired_total: 0,
+            orphan_promoted_total: 0,
+            gossip_replacement_rate_limited_total: 0,
+        };
+        super::append_relay_telemetry_snapshot(&telemetry_path, &telemetry_snapshot)
+            .expect("append telemetry");
+
+        let _runtime_db_lock = redb::Database::open(&runtime_db_path).expect("open db lock");
+        let state = super::AxumRpcState {
+            network: Network::Devnet,
+            cfg: cfg.clone(),
+            runtime_db_path: runtime_db_path.clone(),
+            runtime_cache: Arc::new(std::sync::Mutex::new(super::AxumRuntimeCache {
+                runtime: cached_runtime,
+                last_seen_mtime: None,
+            })),
+            mempool_db_path: work_dir.join("mempool.redb"),
+            relay_telemetry: Some(telemetry_path.clone()),
+            stratum_telemetry: None,
+            pool_ledger_db_path: work_dir.join("pool-ledger.redb"),
+            ui_dir: work_dir.join("ui"),
+        };
+
+        let payload = super::axum_status_payload(&state).expect("status payload");
+        assert_eq!(payload.tip_height, telemetry_snapshot.tip_height);
+        assert_eq!(payload.tip_hash, telemetry_snapshot.tip_hash);
+        assert_eq!(
+            payload.network_hashrate_hps, cached_hashrate,
+            "zero telemetry hashrate must not erase cached runtime estimate"
+        );
+
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
+    fn axum_status_payload_prefers_fresh_runtime_over_telemetry_when_db_refresh_succeeds() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let work_dir = temp_dir("test-axum-status-prefers-runtime-on-refresh");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let runtime_db_path = work_dir.join("runtime.redb");
+        let telemetry_path = work_dir.join("relay.telemetry.jsonl");
+
+        let mut persisted_runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        mine_blocks_on_runtime(
+            &mut persisted_runtime,
+            &super::MiningLoopParams {
+                count: 1,
+                interval_sec: cfg.target_block_time_sec,
+                max_nonce: 500_000,
+                subsidy: cfg.block_subsidy,
+                miner_key_hash: cfg.genesis_reward_key_hash20().expect("reward key"),
+                label_prefix: "axum-status-runtime-preferred",
+                print_each: false,
+            },
+        )
+        .expect("mine persisted runtime");
+        persist_runtime_db(&persisted_runtime, &runtime_db_path).expect("persist runtime");
+        let cached_runtime = ChainRuntime::from_config(cfg.clone()).expect("cached runtime");
+        assert_ne!(
+            cached_runtime.tip_height(),
+            persisted_runtime.tip_height(),
+            "test requires cached runtime to be stale"
+        );
+
+        let telemetry_snapshot = super::RelayServerTelemetrySnapshot {
+            timestamp_unix_sec: 99,
+            active_peers: 9,
+            tip_height: 777,
+            utxo_count: 777,
+            cumulative_work: "999999".to_owned(),
+            network_hashrate_hps: 999.0,
+            max_known_tip_height: 777,
+            global_sync_lag_blocks: 0,
+            tip_hash: "33".repeat(32),
+            mempool_len: 0,
+            orphan_pool_len: 0,
+            mempool_inserted_total: 0,
+            mempool_replaced_total: 0,
+            mempool_removed_by_replacement_total: 0,
+            mempool_rejected_conflict_total: 0,
+            orphan_accepted_total: 0,
+            orphan_evicted_total: 0,
+            orphan_expired_total: 0,
+            orphan_promoted_total: 0,
+            gossip_replacement_rate_limited_total: 0,
+        };
+        super::append_relay_telemetry_snapshot(&telemetry_path, &telemetry_snapshot)
+            .expect("append telemetry");
+
+        let state = super::AxumRpcState {
+            network: Network::Devnet,
+            cfg: cfg.clone(),
+            runtime_db_path: runtime_db_path.clone(),
+            runtime_cache: Arc::new(std::sync::Mutex::new(super::AxumRuntimeCache {
+                runtime: cached_runtime,
+                last_seen_mtime: None,
+            })),
+            mempool_db_path: work_dir.join("mempool.redb"),
+            relay_telemetry: Some(telemetry_path.clone()),
+            stratum_telemetry: None,
+            pool_ledger_db_path: work_dir.join("pool-ledger.redb"),
+            ui_dir: work_dir.join("ui"),
+        };
+
+        let payload = super::axum_status_payload(&state).expect("status payload");
+        assert_eq!(payload.tip_height, persisted_runtime.tip_height());
+        assert_eq!(payload.tip_hash, persisted_runtime.tip_hash().to_hex());
+        assert_ne!(
+            payload.tip_height, telemetry_snapshot.tip_height,
+            "telemetry override must not apply after successful runtime DB refresh"
+        );
 
         let _ = fs::remove_dir_all(work_dir);
     }
