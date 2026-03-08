@@ -40,12 +40,7 @@ pub fn select_outbound_peers(
 
     // Addrman-inspired quota: bias toward previously successful peers while always
     // keeping room for "new" addresses to avoid eclipse lock-in.
-    let tried_quota = if tried.is_empty() {
-        0
-    } else {
-        ((max_outbound * 2) / 3).max(1)
-    };
-    let new_quota = max_outbound.saturating_sub(tried_quota);
+    let (tried_quota, new_quota) = addrman_quotas(max_outbound, !tried.is_empty());
 
     let mut selected = Vec::<SocketAddr>::new();
     let mut selected_addrs = HashSet::<SocketAddr>::new();
@@ -89,8 +84,8 @@ fn diversity_key(ip: IpAddr) -> String {
 fn sort_candidates(candidates: &mut [PeerCandidate], rotate_after_sec: u64, now_unix_sec: u64) {
     let stale_cutoff = now_unix_sec.saturating_sub(rotate_after_sec.max(1));
     candidates.sort_unstable_by(|a, b| {
-        let a_stale = a.last_connected_unix_sec == 0 || a.last_connected_unix_sec <= stale_cutoff;
-        let b_stale = b.last_connected_unix_sec == 0 || b.last_connected_unix_sec <= stale_cutoff;
+        let a_stale = is_stale(a.last_connected_unix_sec, stale_cutoff);
+        let b_stale = is_stale(b.last_connected_unix_sec, stale_cutoff);
         a.failure_count
             .cmp(&b.failure_count)
             // Rotate away from recently-used peers.
@@ -99,6 +94,22 @@ fn sort_candidates(candidates: &mut [PeerCandidate], rotate_after_sec: u64, now_
             .then_with(|| a.last_connected_unix_sec.cmp(&b.last_connected_unix_sec))
             .then_with(|| a.addr.cmp(&b.addr))
     });
+}
+
+fn is_stale(last_connected_unix_sec: u64, stale_cutoff: u64) -> bool {
+    last_connected_unix_sec <= stale_cutoff
+}
+
+fn addrman_quotas(max_outbound: usize, has_tried_peers: bool) -> (usize, usize) {
+    let tried_quota = if has_tried_peers {
+        // 2/3 bias toward tried addresses.
+        ((max_outbound.saturating_mul(2)) / 3).max(1)
+    } else {
+        0
+    };
+    let tried_quota = tried_quota.min(max_outbound);
+    let new_quota = max_outbound.saturating_sub(tried_quota);
+    (tried_quota, new_quota)
 }
 
 fn select_diverse(
@@ -148,7 +159,7 @@ fn backfill_candidates(
 mod tests {
     use std::net::{IpAddr, SocketAddr};
 
-    use crate::discovery::{PeerCandidate, select_outbound_peers};
+    use crate::discovery::{PeerCandidate, addrman_quotas, is_stale, select_outbound_peers};
 
     fn addr(raw: &str) -> SocketAddr {
         raw.parse().expect("socket addr")
@@ -434,5 +445,32 @@ mod tests {
 
         let selected = select_outbound_peers(&candidates, 1, 60, 1_000);
         assert_eq!(selected, vec![addr("10.1.1.1:8333")]);
+    }
+
+    #[test]
+    fn stale_cutoff_is_inclusive_and_changes_at_boundary() {
+        assert!(is_stale(940, 940));
+        assert!(is_stale(939, 940));
+        assert!(!is_stale(941, 940));
+    }
+
+    #[test]
+    fn addrman_quota_helper_uses_two_thirds_bias() {
+        assert_eq!(addrman_quotas(0, false), (0, 0));
+        assert_eq!(addrman_quotas(1, true), (1, 0));
+        assert_eq!(addrman_quotas(2, true), (1, 1));
+        assert_eq!(addrman_quotas(3, true), (2, 1));
+        assert_eq!(addrman_quotas(6, true), (4, 2));
+        assert_eq!(addrman_quotas(7, true), (4, 3));
+        assert_eq!(addrman_quotas(6, false), (0, 6));
+    }
+
+    #[test]
+    fn addrman_quota_helper_never_exceeds_max_outbound() {
+        for max_outbound in 0..32 {
+            let (tried, new) = addrman_quotas(max_outbound, true);
+            assert!(tried <= max_outbound);
+            assert_eq!(tried + new, max_outbound);
+        }
     }
 }
