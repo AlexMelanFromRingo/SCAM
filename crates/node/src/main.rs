@@ -8970,11 +8970,11 @@ fn tokio_worker_threads_from_env(env_key: &str, default_cap: usize) -> usize {
 }
 
 fn relay_tokio_worker_threads() -> usize {
-    tokio_worker_threads_from_env("SCAM_RELAY_TOKIO_WORKER_THREADS", 2)
+    tokio_worker_threads_from_env("SCAM_RELAY_TOKIO_WORKER_THREADS", 8)
 }
 
 fn stratum_tokio_worker_threads() -> usize {
-    tokio_worker_threads_from_env("SCAM_STRATUM_TOKIO_WORKER_THREADS", 2)
+    tokio_worker_threads_from_env("SCAM_STRATUM_TOKIO_WORKER_THREADS", 4)
 }
 
 fn relay_handshake_timeout_sec(read_timeout_sec: u64) -> u64 {
