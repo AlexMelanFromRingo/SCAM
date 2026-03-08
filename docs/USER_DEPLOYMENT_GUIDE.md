@@ -167,6 +167,14 @@ NODE_COUNT=5 RUN_STRATUM=true BASE_P2P_PORT=20444 BASE_RPC_PORT=20080 \
   scripts/local-multinode.sh up
 ```
 
+Run Stratum only on selected nodes (example: only node `0` and `1`):
+
+```bash
+NODE_COUNT=50 RUN_STRATUM=true STRATUM_NODE_INDEXES=0,1 \
+  BASE_P2P_PORT=44400 BASE_RPC_PORT=44000 BASE_STRATUM_PORT=45000 \
+  scripts/local-multinode.sh up
+```
+
 Binary-only mode (outside repo, no cargo):
 
 ```bash
