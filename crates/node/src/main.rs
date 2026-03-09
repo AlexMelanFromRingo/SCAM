@@ -6646,15 +6646,18 @@ fn relay_build_blocks_request(
     }
 }
 
-fn relay_inv_has_unknown_block(state: &RelayServerState, items: &[InventoryItem]) -> bool {
-    items.iter().any(|item| match item {
-        InventoryItem::Block(hash) => {
-            state.runtime.header_by_hash(hash).is_none()
-                && !state.pending_block_orphans.contains_key(hash)
-                && !state.pending_compact_blocks.contains_key(hash)
-        }
-        InventoryItem::Tx(_) => false,
-    })
+fn relay_unknown_block_inv_count(state: &RelayServerState, items: &[InventoryItem]) -> u64 {
+    items
+        .iter()
+        .filter(|item| match item {
+            InventoryItem::Block(hash) => {
+                state.runtime.header_by_hash(hash).is_none()
+                    && !state.pending_block_orphans.contains_key(hash)
+                    && !state.pending_compact_blocks.contains_key(hash)
+            }
+            InventoryItem::Tx(_) => false,
+        })
+        .count() as u64
 }
 
 fn relay_maybe_request_headers_on_block_inv(
@@ -6663,13 +6666,14 @@ fn relay_maybe_request_headers_on_block_inv(
     items: &[InventoryItem],
     now_unix_sec: u64,
 ) -> Option<WireMessage> {
-    if !relay_inv_has_unknown_block(state, items) {
+    let unknown_count = relay_unknown_block_inv_count(state, items);
+    if unknown_count == 0 {
         return None;
     }
     let local_tip = state.runtime.tip_height();
     // Treat an unknown block inventory as "peer is at least one block ahead",
     // then trigger accelerated headers catchup cadence.
-    relay_record_peer_tip_height(state, peer_id, local_tip.saturating_add(1));
+    relay_record_peer_tip_height(state, peer_id, local_tip.saturating_add(unknown_count));
     let last = state
         .peer_last_headers_request_sec
         .get(&peer_id)
@@ -6687,7 +6691,7 @@ fn relay_maybe_request_blocks_on_block_inv(
     items: &[InventoryItem],
     now_unix_sec: u64,
 ) -> Option<WireMessage> {
-    if !relay_inv_has_unknown_block(state, items) {
+    if relay_unknown_block_inv_count(state, items) == 0 {
         return None;
     }
     let last = state
@@ -24551,6 +24555,11 @@ mod tests {
             state.peer_last_headers_request_sec.get(&peer_id).copied(),
             Some(1_000)
         );
+        assert_eq!(
+            state.peer_reported_tip_heights.get(&peer_id).copied(),
+            Some(state.runtime.tip_height().saturating_add(1)),
+            "single unknown block inv should mark peer tip at least one block ahead"
+        );
 
         let second_unknown = Hash256([0x92; 32]);
         let second = super::process_relay_wire_message(
@@ -24596,6 +24605,46 @@ mod tests {
                 .iter()
                 .any(|msg| matches!(msg, WireMessage::GetBlocks { .. })),
             "blocks catchup fast-path should reopen after one-second inv cooldown"
+        );
+    }
+
+    #[test]
+    fn relay_inv_unknown_block_batch_updates_peer_tip_by_unknown_count() {
+        let mut state = relay_state_for_tests();
+        let peer_id = 11u64;
+        state.relay.gossip.connect_peer(peer_id);
+        let local_tip = state.runtime.tip_height();
+        let unknown_a = Hash256([0xA1; 32]);
+        let unknown_b = Hash256([0xA2; 32]);
+        let unknown_c = Hash256([0xA3; 32]);
+
+        let out = super::process_relay_wire_message(
+            &mut state,
+            peer_id,
+            WireMessage::Inv {
+                items: vec![
+                    InventoryItem::Block(unknown_a),
+                    InventoryItem::Block(unknown_b),
+                    InventoryItem::Block(unknown_c),
+                ],
+            },
+            1_111,
+        )
+        .expect("batched unknown inv handling");
+        assert!(
+            out.iter()
+                .any(|msg| matches!(msg, WireMessage::GetHeaders { .. })),
+            "unknown block batch should trigger headers catchup"
+        );
+        assert!(
+            out.iter()
+                .any(|msg| matches!(msg, WireMessage::GetBlocks { .. })),
+            "unknown block batch should trigger blocks catchup"
+        );
+        assert_eq!(
+            state.peer_reported_tip_heights.get(&peer_id).copied(),
+            Some(local_tip.saturating_add(3)),
+            "peer tip tracking should scale with unknown block batch size"
         );
     }
 
