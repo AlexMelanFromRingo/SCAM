@@ -173,6 +173,10 @@ impl ChainRuntime {
         self.headers.get(hash)
     }
 
+    pub fn median_time_past_for_tip(&self) -> Result<u64, ChainError> {
+        self.median_time_past(self.tip_hash())
+    }
+
     fn median_time_past(&self, parent_hash: Hash256) -> Result<u64, ChainError> {
         let mut timestamps = Vec::with_capacity(MEDIAN_TIME_PAST_WINDOW);
         let mut cursor = Some(parent_hash);
