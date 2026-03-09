@@ -217,6 +217,43 @@ peer_book_lock_conflict() {
   [[ "${raw}" == *"Database already open"* || "${raw}" == *"Cannot acquire lock"* || "${raw}" == *"lock-contended"* ]]
 }
 
+supports_add_peers_subcommand() {
+  local bin="$1"
+  if [[ -n "${ADD_PEERS_SUPPORTED_CACHE:-}" ]]; then
+    [[ "${ADD_PEERS_SUPPORTED_CACHE}" == "1" ]]
+    return
+  fi
+  if "${bin}" --help 2>/dev/null | grep -qE '^[[:space:]]+add-peers([[:space:]]|$)'; then
+    ADD_PEERS_SUPPORTED_CACHE="1"
+    return 0
+  fi
+  ADD_PEERS_SUPPORTED_CACHE="0"
+  return 1
+}
+
+add_single_peer_with_retry() {
+  local bin="$1"
+  local network="$2"
+  local peersdir="$3"
+  local peer="$4"
+  local max_attempts="${5:-25}"
+  local delay_sec="${6:-0.05}"
+  local attempt
+  for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+    local output
+    if output="$("${bin}" add-peer --network "${network}" --peers-dir "${peersdir}" --peer "${peer}" 2>&1)"; then
+      return 0
+    fi
+    if peer_book_lock_conflict "${output}"; then
+      sleep "${delay_sec}"
+      continue
+    fi
+    echo "${output}" >&2
+    return 1
+  done
+  return 1
+}
+
 add_peers_with_retry() {
   local bin="$1"
   local network="$2"
@@ -226,6 +263,15 @@ add_peers_with_retry() {
   shift 5
   local peers=("$@")
   if (( ${#peers[@]} == 0 )); then
+    return 0
+  fi
+  if ! supports_add_peers_subcommand "${bin}"; then
+    local peer
+    for peer in "${peers[@]}"; do
+      if ! add_single_peer_with_retry "${bin}" "${network}" "${peersdir}" "${peer}" "${max_attempts}" "${delay_sec}"; then
+        return 1
+      fi
+    done
     return 0
   fi
   local attempt
