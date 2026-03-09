@@ -8339,7 +8339,8 @@ fn run_relay_outbound_worker(
                     let now_unix_sec = current_unix_sec().unwrap_or(0);
                     let _ = update_peer_anchor_store_attempt(store, &target, now_unix_sec, false);
                 }
-                failure_streak = failure_streak.saturating_add(1);
+                failure_streak =
+                    relay_outbound_next_failure_streak_from_connect_error(failure_streak, &err);
                 let now_nanos = SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|duration| duration.as_nanos() as u64)
@@ -8402,7 +8403,8 @@ fn run_relay_outbound_worker(
                 let now_unix_sec = current_unix_sec().unwrap_or(0);
                 let _ = update_peer_anchor_store_attempt(store, &target, now_unix_sec, false);
             }
-            failure_streak = failure_streak.saturating_add(1);
+            failure_streak =
+                relay_outbound_next_failure_streak_from_session_error(failure_streak, &err);
         } else {
             failure_streak = 0;
         }
@@ -8578,7 +8580,8 @@ async fn run_relay_outbound_worker_async(
                     let now_unix_sec = current_unix_sec().unwrap_or(0);
                     let _ = update_peer_anchor_store_attempt(store, &target, now_unix_sec, false);
                 }
-                failure_streak = failure_streak.saturating_add(1);
+                failure_streak =
+                    relay_outbound_next_failure_streak_from_connect_failure(failure_streak, &err);
                 let now_nanos = SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|duration| duration.as_nanos() as u64)
@@ -8626,7 +8629,8 @@ async fn run_relay_outbound_worker_async(
                 let now_unix_sec = current_unix_sec().unwrap_or(0);
                 let _ = update_peer_anchor_store_attempt(store, &target, now_unix_sec, false);
             }
-            failure_streak = failure_streak.saturating_add(1);
+            failure_streak =
+                relay_outbound_next_failure_streak_from_session_error(failure_streak, &err);
         } else {
             failure_streak = 0;
         }
@@ -9025,6 +9029,58 @@ fn relay_handshake_timeout_sec(read_timeout_sec: u64) -> u64 {
         .and_then(|raw| raw.parse::<u64>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(read_timeout_sec.max(10))
+}
+
+fn relay_outbound_next_failure_streak(streak: u32) -> u32 {
+    streak.saturating_add(1)
+}
+
+fn relay_outbound_next_failure_streak_from_connect_error(streak: u32, err: &std::io::Error) -> u32 {
+    let next = relay_outbound_next_failure_streak(streak);
+    if matches!(
+        err.kind(),
+        std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::NotConnected
+    ) {
+        return next.min(3);
+    }
+    next
+}
+
+fn relay_outbound_next_failure_streak_from_connect_failure(streak: u32, err: &NodeError) -> u32 {
+    let next = relay_outbound_next_failure_streak(streak);
+    match err {
+        NodeError::Transport(TransportError::Io(io_err)) => {
+            relay_outbound_next_failure_streak_from_connect_error(streak, io_err)
+        }
+        NodeError::Runtime(msg) => {
+            let lowered = msg.to_ascii_lowercase();
+            if lowered.contains("connection refused")
+                || lowered.contains("timed out")
+                || lowered.contains("connection reset")
+                || lowered.contains("connection aborted")
+                || lowered.contains("broken pipe")
+                || lowered.contains("not connected")
+            {
+                next.min(3)
+            } else {
+                next
+            }
+        }
+        _ => next,
+    }
+}
+
+fn relay_outbound_next_failure_streak_from_session_error(streak: u32, err: &NodeError) -> u32 {
+    let next = relay_outbound_next_failure_streak(streak);
+    match relay_disconnect_reason(err) {
+        "io-timeout" | "io-closed" => next.min(3),
+        _ => next,
+    }
 }
 
 fn relay_outbound_backoff_delay(
@@ -37512,6 +37568,96 @@ mod tests {
         assert_eq!(
             delay, expected,
             "backoff jitter must follow modulo-based deterministic formula"
+        );
+    }
+
+    #[test]
+    fn relay_outbound_failure_streak_caps_soft_connect_and_session_errors() {
+        let connect_refused = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
+        assert_eq!(
+            super::relay_outbound_next_failure_streak_from_connect_error(0, &connect_refused),
+            1
+        );
+        assert_eq!(
+            super::relay_outbound_next_failure_streak_from_connect_error(3, &connect_refused),
+            3,
+            "soft connect failures should cap streak growth to keep redial responsive"
+        );
+
+        let connect_other = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            super::relay_outbound_next_failure_streak_from_connect_error(3, &connect_other),
+            4,
+            "non-soft connect failures should keep growing the streak"
+        );
+
+        let timeout_session = super::NodeError::Transport(super::TransportError::Io(
+            std::io::Error::from(std::io::ErrorKind::TimedOut),
+        ));
+        assert_eq!(
+            super::relay_outbound_next_failure_streak_from_session_error(2, &timeout_session),
+            3
+        );
+        assert_eq!(
+            super::relay_outbound_next_failure_streak_from_session_error(3, &timeout_session),
+            3,
+            "soft session failures should cap streak growth"
+        );
+
+        let mismatch = super::NodeError::Runtime("relay peer network mismatch".to_owned());
+        assert_eq!(
+            super::relay_outbound_next_failure_streak_from_session_error(3, &mismatch),
+            4,
+            "hard session failures must keep growing the streak"
+        );
+
+        let async_refused = super::NodeError::Runtime(
+            "outbound relay connect to 127.0.0.1:18444 failed: Connection refused (os error 111)"
+                .to_owned(),
+        );
+        assert_eq!(
+            super::relay_outbound_next_failure_streak_from_connect_failure(3, &async_refused),
+            3,
+            "async connect failures with refused-like detail should be treated as soft"
+        );
+
+        let soft_runtime_details = [
+            "timed out",
+            "connection reset by peer",
+            "connection aborted",
+            "broken pipe",
+            "not connected",
+        ];
+        for detail in soft_runtime_details {
+            let err = super::NodeError::Runtime(format!("outbound relay connect failed: {detail}"));
+            assert_eq!(
+                super::relay_outbound_next_failure_streak_from_connect_failure(3, &err),
+                3,
+                "soft runtime connect error '{detail}' should keep capped streak"
+            );
+        }
+
+        let hard_runtime_connect =
+            super::NodeError::Runtime("dns resolution failed for peer target".to_owned());
+        assert_eq!(
+            super::relay_outbound_next_failure_streak_from_connect_failure(
+                3,
+                &hard_runtime_connect
+            ),
+            4,
+            "non-soft runtime connect failures should increase streak"
+        );
+
+        let soft_transport_connect = super::NodeError::Transport(super::TransportError::Io(
+            std::io::Error::from(std::io::ErrorKind::TimedOut),
+        ));
+        assert_eq!(
+            super::relay_outbound_next_failure_streak_from_connect_failure(
+                3,
+                &soft_transport_connect
+            ),
+            3,
+            "transport io connect failures should route through soft connect policy"
         );
     }
 
