@@ -40,6 +40,9 @@ set -euo pipefail
 #   RELAY_OUTBOUND_INITIAL_JITTER_MS=2000
 #   RELAY_OUTBOUND_CONNECT=true
 #   RELAY_OUTBOUND_REDIAL_SEC=2
+#   WAIT_FOR_RELAY_READY=true
+#   RELAY_READY_TIMEOUT_SEC=90
+#   RELAY_READY_POLL_MS=200
 #   STRATUM_READ_TIMEOUT_SEC=30
 #   STRATUM_TELEMETRY_EVERY_SEC=5
 
@@ -75,6 +78,9 @@ RELAY_OUTBOUND_SPAWN_BURST="${RELAY_OUTBOUND_SPAWN_BURST:-4}"
 RELAY_OUTBOUND_INITIAL_JITTER_MS="${RELAY_OUTBOUND_INITIAL_JITTER_MS:-2000}"
 RELAY_OUTBOUND_CONNECT="${RELAY_OUTBOUND_CONNECT:-true}"
 RELAY_OUTBOUND_REDIAL_SEC="${RELAY_OUTBOUND_REDIAL_SEC:-2}"
+WAIT_FOR_RELAY_READY="${WAIT_FOR_RELAY_READY:-true}"
+RELAY_READY_TIMEOUT_SEC="${RELAY_READY_TIMEOUT_SEC:-90}"
+RELAY_READY_POLL_MS="${RELAY_READY_POLL_MS:-200}"
 STRATUM_READ_TIMEOUT_SEC="${STRATUM_READ_TIMEOUT_SEC:-30}"
 STRATUM_TELEMETRY_EVERY_SEC="${STRATUM_TELEMETRY_EVERY_SEC:-5}"
 UI_DIR="${UI_DIR:-web}"
@@ -247,6 +253,54 @@ add_peers_with_retry() {
   return 1
 }
 
+wait_for_tcp_listen() {
+  local host="$1"
+  local port="$2"
+  local timeout_sec="$3"
+  local poll_ms="$4"
+  python3 - "$host" "$port" "$timeout_sec" "$poll_ms" <<'PY'
+import socket
+import sys
+import time
+
+host = sys.argv[1]
+port = int(sys.argv[2])
+timeout_sec = max(float(sys.argv[3]), 1.0)
+poll_ms = max(float(sys.argv[4]), 10.0)
+deadline = time.time() + timeout_sec
+sleep_sec = poll_ms / 1000.0
+
+while time.time() < deadline:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(0.5)
+    try:
+        sock.connect((host, port))
+    except OSError:
+        time.sleep(sleep_sec)
+    else:
+        raise SystemExit(0)
+    finally:
+        sock.close()
+
+raise SystemExit(1)
+PY
+}
+
+wait_for_relays_ready() {
+  local timeout_sec="$1"
+  local poll_ms="$2"
+  echo "[cluster] waiting for relay listeners (${timeout_sec}s timeout)"
+  for ((idx = 0; idx < NODE_COUNT; idx++)); do
+    local p2p_port
+    p2p_port="$(p2p_port_for "${idx}")"
+    if ! wait_for_tcp_listen "127.0.0.1" "${p2p_port}" "${timeout_sec}" "${poll_ms}"; then
+      echo "[cluster] relay listener did not become ready: node-${idx} 127.0.0.1:${p2p_port}" >&2
+      return 1
+    fi
+  done
+  echo "[cluster] relay listeners ready"
+}
+
 stop_pid_file() {
   local pid_file="$1"
   if [[ ! -f "${pid_file}" ]]; then
@@ -319,6 +373,8 @@ start_cluster() {
   require_positive_int "STRATUM_TOKIO_WORKER_THREADS" "${STRATUM_TOKIO_WORKER_THREADS}"
   require_positive_int "RELAY_OUTBOUND_MAX_PEERS" "${RELAY_OUTBOUND_MAX_PEERS}"
   require_positive_int "RELAY_OUTBOUND_REDIAL_SEC" "${RELAY_OUTBOUND_REDIAL_SEC}"
+  require_positive_int "RELAY_READY_TIMEOUT_SEC" "${RELAY_READY_TIMEOUT_SEC}"
+  require_positive_int "RELAY_READY_POLL_MS" "${RELAY_READY_POLL_MS}"
   require_positive_int "STRATUM_READ_TIMEOUT_SEC" "${STRATUM_READ_TIMEOUT_SEC}"
   require_positive_int "STRATUM_TELEMETRY_EVERY_SEC" "${STRATUM_TELEMETRY_EVERY_SEC}"
   require_non_negative_int "WIRE_PEERS_PER_NODE" "${WIRE_PEERS_PER_NODE}"
@@ -414,6 +470,10 @@ start_cluster() {
   done
 
   sleep 1
+
+  if is_true "${WAIT_FOR_RELAY_READY}"; then
+    wait_for_relays_ready "${RELAY_READY_TIMEOUT_SEC}" "${RELAY_READY_POLL_MS}"
+  fi
 
   if is_true "${WIRE_PEERS}"; then
     echo "[cluster] wiring peer books"
