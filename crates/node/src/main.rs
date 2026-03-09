@@ -1975,12 +1975,18 @@ fn persist_pool_ledger_db_with_retry(
 
 fn next_stratum_job_timestamp(runtime: &ChainRuntime, _cfg: &ChainConfig) -> u64 {
     const CONSENSUS_MAX_FUTURE_BLOCK_TIME_SEC: u64 = 7_200;
+    const STRATUM_LOCAL_FUTURE_DRIFT_SEC: u64 = 2;
     let tip_ts = runtime.tip_header().timestamp;
-    let min_next = tip_ts.saturating_add(1);
-    let wall_now = current_unix_sec().unwrap_or(min_next);
-    let max_future = wall_now.saturating_add(CONSENSUS_MAX_FUTURE_BLOCK_TIME_SEC);
-    let candidate = wall_now;
-    std::cmp::max(min_next, candidate.min(max_future))
+    let wall_now = current_unix_sec().unwrap_or(tip_ts.saturating_add(1));
+    let mtp_next = runtime
+        .median_time_past_for_tip()
+        .map(|mtp| mtp.saturating_add(1))
+        .unwrap_or_else(|_| tip_ts.saturating_add(1));
+    let consensus_cap = wall_now.saturating_add(CONSENSUS_MAX_FUTURE_BLOCK_TIME_SEC);
+    let local_cap = wall_now.saturating_add(STRATUM_LOCAL_FUTURE_DRIFT_SEC);
+    let cap = consensus_cap.min(local_cap);
+    let candidate = wall_now.max(mtp_next);
+    candidate.min(cap).max(mtp_next)
 }
 
 fn handle_runtime_persist_result(
@@ -5403,14 +5409,14 @@ const RELAY_OUTBOUND_FEELER_INTERVAL_SEC: u64 = 60;
 const RELAY_OUTBOUND_FEELER_TIMEOUT_SEC: u64 = 3;
 const RELAY_OUTBOUND_MAX_BACKOFF_SEC: u64 = 30;
 const RELAY_OUTBOUND_INITIAL_JITTER_MS: u64 = 500;
-const RELAY_HEADERS_CATCHUP_INTERVAL_SEC: u64 = 2;
-const RELAY_HEADERS_PROBE_INTERVAL_SEC: u64 = 15;
+const RELAY_HEADERS_CATCHUP_INTERVAL_SEC: u64 = 1;
+const RELAY_HEADERS_PROBE_INTERVAL_SEC: u64 = 5;
 const RELAY_HEADERS_INV_TRIGGER_INTERVAL_SEC: u64 = 1;
 const RELAY_HEADERS_AGGRESSIVE_LAG_THRESHOLD: u64 = 4;
 const RELAY_HEADERS_AGGRESSIVE_INTERVAL_SEC: u64 = 1;
-const RELAY_BLOCKS_CATCHUP_INTERVAL_SEC: u64 = 4;
-const RELAY_BLOCKS_AGGRESSIVE_INTERVAL_SEC: u64 = 2;
-const RELAY_PEER_TIP_STALE_SEC: u64 = 120;
+const RELAY_BLOCKS_CATCHUP_INTERVAL_SEC: u64 = 2;
+const RELAY_BLOCKS_AGGRESSIVE_INTERVAL_SEC: u64 = 1;
+const RELAY_PEER_TIP_STALE_SEC: u64 = 60;
 const RELAY_DISCOVERY_REFRESH_SEC: u64 = 30;
 const RELAY_DISCOVERY_REFRESH_JITTER_SEC: u64 = 5;
 const RELAY_ASYNC_READ_POLL_INTERVAL_MS: u64 = 250;
@@ -6614,6 +6620,20 @@ fn relay_should_request_headers_catchup(
         return elapsed >= interval;
     }
     elapsed >= relay_headers_probe_interval_sec()
+}
+
+fn relay_peer_tip_ahead(state: &RelayServerState, peer_id: u64, now_unix_sec: u64) -> bool {
+    let local_tip = state.runtime.tip_height();
+    let peer_tip = if relay_peer_tip_is_fresh(state, peer_id, now_unix_sec) {
+        state
+            .peer_reported_tip_heights
+            .get(&peer_id)
+            .copied()
+            .unwrap_or(local_tip)
+    } else {
+        local_tip
+    };
+    peer_tip > local_tip
 }
 
 fn relay_maybe_request_headers_catchup(
@@ -8041,11 +8061,41 @@ fn process_relay_wire_message_inner(
                     block_hash
                 )));
             };
-            relay_submit_incoming_block(state, block, now_unix_sec)
+            let tip_before = state.runtime.tip_height();
+            let mut out = relay_submit_incoming_block(state, block, now_unix_sec)?;
+            let tip_after = state.runtime.tip_height();
+            relay_record_peer_tip_height(state, peer_id, tip_after);
+            if tip_after > tip_before && relay_peer_tip_ahead(state, peer_id, now_unix_sec) {
+                if let Some(get_headers) =
+                    relay_maybe_request_headers_catchup(state, peer_id, now_unix_sec)
+                {
+                    out.push(get_headers);
+                }
+                if let Some(get_blocks) =
+                    relay_maybe_request_blocks_catchup(state, peer_id, now_unix_sec)
+                {
+                    out.push(get_blocks);
+                }
+            }
+            Ok(out)
         }
         WireMessage::Block { block } => {
-            let out = relay_submit_incoming_block(state, block, now_unix_sec)?;
-            relay_record_peer_tip_height(state, peer_id, state.runtime.tip_height());
+            let tip_before = state.runtime.tip_height();
+            let mut out = relay_submit_incoming_block(state, block, now_unix_sec)?;
+            let tip_after = state.runtime.tip_height();
+            relay_record_peer_tip_height(state, peer_id, tip_after);
+            if tip_after > tip_before && relay_peer_tip_ahead(state, peer_id, now_unix_sec) {
+                if let Some(get_headers) =
+                    relay_maybe_request_headers_catchup(state, peer_id, now_unix_sec)
+                {
+                    out.push(get_headers);
+                }
+                if let Some(get_blocks) =
+                    relay_maybe_request_blocks_catchup(state, peer_id, now_unix_sec)
+                {
+                    out.push(get_blocks);
+                }
+            }
             Ok(out)
         }
         WireMessage::NotFound { .. } => Ok(Vec::new()),
@@ -11934,24 +11984,7 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
                             } else {
                                 None
                             };
-                            record_pool_share_accepted(
-                                &ctx,
-                                &worker_label,
-                                channel_id,
-                                job_id,
-                                nonce,
-                                ntime,
-                                session.share_target(),
-                                is_block,
-                                reserve_spendable_atomic,
-                            );
-                            record_stratum_share_accepted(
-                                &ctx,
-                                &worker_label,
-                                session.share_target(),
-                                is_block,
-                                ntime,
-                            );
+                            let mut accepted_as_block = false;
                             if should_process_share_as_block(is_block) {
                                 let Some(work) = jobs.get(&job_id).cloned() else {
                                     continue;
@@ -11984,98 +12017,110 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
 
                                 {
                                     let mut runtime = lock_runtime(&ctx.runtime)?;
-                                    let submission = match runtime.submit_block(block.clone()) {
-                                        Ok(submission) => Ok(submission),
-                                        Err(ChainError::Validation(
-                                            TxValidationError::CoinbaseRewardTooHigh {
-                                                allowed,
-                                                got,
-                                            },
-                                        )) => {
-                                            eprintln!(
-                                                "warning: stratum coinbase reward mismatch for channel={} job={}: allowed={}, got={}; rewriting and retrying",
-                                                channel_id, job_id, allowed, got
-                                            );
-                                            rewrite_block_coinbase_to_allowed_reward(
-                                                &mut block, allowed, channel_id, job_id,
-                                            )?;
-                                            runtime.submit_block(block.clone())
-                                        }
-                                        Err(err) => Err(err),
-                                    };
-                                    match submission {
-                                        Ok(submission) => {
-                                            handle_runtime_persist_result(
-                                                persist_runtime_db_with_retry(
-                                                    &runtime,
-                                                    &ctx.runtime_db_path,
-                                                    80,
-                                                    25,
-                                                ),
-                                                runtime.tip_hash(),
-                                            )?;
-                                            match submission {
-                                                scam_chain::BlockSubmissionOutcome::ExtendedTip {
-                                                    new_tip,
-                                                    new_height,
-                                                }
-                                                | scam_chain::BlockSubmissionOutcome::Reorged {
-                                                    new_tip,
-                                                    new_height,
-                                                    ..
-                                                } => {
-                                                    let block_reward_atomic = block
-                                                        .transactions
-                                                        .first()
-                                                        .map(|tx| {
-                                                            tx.outputs.iter().fold(
-                                                                0u128,
-                                                                |acc, output| {
-                                                                    acc.saturating_add(
-                                                                        output.value as u128,
-                                                                    )
-                                                                },
-                                                            )
-                                                        })
-                                                        .unwrap_or(ctx.cfg.block_subsidy as u128);
-                                                    record_pool_round_closed(
-                                                        &ctx,
-                                                        &worker_label,
-                                                        new_tip,
-                                                        block_reward_atomic,
-                                                        new_height,
-                                                        new_tip,
-                                                        ntime,
-                                                    );
-                                                    last_tip_hash = new_tip;
-                                                    tip_advanced = true;
-                                                }
-                                                scam_chain::BlockSubmissionOutcome::AlreadyKnown {
-                                                    ..
-                                                }
-                                                | scam_chain::BlockSubmissionOutcome::StoredSideBranch {
-                                                    ..
-                                                } => {}
-                                            }
-                                            if tip_advanced
-                                                && let Err(err) =
-                                                    remove_confirmed_txids_from_mempool_db(
-                                                        &ctx.cfg,
-                                                        &ctx.mempool_db_path,
-                                                        &included_txids,
-                                                    )
-                                            {
+                                    if work.job.prev_hash != runtime.tip_hash() {
+                                        submit_failed = true;
+                                        eprintln!(
+                                            "warning: stale stratum block share for channel={} job={}: expected tip={}, job_prev={}",
+                                            channel_id,
+                                            job_id,
+                                            runtime.tip_hash(),
+                                            work.job.prev_hash
+                                        );
+                                    } else {
+                                        let submission = match runtime.submit_block(block.clone()) {
+                                            Ok(submission) => Ok(submission),
+                                            Err(ChainError::Validation(
+                                                TxValidationError::CoinbaseRewardTooHigh {
+                                                    allowed,
+                                                    got,
+                                                },
+                                            )) => {
                                                 eprintln!(
-                                                    "warning: failed to trim confirmed txids from mempool db: {err}"
+                                                    "warning: stratum coinbase reward mismatch for channel={} job={}: allowed={}, got={}; rewriting and retrying",
+                                                    channel_id, job_id, allowed, got
+                                                );
+                                                rewrite_block_coinbase_to_allowed_reward(
+                                                    &mut block, allowed, channel_id, job_id,
+                                                )?;
+                                                runtime.submit_block(block.clone())
+                                            }
+                                            Err(err) => Err(err),
+                                        };
+                                        match submission {
+                                            Ok(submission) => {
+                                                handle_runtime_persist_result(
+                                                    persist_runtime_db_with_retry(
+                                                        &runtime,
+                                                        &ctx.runtime_db_path,
+                                                        80,
+                                                        25,
+                                                    ),
+                                                    runtime.tip_hash(),
+                                                )?;
+                                                match submission {
+                                                    scam_chain::BlockSubmissionOutcome::ExtendedTip {
+                                                        new_tip,
+                                                        new_height,
+                                                    }
+                                                    | scam_chain::BlockSubmissionOutcome::Reorged {
+                                                        new_tip,
+                                                        new_height,
+                                                        ..
+                                                    } => {
+                                                        accepted_as_block = true;
+                                                        let block_reward_atomic = block
+                                                            .transactions
+                                                            .first()
+                                                            .map(|tx| {
+                                                                tx.outputs.iter().fold(
+                                                                    0u128,
+                                                                    |acc, output| {
+                                                                        acc.saturating_add(
+                                                                            output.value as u128,
+                                                                        )
+                                                                    },
+                                                                )
+                                                            })
+                                                            .unwrap_or(ctx.cfg.block_subsidy as u128);
+                                                        record_pool_round_closed(
+                                                            &ctx,
+                                                            &worker_label,
+                                                            new_tip,
+                                                            block_reward_atomic,
+                                                            new_height,
+                                                            new_tip,
+                                                            ntime,
+                                                        );
+                                                        last_tip_hash = new_tip;
+                                                        tip_advanced = true;
+                                                    }
+                                                    scam_chain::BlockSubmissionOutcome::AlreadyKnown {
+                                                        ..
+                                                    }
+                                                    | scam_chain::BlockSubmissionOutcome::StoredSideBranch {
+                                                        ..
+                                                    } => {}
+                                                }
+                                                if tip_advanced
+                                                    && let Err(err) =
+                                                        remove_confirmed_txids_from_mempool_db(
+                                                            &ctx.cfg,
+                                                            &ctx.mempool_db_path,
+                                                            &included_txids,
+                                                        )
+                                                {
+                                                    eprintln!(
+                                                        "warning: failed to trim confirmed txids from mempool db: {err}"
+                                                    );
+                                                }
+                                            }
+                                            Err(err) => {
+                                                submit_failed = true;
+                                                eprintln!(
+                                                    "warning: stratum block submit failed for channel={} job={}: {}",
+                                                    channel_id, job_id, err
                                                 );
                                             }
-                                        }
-                                        Err(err) => {
-                                            submit_failed = true;
-                                            eprintln!(
-                                                "warning: stratum block submit failed for channel={} job={}: {}",
-                                                channel_id, job_id, err
-                                            );
                                         }
                                     }
                                 }
@@ -12103,6 +12148,24 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
                                 }
                                 run_pool_payout_tick_with_warning(&ctx);
                             }
+                            record_pool_share_accepted(
+                                &ctx,
+                                &worker_label,
+                                channel_id,
+                                job_id,
+                                nonce,
+                                ntime,
+                                session.share_target(),
+                                accepted_as_block,
+                                reserve_spendable_atomic,
+                            );
+                            record_stratum_share_accepted(
+                                &ctx,
+                                &worker_label,
+                                session.share_target(),
+                                accepted_as_block,
+                                ntime,
+                            );
                         }
                         SessionEvent::ShareRejected { .. } => {
                             record_pool_share_rejected(&ctx, &worker_label);
@@ -24542,6 +24605,8 @@ mod tests {
         };
         let mut state = RelayServerState::new(runtime, relay);
         let peer_id = 17u64;
+        let probe_interval = super::relay_headers_probe_interval_sec();
+        let normal_interval = super::relay_headers_catchup_interval_sec();
 
         // Same height => periodic probe requests headers.
         state.peer_reported_tip_heights.insert(peer_id, 0);
@@ -24554,18 +24619,21 @@ mod tests {
                 stop: None
             }
         ));
+        let probe_cooldown_ts = 100 + probe_interval.saturating_sub(1);
         assert!(
-            super::relay_maybe_request_headers_catchup(&mut state, peer_id, 114).is_none(),
+            super::relay_maybe_request_headers_catchup(&mut state, peer_id, probe_cooldown_ts)
+                .is_none(),
             "probe cooldown must suppress early refreshes"
         );
         assert!(
-            super::relay_maybe_request_headers_catchup(&mut state, peer_id, 115).is_some(),
+            super::relay_maybe_request_headers_catchup(&mut state, peer_id, 100 + probe_interval)
+                .is_some(),
             "probe should fire again after probe interval"
         );
 
         // Peer moderately ahead => request cadence uses normal catchup interval.
         state.peer_reported_tip_heights.insert(peer_id, 3);
-        let first = super::relay_maybe_request_headers_catchup(&mut state, peer_id, 117)
+        let first = super::relay_maybe_request_headers_catchup(&mut state, peer_id, 200)
             .expect("should request headers");
         assert!(matches!(
             first,
@@ -24575,19 +24643,25 @@ mod tests {
             }
         ));
 
-        // Cooldown applies.
+        // Cooldown applies for intervals >1s; for a 1s interval, same-second requests must still be suppressed.
+        let cooldown_ts = if normal_interval > 1 {
+            200 + normal_interval - 1
+        } else {
+            200
+        };
         assert!(
-            super::relay_maybe_request_headers_catchup(&mut state, peer_id, 118).is_none(),
+            super::relay_maybe_request_headers_catchup(&mut state, peer_id, cooldown_ts).is_none(),
             "cooldown must suppress rapid repeats"
         );
         assert!(
-            super::relay_maybe_request_headers_catchup(&mut state, peer_id, 119).is_some(),
+            super::relay_maybe_request_headers_catchup(&mut state, peer_id, 200 + normal_interval)
+                .is_some(),
             "request should re-open after cooldown interval"
         );
 
         // Peer far ahead => aggressive interval allows one-second cadence.
         state.peer_reported_tip_heights.insert(peer_id, 10);
-        let aggressive = super::relay_maybe_request_headers_catchup(&mut state, peer_id, 120)
+        let aggressive = super::relay_maybe_request_headers_catchup(&mut state, peer_id, 300)
             .expect("aggressive catchup should request immediately");
         assert!(matches!(
             aggressive,
@@ -24597,7 +24671,12 @@ mod tests {
             }
         ));
         assert!(
-            super::relay_maybe_request_headers_catchup(&mut state, peer_id, 121).is_some(),
+            super::relay_maybe_request_headers_catchup(
+                &mut state,
+                peer_id,
+                300 + super::relay_headers_aggressive_interval_sec()
+            )
+            .is_some(),
             "aggressive lag mode should allow one-second catchup cadence"
         );
     }
@@ -24616,6 +24695,8 @@ mod tests {
         };
         let mut state = RelayServerState::new(runtime, relay);
         let peer_id = 33u64;
+        let normal_interval = super::relay_blocks_catchup_interval_sec();
+        let aggressive_interval = super::relay_blocks_aggressive_interval_sec();
 
         state.peer_reported_tip_heights.insert(peer_id, 0);
         assert!(
@@ -24624,7 +24705,7 @@ mod tests {
         );
 
         state.peer_reported_tip_heights.insert(peer_id, 2);
-        let first = super::relay_maybe_request_blocks_catchup(&mut state, peer_id, 101)
+        let first = super::relay_maybe_request_blocks_catchup(&mut state, peer_id, 200)
             .expect("lagging node should request blocks");
         assert!(matches!(
             first,
@@ -24635,24 +24716,41 @@ mod tests {
         ));
         assert_eq!(
             state.peer_last_blocks_request_sec.get(&peer_id).copied(),
-            Some(101)
+            Some(200)
         );
+        let cooldown_ts = if normal_interval > 1 {
+            200 + normal_interval - 1
+        } else {
+            200
+        };
         assert!(
-            super::relay_maybe_request_blocks_catchup(&mut state, peer_id, 104).is_none(),
+            super::relay_maybe_request_blocks_catchup(&mut state, peer_id, cooldown_ts).is_none(),
             "normal blocks catchup interval must rate-limit requests"
         );
         assert!(
-            super::relay_maybe_request_blocks_catchup(&mut state, peer_id, 105).is_some(),
+            super::relay_maybe_request_blocks_catchup(&mut state, peer_id, 200 + normal_interval)
+                .is_some(),
             "normal interval should allow another request at boundary"
         );
 
         state.peer_reported_tip_heights.insert(peer_id, 10);
+        let last_normal_ts = 200 + normal_interval;
+        let aggressive_cooldown_ts = if aggressive_interval > 1 {
+            last_normal_ts + aggressive_interval - 1
+        } else {
+            last_normal_ts
+        };
         assert!(
-            super::relay_maybe_request_blocks_catchup(&mut state, peer_id, 106).is_none(),
+            super::relay_maybe_request_blocks_catchup(&mut state, peer_id, aggressive_cooldown_ts)
+                .is_none(),
             "aggressive cadence still honors latest request timestamp"
         );
-        let aggressive = super::relay_maybe_request_blocks_catchup(&mut state, peer_id, 107)
-            .expect("large lag should use aggressive blocks cadence");
+        let aggressive = super::relay_maybe_request_blocks_catchup(
+            &mut state,
+            peer_id,
+            last_normal_ts + aggressive_interval,
+        )
+        .expect("large lag should use aggressive blocks cadence");
         assert!(matches!(
             aggressive,
             WireMessage::GetBlocks {
@@ -24660,12 +24758,24 @@ mod tests {
                 stop: None
             }
         ));
+        let after_aggressive = last_normal_ts + aggressive_interval;
+        let second_cooldown_ts = if aggressive_interval > 1 {
+            after_aggressive + aggressive_interval - 1
+        } else {
+            after_aggressive
+        };
         assert!(
-            super::relay_maybe_request_blocks_catchup(&mut state, peer_id, 108).is_none(),
+            super::relay_maybe_request_blocks_catchup(&mut state, peer_id, second_cooldown_ts)
+                .is_none(),
             "aggressive cadence still enforces one-cycle cooldown"
         );
         assert!(
-            super::relay_maybe_request_blocks_catchup(&mut state, peer_id, 109).is_some(),
+            super::relay_maybe_request_blocks_catchup(
+                &mut state,
+                peer_id,
+                after_aggressive + aggressive_interval
+            )
+            .is_some(),
             "aggressive interval should re-open quickly for large lag"
         );
     }
@@ -34195,6 +34305,68 @@ mod tests {
             "parent gap should additionally trigger blocks catchup"
         );
         assert_eq!(state.relay.gossip.peer_score(peer_id), Some(0));
+    }
+
+    #[test]
+    fn relay_block_acceptance_triggers_immediate_catchup_when_peer_tip_ahead() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let relay = RelayAdmissionState {
+            mempool: Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip: GossipEngine::new(64).expect("gossip"),
+        };
+        let mut state = RelayServerState::new(runtime, relay);
+        let peer_id = 85;
+        state.relay.gossip.connect_peer(peer_id);
+
+        let now_unix_sec = 2_500u64;
+        state.peer_reported_tip_heights.insert(peer_id, 3);
+        state.peer_tip_last_update_sec.insert(peer_id, now_unix_sec);
+
+        let expected_target = state
+            .runtime
+            .expected_target_for_next_block()
+            .expect("target");
+        let block_template = BlockTemplate {
+            version: 1,
+            prev_block: state.runtime.tip_hash(),
+            timestamp: state
+                .runtime
+                .tip_header()
+                .timestamp
+                .saturating_add(cfg.target_block_time_sec),
+            target: expected_target,
+            transactions: vec![build_coinbase_tx(
+                "relay-block-catchup".to_owned(),
+                cfg.block_subsidy,
+                cfg.genesis_reward_key_hash20().expect("reward"),
+            )],
+        };
+        let block = mine_block(&block_template, 500_000).expect("mine block");
+
+        let out = process_relay_wire_message(
+            &mut state,
+            peer_id,
+            WireMessage::Block { block },
+            now_unix_sec,
+        )
+        .expect("block should be accepted");
+
+        assert_eq!(state.runtime.tip_height(), 1);
+        assert!(
+            out.iter()
+                .any(|msg| matches!(msg, WireMessage::GetHeaders { stop: None, .. })),
+            "block acceptance should immediately request headers when peer tip is still ahead"
+        );
+        assert!(
+            out.iter()
+                .any(|msg| matches!(msg, WireMessage::GetBlocks { stop: None, .. })),
+            "block acceptance should immediately request additional blocks when lag remains"
+        );
     }
 
     #[test]
