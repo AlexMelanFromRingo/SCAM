@@ -5333,6 +5333,7 @@ struct RelayServerState {
     peer_reported_tip_heights: HashMap<u64, u64>,
     peer_last_headers_request_sec: HashMap<u64, u64>,
     peer_last_blocks_request_sec: HashMap<u64, u64>,
+    peer_last_non_fatal_recon_log_sec: HashMap<u64, u64>,
     known_peer_addresses: Vec<PeerAddress>,
     pending_peer_book_updates: Vec<PeerAddress>,
     outbound_worker_starts_total: u64,
@@ -5355,6 +5356,7 @@ impl RelayServerState {
             peer_reported_tip_heights: HashMap::new(),
             peer_last_headers_request_sec: HashMap::new(),
             peer_last_blocks_request_sec: HashMap::new(),
+            peer_last_non_fatal_recon_log_sec: HashMap::new(),
             known_peer_addresses: Vec::new(),
             pending_peer_book_updates: Vec::new(),
             outbound_worker_starts_total: 0,
@@ -5378,6 +5380,7 @@ struct PendingCompactBlock {
 
 const RELAY_MAX_PENDING_BLOCK_ORPHANS: usize = 512;
 const RELAY_PARENT_RESYNC_COOLDOWN_SEC: u64 = 2;
+const RELAY_NON_FATAL_RECON_LOG_INTERVAL_SEC: u64 = 30;
 const RELAY_OUTBOUND_MAX_PEERS: usize = 16;
 const RELAY_OUTBOUND_SPAWN_BURST: usize = 4;
 const RELAY_OUTBOUND_ROTATE_AFTER_SEC: u64 = 6 * 60 * 60;
@@ -6501,6 +6504,24 @@ fn relay_forget_peer_tip_height(state: &mut RelayServerState, peer_id: u64) {
     state.peer_reported_tip_heights.remove(&peer_id);
     state.peer_last_headers_request_sec.remove(&peer_id);
     state.peer_last_blocks_request_sec.remove(&peer_id);
+    state.peer_last_non_fatal_recon_log_sec.remove(&peer_id);
+}
+
+fn relay_should_log_non_fatal_recon_race(
+    state: &mut RelayServerState,
+    peer_id: u64,
+    now_unix_sec: u64,
+) -> bool {
+    let last = state
+        .peer_last_non_fatal_recon_log_sec
+        .entry(peer_id)
+        .or_insert(0);
+    if now_unix_sec.saturating_sub(*last) >= RELAY_NON_FATAL_RECON_LOG_INTERVAL_SEC {
+        *last = now_unix_sec;
+        true
+    } else {
+        false
+    }
 }
 
 fn relay_max_known_tip_height(state: &RelayServerState) -> u64 {
@@ -7453,7 +7474,10 @@ fn relay_handle_gossip_message(
     match state.relay.gossip.on_message(peer_id, message) {
         Ok(outbound) => Ok(relay_gossip_outbound_for_peer(state, peer_id, outbound)),
         Err(err) if relay_gossip_error_is_non_fatal(&err) => {
-            eprintln!("warning: ignoring non-fatal relay recon race for peer {peer_id}: {err}");
+            let now_unix_sec = current_unix_sec().unwrap_or(0);
+            if relay_should_log_non_fatal_recon_race(state, peer_id, now_unix_sec) {
+                eprintln!("warning: ignoring non-fatal relay recon race for peer {peer_id}: {err}");
+            }
             Ok(Vec::new())
         }
         Err(err) => Err(NodeError::Gossip(err)),
@@ -36984,6 +37008,7 @@ mod tests {
         let peer_id = 77u64;
         state.peer_last_headers_request_sec.insert(peer_id, 123);
         state.peer_last_blocks_request_sec.insert(peer_id, 321);
+        state.peer_last_non_fatal_recon_log_sec.insert(peer_id, 456);
 
         super::relay_record_peer_tip_height(&mut state, peer_id, 7);
         assert_eq!(
@@ -37010,6 +37035,50 @@ mod tests {
         assert!(!state.peer_reported_tip_heights.contains_key(&peer_id));
         assert!(!state.peer_last_headers_request_sec.contains_key(&peer_id));
         assert!(!state.peer_last_blocks_request_sec.contains_key(&peer_id));
+        assert!(
+            !state
+                .peer_last_non_fatal_recon_log_sec
+                .contains_key(&peer_id)
+        );
+    }
+
+    #[test]
+    fn relay_non_fatal_recon_log_throttle_enforces_interval() {
+        let mut state = relay_state_for_tests();
+        let peer_id = 42u64;
+
+        assert!(
+            !super::relay_should_log_non_fatal_recon_race(&mut state, peer_id, 0),
+            "initial zero timestamp should not emit logs"
+        );
+        assert!(
+            !super::relay_should_log_non_fatal_recon_race(&mut state, peer_id, 1),
+            "sub-interval timestamps should remain throttled"
+        );
+        assert!(
+            super::relay_should_log_non_fatal_recon_race(
+                &mut state,
+                peer_id,
+                super::RELAY_NON_FATAL_RECON_LOG_INTERVAL_SEC
+            ),
+            "exact interval boundary should allow logging"
+        );
+        assert!(
+            !super::relay_should_log_non_fatal_recon_race(
+                &mut state,
+                peer_id,
+                super::RELAY_NON_FATAL_RECON_LOG_INTERVAL_SEC.saturating_add(1)
+            ),
+            "calls before next interval should be suppressed"
+        );
+        assert!(
+            super::relay_should_log_non_fatal_recon_race(
+                &mut state,
+                peer_id,
+                super::RELAY_NON_FATAL_RECON_LOG_INTERVAL_SEC.saturating_mul(2)
+            ),
+            "next interval should re-enable logging"
+        );
     }
 
     #[test]
