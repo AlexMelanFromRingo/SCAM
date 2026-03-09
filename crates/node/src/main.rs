@@ -8323,7 +8323,7 @@ fn run_relay_outbound_worker(
     let redial_sec = redial_sec.max(1);
     let mut failure_streak = 0u32;
     relay_mark_outbound_worker_start(&state);
-    let initial_delay = relay_outbound_initial_delay(&target);
+    let initial_delay = relay_outbound_initial_delay(&target, &bind_addr);
     if initial_delay > Duration::from_millis(0) {
         thread::sleep(initial_delay);
     }
@@ -8564,7 +8564,7 @@ async fn run_relay_outbound_worker_async(
     }
     let redial_sec = redial_sec.max(1);
     let mut failure_streak = 0u32;
-    let initial_delay = relay_outbound_initial_delay(&target);
+    let initial_delay = relay_outbound_initial_delay(&target, &bind_addr);
     if initial_delay > Duration::from_millis(0) {
         sleep(initial_delay).await;
     }
@@ -8932,12 +8932,16 @@ fn relay_outbound_initial_jitter_ms() -> u64 {
         .min(60_000)
 }
 
-fn relay_outbound_initial_delay(target: &str) -> Duration {
+fn relay_outbound_initial_delay(target: &str, bind_addr: &str) -> Duration {
     let max_jitter_ms = relay_outbound_initial_jitter_ms();
     if max_jitter_ms == 0 {
         return Duration::from_millis(0);
     }
-    let mixed = scam_core::hash::hash256(target.as_bytes());
+    let mut entropy = Vec::with_capacity(target.len().saturating_add(bind_addr.len() + 1));
+    entropy.extend_from_slice(bind_addr.as_bytes());
+    entropy.push(b'|');
+    entropy.extend_from_slice(target.as_bytes());
+    let mixed = scam_core::hash::hash256(&entropy);
     let jitter_ms =
         u16::from_be_bytes([mixed.0[0], mixed.0[1]]) as u64 % max_jitter_ms.saturating_add(1);
     Duration::from_millis(jitter_ms)
@@ -37669,27 +37673,37 @@ mod tests {
             std::env::set_var(INITIAL_JITTER_KEY, "250");
         }
 
+        let bind_addr = "127.0.0.1:18440";
         let target = "127.0.0.1:18444";
-        let delay_a = super::relay_outbound_initial_delay(target);
-        let delay_b = super::relay_outbound_initial_delay(target);
+        let delay_a = super::relay_outbound_initial_delay(target, bind_addr);
+        let delay_b = super::relay_outbound_initial_delay(target, bind_addr);
         assert_eq!(
             delay_a, delay_b,
-            "initial connect delay must be stable for a given target"
+            "initial connect delay must be stable for a given bind/target pair"
         );
         assert!(
             delay_a <= Duration::from_millis(250),
             "initial connect delay must stay within configured jitter bound"
         );
 
-        let mixed = scam_core::hash::hash256(target.as_bytes());
+        let mut entropy = Vec::new();
+        entropy.extend_from_slice(bind_addr.as_bytes());
+        entropy.push(b'|');
+        entropy.extend_from_slice(target.as_bytes());
+        let mixed = scam_core::hash::hash256(&entropy);
         let expected_ms = u16::from_be_bytes([mixed.0[0], mixed.0[1]]) as u64 % 251;
         assert_eq!(delay_a, Duration::from_millis(expected_ms));
+        let different_bind_delay = super::relay_outbound_initial_delay(target, "127.0.0.1:18441");
+        assert_ne!(
+            delay_a, different_bind_delay,
+            "different bind identities should avoid synchronized startup dials to the same target"
+        );
 
         unsafe {
             std::env::set_var(INITIAL_JITTER_KEY, "0");
         }
         assert_eq!(
-            super::relay_outbound_initial_delay(target),
+            super::relay_outbound_initial_delay(target, bind_addr),
             Duration::from_millis(0),
             "zero jitter should disable startup delay"
         );
