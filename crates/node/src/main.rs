@@ -5331,6 +5331,7 @@ struct RelayServerState {
     pending_parent_tx_requests: HashMap<Hash256, u64>,
     pending_compact_blocks: HashMap<Hash256, PendingCompactBlock>,
     peer_reported_tip_heights: HashMap<u64, u64>,
+    peer_tip_last_update_sec: HashMap<u64, u64>,
     peer_last_headers_request_sec: HashMap<u64, u64>,
     peer_last_blocks_request_sec: HashMap<u64, u64>,
     peer_last_non_fatal_recon_log_sec: HashMap<u64, u64>,
@@ -5354,6 +5355,7 @@ impl RelayServerState {
             pending_parent_tx_requests: HashMap::new(),
             pending_compact_blocks: HashMap::new(),
             peer_reported_tip_heights: HashMap::new(),
+            peer_tip_last_update_sec: HashMap::new(),
             peer_last_headers_request_sec: HashMap::new(),
             peer_last_blocks_request_sec: HashMap::new(),
             peer_last_non_fatal_recon_log_sec: HashMap::new(),
@@ -5408,6 +5410,7 @@ const RELAY_HEADERS_AGGRESSIVE_LAG_THRESHOLD: u64 = 4;
 const RELAY_HEADERS_AGGRESSIVE_INTERVAL_SEC: u64 = 1;
 const RELAY_BLOCKS_CATCHUP_INTERVAL_SEC: u64 = 4;
 const RELAY_BLOCKS_AGGRESSIVE_INTERVAL_SEC: u64 = 2;
+const RELAY_PEER_TIP_STALE_SEC: u64 = 120;
 const RELAY_DISCOVERY_REFRESH_SEC: u64 = 30;
 const RELAY_DISCOVERY_REFRESH_JITTER_SEC: u64 = 5;
 const RELAY_ASYNC_READ_POLL_INTERVAL_MS: u64 = 250;
@@ -6492,19 +6495,39 @@ fn nonempty_parent_dir(path: &Path) -> Option<&Path> {
     }
 }
 
-fn relay_record_peer_tip_height(state: &mut RelayServerState, peer_id: u64, tip_height: u64) {
+fn relay_record_peer_tip_height_at(
+    state: &mut RelayServerState,
+    peer_id: u64,
+    tip_height: u64,
+    now_unix_sec: u64,
+) {
     let entry = state
         .peer_reported_tip_heights
         .entry(peer_id)
         .or_insert(tip_height);
     *entry = (*entry).max(tip_height);
+    let updated = state.peer_tip_last_update_sec.entry(peer_id).or_insert(0);
+    *updated = (*updated).max(now_unix_sec);
+}
+
+fn relay_record_peer_tip_height(state: &mut RelayServerState, peer_id: u64, tip_height: u64) {
+    relay_record_peer_tip_height_at(state, peer_id, tip_height, current_unix_sec().unwrap_or(0));
 }
 
 fn relay_forget_peer_tip_height(state: &mut RelayServerState, peer_id: u64) {
     state.peer_reported_tip_heights.remove(&peer_id);
+    state.peer_tip_last_update_sec.remove(&peer_id);
     state.peer_last_headers_request_sec.remove(&peer_id);
     state.peer_last_blocks_request_sec.remove(&peer_id);
     state.peer_last_non_fatal_recon_log_sec.remove(&peer_id);
+}
+
+fn relay_peer_tip_is_fresh(state: &RelayServerState, peer_id: u64, now_unix_sec: u64) -> bool {
+    let stale_after_sec = relay_peer_tip_stale_after_sec();
+    match state.peer_tip_last_update_sec.get(&peer_id).copied() {
+        Some(last_seen) => now_unix_sec.saturating_sub(last_seen) <= stale_after_sec,
+        None => true,
+    }
 }
 
 fn relay_should_log_non_fatal_recon_race(
@@ -6524,12 +6547,14 @@ fn relay_should_log_non_fatal_recon_race(
     }
 }
 
-fn relay_max_known_tip_height(state: &RelayServerState) -> u64 {
+fn relay_max_known_tip_height(state: &RelayServerState, now_unix_sec: u64) -> u64 {
     let local_tip = state.runtime.tip_height();
     state
         .peer_reported_tip_heights
-        .values()
-        .copied()
+        .iter()
+        .filter_map(|(peer_id, tip_height)| {
+            relay_peer_tip_is_fresh(state, *peer_id, now_unix_sec).then_some(*tip_height)
+        })
         .max()
         .map_or(local_tip, |peer_tip| local_tip.max(peer_tip))
 }
@@ -6564,11 +6589,15 @@ fn relay_should_request_headers_catchup(
     now_unix_sec: u64,
 ) -> bool {
     let local_tip = state.runtime.tip_height();
-    let peer_tip = state
-        .peer_reported_tip_heights
-        .get(&peer_id)
-        .copied()
-        .unwrap_or(local_tip);
+    let peer_tip = if relay_peer_tip_is_fresh(state, peer_id, now_unix_sec) {
+        state
+            .peer_reported_tip_heights
+            .get(&peer_id)
+            .copied()
+            .unwrap_or(local_tip)
+    } else {
+        local_tip
+    };
     let last = state
         .peer_last_headers_request_sec
         .get(&peer_id)
@@ -6604,11 +6633,15 @@ fn relay_should_request_blocks_catchup(
     now_unix_sec: u64,
 ) -> bool {
     let local_tip = state.runtime.tip_height();
-    let peer_tip = state
-        .peer_reported_tip_heights
-        .get(&peer_id)
-        .copied()
-        .unwrap_or(local_tip);
+    let peer_tip = if relay_peer_tip_is_fresh(state, peer_id, now_unix_sec) {
+        state
+            .peer_reported_tip_heights
+            .get(&peer_id)
+            .copied()
+            .unwrap_or(local_tip)
+    } else {
+        local_tip
+    };
     if peer_tip <= local_tip {
         return false;
     }
@@ -6735,7 +6768,7 @@ fn relay_server_snapshot(
     let orphan = state.relay.orphan_pool.telemetry();
     let gossip = state.relay.gossip.telemetry();
     let local_tip_height = state.runtime.tip_height();
-    let max_known_tip_height = relay_max_known_tip_height(state);
+    let max_known_tip_height = relay_max_known_tip_height(state, now_unix_sec);
     RelayServerTelemetrySnapshot {
         timestamp_unix_sec: now_unix_sec,
         active_peers,
@@ -9000,6 +9033,10 @@ fn relay_blocks_catchup_interval_sec() -> u64 {
 fn relay_blocks_aggressive_interval_sec() -> u64 {
     env_nonzero_u64("SCAM_RELAY_BLOCKS_AGGRESSIVE_INTERVAL_SEC")
         .unwrap_or(RELAY_BLOCKS_AGGRESSIVE_INTERVAL_SEC)
+}
+
+fn relay_peer_tip_stale_after_sec() -> u64 {
+    env_nonzero_u64("SCAM_RELAY_PEER_TIP_STALE_SEC").unwrap_or(RELAY_PEER_TIP_STALE_SEC)
 }
 
 fn relay_discovery_refresh_sec() -> u64 {
@@ -24460,6 +24497,38 @@ mod tests {
     }
 
     #[test]
+    fn relay_server_snapshot_ignores_stale_peer_tip_heights() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let relay = RelayAdmissionState {
+            mempool: Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip: GossipEngine::new(64).expect("gossip"),
+        };
+        let mut state = RelayServerState::new(runtime, relay);
+        assert_eq!(state.runtime.tip_height(), 0);
+        let stale_after = super::relay_peer_tip_stale_after_sec();
+
+        state.peer_reported_tip_heights.insert(11, 7);
+        state.peer_tip_last_update_sec.insert(11, 1_000);
+        state.peer_reported_tip_heights.insert(22, 9);
+        state
+            .peer_tip_last_update_sec
+            .insert(22, 1_000 + stale_after + 5);
+
+        let snapshot = super::relay_server_snapshot(&state, 2, 1_000 + stale_after + 10);
+        assert_eq!(snapshot.tip_height, 0);
+        assert_eq!(
+            snapshot.max_known_tip_height, 9,
+            "fresh peer tip should be used while stale peer tip is ignored"
+        );
+        assert_eq!(snapshot.global_sync_lag_blocks, 9);
+    }
+
+    #[test]
     fn relay_headers_catchup_requests_use_probe_and_ahead_intervals() {
         let cfg: ChainConfig =
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
@@ -37008,6 +37077,7 @@ mod tests {
         let peer_id = 77u64;
         state.peer_last_headers_request_sec.insert(peer_id, 123);
         state.peer_last_blocks_request_sec.insert(peer_id, 321);
+        state.peer_tip_last_update_sec.insert(peer_id, 222);
         state.peer_last_non_fatal_recon_log_sec.insert(peer_id, 456);
 
         super::relay_record_peer_tip_height(&mut state, peer_id, 7);
@@ -37033,12 +37103,58 @@ mod tests {
 
         super::relay_forget_peer_tip_height(&mut state, peer_id);
         assert!(!state.peer_reported_tip_heights.contains_key(&peer_id));
+        assert!(!state.peer_tip_last_update_sec.contains_key(&peer_id));
         assert!(!state.peer_last_headers_request_sec.contains_key(&peer_id));
         assert!(!state.peer_last_blocks_request_sec.contains_key(&peer_id));
         assert!(
             !state
                 .peer_last_non_fatal_recon_log_sec
                 .contains_key(&peer_id)
+        );
+    }
+
+    #[test]
+    fn relay_peer_tip_staleness_suppresses_ahead_catchup_until_refresh() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let relay = RelayAdmissionState {
+            mempool: Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip: GossipEngine::new(64).expect("gossip"),
+        };
+        let mut state = RelayServerState::new(runtime, relay);
+        let peer_id = 5u64;
+        let now = 10_000u64;
+        let stale_after = super::relay_peer_tip_stale_after_sec();
+
+        super::relay_record_peer_tip_height_at(&mut state, peer_id, 50, now);
+        assert!(
+            super::relay_should_request_blocks_catchup(&state, peer_id, now.saturating_add(1)),
+            "fresh ahead peer tip should trigger catchup"
+        );
+
+        state
+            .peer_tip_last_update_sec
+            .insert(peer_id, now.saturating_sub(stale_after).saturating_sub(1));
+        state
+            .peer_last_headers_request_sec
+            .insert(peer_id, now.saturating_add(2));
+        assert!(
+            !super::relay_should_request_blocks_catchup(&state, peer_id, now.saturating_add(3)),
+            "stale peer tip should not trigger block catchup"
+        );
+        assert!(
+            !super::relay_should_request_headers_catchup(&state, peer_id, now.saturating_add(3)),
+            "stale peer tip should not trigger immediate headers catchup"
+        );
+
+        super::relay_record_peer_tip_height_at(&mut state, peer_id, 55, now.saturating_add(5));
+        assert!(
+            super::relay_should_request_blocks_catchup(&state, peer_id, now.saturating_add(6)),
+            "freshly refreshed tip should re-enable catchup"
         );
     }
 
