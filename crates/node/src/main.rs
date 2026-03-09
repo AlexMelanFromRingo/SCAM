@@ -8324,9 +8324,7 @@ fn run_relay_outbound_worker(
     let mut failure_streak = 0u32;
     relay_mark_outbound_worker_start(&state);
     let initial_delay = relay_outbound_initial_delay(&target, &bind_addr);
-    if initial_delay > Duration::from_millis(0) {
-        thread::sleep(initial_delay);
-    }
+    thread::sleep(initial_delay);
     loop {
         if stop_flag.load(Ordering::Relaxed) {
             break;
@@ -8565,9 +8563,7 @@ async fn run_relay_outbound_worker_async(
     let redial_sec = redial_sec.max(1);
     let mut failure_streak = 0u32;
     let initial_delay = relay_outbound_initial_delay(&target, &bind_addr);
-    if initial_delay > Duration::from_millis(0) {
-        sleep(initial_delay).await;
-    }
+    sleep(initial_delay).await;
     loop {
         if stop_flag.load(Ordering::Relaxed) {
             break;
@@ -9510,13 +9506,16 @@ fn run_relay_peer_session<IO: Read + Write>(
                 {
                     periodic.push(get_blocks);
                 }
-                if matches!(mode, RelayPeerSessionMode::Outbound)
-                    && relay_discovery_refresh_due(
+                let outbound_discovery_due = if matches!(mode, RelayPeerSessionMode::Outbound) {
+                    relay_discovery_refresh_due(
                         now_for_periodic,
                         last_discovery_request_unix_sec,
                         peer_id,
                     )
-                {
+                } else {
+                    false
+                };
+                if outbound_discovery_due {
                     periodic.push(WireMessage::GetAddr);
                     last_discovery_request_unix_sec = now_for_periodic;
                 }
@@ -9809,13 +9808,16 @@ async fn run_relay_peer_session_async<S: AsyncRead + AsyncWrite + Unpin>(
                 {
                     periodic.push(get_blocks);
                 }
-                if matches!(mode, RelayPeerSessionMode::Outbound)
-                    && relay_discovery_refresh_due(
+                let outbound_discovery_due = if matches!(mode, RelayPeerSessionMode::Outbound) {
+                    relay_discovery_refresh_due(
                         now_for_periodic,
                         last_discovery_request_unix_sec,
                         peer_id,
                     )
-                {
+                } else {
+                    false
+                };
+                if outbound_discovery_due {
                     periodic.push(WireMessage::GetAddr);
                     last_discovery_request_unix_sec = now_for_periodic;
                 }
