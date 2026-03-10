@@ -5338,6 +5338,9 @@ struct RelayServerState {
     pending_compact_blocks: HashMap<Hash256, PendingCompactBlock>,
     peer_reported_tip_heights: HashMap<u64, u64>,
     peer_tip_last_update_sec: HashMap<u64, u64>,
+    peer_session_addresses: HashMap<u64, String>,
+    peer_tip_by_address: HashMap<String, u64>,
+    peer_tip_last_update_by_address: HashMap<String, u64>,
     peer_last_headers_request_sec: HashMap<u64, u64>,
     peer_last_blocks_request_sec: HashMap<u64, u64>,
     peer_last_non_fatal_recon_log_sec: HashMap<u64, u64>,
@@ -5362,6 +5365,9 @@ impl RelayServerState {
             pending_compact_blocks: HashMap::new(),
             peer_reported_tip_heights: HashMap::new(),
             peer_tip_last_update_sec: HashMap::new(),
+            peer_session_addresses: HashMap::new(),
+            peer_tip_by_address: HashMap::new(),
+            peer_tip_last_update_by_address: HashMap::new(),
             peer_last_headers_request_sec: HashMap::new(),
             peer_last_blocks_request_sec: HashMap::new(),
             peer_last_non_fatal_recon_log_sec: HashMap::new(),
@@ -5394,6 +5400,7 @@ const RELAY_OUTBOUND_SPAWN_BURST: usize = 4;
 const RELAY_OUTBOUND_SPAWN_LAG_THRESHOLD: u64 = 8;
 const RELAY_OUTBOUND_SPAWN_LAG_MIN_BURST: usize = 8;
 const RELAY_OUTBOUND_LAG_MAX_PEERS: usize = 32;
+const RELAY_OUTBOUND_LAG_ROTATE_AFTER_SEC: u64 = 90;
 const RELAY_OUTBOUND_ROTATE_AFTER_SEC: u64 = 6 * 60 * 60;
 const RELAY_INBOUND_ACCEPT_WINDOW_SEC: u64 = 5;
 const RELAY_INBOUND_ACCEPT_MAX_PER_IP: usize = 64;
@@ -6517,15 +6524,50 @@ fn relay_record_peer_tip_height_at(
     *entry = (*entry).max(tip_height);
     let updated = state.peer_tip_last_update_sec.entry(peer_id).or_insert(0);
     *updated = (*updated).max(now_unix_sec);
+    if let Some(address) = state.peer_session_addresses.get(&peer_id) {
+        let tip_entry = state
+            .peer_tip_by_address
+            .entry(address.clone())
+            .or_insert(tip_height);
+        *tip_entry = (*tip_entry).max(tip_height);
+        let updated_entry = state
+            .peer_tip_last_update_by_address
+            .entry(address.clone())
+            .or_insert(0);
+        *updated_entry = (*updated_entry).max(now_unix_sec);
+    }
 }
 
 fn relay_record_peer_tip_height(state: &mut RelayServerState, peer_id: u64, tip_height: u64) {
     relay_record_peer_tip_height_at(state, peer_id, tip_height, current_unix_sec().unwrap_or(0));
 }
 
+fn relay_register_peer_session_address(
+    state: &mut RelayServerState,
+    peer_id: u64,
+    address: &str,
+    tip_height: u64,
+    now_unix_sec: u64,
+) {
+    state
+        .peer_session_addresses
+        .insert(peer_id, address.to_owned());
+    let tip_entry = state
+        .peer_tip_by_address
+        .entry(address.to_owned())
+        .or_insert(tip_height);
+    *tip_entry = (*tip_entry).max(tip_height);
+    let updated = state
+        .peer_tip_last_update_by_address
+        .entry(address.to_owned())
+        .or_insert(0);
+    *updated = (*updated).max(now_unix_sec);
+}
+
 fn relay_forget_peer_tip_height(state: &mut RelayServerState, peer_id: u64) {
     state.peer_reported_tip_heights.remove(&peer_id);
     state.peer_tip_last_update_sec.remove(&peer_id);
+    state.peer_session_addresses.remove(&peer_id);
     state.peer_last_headers_request_sec.remove(&peer_id);
     state.peer_last_blocks_request_sec.remove(&peer_id);
     state.peer_last_non_fatal_recon_log_sec.remove(&peer_id);
@@ -7162,6 +7204,38 @@ fn merge_outbound_targets(
         }
     }
     merged
+}
+
+fn relay_sort_targets_by_known_tip(
+    state: &RelayServerState,
+    mut targets: Vec<String>,
+    now_unix_sec: u64,
+) -> Vec<String> {
+    if targets.len() <= 1 {
+        return targets;
+    }
+    let stale_after_sec = relay_peer_tip_stale_after_sec();
+    targets.sort_unstable_by(|a, b| {
+        let a_tip = state.peer_tip_by_address.get(a).copied().unwrap_or(0);
+        let b_tip = state.peer_tip_by_address.get(b).copied().unwrap_or(0);
+        let a_fresh = state
+            .peer_tip_last_update_by_address
+            .get(a)
+            .copied()
+            .map(|last| now_unix_sec.saturating_sub(last) <= stale_after_sec)
+            .unwrap_or(false);
+        let b_fresh = state
+            .peer_tip_last_update_by_address
+            .get(b)
+            .copied()
+            .map(|last| now_unix_sec.saturating_sub(last) <= stale_after_sec)
+            .unwrap_or(false);
+        b_fresh
+            .cmp(&a_fresh)
+            .then_with(|| b_tip.cmp(&a_tip))
+            .then_with(|| a.cmp(b))
+    });
+    targets
 }
 
 fn relay_parent_request_cache_cleanup(state: &mut RelayServerState, now_unix_sec: u64) {
@@ -8557,6 +8631,7 @@ fn run_relay_outbound_supervisor(
     let configured_max_outbound_peers = relay_outbound_max_peers();
     let base_spawn_burst = relay_outbound_spawn_burst();
     let mut workers = HashMap::<String, thread::JoinHandle<()>>::new();
+    let mut worker_started_unix_sec = HashMap::<String, u64>::new();
 
     loop {
         if stop_flag.load(Ordering::Relaxed) {
@@ -8574,6 +8649,7 @@ fn run_relay_outbound_supervisor(
             {
                 eprintln!("warning: outbound relay worker thread panicked for {target}");
             }
+            worker_started_unix_sec.remove(&target);
         }
 
         match load_relay_outbound_targets_selected(
@@ -8585,7 +8661,11 @@ fn run_relay_outbound_supervisor(
         ) {
             Ok(targets) => {
                 let now_unix_sec = current_unix_sec().unwrap_or(0);
-                let (effective_max_outbound_peers, effective_spawn_burst) = match state.lock() {
+                let (
+                    effective_max_outbound_peers,
+                    effective_spawn_burst,
+                    effective_rotate_after_sec,
+                ) = match state.lock() {
                     Ok(guard) => {
                         let effective_max_outbound_peers = relay_outbound_effective_max_peers(
                             &guard,
@@ -8598,14 +8678,48 @@ fn run_relay_outbound_supervisor(
                             effective_max_outbound_peers,
                             now_unix_sec,
                         );
-                        (effective_max_outbound_peers, effective_spawn_burst)
+                        let effective_rotate_after_sec = relay_outbound_effective_rotate_after_sec(
+                            &guard,
+                            rotate_after_sec,
+                            now_unix_sec,
+                        );
+                        (
+                            effective_max_outbound_peers,
+                            effective_spawn_burst,
+                            effective_rotate_after_sec,
+                        )
                     }
                     Err(_) => (
                         configured_max_outbound_peers.max(1),
                         base_spawn_burst
                             .max(1)
                             .min(configured_max_outbound_peers.max(1)),
+                        rotate_after_sec.max(1),
                     ),
+                };
+                if let Some((stale_target, _)) = worker_started_unix_sec
+                    .iter()
+                    .find(|(_, started_at)| {
+                        relay_outbound_worker_rotation_due(
+                            now_unix_sec,
+                            **started_at,
+                            effective_rotate_after_sec,
+                        )
+                    })
+                    .map(|(target, started_at)| (target.clone(), *started_at))
+                {
+                    if let Some(handle) = workers.remove(&stale_target)
+                        && handle.join().is_err()
+                    {
+                        eprintln!(
+                            "warning: outbound relay worker thread panicked for {stale_target}"
+                        );
+                    }
+                    worker_started_unix_sec.remove(&stale_target);
+                }
+                let targets = match state.lock() {
+                    Ok(guard) => relay_sort_targets_by_known_tip(&guard, targets, now_unix_sec),
+                    Err(_) => targets,
                 };
                 let mut spawned_this_round = 0usize;
                 for target in targets {
@@ -8632,7 +8746,7 @@ fn run_relay_outbound_supervisor(
                     let target_clone = target.clone();
                     let reputation_store_clone = peer_reputation_store.clone();
                     workers.insert(
-                        target,
+                        target.clone(),
                         thread::spawn(move || {
                             run_relay_outbound_worker(
                                 target_clone,
@@ -8653,6 +8767,7 @@ fn run_relay_outbound_supervisor(
                             );
                         }),
                     );
+                    worker_started_unix_sec.insert(target, now_unix_sec);
                     spawned_this_round = spawned_this_round.saturating_add(1);
                 }
             }
@@ -9074,6 +9189,11 @@ fn relay_outbound_lag_max_peers() -> usize {
         .min(512)
 }
 
+fn relay_outbound_lag_rotate_after_sec() -> u64 {
+    env_nonzero_u64("SCAM_RELAY_OUTBOUND_LAG_ROTATE_AFTER_SEC")
+        .unwrap_or(RELAY_OUTBOUND_LAG_ROTATE_AFTER_SEC)
+}
+
 fn relay_outbound_max_backoff_sec() -> u64 {
     env_nonzero_u64("SCAM_RELAY_OUTBOUND_MAX_BACKOFF_SEC").unwrap_or(RELAY_OUTBOUND_MAX_BACKOFF_SEC)
 }
@@ -9349,6 +9469,25 @@ fn relay_outbound_effective_max_peers(
     base
 }
 
+fn relay_outbound_effective_rotate_after_sec(
+    state: &RelayServerState,
+    rotate_after_sec: u64,
+    now_unix_sec: u64,
+) -> u64 {
+    let base = rotate_after_sec.max(1);
+    let lag_threshold = relay_outbound_spawn_lag_threshold();
+    if lag_threshold == 0 {
+        return base;
+    }
+    let local_tip = state.runtime.tip_height();
+    let max_known_tip = relay_max_known_tip_height(state, now_unix_sec);
+    let lag = max_known_tip.saturating_sub(local_tip);
+    if lag >= lag_threshold {
+        return relay_outbound_lag_rotate_after_sec().max(1).min(base);
+    }
+    base
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_relay_outbound_supervisor_async(
     stop_flag: Arc<AtomicBool>,
@@ -9403,28 +9542,39 @@ async fn run_relay_outbound_supervisor_async(
         }
 
         let now_unix_sec = current_unix_sec().unwrap_or(0);
-        let (effective_max_outbound_peers, effective_spawn_burst) = match state.lock() {
-            Ok(guard) => {
-                let effective_max_outbound_peers = relay_outbound_effective_max_peers(
-                    &guard,
-                    configured_max_outbound_peers,
-                    now_unix_sec,
-                );
-                let effective_spawn_burst = relay_outbound_effective_spawn_burst(
-                    &guard,
-                    base_spawn_burst,
-                    effective_max_outbound_peers,
-                    now_unix_sec,
-                );
-                (effective_max_outbound_peers, effective_spawn_burst)
-            }
-            Err(_) => (
-                configured_max_outbound_peers.max(1),
-                base_spawn_burst
-                    .max(1)
-                    .min(configured_max_outbound_peers.max(1)),
-            ),
-        };
+        let (effective_max_outbound_peers, effective_spawn_burst, effective_rotate_after_sec) =
+            match state.lock() {
+                Ok(guard) => {
+                    let effective_max_outbound_peers = relay_outbound_effective_max_peers(
+                        &guard,
+                        configured_max_outbound_peers,
+                        now_unix_sec,
+                    );
+                    let effective_spawn_burst = relay_outbound_effective_spawn_burst(
+                        &guard,
+                        base_spawn_burst,
+                        effective_max_outbound_peers,
+                        now_unix_sec,
+                    );
+                    let effective_rotate_after_sec = relay_outbound_effective_rotate_after_sec(
+                        &guard,
+                        rotate_after_sec,
+                        now_unix_sec,
+                    );
+                    (
+                        effective_max_outbound_peers,
+                        effective_spawn_burst,
+                        effective_rotate_after_sec,
+                    )
+                }
+                Err(_) => (
+                    configured_max_outbound_peers.max(1),
+                    base_spawn_burst
+                        .max(1)
+                        .min(configured_max_outbound_peers.max(1)),
+                    rotate_after_sec.max(1),
+                ),
+            };
 
         let selected_targets = match load_relay_outbound_targets_selected(
             &peers_dir,
@@ -9461,10 +9611,18 @@ async fn run_relay_outbound_supervisor_async(
             selected_targets,
             effective_max_outbound_peers,
         );
+        let targets = match state.lock() {
+            Ok(guard) => relay_sort_targets_by_known_tip(&guard, targets, now_unix_sec),
+            Err(_) => targets,
+        };
         if let Some((stale_target, _)) = worker_started_unix_sec
             .iter()
             .find(|(_, started_at)| {
-                relay_outbound_worker_rotation_due(now_unix_sec, **started_at, rotate_after_sec)
+                relay_outbound_worker_rotation_due(
+                    now_unix_sec,
+                    **started_at,
+                    effective_rotate_after_sec,
+                )
             })
             .map(|(target, started_at)| (target.clone(), *started_at))
             && let Some(handle) = workers.remove(&stale_target)
@@ -9645,14 +9803,18 @@ fn run_relay_peer_session<IO: Read + Write>(
             guard.peer_compact_pref.insert(peer_id, false);
             relay_record_peer_tip_height(&mut guard, peer_id, remote.start_height);
             guard.peer_runtime_reputation.entry(peer_id).or_default();
-            if matches!(mode, RelayPeerSessionMode::Outbound)
-                && let Some(address) = peer_address
-            {
-                relay_register_connected_peer_address(
+            if let Some(address) = peer_address {
+                let now_unix_sec = current_unix_sec().unwrap_or(0);
+                relay_register_peer_session_address(
                     &mut guard,
+                    peer_id,
                     address,
-                    current_unix_sec().unwrap_or(0),
+                    remote.start_height,
+                    now_unix_sec,
                 );
+                if matches!(mode, RelayPeerSessionMode::Outbound) {
+                    relay_register_connected_peer_address(&mut guard, address, now_unix_sec);
+                }
             }
             guard.relay.gossip.build_send_recon(peer_id)?
         };
@@ -9941,14 +10103,18 @@ async fn run_relay_peer_session_async<S: AsyncRead + AsyncWrite + Unpin>(
             guard.peer_compact_pref.insert(peer_id, false);
             relay_record_peer_tip_height(&mut guard, peer_id, remote.start_height);
             guard.peer_runtime_reputation.entry(peer_id).or_default();
-            if matches!(mode, RelayPeerSessionMode::Outbound)
-                && let Some(address) = peer_address
-            {
-                relay_register_connected_peer_address(
+            if let Some(address) = peer_address {
+                let now_unix_sec = current_unix_sec().unwrap_or(0);
+                relay_register_peer_session_address(
                     &mut guard,
+                    peer_id,
                     address,
-                    current_unix_sec().unwrap_or(0),
+                    remote.start_height,
+                    now_unix_sec,
                 );
+                if matches!(mode, RelayPeerSessionMode::Outbound) {
+                    relay_register_connected_peer_address(&mut guard, address, now_unix_sec);
+                }
             }
             guard.relay.gossip.build_send_recon(peer_id)?
         };
@@ -31702,6 +31868,89 @@ mod tests {
     }
 
     #[test]
+    fn relay_outbound_effective_rotate_after_sec_scales_with_lag_signal() {
+        let mut state = relay_state_for_tests();
+        let now_unix_sec = 7_100u64;
+        let rotate_after_sec = 500u64;
+
+        state.peer_reported_tip_heights.insert(6, 50);
+        state.peer_tip_last_update_sec.insert(6, now_unix_sec);
+        assert_eq!(
+            super::relay_outbound_effective_rotate_after_sec(
+                &state,
+                rotate_after_sec,
+                now_unix_sec
+            ),
+            super::RELAY_OUTBOUND_LAG_ROTATE_AFTER_SEC,
+            "lagging node should rotate outbound peers faster"
+        );
+
+        let stale_cutoff = super::relay_peer_tip_stale_after_sec();
+        state.peer_tip_last_update_sec.insert(
+            6,
+            now_unix_sec.saturating_sub(stale_cutoff).saturating_sub(1),
+        );
+        assert_eq!(
+            super::relay_outbound_effective_rotate_after_sec(
+                &state,
+                rotate_after_sec,
+                now_unix_sec
+            ),
+            rotate_after_sec,
+            "stale lag signal must not force aggressive rotation"
+        );
+    }
+
+    #[test]
+    fn relay_sort_targets_by_known_tip_prefers_fresh_and_higher_tip() {
+        let mut state = relay_state_for_tests();
+        let now_unix_sec = 8_000u64;
+        let stale_after_sec = super::relay_peer_tip_stale_after_sec();
+        state
+            .peer_tip_by_address
+            .insert("127.0.0.1:3001".to_owned(), 11);
+        state
+            .peer_tip_last_update_by_address
+            .insert("127.0.0.1:3001".to_owned(), now_unix_sec);
+        state
+            .peer_tip_by_address
+            .insert("127.0.0.1:3002".to_owned(), 99);
+        state.peer_tip_last_update_by_address.insert(
+            "127.0.0.1:3002".to_owned(),
+            now_unix_sec
+                .saturating_sub(stale_after_sec)
+                .saturating_sub(5),
+        );
+        state
+            .peer_tip_by_address
+            .insert("127.0.0.1:3003".to_owned(), 22);
+        state
+            .peer_tip_last_update_by_address
+            .insert("127.0.0.1:3003".to_owned(), now_unix_sec);
+
+        let sorted = super::relay_sort_targets_by_known_tip(
+            &state,
+            vec![
+                "127.0.0.1:3002".to_owned(),
+                "127.0.0.1:3001".to_owned(),
+                "127.0.0.1:3003".to_owned(),
+                "127.0.0.1:3999".to_owned(),
+            ],
+            now_unix_sec,
+        );
+        assert_eq!(
+            sorted,
+            vec![
+                "127.0.0.1:3003",
+                "127.0.0.1:3001",
+                "127.0.0.1:3002",
+                "127.0.0.1:3999"
+            ],
+            "fresh higher-tip targets should be dialed first; stale or unknown tips later"
+        );
+    }
+
+    #[test]
     fn run_relay_outbound_worker_async_marks_start_counter() {
         let cfg: ChainConfig =
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
@@ -38253,6 +38502,7 @@ mod tests {
         const SPAWN_LAG_THRESHOLD_KEY: &str = "SCAM_RELAY_OUTBOUND_SPAWN_LAG_THRESHOLD";
         const SPAWN_LAG_MIN_BURST_KEY: &str = "SCAM_RELAY_OUTBOUND_SPAWN_LAG_MIN_BURST";
         const LAG_MAX_PEERS_KEY: &str = "SCAM_RELAY_OUTBOUND_LAG_MAX_PEERS";
+        const LAG_ROTATE_AFTER_SEC_KEY: &str = "SCAM_RELAY_OUTBOUND_LAG_ROTATE_AFTER_SEC";
         const OUTBOUND_BUCKET_CAP_KEY: &str = "SCAM_RELAY_OUTBOUND_BUCKET_CAP";
         const MAX_BACKOFF_KEY: &str = "SCAM_RELAY_OUTBOUND_MAX_BACKOFF_SEC";
         const INITIAL_JITTER_KEY: &str = "SCAM_RELAY_OUTBOUND_INITIAL_JITTER_MS";
@@ -38276,6 +38526,7 @@ mod tests {
             SPAWN_LAG_THRESHOLD_KEY,
             SPAWN_LAG_MIN_BURST_KEY,
             LAG_MAX_PEERS_KEY,
+            LAG_ROTATE_AFTER_SEC_KEY,
             OUTBOUND_BUCKET_CAP_KEY,
             MAX_BACKOFF_KEY,
             INITIAL_JITTER_KEY,
@@ -38326,6 +38577,10 @@ mod tests {
         assert_eq!(
             super::relay_outbound_lag_max_peers(),
             super::RELAY_OUTBOUND_LAG_MAX_PEERS
+        );
+        assert_eq!(
+            super::relay_outbound_lag_rotate_after_sec(),
+            super::RELAY_OUTBOUND_LAG_ROTATE_AFTER_SEC
         );
         assert_eq!(
             super::relay_outbound_bucket_cap(7),
@@ -38396,6 +38651,7 @@ mod tests {
             std::env::set_var(SPAWN_LAG_THRESHOLD_KEY, "0");
             std::env::set_var(SPAWN_LAG_MIN_BURST_KEY, "999999");
             std::env::set_var(LAG_MAX_PEERS_KEY, "999999");
+            std::env::set_var(LAG_ROTATE_AFTER_SEC_KEY, "0");
             std::env::set_var(OUTBOUND_BUCKET_CAP_KEY, "0");
             std::env::set_var(MAX_BACKOFF_KEY, "0");
             std::env::set_var(INITIAL_JITTER_KEY, "999999999");
@@ -38428,6 +38684,10 @@ mod tests {
         );
         assert_eq!(super::relay_outbound_spawn_lag_min_burst(), 256);
         assert_eq!(super::relay_outbound_lag_max_peers(), 512);
+        assert_eq!(
+            super::relay_outbound_lag_rotate_after_sec(),
+            super::RELAY_OUTBOUND_LAG_ROTATE_AFTER_SEC
+        );
         assert_eq!(super::relay_outbound_bucket_cap(9), 9);
         assert_eq!(
             super::relay_outbound_max_backoff_sec(),
@@ -38491,6 +38751,7 @@ mod tests {
             std::env::set_var(SPAWN_LAG_THRESHOLD_KEY, "13");
             std::env::set_var(SPAWN_LAG_MIN_BURST_KEY, "17");
             std::env::set_var(LAG_MAX_PEERS_KEY, "29");
+            std::env::set_var(LAG_ROTATE_AFTER_SEC_KEY, "77");
             std::env::set_var(OUTBOUND_BUCKET_CAP_KEY, "41");
             std::env::set_var(MAX_BACKOFF_KEY, "23");
             std::env::set_var(INITIAL_JITTER_KEY, "275");
@@ -38514,6 +38775,7 @@ mod tests {
         assert_eq!(super::relay_outbound_spawn_lag_threshold(), 13);
         assert_eq!(super::relay_outbound_spawn_lag_min_burst(), 17);
         assert_eq!(super::relay_outbound_lag_max_peers(), 29);
+        assert_eq!(super::relay_outbound_lag_rotate_after_sec(), 77);
         assert_eq!(super::relay_outbound_bucket_cap(11), 41);
         assert_eq!(super::relay_outbound_max_backoff_sec(), 23);
         assert_eq!(super::relay_outbound_initial_jitter_ms(), 275);
