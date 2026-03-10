@@ -8305,14 +8305,11 @@ fn load_relay_outbound_targets_selected(
         );
         [0u8; 32]
     });
-    selected = apply_bucket_cap_with_secret(
-        selected_socket,
-        cfg.p2p_max_outbound_per_bucket,
-        &bucket_secret,
-    )
-    .into_iter()
-    .map(|addr| addr.to_string())
-    .collect::<Vec<_>>();
+    let outbound_bucket_cap = relay_outbound_bucket_cap(cfg.p2p_max_outbound_per_bucket);
+    selected = apply_bucket_cap_with_secret(selected_socket, outbound_bucket_cap, &bucket_secret)
+        .into_iter()
+        .map(|addr| addr.to_string())
+        .collect::<Vec<_>>();
 
     domain_candidates.sort_unstable_by(|a, b| {
         a.2.cmp(&b.2)
@@ -8339,6 +8336,13 @@ fn relay_outbound_selector_jitter(selector_identity: &str, candidate: &str) -> u
     mixed.push_str(candidate);
     let hash = scam_core::hash::hash256(mixed.as_bytes());
     (u16::from_be_bytes([hash.0[0], hash.0[1]]) % 31) as u32
+}
+
+fn relay_outbound_bucket_cap(default_cap: u32) -> u32 {
+    env_opt("SCAM_RELAY_OUTBOUND_BUCKET_CAP")
+        .and_then(|raw| raw.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default_cap.max(1))
 }
 
 fn relay_target_matches_bind(bind_addr: &str, target: &str) -> bool {
@@ -9653,7 +9657,14 @@ fn run_relay_peer_session<IO: Read + Write>(
             guard.relay.gossip.build_send_recon(peer_id)?
         };
 
-        let mut startup = vec![send_recon];
+        let mut startup = vec![
+            send_recon,
+            WireMessage::SendCmpct {
+                high_bandwidth: true,
+                version: 1,
+            },
+            WireMessage::GetAddr,
+        ];
         if matches!(mode, RelayPeerSessionMode::Outbound) || peer_is_ahead {
             let locator = {
                 let guard = state
@@ -9661,15 +9672,6 @@ fn run_relay_peer_session<IO: Read + Write>(
                     .map_err(|_| NodeError::Runtime("relay state mutex poisoned".to_owned()))?;
                 build_block_locator(guard.runtime.block_hashes())
             };
-            if matches!(mode, RelayPeerSessionMode::Outbound) {
-                startup.extend([
-                    WireMessage::SendCmpct {
-                        high_bandwidth: true,
-                        version: 1,
-                    },
-                    WireMessage::GetAddr,
-                ]);
-            }
             startup.extend([
                 WireMessage::GetHeaders {
                     locator: locator.clone(),
@@ -9951,7 +9953,14 @@ async fn run_relay_peer_session_async<S: AsyncRead + AsyncWrite + Unpin>(
             guard.relay.gossip.build_send_recon(peer_id)?
         };
 
-        let mut first_sync = vec![send_recon];
+        let mut first_sync = vec![
+            send_recon,
+            WireMessage::SendCmpct {
+                high_bandwidth: true,
+                version: 1,
+            },
+            WireMessage::GetAddr,
+        ];
         if matches!(mode, RelayPeerSessionMode::Outbound) || peer_is_ahead {
             let locator = {
                 let guard = state
@@ -9959,15 +9968,6 @@ async fn run_relay_peer_session_async<S: AsyncRead + AsyncWrite + Unpin>(
                     .map_err(|_| NodeError::Runtime("relay state mutex poisoned".to_owned()))?;
                 build_block_locator(guard.runtime.block_hashes())
             };
-            if matches!(mode, RelayPeerSessionMode::Outbound) {
-                first_sync.extend([
-                    WireMessage::SendCmpct {
-                        high_bandwidth: true,
-                        version: 1,
-                    },
-                    WireMessage::GetAddr,
-                ]);
-            }
             first_sync.extend([
                 WireMessage::GetHeaders {
                     locator: locator.clone(),
@@ -32099,6 +32099,115 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn run_relay_peer_session_inbound_startup_emits_compact_and_addr_probe() {
+        use std::os::unix::net::UnixStream;
+
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let relay = RelayAdmissionState {
+            mempool: Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip: GossipEngine::new(16).expect("gossip"),
+        };
+        let state =
+            std::sync::Arc::new(std::sync::Mutex::new(RelayServerState::new(runtime, relay)));
+        let active = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let work_dir = temp_dir("test-relay-peer-session-inbound-startup");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let runtime_db = work_dir.join("runtime.redb");
+        let mempool_db = work_dir.join("mempool.redb");
+        {
+            let guard = state.lock().expect("state");
+            persist_runtime_db(&guard.runtime, &runtime_db).expect("persist runtime");
+        }
+
+        let (mut server_stream, mut client_stream) = UnixStream::pair().expect("unix pair");
+        client_stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("client timeout");
+
+        let server = thread::spawn({
+            let state = state.clone();
+            let active = active.clone();
+            let stop = stop.clone();
+            let cfg = cfg.clone();
+            move || {
+                super::run_relay_peer_session(
+                    &mut server_stream,
+                    super::RelayPeerSessionMode::Inbound,
+                    53,
+                    &state,
+                    &active,
+                    &stop,
+                    &cfg,
+                    &runtime_db,
+                    &mempool_db,
+                    64,
+                    8,
+                    None,
+                    None,
+                )
+            }
+        });
+
+        let framing = FramingConfig::default();
+        let local_hello = LocalHandshake {
+            protocol_version: 1,
+            network_id: "devnet".to_owned(),
+            consensus_fingerprint: devnet_consensus_fingerprint(),
+            user_agent: "test-relay-inbound-startup-client".to_owned(),
+            start_height: 0,
+        };
+        let remote =
+            client_handshake(&mut client_stream, &framing, &local_hello).expect("client handshake");
+        assert_eq!(remote.network_id, "devnet");
+
+        let mut saw_sendcmpct = false;
+        let mut saw_getaddr = false;
+        let mut saw_getheaders = false;
+        let mut saw_getblocks = false;
+        for _ in 0..6 {
+            let msg = read_message(&mut client_stream, &framing).expect("startup message");
+            match msg {
+                WireMessage::SendCmpct {
+                    high_bandwidth: true,
+                    version: 1,
+                } => saw_sendcmpct = true,
+                WireMessage::GetAddr => saw_getaddr = true,
+                WireMessage::GetHeaders { .. } => saw_getheaders = true,
+                WireMessage::GetBlocks { .. } => saw_getblocks = true,
+                _ => {}
+            }
+            if saw_sendcmpct && saw_getaddr {
+                break;
+            }
+        }
+        assert!(
+            saw_sendcmpct && saw_getaddr,
+            "inbound startup should announce compact preference and request peer addrs"
+        );
+        assert!(
+            !saw_getheaders && !saw_getblocks,
+            "inbound startup should skip catchup probes when peer is not ahead"
+        );
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        drop(client_stream);
+        join_with_timeout(
+            server,
+            Duration::from_secs(6),
+            "relay peer session inbound startup",
+        )
+        .expect("session result");
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn run_relay_peer_session_inbound_ahead_peer_requests_headers_on_startup() {
         use std::os::unix::net::UnixStream;
 
@@ -32460,6 +32569,123 @@ mod tests {
             assert!(
                 saw_pong2,
                 "async outbound session must keep responding after timeout"
+            );
+
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            drop(remote_stream);
+            tokio::time::timeout(Duration::from_secs(8), session)
+                .await
+                .expect("async session join timeout")
+                .expect("async session task")
+                .expect("async session result");
+        });
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
+    fn run_relay_peer_session_async_inbound_startup_emits_compact_and_addr_probe() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let relay = RelayAdmissionState {
+            mempool: Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip: GossipEngine::new(16).expect("gossip"),
+        };
+        let state =
+            std::sync::Arc::new(std::sync::Mutex::new(RelayServerState::new(runtime, relay)));
+        let active = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let work_dir = temp_dir("test-relay-peer-session-async-inbound-startup");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let runtime_db = work_dir.join("runtime.redb");
+        let mempool_db = work_dir.join("mempool.redb");
+        {
+            let guard = state.lock().expect("state");
+            persist_runtime_db(&guard.runtime, &runtime_db).expect("persist runtime");
+        }
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        rt.block_on(async {
+            let (mut remote_stream, mut session_stream) = tokio::io::duplex(64 * 1024);
+            let session = tokio::spawn({
+                let state = state.clone();
+                let active = active.clone();
+                let stop = stop.clone();
+                let cfg = cfg.clone();
+                async move {
+                    super::run_relay_peer_session_async(
+                        &mut session_stream,
+                        super::RelayPeerSessionMode::Inbound,
+                        88,
+                        &state,
+                        &active,
+                        &stop,
+                        &cfg,
+                        &runtime_db,
+                        &mempool_db,
+                        64,
+                        8,
+                        1,
+                        1,
+                        None,
+                        None,
+                    )
+                    .await
+                }
+            });
+
+            let framing = FramingConfig::default();
+            let local_hello = LocalHandshake {
+                protocol_version: 1,
+                network_id: "devnet".to_owned(),
+                consensus_fingerprint: devnet_consensus_fingerprint(),
+                user_agent: "relay-async-inbound-startup-client".to_owned(),
+                start_height: 0,
+            };
+            let remote = client_handshake_async(&mut remote_stream, &framing, &local_hello)
+                .await
+                .expect("client handshake async");
+            assert_eq!(remote.network_id, "devnet");
+
+            let mut saw_sendcmpct = false;
+            let mut saw_getaddr = false;
+            let mut saw_getheaders = false;
+            let mut saw_getblocks = false;
+            for _ in 0..6 {
+                let msg = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    read_message_async(&mut remote_stream, &framing),
+                )
+                .await
+                .expect("startup message timeout")
+                .expect("startup message");
+                match msg {
+                    WireMessage::SendCmpct {
+                        high_bandwidth: true,
+                        version: 1,
+                    } => saw_sendcmpct = true,
+                    WireMessage::GetAddr => saw_getaddr = true,
+                    WireMessage::GetHeaders { .. } => saw_getheaders = true,
+                    WireMessage::GetBlocks { .. } => saw_getblocks = true,
+                    _ => {}
+                }
+                if saw_sendcmpct && saw_getaddr {
+                    break;
+                }
+            }
+            assert!(
+                saw_sendcmpct && saw_getaddr,
+                "async inbound startup should announce compact preference and request peer addrs"
+            );
+            assert!(
+                !saw_getheaders && !saw_getblocks,
+                "async inbound startup should skip catchup probes when peer is not ahead"
             );
 
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -38027,6 +38253,7 @@ mod tests {
         const SPAWN_LAG_THRESHOLD_KEY: &str = "SCAM_RELAY_OUTBOUND_SPAWN_LAG_THRESHOLD";
         const SPAWN_LAG_MIN_BURST_KEY: &str = "SCAM_RELAY_OUTBOUND_SPAWN_LAG_MIN_BURST";
         const LAG_MAX_PEERS_KEY: &str = "SCAM_RELAY_OUTBOUND_LAG_MAX_PEERS";
+        const OUTBOUND_BUCKET_CAP_KEY: &str = "SCAM_RELAY_OUTBOUND_BUCKET_CAP";
         const MAX_BACKOFF_KEY: &str = "SCAM_RELAY_OUTBOUND_MAX_BACKOFF_SEC";
         const INITIAL_JITTER_KEY: &str = "SCAM_RELAY_OUTBOUND_INITIAL_JITTER_MS";
         const HEADERS_CATCHUP_KEY: &str = "SCAM_RELAY_HEADERS_CATCHUP_INTERVAL_SEC";
@@ -38049,6 +38276,7 @@ mod tests {
             SPAWN_LAG_THRESHOLD_KEY,
             SPAWN_LAG_MIN_BURST_KEY,
             LAG_MAX_PEERS_KEY,
+            OUTBOUND_BUCKET_CAP_KEY,
             MAX_BACKOFF_KEY,
             INITIAL_JITTER_KEY,
             HEADERS_CATCHUP_KEY,
@@ -38098,6 +38326,11 @@ mod tests {
         assert_eq!(
             super::relay_outbound_lag_max_peers(),
             super::RELAY_OUTBOUND_LAG_MAX_PEERS
+        );
+        assert_eq!(
+            super::relay_outbound_bucket_cap(7),
+            7,
+            "bucket cap should default to config value"
         );
         assert_eq!(
             super::relay_outbound_max_backoff_sec(),
@@ -38163,6 +38396,7 @@ mod tests {
             std::env::set_var(SPAWN_LAG_THRESHOLD_KEY, "0");
             std::env::set_var(SPAWN_LAG_MIN_BURST_KEY, "999999");
             std::env::set_var(LAG_MAX_PEERS_KEY, "999999");
+            std::env::set_var(OUTBOUND_BUCKET_CAP_KEY, "0");
             std::env::set_var(MAX_BACKOFF_KEY, "0");
             std::env::set_var(INITIAL_JITTER_KEY, "999999999");
             std::env::set_var(HEADERS_CATCHUP_KEY, "0");
@@ -38194,6 +38428,7 @@ mod tests {
         );
         assert_eq!(super::relay_outbound_spawn_lag_min_burst(), 256);
         assert_eq!(super::relay_outbound_lag_max_peers(), 512);
+        assert_eq!(super::relay_outbound_bucket_cap(9), 9);
         assert_eq!(
             super::relay_outbound_max_backoff_sec(),
             super::RELAY_OUTBOUND_MAX_BACKOFF_SEC
@@ -38256,6 +38491,7 @@ mod tests {
             std::env::set_var(SPAWN_LAG_THRESHOLD_KEY, "13");
             std::env::set_var(SPAWN_LAG_MIN_BURST_KEY, "17");
             std::env::set_var(LAG_MAX_PEERS_KEY, "29");
+            std::env::set_var(OUTBOUND_BUCKET_CAP_KEY, "41");
             std::env::set_var(MAX_BACKOFF_KEY, "23");
             std::env::set_var(INITIAL_JITTER_KEY, "275");
             std::env::set_var(HEADERS_CATCHUP_KEY, "3");
@@ -38278,6 +38514,7 @@ mod tests {
         assert_eq!(super::relay_outbound_spawn_lag_threshold(), 13);
         assert_eq!(super::relay_outbound_spawn_lag_min_burst(), 17);
         assert_eq!(super::relay_outbound_lag_max_peers(), 29);
+        assert_eq!(super::relay_outbound_bucket_cap(11), 41);
         assert_eq!(super::relay_outbound_max_backoff_sec(), 23);
         assert_eq!(super::relay_outbound_initial_jitter_ms(), 275);
         assert_eq!(super::relay_headers_catchup_interval_sec(), 3);
