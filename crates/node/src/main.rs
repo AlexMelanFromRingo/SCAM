@@ -5429,6 +5429,7 @@ const RELAY_BLOCKS_AGGRESSIVE_INTERVAL_SEC: u64 = 1;
 const RELAY_PEER_TIP_STALE_SEC: u64 = 60;
 const RELAY_DISCOVERY_REFRESH_SEC: u64 = 30;
 const RELAY_DISCOVERY_REFRESH_JITTER_SEC: u64 = 5;
+const RELAY_SESSION_DB_REFRESH_INTERVAL_SEC: u64 = 1;
 const RELAY_ASYNC_READ_POLL_INTERVAL_MS: u64 = 250;
 
 static RELAY_TX_DIFFUSION_BASE_MS: AtomicU64 = AtomicU64::new(0);
@@ -7238,6 +7239,57 @@ fn relay_sort_targets_by_known_tip(
     targets
 }
 
+fn relay_known_ahead_targets(
+    state: &RelayServerState,
+    candidates: &[String],
+    now_unix_sec: u64,
+    limit: usize,
+) -> Vec<String> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let local_tip = state.runtime.tip_height();
+    let stale_after_sec = relay_peer_tip_stale_after_sec();
+    let allowed = candidates.iter().cloned().collect::<HashSet<_>>();
+    if allowed.is_empty() {
+        return Vec::new();
+    }
+    let mut ranked = state
+        .peer_tip_by_address
+        .iter()
+        .filter_map(|(address, tip)| {
+            if !allowed.contains(address) {
+                return None;
+            }
+            let last = state
+                .peer_tip_last_update_by_address
+                .get(address)
+                .copied()
+                .unwrap_or(0);
+            if now_unix_sec.saturating_sub(last) > stale_after_sec {
+                return None;
+            }
+            (*tip > local_tip).then_some((address.clone(), *tip))
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    ranked.truncate(limit);
+    ranked.into_iter().map(|(address, _)| address).collect()
+}
+
+fn relay_prioritize_outbound_targets(
+    state: &RelayServerState,
+    anchor_targets: Vec<String>,
+    selected_targets: Vec<String>,
+    max_outbound_peers: usize,
+    now_unix_sec: u64,
+) -> Vec<String> {
+    let merged = merge_outbound_targets(anchor_targets, selected_targets, max_outbound_peers);
+    let ahead = relay_known_ahead_targets(state, &merged, now_unix_sec, max_outbound_peers);
+    let merged = merge_outbound_targets(ahead, merged, max_outbound_peers);
+    relay_sort_targets_by_known_tip(state, merged, now_unix_sec)
+}
+
 fn relay_parent_request_cache_cleanup(state: &mut RelayServerState, now_unix_sec: u64) {
     state.pending_parent_tx_requests.retain(|_, requested_at| {
         now_unix_sec.saturating_sub(*requested_at) < RELAY_PARENT_REQUEST_TTL_SEC
@@ -8632,6 +8684,9 @@ fn run_relay_outbound_supervisor(
     let base_spawn_burst = relay_outbound_spawn_burst();
     let mut workers = HashMap::<String, thread::JoinHandle<()>>::new();
     let mut worker_started_unix_sec = HashMap::<String, u64>::new();
+    let anchor_store = peer_reputation_store
+        .as_ref()
+        .map(PeerAnchorStore::from_reputation_store);
 
     loop {
         if stop_flag.load(Ordering::Relaxed) {
@@ -8652,51 +8707,64 @@ fn run_relay_outbound_supervisor(
             worker_started_unix_sec.remove(&target);
         }
 
+        let now_unix_sec = current_unix_sec().unwrap_or(0);
+        let (effective_max_outbound_peers, effective_spawn_burst, effective_rotate_after_sec) =
+            match state.lock() {
+                Ok(guard) => {
+                    let effective_max_outbound_peers = relay_outbound_effective_max_peers(
+                        &guard,
+                        configured_max_outbound_peers,
+                        now_unix_sec,
+                    );
+                    let effective_spawn_burst = relay_outbound_effective_spawn_burst(
+                        &guard,
+                        base_spawn_burst,
+                        effective_max_outbound_peers,
+                        now_unix_sec,
+                    );
+                    let effective_rotate_after_sec = relay_outbound_effective_rotate_after_sec(
+                        &guard,
+                        rotate_after_sec,
+                        now_unix_sec,
+                    );
+                    (
+                        effective_max_outbound_peers,
+                        effective_spawn_burst,
+                        effective_rotate_after_sec,
+                    )
+                }
+                Err(_) => (
+                    configured_max_outbound_peers.max(1),
+                    base_spawn_burst
+                        .max(1)
+                        .min(configured_max_outbound_peers.max(1)),
+                    rotate_after_sec.max(1),
+                ),
+            };
         match load_relay_outbound_targets_selected(
             &peers_dir,
             &cfg,
-            configured_max_outbound_peers,
-            rotate_after_sec,
+            effective_max_outbound_peers,
+            effective_rotate_after_sec,
             &bind_addr,
         ) {
-            Ok(targets) => {
-                let now_unix_sec = current_unix_sec().unwrap_or(0);
-                let (
-                    effective_max_outbound_peers,
-                    effective_spawn_burst,
-                    effective_rotate_after_sec,
-                ) = match state.lock() {
-                    Ok(guard) => {
-                        let effective_max_outbound_peers = relay_outbound_effective_max_peers(
-                            &guard,
-                            configured_max_outbound_peers,
-                            now_unix_sec,
-                        );
-                        let effective_spawn_burst = relay_outbound_effective_spawn_burst(
-                            &guard,
-                            base_spawn_burst,
-                            effective_max_outbound_peers,
-                            now_unix_sec,
-                        );
-                        let effective_rotate_after_sec = relay_outbound_effective_rotate_after_sec(
-                            &guard,
-                            rotate_after_sec,
-                            now_unix_sec,
-                        );
-                        (
-                            effective_max_outbound_peers,
-                            effective_spawn_burst,
-                            effective_rotate_after_sec,
-                        )
+            Ok(selected_targets) => {
+                let anchor_targets = match anchor_store.as_ref() {
+                    Some(store) => {
+                        match load_peer_anchor_targets(store, RELAY_OUTBOUND_ANCHOR_TARGETS) {
+                            Ok(anchors) => anchors,
+                            Err(err) => {
+                                eprintln!(
+                                    "warning: outbound relay anchor load failed ({}): {err}",
+                                    store.path.display()
+                                );
+                                Vec::new()
+                            }
+                        }
                     }
-                    Err(_) => (
-                        configured_max_outbound_peers.max(1),
-                        base_spawn_burst
-                            .max(1)
-                            .min(configured_max_outbound_peers.max(1)),
-                        rotate_after_sec.max(1),
-                    ),
+                    None => Vec::new(),
                 };
+                let now_unix_sec = current_unix_sec().unwrap_or(0);
                 if let Some((stale_target, _)) = worker_started_unix_sec
                     .iter()
                     .find(|(_, started_at)| {
@@ -8718,8 +8786,18 @@ fn run_relay_outbound_supervisor(
                     worker_started_unix_sec.remove(&stale_target);
                 }
                 let targets = match state.lock() {
-                    Ok(guard) => relay_sort_targets_by_known_tip(&guard, targets, now_unix_sec),
-                    Err(_) => targets,
+                    Ok(guard) => relay_prioritize_outbound_targets(
+                        &guard,
+                        anchor_targets,
+                        selected_targets,
+                        effective_max_outbound_peers,
+                        now_unix_sec,
+                    ),
+                    Err(_) => merge_outbound_targets(
+                        anchor_targets,
+                        selected_targets,
+                        effective_max_outbound_peers,
+                    ),
                 };
                 let mut spawned_this_round = 0usize;
                 for target in targets {
@@ -9270,6 +9348,11 @@ fn relay_discovery_refresh_jitter_sec() -> u64 {
         .min(300)
 }
 
+fn relay_session_db_refresh_interval_sec() -> u64 {
+    env_nonzero_u64("SCAM_RELAY_SESSION_DB_REFRESH_INTERVAL_SEC")
+        .unwrap_or(RELAY_SESSION_DB_REFRESH_INTERVAL_SEC)
+}
+
 fn relay_discovery_refresh_due(
     now_unix_sec: u64,
     last_discovery_request_unix_sec: u64,
@@ -9580,7 +9663,7 @@ async fn run_relay_outbound_supervisor_async(
             &peers_dir,
             &cfg,
             effective_max_outbound_peers,
-            rotate_after_sec,
+            effective_rotate_after_sec,
             &bind_addr,
         ) {
             Ok(targets) => targets,
@@ -9612,7 +9695,13 @@ async fn run_relay_outbound_supervisor_async(
             effective_max_outbound_peers,
         );
         let targets = match state.lock() {
-            Ok(guard) => relay_sort_targets_by_known_tip(&guard, targets, now_unix_sec),
+            Ok(guard) => relay_prioritize_outbound_targets(
+                &guard,
+                Vec::new(),
+                targets,
+                effective_max_outbound_peers,
+                now_unix_sec,
+            ),
             Err(_) => targets,
         };
         if let Some((stale_target, _)) = worker_started_unix_sec
@@ -9857,6 +9946,8 @@ fn run_relay_peer_session<IO: Read + Write>(
         let mut announced_txids = HashSet::<Hash256>::new();
         let mut timeout_streak = 0u32;
         let mut last_discovery_request_unix_sec = current_unix_sec().unwrap_or(0);
+        let refresh_interval_sec = relay_session_db_refresh_interval_sec();
+        let mut last_db_refresh_unix_sec = 0u64;
         loop {
             if stop_flag.load(Ordering::Relaxed) {
                 break;
@@ -9869,19 +9960,23 @@ fn run_relay_peer_session<IO: Read + Write>(
                 let mut guard = state
                     .lock()
                     .map_err(|_| NodeError::Runtime("relay state mutex poisoned".to_owned()))?;
-                let _ = refresh_relay_runtime_from_db_if_changed(
-                    cfg,
-                    &mut guard,
-                    runtime_db_path,
-                    &mut runtime_db_seen_mtime,
-                    now_for_periodic,
-                )?;
-                refresh_mempool_from_db_if_changed(
-                    cfg,
-                    &mut guard.relay,
-                    mempool_db_path,
-                    &mut mempool_db_seen_mtime,
-                )?;
+                if now_for_periodic.saturating_sub(last_db_refresh_unix_sec) >= refresh_interval_sec
+                {
+                    let _ = refresh_relay_runtime_from_db_if_changed(
+                        cfg,
+                        &mut guard,
+                        runtime_db_path,
+                        &mut runtime_db_seen_mtime,
+                        now_for_periodic,
+                    )?;
+                    refresh_mempool_from_db_if_changed(
+                        cfg,
+                        &mut guard.relay,
+                        mempool_db_path,
+                        &mut mempool_db_seen_mtime,
+                    )?;
+                    last_db_refresh_unix_sec = now_for_periodic;
+                }
                 let mut periodic = relay_proactive_inventory_messages(
                     &guard,
                     &mut last_tip_announced,
@@ -10166,6 +10261,8 @@ async fn run_relay_peer_session_async<S: AsyncRead + AsyncWrite + Unpin>(
         let timeout_streak_limit =
             relay_async_timeout_streak_limit(read_timeout_sec, read_poll_interval_ms);
         let mut last_discovery_request_unix_sec = current_unix_sec().unwrap_or(0);
+        let refresh_interval_sec = relay_session_db_refresh_interval_sec();
+        let mut last_db_refresh_unix_sec = 0u64;
         loop {
             if stop_flag.load(Ordering::Relaxed) {
                 break;
@@ -10178,19 +10275,23 @@ async fn run_relay_peer_session_async<S: AsyncRead + AsyncWrite + Unpin>(
                 let mut guard = state
                     .lock()
                     .map_err(|_| NodeError::Runtime("relay state mutex poisoned".to_owned()))?;
-                let _ = refresh_relay_runtime_from_db_if_changed(
-                    cfg,
-                    &mut guard,
-                    runtime_db_path,
-                    &mut runtime_db_seen_mtime,
-                    now_for_periodic,
-                )?;
-                refresh_mempool_from_db_if_changed(
-                    cfg,
-                    &mut guard.relay,
-                    mempool_db_path,
-                    &mut mempool_db_seen_mtime,
-                )?;
+                if now_for_periodic.saturating_sub(last_db_refresh_unix_sec) >= refresh_interval_sec
+                {
+                    let _ = refresh_relay_runtime_from_db_if_changed(
+                        cfg,
+                        &mut guard,
+                        runtime_db_path,
+                        &mut runtime_db_seen_mtime,
+                        now_for_periodic,
+                    )?;
+                    refresh_mempool_from_db_if_changed(
+                        cfg,
+                        &mut guard.relay,
+                        mempool_db_path,
+                        &mut mempool_db_seen_mtime,
+                    )?;
+                    last_db_refresh_unix_sec = now_for_periodic;
+                }
                 let mut periodic = relay_proactive_inventory_messages(
                     &guard,
                     &mut last_tip_announced,
@@ -31951,6 +32052,103 @@ mod tests {
     }
 
     #[test]
+    fn relay_known_ahead_targets_returns_only_fresh_addresses_ahead_of_local_tip() {
+        let mut state = relay_state_for_tests();
+        let now_unix_sec = 8_500u64;
+        let stale_after_sec = super::relay_peer_tip_stale_after_sec();
+        let local_tip = state.runtime.tip_height();
+
+        state
+            .peer_tip_by_address
+            .insert("127.0.0.1:3011".to_owned(), local_tip.saturating_add(3));
+        state
+            .peer_tip_last_update_by_address
+            .insert("127.0.0.1:3011".to_owned(), now_unix_sec);
+
+        state
+            .peer_tip_by_address
+            .insert("127.0.0.1:3012".to_owned(), local_tip.saturating_add(9));
+        state.peer_tip_last_update_by_address.insert(
+            "127.0.0.1:3012".to_owned(),
+            now_unix_sec
+                .saturating_sub(stale_after_sec)
+                .saturating_sub(1),
+        );
+
+        state
+            .peer_tip_by_address
+            .insert("127.0.0.1:3013".to_owned(), local_tip.saturating_add(5));
+        state
+            .peer_tip_last_update_by_address
+            .insert("127.0.0.1:3013".to_owned(), now_unix_sec);
+
+        state
+            .peer_tip_by_address
+            .insert("127.0.0.1:3014".to_owned(), local_tip);
+        state
+            .peer_tip_last_update_by_address
+            .insert("127.0.0.1:3014".to_owned(), now_unix_sec);
+
+        state
+            .peer_tip_by_address
+            .insert("127.0.0.1:3015".to_owned(), local_tip.saturating_add(50));
+        state
+            .peer_tip_last_update_by_address
+            .insert("127.0.0.1:3015".to_owned(), now_unix_sec);
+
+        let ahead = super::relay_known_ahead_targets(
+            &state,
+            &[
+                "127.0.0.1:3011".to_owned(),
+                "127.0.0.1:3012".to_owned(),
+                "127.0.0.1:3013".to_owned(),
+                "127.0.0.1:3014".to_owned(),
+                "127.0.0.1:3999".to_owned(),
+            ],
+            now_unix_sec,
+            8,
+        );
+        assert_eq!(
+            ahead,
+            vec!["127.0.0.1:3013", "127.0.0.1:3011"],
+            "must include only fresh peers that are ahead within candidate set, ordered by tip desc"
+        );
+    }
+
+    #[test]
+    fn relay_prioritize_outbound_targets_promotes_known_ahead_peers() {
+        let mut state = relay_state_for_tests();
+        let now_unix_sec = 9_100u64;
+        let local_tip = state.runtime.tip_height();
+
+        state
+            .peer_tip_by_address
+            .insert("127.0.0.1:3020".to_owned(), local_tip.saturating_add(7));
+        state
+            .peer_tip_last_update_by_address
+            .insert("127.0.0.1:3020".to_owned(), now_unix_sec);
+
+        let targets = super::relay_prioritize_outbound_targets(
+            &state,
+            vec!["127.0.0.1:3001".to_owned()],
+            vec!["127.0.0.1:3002".to_owned(), "127.0.0.1:3020".to_owned()],
+            4,
+            now_unix_sec,
+        );
+
+        assert_eq!(
+            targets.first().map(String::as_str),
+            Some("127.0.0.1:3020"),
+            "ahead peer should be prioritized for outbound dials"
+        );
+        assert!(
+            targets.contains(&"127.0.0.1:3001".to_owned())
+                && targets.contains(&"127.0.0.1:3002".to_owned()),
+            "existing anchor/selected targets must be preserved after prioritization"
+        );
+    }
+
+    #[test]
     fn run_relay_outbound_worker_async_marks_start_counter() {
         let cfg: ChainConfig =
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
@@ -38515,6 +38713,7 @@ mod tests {
         const BLOCKS_AGGR_INTERVAL_KEY: &str = "SCAM_RELAY_BLOCKS_AGGRESSIVE_INTERVAL_SEC";
         const DISCOVERY_REFRESH_KEY: &str = "SCAM_RELAY_DISCOVERY_REFRESH_SEC";
         const DISCOVERY_REFRESH_JITTER_KEY: &str = "SCAM_RELAY_DISCOVERY_REFRESH_JITTER_SEC";
+        const SESSION_DB_REFRESH_KEY: &str = "SCAM_RELAY_SESSION_DB_REFRESH_INTERVAL_SEC";
         const INBOUND_WINDOW_KEY: &str = "SCAM_RELAY_INBOUND_ACCEPT_WINDOW_SEC";
         const INBOUND_MAX_PER_IP_KEY: &str = "SCAM_RELAY_INBOUND_ACCEPT_MAX_PER_IP";
         const INBOUND_LOOPBACK_MULT_KEY: &str = "SCAM_RELAY_INBOUND_ACCEPT_LOOPBACK_MULTIPLIER";
@@ -38539,6 +38738,7 @@ mod tests {
             BLOCKS_AGGR_INTERVAL_KEY,
             DISCOVERY_REFRESH_KEY,
             DISCOVERY_REFRESH_JITTER_KEY,
+            SESSION_DB_REFRESH_KEY,
             INBOUND_WINDOW_KEY,
             INBOUND_MAX_PER_IP_KEY,
             INBOUND_LOOPBACK_MULT_KEY,
@@ -38632,6 +38832,10 @@ mod tests {
             super::RELAY_DISCOVERY_REFRESH_JITTER_SEC
         );
         assert_eq!(
+            super::relay_session_db_refresh_interval_sec(),
+            super::RELAY_SESSION_DB_REFRESH_INTERVAL_SEC
+        );
+        assert_eq!(
             super::relay_inbound_accept_window_sec(),
             super::RELAY_INBOUND_ACCEPT_WINDOW_SEC
         );
@@ -38664,6 +38868,7 @@ mod tests {
             std::env::set_var(BLOCKS_AGGR_INTERVAL_KEY, "0");
             std::env::set_var(DISCOVERY_REFRESH_KEY, "0");
             std::env::set_var(DISCOVERY_REFRESH_JITTER_KEY, "999999");
+            std::env::set_var(SESSION_DB_REFRESH_KEY, "0");
             std::env::set_var(INBOUND_WINDOW_KEY, "0");
             std::env::set_var(INBOUND_MAX_PER_IP_KEY, "0");
             std::env::set_var(INBOUND_LOOPBACK_MULT_KEY, "0");
@@ -38728,6 +38933,10 @@ mod tests {
         );
         assert_eq!(super::relay_discovery_refresh_jitter_sec(), 300);
         assert_eq!(
+            super::relay_session_db_refresh_interval_sec(),
+            super::RELAY_SESSION_DB_REFRESH_INTERVAL_SEC
+        );
+        assert_eq!(
             super::relay_inbound_accept_window_sec(),
             super::RELAY_INBOUND_ACCEPT_WINDOW_SEC
         );
@@ -38764,6 +38973,7 @@ mod tests {
             std::env::set_var(BLOCKS_AGGR_INTERVAL_KEY, "3");
             std::env::set_var(DISCOVERY_REFRESH_KEY, "11");
             std::env::set_var(DISCOVERY_REFRESH_JITTER_KEY, "3");
+            std::env::set_var(SESSION_DB_REFRESH_KEY, "2");
             std::env::set_var(INBOUND_WINDOW_KEY, "7");
             std::env::set_var(INBOUND_MAX_PER_IP_KEY, "13");
             std::env::set_var(INBOUND_LOOPBACK_MULT_KEY, "5");
@@ -38788,6 +38998,7 @@ mod tests {
         assert_eq!(super::relay_blocks_aggressive_interval_sec(), 3);
         assert_eq!(super::relay_discovery_refresh_sec(), 11);
         assert_eq!(super::relay_discovery_refresh_jitter_sec(), 3);
+        assert_eq!(super::relay_session_db_refresh_interval_sec(), 2);
         assert_eq!(super::relay_inbound_accept_window_sec(), 7);
         assert_eq!(super::relay_inbound_accept_base_max_per_ip(8), 13);
         assert_eq!(super::relay_inbound_accept_loopback_multiplier(), 5);
