@@ -20,8 +20,9 @@ set -euo pipefail
 #   RELAY_OUTBOUND_SPAWN_LAG_THRESHOLD=4
 #   RELAY_OUTBOUND_SPAWN_LAG_MIN_BURST=8
 #   RELAY_OUTBOUND_LAG_MAX_PEERS=24
+#   RELAY_OUTBOUND_BUCKET_CAP=64
 #   RELAY_OUTBOUND_INITIAL_JITTER_MS=12000
-#   RELAY_TOKIO_WORKER_THREADS=4
+#   RELAY_TOKIO_WORKER_THREADS=1  # auto: 1 when NODE_COUNT>=20, else 4
 #   P2P_READ_TIMEOUT_SEC=10
 #   P2P_WRITE_TIMEOUT_SEC=10
 #   RELAY_HANDSHAKE_TIMEOUT_SEC=90
@@ -32,6 +33,7 @@ set -euo pipefail
 #   DURATION_SEC=600
 #   INTERVAL_SEC=15
 #   HTTP_TIMEOUT_SEC=5.0
+#   SAMPLE_MODE=telemetry          # telemetry|status
 #   KEEP_RUNNING=false
 #   CLEAN_CLUSTER_DIR=true
 #   BUILD=false
@@ -51,8 +53,15 @@ RELAY_OUTBOUND_SPAWN_BURST="${RELAY_OUTBOUND_SPAWN_BURST:-2}"
 RELAY_OUTBOUND_SPAWN_LAG_THRESHOLD="${RELAY_OUTBOUND_SPAWN_LAG_THRESHOLD:-4}"
 RELAY_OUTBOUND_SPAWN_LAG_MIN_BURST="${RELAY_OUTBOUND_SPAWN_LAG_MIN_BURST:-8}"
 RELAY_OUTBOUND_LAG_MAX_PEERS="${RELAY_OUTBOUND_LAG_MAX_PEERS:-24}"
+RELAY_OUTBOUND_BUCKET_CAP="${RELAY_OUTBOUND_BUCKET_CAP:-64}"
 RELAY_OUTBOUND_INITIAL_JITTER_MS="${RELAY_OUTBOUND_INITIAL_JITTER_MS:-12000}"
-RELAY_TOKIO_WORKER_THREADS="${RELAY_TOKIO_WORKER_THREADS:-4}"
+if [[ -z "${RELAY_TOKIO_WORKER_THREADS:-}" ]]; then
+  if (( NODE_COUNT >= 20 )); then
+    RELAY_TOKIO_WORKER_THREADS=1
+  else
+    RELAY_TOKIO_WORKER_THREADS=4
+  fi
+fi
 P2P_READ_TIMEOUT_SEC="${P2P_READ_TIMEOUT_SEC:-10}"
 P2P_WRITE_TIMEOUT_SEC="${P2P_WRITE_TIMEOUT_SEC:-10}"
 RELAY_HANDSHAKE_TIMEOUT_SEC="${RELAY_HANDSHAKE_TIMEOUT_SEC:-90}"
@@ -63,6 +72,7 @@ MINER_B_ADDRESS="${MINER_B_ADDRESS:-}"
 DURATION_SEC="${DURATION_SEC:-600}"
 INTERVAL_SEC="${INTERVAL_SEC:-15}"
 HTTP_TIMEOUT_SEC="${HTTP_TIMEOUT_SEC:-5.0}"
+SAMPLE_MODE="${SAMPLE_MODE:-telemetry}"
 KEEP_RUNNING="${KEEP_RUNNING:-false}"
 CLEAN_CLUSTER_DIR="${CLEAN_CLUSTER_DIR:-true}"
 BUILD="${BUILD:-false}"
@@ -150,6 +160,7 @@ RELAY_OUTBOUND_SPAWN_BURST="${RELAY_OUTBOUND_SPAWN_BURST}" \
 RELAY_OUTBOUND_SPAWN_LAG_THRESHOLD="${RELAY_OUTBOUND_SPAWN_LAG_THRESHOLD}" \
 RELAY_OUTBOUND_SPAWN_LAG_MIN_BURST="${RELAY_OUTBOUND_SPAWN_LAG_MIN_BURST}" \
 RELAY_OUTBOUND_LAG_MAX_PEERS="${RELAY_OUTBOUND_LAG_MAX_PEERS}" \
+RELAY_OUTBOUND_BUCKET_CAP="${RELAY_OUTBOUND_BUCKET_CAP}" \
 RELAY_OUTBOUND_INITIAL_JITTER_MS="${RELAY_OUTBOUND_INITIAL_JITTER_MS}" \
 RELAY_TOKIO_WORKER_THREADS="${RELAY_TOKIO_WORKER_THREADS}" \
 P2P_READ_TIMEOUT_SEC="${P2P_READ_TIMEOUT_SEC}" \
@@ -174,43 +185,110 @@ fi
 echo "[sample] sampling sync spread for ${DURATION_SEC}s (interval=${INTERVAL_SEC}s)"
 python3 -u - <<PY | tee "${SUMMARY_FILE}"
 import json
+import os
 import statistics
 import time
 import urllib.request
 import concurrent.futures
+from collections import Counter
+from pathlib import Path
 
 BASE = int(${BASE_RPC_PORT})
 COUNT = int(${NODE_COUNT})
 DURATION = int(${DURATION_SEC})
 INTERVAL = int(${INTERVAL_SEC})
 TIMEOUT = float(${HTTP_TIMEOUT_SEC})
+SAMPLE_MODE = "${SAMPLE_MODE}".strip().lower()
+CLUSTER_DIR = Path("${CLUSTER_DIR}")
 # Keep sampler pressure below RPC server fan-out to avoid skewing "bad" with probe overload.
-MAX_WORKERS = min(32, max(8, (COUNT + 3) // 4))
+MAX_WORKERS = min(16, max(6, (COUNT + 7) // 8))
 
 
-def fetch(port: int):
+def parse_work(raw):
+    if raw is None:
+        return 0
+    text = str(raw).strip().lower()
+    if not text:
+        return 0
+    if text.startswith("0x"):
+        return int(text, 16)
+    if all(ch in "0123456789abcdef" for ch in text):
+        return int(text, 16)
+    return int(text)
+
+
+def fetch_status(port: int):
     try:
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/status", timeout=TIMEOUT) as resp:
-            return int(json.load(resp).get("tip_height", 0))
+            payload = json.load(resp)
+            return (
+                int(payload.get("tip_height", 0)),
+                parse_work(payload.get("cumulative_work", 0)),
+                str(payload.get("tip_hash", "")),
+            )
     except Exception:
         return None
+
+
+def fetch_telemetry(node_idx: int):
+    path = CLUSTER_DIR / f"node-{node_idx:02d}" / "relay.telemetry.jsonl"
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            if size == 0:
+                return None
+            offset = min(size, 65536)
+            handle.seek(-offset, os.SEEK_END)
+            chunk = handle.read().decode("utf-8", errors="ignore")
+        lines = [line.strip() for line in chunk.splitlines() if line.strip()]
+        for line in reversed(lines):
+            try:
+                payload = json.loads(line)
+            except Exception:
+                continue
+            if "tip_height" in payload:
+                return (
+                    int(payload.get("tip_height", 0)),
+                    parse_work(payload.get("cumulative_work", 0)),
+                    str(payload.get("tip_hash", "")),
+                )
+    except Exception:
+        return None
+    return None
+
+
+def fetch(node_idx: int):
+    if SAMPLE_MODE == "telemetry":
+        return fetch_telemetry(node_idx)
+    return fetch_status(BASE + node_idx)
 
 samples = []
 start = time.time()
 rounds = max(1, DURATION // max(1, INTERVAL))
 for idx in range(rounds):
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        vals = list(ex.map(fetch, [BASE + n for n in range(COUNT)]))
-    heights = [v for v in vals if v is not None]
-    bad = COUNT - len(heights)
+        vals = list(ex.map(fetch, list(range(COUNT))))
+    rows = [v for v in vals if v is not None]
+    bad = COUNT - len(rows)
     elapsed = time.time() - start
-    if heights:
+    if rows:
+        heights = [row[0] for row in rows]
+        works = [row[1] for row in rows]
+        tips = [row[2] for row in rows if row[2]]
         lo = min(heights)
         hi = max(heights)
         spread = hi - lo
         median = statistics.median(heights)
+        work_spread = max(works) - min(works)
+        dominant_tip_count = Counter(tips).most_common(1)[0][1] if tips else 0
+        dominant_tip_ratio = dominant_tip_count / max(1, len(rows))
         samples.append((spread, bad))
-        print(f"round={idx:03d} t={elapsed:6.1f}s lo={lo:5d} hi={hi:5d} spread={spread:4d} bad={bad:3d} med={median:5.1f}")
+        print(
+            f"round={idx:03d} t={elapsed:6.1f}s lo={lo:5d} hi={hi:5d} spread={spread:4d} "
+            f"work_spread={work_spread:6d} bad={bad:3d} med={median:5.1f} "
+            f"tip_majority={dominant_tip_ratio:4.2f}"
+        )
     else:
         samples.append((None, bad))
         print(f"round={idx:03d} t={elapsed:6.1f}s no-response bad={bad:3d}")
