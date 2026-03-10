@@ -67,6 +67,7 @@
   - `final_spread <= 1`,
   - `max_spread <= 6` after warm-up window,
   - `avg_bad == 0`.
+- [ ] RC mutation gate: full non-iterative Stage 3 run (`scripts/mutation-staged.sh stage3`, `MUTATION_ITERATE=false`) with `0 missed` and `0 timeout`.
 - [x] Mutation stage2/3 rerun after live submit/realtime changes.
   - Closure (`2026-02-28`): Stage 2 iterate closure (`0 missed/timeout`), Stage 3 full workspace (`0 missed/timeout`).
 - [x] Fuzz target for relay wire parsing and tx submit route.

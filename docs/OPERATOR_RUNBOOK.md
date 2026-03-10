@@ -265,3 +265,11 @@ Proposed gate thresholds:
 - `final_spread <= 1`,
 - `max_spread <= 6` after initial warm-up window,
 - `avg_bad == 0`.
+
+Mutation release gate (for RC/mainnet candidate):
+
+- Run full Stage 3 mutation without iterate:
+  - `MUTATION_ITERATE=false scripts/mutation-staged.sh stage3`
+- Accept only:
+  - `missed = 0`,
+  - `timeout = 0`.
