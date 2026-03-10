@@ -2,8 +2,8 @@
 
 SCAM is a Rust 2024 implementation of a PoW L1 blockchain with a configurable, production-style baseline.
 
-Current repository status (2026-02-28, `RC1`):
-- Release candidate baseline is marked as `RC1`.
+Current repository status (2026-03-10, `RC3`):
+- Release candidate baseline is marked as `RC3`.
 - Full mutation closure is green on current code (`stage2` closure + full `stage3` with `0 missed`, `0 timeout`).
 - Workspace quality gates are green: `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`.
 - Remaining deferred non-code gates: long-run soak, external audit, and the maximum-detail documentation pack.
@@ -172,6 +172,19 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
+### 4.5 Release automation (GitHub Actions)
+
+- Workflow: `.github/workflows/release-build.yml`
+- Trigger:
+  - push to `master` when `Cargo.toml` workspace version changes,
+  - manual `workflow_dispatch`.
+- Output:
+  - creates/updates GitHub Release tag `v<workspace-version>`,
+  - uploads raw binaries (no archive):
+    - `scam-node-linux-x86_64`
+    - `scam-node-windows-x86_64.exe`
+    - `scam-node-macos-x86_64`
+
 ---
 
 ## 5) Configuration and Network Profiles
@@ -241,6 +254,26 @@ scripts/run-node-miner.sh start
 
 Each script supports `start|stop|status|logs`.
 `ADD_PEERS` is optional and applies only to scripts that run a node (`run-node-only.sh`, `run-node-miner.sh`).
+
+Windows launcher equivalents (same commands, `.bat` wrappers over PowerShell):
+
+```bat
+:: 1) Miner only
+set POOL_ADDR=127.0.0.1:3347
+set COINBASE_ADDRESS=sd1...
+scripts\run-miner.bat start
+
+:: 2) Node only
+set ADD_PEERS=203.0.113.10:18444,198.51.100.25:18444
+scripts\run-node-only.bat start
+
+:: 3) Node + local miner
+set ADD_PEERS=203.0.113.10:18444,198.51.100.25:18444
+set COINBASE_ADDRESS=sd1...
+scripts\run-node-miner.bat start
+```
+
+The `.bat` launchers also support `start|stop|status|logs`.
 
 For local multi-node verification:
 

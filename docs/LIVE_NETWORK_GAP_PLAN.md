@@ -63,6 +63,10 @@
 
 ## P2 (launch confidence)
 - [ ] Soak test profile for 24h: 2-5 nodes + miner + tx spam profile.
+- [ ] Mainnet-grade WAN profile run (2-6h) with synthetic latency/loss/reorder (`tc netem`) and explicit SLO gate:
+  - `final_spread <= 1`,
+  - `max_spread <= 6` after warm-up window,
+  - `avg_bad == 0`.
 - [x] Mutation stage2/3 rerun after live submit/realtime changes.
   - Closure (`2026-02-28`): Stage 2 iterate closure (`0 missed/timeout`), Stage 3 full workspace (`0 missed/timeout`).
 - [x] Fuzz target for relay wire parsing and tx submit route.

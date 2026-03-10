@@ -251,3 +251,17 @@ Escalate to `sev-1` immediately when:
 - two healthy relays disagree on best tip for `> 5m`,
 - mempool admission rejects valid signed tx across multiple peers,
 - Stratum workers cannot submit accepted shares after transport/channel setup.
+
+## 12) Pending Mainnet WAN SLO Gate
+
+Before declaring mainnet-grade readiness, run a dedicated WAN-emulation profile:
+
+- duration: `2-6h`,
+- topology: at least `50` relay nodes, `2+` active miners,
+- network shaping: latency + jitter + packet loss + reorder via `tc netem`.
+
+Proposed gate thresholds:
+
+- `final_spread <= 1`,
+- `max_spread <= 6` after initial warm-up window,
+- `avg_bad == 0`.
