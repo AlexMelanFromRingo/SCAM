@@ -1553,6 +1553,10 @@ fn default_pool_ledger_db_path(runtime_db_path: &Path) -> PathBuf {
     runtime_db_path.with_file_name("pool.ledger.redb")
 }
 
+fn default_relay_telemetry_path(runtime_db_path: &Path) -> PathBuf {
+    runtime_db_path.with_file_name("relay.telemetry.jsonl")
+}
+
 fn runtime_to_archive(runtime: &ChainRuntime) -> Result<ChainArchive, NodeError> {
     let blocks_by_height = runtime.main_chain_blocks()?;
     Ok(ChainArchive {
@@ -2164,6 +2168,11 @@ fn run_mode(args: RunModeArgs) -> Result<(), NodeError> {
         "Services: relay={} rpc={} stratum={} miner={}",
         plan.run_relay, plan.run_rpc, plan.run_stratum, plan.run_miner
     );
+    let relay_telemetry_path = default_relay_telemetry_path(&runtime_db_path);
+    let relay_telemetry_enabled = plan.run_relay || relay_telemetry_path.exists();
+    if relay_telemetry_enabled {
+        println!("Relay telemetry path: {}", relay_telemetry_path.display());
+    }
 
     let (done_tx, done_rx) = mpsc::channel::<(&'static str, Result<(), NodeError>)>();
 
@@ -2183,8 +2192,8 @@ fn run_mode(args: RunModeArgs) -> Result<(), NodeError> {
             replacement_window_sec: None,
             replacement_max_per_peer: None,
             replacement_penalty: None,
-            telemetry_out: None,
-            telemetry_every_sec: 30,
+            telemetry_out: Some(relay_telemetry_path.clone()),
+            telemetry_every_sec: 5,
             outbound_connect: args.relay_outbound_connect,
             outbound_redial_sec: args.relay_outbound_redial_sec,
         };
@@ -2199,7 +2208,11 @@ fn run_mode(args: RunModeArgs) -> Result<(), NodeError> {
             runtime_db: Some(runtime_db_path.clone()),
             bind: args.rpc_bind.clone(),
             ui_dir: args.ui_dir.clone(),
-            relay_telemetry: None,
+            relay_telemetry: if relay_telemetry_enabled {
+                Some(relay_telemetry_path.clone())
+            } else {
+                None
+            },
             stratum_telemetry: None,
             pool_ledger: Some(default_pool_ledger_db_path(&runtime_db_path)),
             mine_blocks: 0,
@@ -5344,6 +5357,8 @@ struct RelayServerState {
     peer_last_headers_request_sec: HashMap<u64, u64>,
     peer_last_blocks_request_sec: HashMap<u64, u64>,
     peer_last_non_fatal_recon_log_sec: HashMap<u64, u64>,
+    inflight_block_requests: HashMap<Hash256, InflightBlockRequest>,
+    peer_inflight_block_requests: HashMap<u64, usize>,
     known_peer_addresses: Vec<PeerAddress>,
     pending_peer_book_updates: Vec<PeerAddress>,
     outbound_worker_starts_total: u64,
@@ -5371,6 +5386,8 @@ impl RelayServerState {
             peer_last_headers_request_sec: HashMap::new(),
             peer_last_blocks_request_sec: HashMap::new(),
             peer_last_non_fatal_recon_log_sec: HashMap::new(),
+            inflight_block_requests: HashMap::new(),
+            peer_inflight_block_requests: HashMap::new(),
             known_peer_addresses: Vec::new(),
             pending_peer_book_updates: Vec::new(),
             outbound_worker_starts_total: 0,
@@ -5390,6 +5407,13 @@ struct PendingCompactBlock {
     tx_count: usize,
     transactions: Vec<Option<Transaction>>,
     missing_indexes: Vec<u32>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct InflightBlockRequest {
+    peer_id: u64,
+    requested_unix_sec: u64,
+    retries: u8,
 }
 
 const RELAY_MAX_PENDING_BLOCK_ORPHANS: usize = 512;
@@ -5419,6 +5443,8 @@ const RELAY_OUTBOUND_FEELER_INTERVAL_SEC: u64 = 60;
 const RELAY_OUTBOUND_FEELER_TIMEOUT_SEC: u64 = 3;
 const RELAY_OUTBOUND_MAX_BACKOFF_SEC: u64 = 30;
 const RELAY_OUTBOUND_INITIAL_JITTER_MS: u64 = 500;
+const RELAY_OUTBOUND_TARGET_COOLDOWN_SEC: u64 = 3;
+const RELAY_OUTBOUND_MAX_WORKERS_PER_BUCKET: usize = 2;
 const RELAY_HEADERS_CATCHUP_INTERVAL_SEC: u64 = 1;
 const RELAY_HEADERS_PROBE_INTERVAL_SEC: u64 = 5;
 const RELAY_HEADERS_INV_TRIGGER_INTERVAL_SEC: u64 = 1;
@@ -5427,6 +5453,10 @@ const RELAY_HEADERS_AGGRESSIVE_INTERVAL_SEC: u64 = 1;
 const RELAY_BLOCKS_CATCHUP_INTERVAL_SEC: u64 = 2;
 const RELAY_BLOCKS_AGGRESSIVE_INTERVAL_SEC: u64 = 1;
 const RELAY_PEER_TIP_STALE_SEC: u64 = 60;
+const RELAY_BLOCK_REQUEST_TIMEOUT_SEC: u64 = 8;
+const RELAY_BLOCK_REQUEST_MAX_RETRIES: u8 = 3;
+const RELAY_MAX_INFLIGHT_BLOCK_REQUESTS: usize = 2_048;
+const RELAY_MAX_INFLIGHT_BLOCK_REQUESTS_PER_PEER: usize = 256;
 const RELAY_DISCOVERY_REFRESH_SEC: u64 = 30;
 const RELAY_DISCOVERY_REFRESH_JITTER_SEC: u64 = 5;
 const RELAY_SESSION_DB_REFRESH_INTERVAL_SEC: u64 = 1;
@@ -5466,6 +5496,9 @@ struct RelayServerTelemetrySnapshot {
 
 const STRATUM_HASHRATE_WINDOW_SEC: u64 = 120;
 const STRATUM_TOP_WORKERS_LIMIT: usize = 32;
+const STRATUM_STALE_GUARD_MAX_LAG_BLOCKS: u64 = 4;
+const STRATUM_STALE_GUARD_MAX_SNAPSHOT_AGE_SEC: u64 = 15;
+const STRATUM_STALE_GUARD_LOG_INTERVAL_SEC: u64 = 5;
 const POOL_DEFAULT_SHARE_RETENTION: usize = 50_000;
 const POOL_DEFAULT_ROUND_RETENTION: usize = 2_000;
 
@@ -6572,6 +6605,133 @@ fn relay_forget_peer_tip_height(state: &mut RelayServerState, peer_id: u64) {
     state.peer_last_headers_request_sec.remove(&peer_id);
     state.peer_last_blocks_request_sec.remove(&peer_id);
     state.peer_last_non_fatal_recon_log_sec.remove(&peer_id);
+    relay_release_inflight_block_requests_for_peer(state, peer_id);
+}
+
+fn relay_release_inflight_block_requests_for_peer(state: &mut RelayServerState, peer_id: u64) {
+    state.peer_inflight_block_requests.remove(&peer_id);
+    let to_remove = state
+        .inflight_block_requests
+        .iter()
+        .filter_map(|(hash, req)| (req.peer_id == peer_id).then_some(*hash))
+        .collect::<Vec<_>>();
+    for hash in to_remove {
+        state.inflight_block_requests.remove(&hash);
+    }
+}
+
+fn relay_cleanup_inflight_block_requests(state: &mut RelayServerState, now_unix_sec: u64) {
+    let timeout = relay_block_request_timeout_sec().max(1);
+    let mut expired = Vec::<Hash256>::new();
+    for (hash, request) in &state.inflight_block_requests {
+        if now_unix_sec.saturating_sub(request.requested_unix_sec) >= timeout {
+            expired.push(*hash);
+        }
+    }
+    for hash in expired {
+        if let Some(request) = state.inflight_block_requests.remove(&hash)
+            && let Some(peer_count) = state.peer_inflight_block_requests.get_mut(&request.peer_id)
+        {
+            *peer_count = peer_count.saturating_sub(1);
+            if *peer_count == 0 {
+                state.peer_inflight_block_requests.remove(&request.peer_id);
+            }
+        }
+    }
+}
+
+fn relay_clear_inflight_block_request(state: &mut RelayServerState, hash: Hash256) {
+    if let Some(request) = state.inflight_block_requests.remove(&hash)
+        && let Some(peer_count) = state.peer_inflight_block_requests.get_mut(&request.peer_id)
+    {
+        *peer_count = peer_count.saturating_sub(1);
+        if *peer_count == 0 {
+            state.peer_inflight_block_requests.remove(&request.peer_id);
+        }
+    }
+}
+
+fn relay_schedule_block_getdata_for_peer(
+    state: &mut RelayServerState,
+    peer_id: u64,
+    block_hashes: &[Hash256],
+    now_unix_sec: u64,
+) -> Vec<InventoryItem> {
+    relay_cleanup_inflight_block_requests(state, now_unix_sec);
+    let global_cap = relay_max_inflight_block_requests().max(1);
+    let per_peer_cap = relay_max_inflight_block_requests_per_peer().max(1);
+    let request_timeout = relay_block_request_timeout_sec().max(1);
+    let max_retries = relay_block_request_max_retries();
+
+    let mut scheduled = Vec::<InventoryItem>::new();
+    let mut peer_count = state
+        .peer_inflight_block_requests
+        .get(&peer_id)
+        .copied()
+        .unwrap_or(0);
+
+    for hash in block_hashes {
+        if state.runtime.block_by_hash(hash).is_some() {
+            relay_clear_inflight_block_request(state, *hash);
+            continue;
+        }
+        if state.pending_block_orphans.contains_key(hash) {
+            continue;
+        }
+
+        if let Some(request) = state.inflight_block_requests.get_mut(hash) {
+            let elapsed = now_unix_sec.saturating_sub(request.requested_unix_sec);
+            if elapsed < request_timeout {
+                continue;
+            }
+            if request.retries >= max_retries {
+                continue;
+            }
+            if peer_count >= per_peer_cap {
+                break;
+            }
+            if request.peer_id != peer_id
+                && let Some(prev) = state.peer_inflight_block_requests.get_mut(&request.peer_id)
+            {
+                *prev = prev.saturating_sub(1);
+                if *prev == 0 {
+                    state.peer_inflight_block_requests.remove(&request.peer_id);
+                }
+            }
+            request.peer_id = peer_id;
+            request.requested_unix_sec = now_unix_sec;
+            request.retries = request.retries.saturating_add(1);
+            scheduled.push(InventoryItem::Block(*hash));
+            peer_count = peer_count.saturating_add(1);
+            continue;
+        }
+
+        if state.inflight_block_requests.len() >= global_cap {
+            break;
+        }
+        if peer_count >= per_peer_cap {
+            break;
+        }
+        state.inflight_block_requests.insert(
+            *hash,
+            InflightBlockRequest {
+                peer_id,
+                requested_unix_sec: now_unix_sec,
+                retries: 0,
+            },
+        );
+        scheduled.push(InventoryItem::Block(*hash));
+        peer_count = peer_count.saturating_add(1);
+    }
+
+    if peer_count == 0 {
+        state.peer_inflight_block_requests.remove(&peer_id);
+    } else {
+        state
+            .peer_inflight_block_requests
+            .insert(peer_id, peer_count);
+    }
+    scheduled
 }
 
 fn relay_peer_tip_is_fresh(state: &RelayServerState, peer_id: u64, now_unix_sec: u64) -> bool {
@@ -7727,6 +7887,42 @@ fn relay_protocol_violation(
     NodeError::Runtime(detail.into())
 }
 
+fn relay_rewrite_getdata_with_ibd_scheduler(
+    state: &mut RelayServerState,
+    peer_id: u64,
+    now_unix_sec: u64,
+    messages: Vec<WireMessage>,
+) -> Vec<WireMessage> {
+    let mut rewritten = Vec::<WireMessage>::with_capacity(messages.len());
+    for message in messages {
+        match message {
+            WireMessage::GetData { items } => {
+                let mut tx_items = Vec::<InventoryItem>::new();
+                let mut block_hashes = Vec::<Hash256>::new();
+                for item in items {
+                    match item {
+                        InventoryItem::Tx(txid) => tx_items.push(InventoryItem::Tx(txid)),
+                        InventoryItem::Block(hash) => block_hashes.push(hash),
+                    }
+                }
+                let mut merged = tx_items;
+                let scheduled = relay_schedule_block_getdata_for_peer(
+                    state,
+                    peer_id,
+                    &block_hashes,
+                    now_unix_sec,
+                );
+                merged.extend(scheduled);
+                if !merged.is_empty() {
+                    rewritten.push(WireMessage::GetData { items: merged });
+                }
+            }
+            other => rewritten.push(other),
+        }
+    }
+    rewritten
+}
+
 fn relay_missing_blocks_from_headers(
     state: &RelayServerState,
     headers: &[scam_core::BlockHeader],
@@ -7929,7 +8125,22 @@ fn process_relay_wire_message_inner(
             }
             let mut out = Vec::new();
             if !missing.is_empty() {
-                out.push(WireMessage::GetData { items: missing });
+                let block_hashes = missing
+                    .iter()
+                    .filter_map(|item| match item {
+                        InventoryItem::Block(hash) => Some(*hash),
+                        InventoryItem::Tx(_) => None,
+                    })
+                    .collect::<Vec<_>>();
+                let scheduled = relay_schedule_block_getdata_for_peer(
+                    state,
+                    peer_id,
+                    &block_hashes,
+                    now_unix_sec,
+                );
+                if !scheduled.is_empty() {
+                    out.push(WireMessage::GetData { items: scheduled });
+                }
             }
             if has_parent_gap
                 && let Some(get_headers) =
@@ -7961,6 +8172,7 @@ fn process_relay_wire_message_inner(
             let maybe_blocks =
                 relay_maybe_request_blocks_on_block_inv(state, peer_id, &items, now_unix_sec);
             let mut out = relay_handle_gossip_message(state, peer_id, WireMessage::Inv { items })?;
+            out = relay_rewrite_getdata_with_ibd_scheduler(state, peer_id, now_unix_sec, out);
             if let Some(get_headers) = maybe_headers {
                 out.push(get_headers);
             }
@@ -8082,6 +8294,7 @@ fn process_relay_wire_message_inner(
         }
         WireMessage::CmpctBlock { block } => {
             let block_hash = block.header.block_hash();
+            relay_clear_inflight_block_request(state, block_hash);
             let (transactions, missing_indexes) =
                 relay_reconstruct_compact_transactions(&state.relay.mempool, &block)?;
             if missing_indexes.is_empty() {
@@ -8150,6 +8363,7 @@ fn process_relay_wire_message_inner(
             block_hash,
             transactions,
         } => {
+            relay_clear_inflight_block_request(state, block_hash);
             let Some(mut pending) = state.pending_compact_blocks.remove(&block_hash) else {
                 return Ok(Vec::new());
             };
@@ -8209,6 +8423,7 @@ fn process_relay_wire_message_inner(
             Ok(out)
         }
         WireMessage::Block { block } => {
+            relay_clear_inflight_block_request(state, block.header.block_hash());
             let tip_before = state.runtime.tip_height();
             let mut out = relay_submit_incoming_block(state, block, now_unix_sec)?;
             let tip_after = state.runtime.tip_height();
@@ -8227,7 +8442,14 @@ fn process_relay_wire_message_inner(
             }
             Ok(out)
         }
-        WireMessage::NotFound { .. } => Ok(Vec::new()),
+        WireMessage::NotFound { items } => {
+            for item in items {
+                if let InventoryItem::Block(hash) = item {
+                    relay_clear_inflight_block_request(state, hash);
+                }
+            }
+            Ok(Vec::new())
+        }
     }
 }
 
@@ -8683,10 +8905,14 @@ fn run_relay_outbound_supervisor(
     let configured_max_outbound_peers = relay_outbound_max_peers();
     let base_spawn_burst = relay_outbound_spawn_burst();
     let mut workers = HashMap::<String, thread::JoinHandle<()>>::new();
+    let mut worker_targets = HashSet::<String>::new();
     let mut worker_started_unix_sec = HashMap::<String, u64>::new();
+    let mut recent_dial_attempt_unix_sec = HashMap::<String, u64>::new();
     let anchor_store = peer_reputation_store
         .as_ref()
         .map(PeerAnchorStore::from_reputation_store);
+    let bucket_secret =
+        load_or_init_peer_bucket_secret(&peers_dir, &cfg.network_id).unwrap_or([0u8; 32]);
 
     loop {
         if stop_flag.load(Ordering::Relaxed) {
@@ -8704,10 +8930,14 @@ fn run_relay_outbound_supervisor(
             {
                 eprintln!("warning: outbound relay worker thread panicked for {target}");
             }
+            worker_targets.remove(&target);
             worker_started_unix_sec.remove(&target);
         }
 
         let now_unix_sec = current_unix_sec().unwrap_or(0);
+        let stale_attempt_ttl = relay_outbound_target_cooldown_sec().saturating_mul(8);
+        recent_dial_attempt_unix_sec
+            .retain(|_, ts| now_unix_sec.saturating_sub(*ts) <= stale_attempt_ttl.max(1));
         let (effective_max_outbound_peers, effective_spawn_burst, effective_rotate_after_sec) =
             match state.lock() {
                 Ok(guard) => {
@@ -8741,6 +8971,12 @@ fn run_relay_outbound_supervisor(
                     rotate_after_sec.max(1),
                 ),
             };
+        let active_now = active_peers.lock().map(|guard| *guard).unwrap_or(0);
+        let effective_max_outbound_peers = relay_outbound_effective_max_peers_with_headroom(
+            effective_max_outbound_peers,
+            active_now,
+            relay_max_active_sessions(0),
+        );
         match load_relay_outbound_targets_selected(
             &peers_dir,
             &cfg,
@@ -8783,6 +9019,7 @@ fn run_relay_outbound_supervisor(
                             "warning: outbound relay worker thread panicked for {stale_target}"
                         );
                     }
+                    worker_targets.remove(&stale_target);
                     worker_started_unix_sec.remove(&stale_target);
                 }
                 let targets = match state.lock() {
@@ -8800,11 +9037,25 @@ fn run_relay_outbound_supervisor(
                     ),
                 };
                 let mut spawned_this_round = 0usize;
+                let candidate_pool_size = targets.len();
                 for target in targets {
                     if workers.contains_key(&target) {
                         continue;
                     }
+                    if worker_targets.contains(&target) {
+                        continue;
+                    }
                     if relay_target_matches_bind(&bind_addr, &target) {
+                        continue;
+                    }
+                    if !relay_outbound_target_passes_topology_guards(
+                        &target,
+                        &worker_targets,
+                        &recent_dial_attempt_unix_sec,
+                        now_unix_sec,
+                        candidate_pool_size,
+                        &bucket_secret,
+                    ) {
                         continue;
                     }
                     if workers.len() >= effective_max_outbound_peers {
@@ -8845,7 +9096,9 @@ fn run_relay_outbound_supervisor(
                             );
                         }),
                     );
-                    worker_started_unix_sec.insert(target, now_unix_sec);
+                    worker_targets.insert(target.clone());
+                    worker_started_unix_sec.insert(target.clone(), now_unix_sec);
+                    recent_dial_attempt_unix_sec.insert(target, now_unix_sec);
                     spawned_this_round = spawned_this_round.saturating_add(1);
                 }
             }
@@ -9276,11 +9529,79 @@ fn relay_outbound_max_backoff_sec() -> u64 {
     env_nonzero_u64("SCAM_RELAY_OUTBOUND_MAX_BACKOFF_SEC").unwrap_or(RELAY_OUTBOUND_MAX_BACKOFF_SEC)
 }
 
+fn relay_outbound_target_cooldown_sec() -> u64 {
+    env_nonzero_u64("SCAM_RELAY_OUTBOUND_TARGET_COOLDOWN_SEC")
+        .unwrap_or(RELAY_OUTBOUND_TARGET_COOLDOWN_SEC)
+}
+
+fn relay_outbound_max_workers_per_bucket() -> usize {
+    env_nonzero_usize("SCAM_RELAY_OUTBOUND_MAX_WORKERS_PER_BUCKET")
+        .unwrap_or(RELAY_OUTBOUND_MAX_WORKERS_PER_BUCKET)
+        .min(16)
+}
+
 fn relay_outbound_initial_jitter_ms() -> u64 {
     env_opt("SCAM_RELAY_OUTBOUND_INITIAL_JITTER_MS")
         .and_then(|raw| raw.parse::<u64>().ok())
         .unwrap_or(RELAY_OUTBOUND_INITIAL_JITTER_MS)
         .min(60_000)
+}
+
+fn relay_target_bucket_key_with_secret(target: &str, secret: &[u8; 32]) -> String {
+    if let Ok(addr) = target.parse::<SocketAddr>() {
+        return peer_diversity_bucket_with_secret(addr, secret);
+    }
+    let mut entropy = Vec::with_capacity(secret.len() + target.len());
+    entropy.extend_from_slice(secret);
+    entropy.extend_from_slice(target.as_bytes());
+    let digest = scam_core::hash::hash256(&entropy);
+    let bucket = u16::from_be_bytes([digest.0[0], digest.0[1]]) & 0x0FFF;
+    format!("dns-{bucket:03x}")
+}
+
+fn relay_outbound_target_passes_topology_guards(
+    target: &str,
+    worker_targets: &HashSet<String>,
+    recent_attempts: &HashMap<String, u64>,
+    now_unix_sec: u64,
+    candidate_pool_size: usize,
+    bucket_secret: &[u8; 32],
+) -> bool {
+    let cooldown = relay_outbound_target_cooldown_sec();
+    if let Some(last) = recent_attempts.get(target).copied()
+        && now_unix_sec.saturating_sub(last) < cooldown
+        && candidate_pool_size > 1
+    {
+        return false;
+    }
+    let bucket_cap = relay_outbound_max_workers_per_bucket();
+    if bucket_cap == 0 {
+        return true;
+    }
+    let bucket = relay_target_bucket_key_with_secret(target, bucket_secret);
+    let mut current = 0usize;
+    for active in worker_targets {
+        if relay_target_bucket_key_with_secret(active, bucket_secret) == bucket {
+            current = current.saturating_add(1);
+        }
+    }
+    current < bucket_cap
+}
+
+fn relay_outbound_effective_max_peers_with_headroom(
+    effective_max_outbound_peers: usize,
+    active_peers: usize,
+    max_active_sessions: usize,
+) -> usize {
+    let base = effective_max_outbound_peers.max(1);
+    let max_active = max_active_sessions.max(1);
+    let inbound_reserve = (max_active / 4).max(16).min(max_active);
+    let used = active_peers.min(max_active);
+    let available = max_active
+        .saturating_sub(used)
+        .saturating_sub(inbound_reserve)
+        .max(1);
+    base.min(available.max(1))
 }
 
 fn relay_outbound_initial_delay(target: &str, bind_addr: &str) -> Duration {
@@ -9337,6 +9658,27 @@ fn relay_peer_tip_stale_after_sec() -> u64 {
     env_nonzero_u64("SCAM_RELAY_PEER_TIP_STALE_SEC").unwrap_or(RELAY_PEER_TIP_STALE_SEC)
 }
 
+fn relay_block_request_timeout_sec() -> u64 {
+    env_nonzero_u64("SCAM_RELAY_BLOCK_REQUEST_TIMEOUT_SEC")
+        .unwrap_or(RELAY_BLOCK_REQUEST_TIMEOUT_SEC)
+}
+
+fn relay_block_request_max_retries() -> u8 {
+    env_nonzero_u64("SCAM_RELAY_BLOCK_REQUEST_MAX_RETRIES")
+        .map(|value| value.min(u8::MAX as u64) as u8)
+        .unwrap_or(RELAY_BLOCK_REQUEST_MAX_RETRIES)
+}
+
+fn relay_max_inflight_block_requests() -> usize {
+    env_nonzero_usize("SCAM_RELAY_MAX_INFLIGHT_BLOCK_REQUESTS")
+        .unwrap_or(RELAY_MAX_INFLIGHT_BLOCK_REQUESTS)
+}
+
+fn relay_max_inflight_block_requests_per_peer() -> usize {
+    env_nonzero_usize("SCAM_RELAY_MAX_INFLIGHT_BLOCK_REQUESTS_PER_PEER")
+        .unwrap_or(RELAY_MAX_INFLIGHT_BLOCK_REQUESTS_PER_PEER)
+}
+
 fn relay_discovery_refresh_sec() -> u64 {
     env_nonzero_u64("SCAM_RELAY_DISCOVERY_REFRESH_SEC").unwrap_or(RELAY_DISCOVERY_REFRESH_SEC)
 }
@@ -9386,6 +9728,22 @@ fn relay_tokio_worker_threads() -> usize {
 
 fn stratum_tokio_worker_threads() -> usize {
     tokio_worker_threads_from_env("SCAM_STRATUM_TOKIO_WORKER_THREADS", 4)
+}
+
+fn stratum_stale_guard_max_lag_blocks() -> u64 {
+    env_opt("SCAM_STRATUM_STALE_GUARD_MAX_LAG_BLOCKS")
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(STRATUM_STALE_GUARD_MAX_LAG_BLOCKS)
+}
+
+fn stratum_stale_guard_max_snapshot_age_sec() -> u64 {
+    env_nonzero_u64("SCAM_STRATUM_STALE_GUARD_MAX_SNAPSHOT_AGE_SEC")
+        .unwrap_or(STRATUM_STALE_GUARD_MAX_SNAPSHOT_AGE_SEC)
+}
+
+fn stratum_stale_guard_log_interval_sec() -> u64 {
+    env_nonzero_u64("SCAM_STRATUM_STALE_GUARD_LOG_INTERVAL_SEC")
+        .unwrap_or(STRATUM_STALE_GUARD_LOG_INTERVAL_SEC)
 }
 
 fn relay_handshake_timeout_sec(read_timeout_sec: u64) -> u64 {
@@ -9597,9 +9955,12 @@ async fn run_relay_outbound_supervisor_async(
     let mut workers = HashMap::<String, tokio::task::JoinHandle<()>>::new();
     let mut worker_targets = HashSet::<String>::new();
     let mut worker_started_unix_sec = HashMap::<String, u64>::new();
+    let mut recent_dial_attempt_unix_sec = HashMap::<String, u64>::new();
     let anchor_store = peer_reputation_store
         .as_ref()
         .map(PeerAnchorStore::from_reputation_store);
+    let bucket_secret =
+        load_or_init_peer_bucket_secret(&peers_dir, &cfg.network_id).unwrap_or([0u8; 32]);
     let mut last_feeler_unix_sec = current_unix_sec().unwrap_or(0);
 
     loop {
@@ -9625,6 +9986,9 @@ async fn run_relay_outbound_supervisor_async(
         }
 
         let now_unix_sec = current_unix_sec().unwrap_or(0);
+        let stale_attempt_ttl = relay_outbound_target_cooldown_sec().saturating_mul(8);
+        recent_dial_attempt_unix_sec
+            .retain(|_, ts| now_unix_sec.saturating_sub(*ts) <= stale_attempt_ttl.max(1));
         let (effective_max_outbound_peers, effective_spawn_burst, effective_rotate_after_sec) =
             match state.lock() {
                 Ok(guard) => {
@@ -9658,6 +10022,12 @@ async fn run_relay_outbound_supervisor_async(
                     rotate_after_sec.max(1),
                 ),
             };
+        let active_now = active_peers.lock().map(|guard| *guard).unwrap_or(0);
+        let effective_max_outbound_peers = relay_outbound_effective_max_peers_with_headroom(
+            effective_max_outbound_peers,
+            active_now,
+            relay_max_active_sessions(0),
+        );
 
         let selected_targets = match load_relay_outbound_targets_selected(
             &peers_dir,
@@ -9723,11 +10093,22 @@ async fn run_relay_outbound_supervisor_async(
         }
 
         let mut spawned_this_round = 0usize;
+        let candidate_pool_size = targets.len();
         for target in targets {
             if worker_targets.contains(&target) {
                 continue;
             }
             if relay_target_matches_bind(&bind_addr, &target) {
+                continue;
+            }
+            if !relay_outbound_target_passes_topology_guards(
+                &target,
+                &worker_targets,
+                &recent_dial_attempt_unix_sec,
+                now_unix_sec,
+                candidate_pool_size,
+                &bucket_secret,
+            ) {
                 continue;
             }
             if workers.len() >= effective_max_outbound_peers {
@@ -9770,7 +10151,8 @@ async fn run_relay_outbound_supervisor_async(
                     .await
                 }),
             );
-            worker_started_unix_sec.insert(target_key, now_unix_sec);
+            worker_started_unix_sec.insert(target_key.clone(), now_unix_sec);
+            recent_dial_attempt_unix_sec.insert(target_key, now_unix_sec);
             spawned_this_round = spawned_this_round.saturating_add(1);
         }
 
@@ -9940,14 +10322,10 @@ fn run_relay_peer_session<IO: Read + Write>(
         }
 
         let mut seen = 0u32;
-        let mut runtime_db_seen_mtime = runtime_db_mtime(runtime_db_path);
-        let mut mempool_db_seen_mtime = mempool_db_mtime(mempool_db_path);
         let mut last_tip_announced = None::<Hash256>;
         let mut announced_txids = HashSet::<Hash256>::new();
         let mut timeout_streak = 0u32;
         let mut last_discovery_request_unix_sec = current_unix_sec().unwrap_or(0);
-        let refresh_interval_sec = relay_session_db_refresh_interval_sec();
-        let mut last_db_refresh_unix_sec = 0u64;
         loop {
             if stop_flag.load(Ordering::Relaxed) {
                 break;
@@ -9960,23 +10338,6 @@ fn run_relay_peer_session<IO: Read + Write>(
                 let mut guard = state
                     .lock()
                     .map_err(|_| NodeError::Runtime("relay state mutex poisoned".to_owned()))?;
-                if now_for_periodic.saturating_sub(last_db_refresh_unix_sec) >= refresh_interval_sec
-                {
-                    let _ = refresh_relay_runtime_from_db_if_changed(
-                        cfg,
-                        &mut guard,
-                        runtime_db_path,
-                        &mut runtime_db_seen_mtime,
-                        now_for_periodic,
-                    )?;
-                    refresh_mempool_from_db_if_changed(
-                        cfg,
-                        &mut guard.relay,
-                        mempool_db_path,
-                        &mut mempool_db_seen_mtime,
-                    )?;
-                    last_db_refresh_unix_sec = now_for_periodic;
-                }
                 let mut periodic = relay_proactive_inventory_messages(
                     &guard,
                     &mut last_tip_announced,
@@ -10068,14 +10429,12 @@ fn run_relay_peer_session<IO: Read + Write>(
                     .lock()
                     .map_err(|_| NodeError::Runtime("relay state mutex poisoned".to_owned()))?;
                 persist_runtime_db_with_retry(&guard.runtime, runtime_db_path, 80, 25)?;
-                runtime_db_seen_mtime = runtime_db_mtime(runtime_db_path);
             }
             if mempool_changed {
                 let guard = state
                     .lock()
                     .map_err(|_| NodeError::Runtime("relay state mutex poisoned".to_owned()))?;
                 persist_mempool_db_with_retry(cfg, &guard.relay.mempool, mempool_db_path, 80, 25)?;
-                mempool_db_seen_mtime = mempool_db_mtime(mempool_db_path);
             }
             if let Err(err) = relay_flush_pending_peer_book_updates(state) {
                 eprintln!("warning: cannot flush discovered peer addresses: {err}");
@@ -10252,8 +10611,6 @@ async fn run_relay_peer_session_async<S: AsyncRead + AsyncWrite + Unpin>(
         }
 
         let mut seen = 0u32;
-        let mut runtime_db_seen_mtime = runtime_db_mtime(runtime_db_path);
-        let mut mempool_db_seen_mtime = mempool_db_mtime(mempool_db_path);
         let mut last_tip_announced = None::<Hash256>;
         let mut announced_txids = HashSet::<Hash256>::new();
         let mut timeout_streak = 0u32;
@@ -10261,8 +10618,6 @@ async fn run_relay_peer_session_async<S: AsyncRead + AsyncWrite + Unpin>(
         let timeout_streak_limit =
             relay_async_timeout_streak_limit(read_timeout_sec, read_poll_interval_ms);
         let mut last_discovery_request_unix_sec = current_unix_sec().unwrap_or(0);
-        let refresh_interval_sec = relay_session_db_refresh_interval_sec();
-        let mut last_db_refresh_unix_sec = 0u64;
         loop {
             if stop_flag.load(Ordering::Relaxed) {
                 break;
@@ -10275,23 +10630,6 @@ async fn run_relay_peer_session_async<S: AsyncRead + AsyncWrite + Unpin>(
                 let mut guard = state
                     .lock()
                     .map_err(|_| NodeError::Runtime("relay state mutex poisoned".to_owned()))?;
-                if now_for_periodic.saturating_sub(last_db_refresh_unix_sec) >= refresh_interval_sec
-                {
-                    let _ = refresh_relay_runtime_from_db_if_changed(
-                        cfg,
-                        &mut guard,
-                        runtime_db_path,
-                        &mut runtime_db_seen_mtime,
-                        now_for_periodic,
-                    )?;
-                    refresh_mempool_from_db_if_changed(
-                        cfg,
-                        &mut guard.relay,
-                        mempool_db_path,
-                        &mut mempool_db_seen_mtime,
-                    )?;
-                    last_db_refresh_unix_sec = now_for_periodic;
-                }
                 let mut periodic = relay_proactive_inventory_messages(
                     &guard,
                     &mut last_tip_announced,
@@ -10411,14 +10749,12 @@ async fn run_relay_peer_session_async<S: AsyncRead + AsyncWrite + Unpin>(
                     .lock()
                     .map_err(|_| NodeError::Runtime("relay state mutex poisoned".to_owned()))?;
                 persist_runtime_db_with_retry(&guard.runtime, runtime_db_path, 80, 25)?;
-                runtime_db_seen_mtime = runtime_db_mtime(runtime_db_path);
             }
             if mempool_changed {
                 let guard = state
                     .lock()
                     .map_err(|_| NodeError::Runtime("relay state mutex poisoned".to_owned()))?;
                 persist_mempool_db_with_retry(cfg, &guard.relay.mempool, mempool_db_path, 80, 25)?;
-                mempool_db_seen_mtime = mempool_db_mtime(mempool_db_path);
             }
             if let Err(err) = relay_flush_pending_peer_book_updates(state) {
                 eprintln!("warning: cannot flush discovered peer addresses: {err}");
@@ -10510,6 +10846,57 @@ async fn relay_handshake_async_with_timeout<S: AsyncRead + AsyncWrite + Unpin>(
                 format!("relay handshake timed out after {}s", handshake_timeout_sec),
             ),
         ))),
+    }
+}
+
+async fn run_relay_state_sync_task_async(
+    stop_flag: Arc<AtomicBool>,
+    state: Arc<Mutex<RelayServerState>>,
+    cfg: ChainConfig,
+    runtime_db_path: PathBuf,
+    mempool_db_path: PathBuf,
+) {
+    let refresh_interval = Duration::from_secs(relay_session_db_refresh_interval_sec().max(1));
+    let mut runtime_db_seen_mtime = runtime_db_mtime(&runtime_db_path);
+    let mut mempool_db_seen_mtime = mempool_db_mtime(&mempool_db_path);
+
+    loop {
+        if stop_flag.load(Ordering::Relaxed) {
+            break;
+        }
+        sleep(refresh_interval).await;
+        if stop_flag.load(Ordering::Relaxed) {
+            break;
+        }
+        let now_unix_sec = current_unix_sec().unwrap_or(0);
+        {
+            let mut guard = match state.lock() {
+                Ok(guard) => guard,
+                Err(_) => continue,
+            };
+            if let Err(err) = refresh_relay_runtime_from_db_if_changed(
+                &cfg,
+                &mut guard,
+                &runtime_db_path,
+                &mut runtime_db_seen_mtime,
+                now_unix_sec,
+            ) && !is_runtime_db_lock_conflict(&err)
+            {
+                eprintln!("warning: relay runtime background refresh failed: {err}");
+            }
+            if let Err(err) = refresh_mempool_from_db_if_changed(
+                &cfg,
+                &mut guard.relay,
+                &mempool_db_path,
+                &mut mempool_db_seen_mtime,
+            ) && !is_mempool_db_lock_conflict(&err)
+            {
+                eprintln!("warning: relay mempool background refresh failed: {err}");
+            }
+        }
+        if let Err(err) = relay_flush_pending_peer_book_updates(&state) {
+            eprintln!("warning: relay peer book background flush failed: {err}");
+        }
     }
 }
 
@@ -10707,6 +11094,24 @@ fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
             None
         };
 
+        let state_sync_handle = {
+            let stop_clone = stop_flag.clone();
+            let state_clone = state.clone();
+            let cfg_clone = cfg.clone();
+            let runtime_db_path_clone = runtime_db_path.clone();
+            let mempool_db_path_clone = mempool_db_path.clone();
+            Some(tokio::spawn(async move {
+                run_relay_state_sync_task_async(
+                    stop_clone,
+                    state_clone,
+                    cfg_clone,
+                    runtime_db_path_clone,
+                    mempool_db_path_clone,
+                )
+                .await;
+            }))
+        };
+
         let outbound_handle = if outbound_connect {
             let stop_clone = stop_flag.clone();
             let next_peer_clone = next_peer_id.clone();
@@ -10872,6 +11277,9 @@ fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
             )));
         }
         if let Some(handle) = telemetry_handle {
+            let _ = handle.await;
+        }
+        if let Some(handle) = state_sync_handle {
             let _ = handle.await;
         }
         if let Some(err) = first_error {
@@ -11907,6 +12315,9 @@ struct StratumServerContext {
     telemetry_state: Arc<Mutex<StratumPoolTelemetryState>>,
     pool_ledger_state: Arc<Mutex<StratumPoolLedgerState>>,
     pool_ledger_db_path: PathBuf,
+    relay_telemetry_path: Option<PathBuf>,
+    stale_guard_max_lag_blocks: u64,
+    stale_guard_max_snapshot_age_sec: u64,
     pool_payout_cfg: PoolPayoutConfig,
     pool_payout_key: Option<WalletKey>,
     pool_coinbase_key_hash20: [u8; 20],
@@ -12142,6 +12553,87 @@ fn load_runtime_tip_hash(ctx: &StratumServerContext) -> Result<Hash256, NodeErro
     Ok(runtime.tip_hash())
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct StratumStaleGuardDecision {
+    blocked: bool,
+    lag_blocks: u64,
+    snapshot_age_sec: u64,
+}
+
+fn stratum_should_defer_job_issuance(
+    ctx: &StratumServerContext,
+    now_unix_sec: u64,
+) -> Result<StratumStaleGuardDecision, NodeError> {
+    if ctx.stale_guard_max_lag_blocks == 0 {
+        return Ok(StratumStaleGuardDecision::default());
+    }
+    let Some(path) = ctx.relay_telemetry_path.as_ref() else {
+        return Ok(StratumStaleGuardDecision::default());
+    };
+    let Some(snapshot) = load_latest_jsonl_record::<RelayServerTelemetrySnapshot>(path)? else {
+        return Ok(StratumStaleGuardDecision::default());
+    };
+    let snapshot_age_sec = now_unix_sec.saturating_sub(snapshot.timestamp_unix_sec);
+    if snapshot_age_sec > ctx.stale_guard_max_snapshot_age_sec {
+        return Ok(StratumStaleGuardDecision {
+            blocked: false,
+            lag_blocks: snapshot.global_sync_lag_blocks,
+            snapshot_age_sec,
+        });
+    }
+    let lag_blocks = snapshot.global_sync_lag_blocks;
+    Ok(StratumStaleGuardDecision {
+        blocked: lag_blocks > ctx.stale_guard_max_lag_blocks,
+        lag_blocks,
+        snapshot_age_sec,
+    })
+}
+
+fn stratum_should_log_stale_guard(now_unix_sec: u64, last_log_unix_sec: &mut u64) -> bool {
+    let interval = stratum_stale_guard_log_interval_sec();
+    if now_unix_sec.saturating_sub(*last_log_unix_sec) >= interval {
+        *last_log_unix_sec = now_unix_sec;
+        true
+    } else {
+        false
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn try_issue_new_stratum_job_async<S: AsyncRead + AsyncWrite + Unpin>(
+    session: &mut Sv2Session,
+    ctx: &StratumServerContext,
+    stream: &mut S,
+    secure: &mut Option<StratumSecureTransport>,
+    jobs: &mut HashMap<u32, StratumWork>,
+    reward_key_hash20: [u8; 20],
+    coinbase_label: &str,
+    last_stale_guard_log_unix_sec: &mut u64,
+) -> Result<Option<Hash256>, NodeError> {
+    let now_unix_sec = current_unix_sec().unwrap_or(0);
+    let guard = stratum_should_defer_job_issuance(ctx, now_unix_sec)?;
+    if guard.blocked {
+        if stratum_should_log_stale_guard(now_unix_sec, last_stale_guard_log_unix_sec) {
+            eprintln!(
+                "warning: stratum stale-guard holding new jobs (lag={} blocks, snapshot_age={}s, limit={} blocks)",
+                guard.lag_blocks, guard.snapshot_age_sec, ctx.stale_guard_max_lag_blocks
+            );
+        }
+        return Ok(None);
+    }
+    issue_new_stratum_job_async(
+        session,
+        ctx,
+        stream,
+        secure,
+        jobs,
+        reward_key_hash20,
+        coinbase_label,
+    )
+    .await
+    .map(Some)
+}
+
 async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
     mut stream: S,
     ctx: StratumServerContext,
@@ -12264,6 +12756,7 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
         stratum_coinbase_label(session.channel_id(), "pool")
     };
     let mut worker_label = "default".to_owned();
+    let mut last_stale_guard_log_unix_sec = 0u64;
 
     loop {
         match read_sv2_message_async(&mut stream, secure_transport.as_mut(), read_timeout).await? {
@@ -12271,9 +12764,9 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
             StratumReadOutcome::Timeout => {
                 if session.is_active() {
                     let current_tip = load_runtime_tip_hash(&ctx)?;
-                    if tip_changed(current_tip, last_tip_hash) {
+                    if tip_changed(current_tip, last_tip_hash) || jobs.is_empty() {
                         jobs.clear();
-                        last_tip_hash = issue_new_stratum_job_async(
+                        if let Some(new_tip_hash) = try_issue_new_stratum_job_async(
                             &mut session,
                             &ctx,
                             &mut stream,
@@ -12281,8 +12774,12 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
                             &mut jobs,
                             payout_key_hash20,
                             &payout_label,
+                            &mut last_stale_guard_log_unix_sec,
                         )
-                        .await?;
+                        .await?
+                        {
+                            last_tip_hash = new_tip_hash;
+                        }
                     }
                     if nonzero_limit_reached(ctx.keepalive_sec, last_keepalive.elapsed().as_secs())
                     {
@@ -12346,7 +12843,7 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
                                 payout_key_hash20 = ctx.pool_coinbase_key_hash20;
                                 payout_label = stratum_coinbase_label(session.channel_id(), "pool");
                             }
-                            last_tip_hash = issue_new_stratum_job_async(
+                            if let Some(new_tip_hash) = try_issue_new_stratum_job_async(
                                 &mut session,
                                 &ctx,
                                 &mut stream,
@@ -12354,8 +12851,12 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
                                 &mut jobs,
                                 payout_key_hash20,
                                 &payout_label,
+                                &mut last_stale_guard_log_unix_sec,
                             )
-                            .await?;
+                            .await?
+                            {
+                                last_tip_hash = new_tip_hash;
+                            }
                         }
                         SessionEvent::ShareAccepted {
                             channel_id,
@@ -12527,8 +13028,8 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
                                     if should_reissue_job_for_channel(
                                         channel_id,
                                         session.channel_id(),
-                                    ) {
-                                        last_tip_hash = issue_new_stratum_job_async(
+                                    ) && let Some(new_tip_hash) =
+                                        try_issue_new_stratum_job_async(
                                             &mut session,
                                             &ctx,
                                             &mut stream,
@@ -12536,8 +13037,11 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
                                             &mut jobs,
                                             payout_key_hash20,
                                             &payout_label,
+                                            &mut last_stale_guard_log_unix_sec,
                                         )
-                                        .await?;
+                                        .await?
+                                    {
+                                        last_tip_hash = new_tip_hash;
                                     }
                                 }
                                 run_pool_payout_tick_with_warning(&ctx);
@@ -13943,6 +14447,9 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
         .pool_ledger_db
         .clone()
         .unwrap_or_else(|| default_pool_ledger_db_path(&runtime_db_path));
+    let relay_telemetry_path = Some(default_relay_telemetry_path(&runtime_db_path));
+    let stale_guard_max_lag_blocks = stratum_stale_guard_max_lag_blocks();
+    let stale_guard_max_snapshot_age_sec = stratum_stale_guard_max_snapshot_age_sec();
     let (runtime, source) = load_runtime_from_db_or_genesis(&cfg, &runtime_db_path)?;
     let mut pool_ledger_state = load_pool_ledger_from_db_or_new(
         &cfg,
@@ -14171,6 +14678,15 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
         "Max protocol violations/session: {}",
         max_protocol_violations
     );
+    println!(
+        "Stratum stale guard: max_lag_blocks={} snapshot_max_age={}s relay_telemetry={}",
+        stale_guard_max_lag_blocks,
+        stale_guard_max_snapshot_age_sec,
+        relay_telemetry_path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "disabled".to_owned())
+    );
     println!("Secure transport: {}", secure_transport);
     println!("Secure transport mode: {}", secure_transport_mode.as_str());
     println!(
@@ -14235,6 +14751,9 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
         telemetry_state: Arc::new(Mutex::new(StratumPoolTelemetryState::default())),
         pool_ledger_state: Arc::new(Mutex::new(pool_ledger_state)),
         pool_ledger_db_path,
+        relay_telemetry_path,
+        stale_guard_max_lag_blocks,
+        stale_guard_max_snapshot_age_sec,
         pool_payout_cfg: payout_cfg.clone(),
         pool_payout_key,
         pool_coinbase_key_hash20,
@@ -19850,6 +20369,9 @@ mod tests {
             )),
             pool_ledger_state: std::sync::Arc::new(std::sync::Mutex::new(pool_ledger_state)),
             pool_ledger_db_path,
+            relay_telemetry_path: None,
+            stale_guard_max_lag_blocks: super::STRATUM_STALE_GUARD_MAX_LAG_BLOCKS,
+            stale_guard_max_snapshot_age_sec: super::STRATUM_STALE_GUARD_MAX_SNAPSHOT_AGE_SEC,
             pool_payout_cfg,
             pool_payout_key,
             pool_coinbase_key_hash20: cfg.genesis_reward_key_hash20().expect("reward key"),
@@ -20503,25 +21025,52 @@ mod tests {
         const RELAY_THREADS_KEY: &str = "SCAM_RELAY_TOKIO_WORKER_THREADS";
         const STRATUM_THREADS_KEY: &str = "SCAM_STRATUM_TOKIO_WORKER_THREADS";
         const RELAY_HANDSHAKE_TIMEOUT_KEY: &str = "SCAM_RELAY_HANDSHAKE_TIMEOUT_SEC";
+        const STRATUM_STALE_GUARD_LAG_KEY: &str = "SCAM_STRATUM_STALE_GUARD_MAX_LAG_BLOCKS";
+        const STRATUM_STALE_GUARD_AGE_KEY: &str = "SCAM_STRATUM_STALE_GUARD_MAX_SNAPSHOT_AGE_SEC";
+        const STRATUM_STALE_GUARD_LOG_KEY: &str = "SCAM_STRATUM_STALE_GUARD_LOG_INTERVAL_SEC";
         let saved_relay_threads = std::env::var(RELAY_THREADS_KEY).ok();
         let saved_stratum_threads = std::env::var(STRATUM_THREADS_KEY).ok();
         let saved_relay_handshake_timeout = std::env::var(RELAY_HANDSHAKE_TIMEOUT_KEY).ok();
+        let saved_stratum_stale_guard_lag = std::env::var(STRATUM_STALE_GUARD_LAG_KEY).ok();
+        let saved_stratum_stale_guard_age = std::env::var(STRATUM_STALE_GUARD_AGE_KEY).ok();
+        let saved_stratum_stale_guard_log = std::env::var(STRATUM_STALE_GUARD_LOG_KEY).ok();
         unsafe {
             std::env::set_var(RELAY_THREADS_KEY, "3");
             std::env::set_var(STRATUM_THREADS_KEY, "5");
             std::env::set_var(RELAY_HANDSHAKE_TIMEOUT_KEY, "17");
+            std::env::set_var(STRATUM_STALE_GUARD_LAG_KEY, "11");
+            std::env::set_var(STRATUM_STALE_GUARD_AGE_KEY, "9");
+            std::env::set_var(STRATUM_STALE_GUARD_LOG_KEY, "13");
         }
         assert_eq!(super::relay_tokio_worker_threads(), 3);
         assert_eq!(super::stratum_tokio_worker_threads(), 5);
         assert_eq!(super::relay_handshake_timeout_sec(2), 17);
+        assert_eq!(super::stratum_stale_guard_max_lag_blocks(), 11);
+        assert_eq!(super::stratum_stale_guard_max_snapshot_age_sec(), 9);
+        assert_eq!(super::stratum_stale_guard_log_interval_sec(), 13);
         unsafe {
             std::env::set_var(RELAY_THREADS_KEY, "0");
             std::env::set_var(STRATUM_THREADS_KEY, "not-a-number");
             std::env::set_var(RELAY_HANDSHAKE_TIMEOUT_KEY, "0");
+            std::env::set_var(STRATUM_STALE_GUARD_LAG_KEY, "not-a-number");
+            std::env::set_var(STRATUM_STALE_GUARD_AGE_KEY, "0");
+            std::env::set_var(STRATUM_STALE_GUARD_LOG_KEY, "0");
         }
         assert!(super::relay_tokio_worker_threads() >= 2);
         assert!(super::stratum_tokio_worker_threads() >= 2);
         assert_eq!(super::relay_handshake_timeout_sec(2), 10);
+        assert_eq!(
+            super::stratum_stale_guard_max_lag_blocks(),
+            super::STRATUM_STALE_GUARD_MAX_LAG_BLOCKS
+        );
+        assert_eq!(
+            super::stratum_stale_guard_max_snapshot_age_sec(),
+            super::STRATUM_STALE_GUARD_MAX_SNAPSHOT_AGE_SEC
+        );
+        assert_eq!(
+            super::stratum_stale_guard_log_interval_sec(),
+            super::STRATUM_STALE_GUARD_LOG_INTERVAL_SEC
+        );
         if let Some(value) = saved_relay_threads {
             unsafe {
                 std::env::set_var(RELAY_THREADS_KEY, value);
@@ -20547,6 +21096,33 @@ mod tests {
         } else {
             unsafe {
                 std::env::remove_var(RELAY_HANDSHAKE_TIMEOUT_KEY);
+            }
+        }
+        if let Some(value) = saved_stratum_stale_guard_lag {
+            unsafe {
+                std::env::set_var(STRATUM_STALE_GUARD_LAG_KEY, value);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var(STRATUM_STALE_GUARD_LAG_KEY);
+            }
+        }
+        if let Some(value) = saved_stratum_stale_guard_age {
+            unsafe {
+                std::env::set_var(STRATUM_STALE_GUARD_AGE_KEY, value);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var(STRATUM_STALE_GUARD_AGE_KEY);
+            }
+        }
+        if let Some(value) = saved_stratum_stale_guard_log {
+            unsafe {
+                std::env::set_var(STRATUM_STALE_GUARD_LOG_KEY, value);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var(STRATUM_STALE_GUARD_LOG_KEY);
             }
         }
         let lock_err = super::NodeError::Runtime("Database already open".to_owned());
@@ -21106,6 +21682,104 @@ mod tests {
             }
             other => panic!("unexpected decode error variant: {other}"),
         }
+    }
+
+    #[test]
+    fn stratum_stale_guard_decision_blocks_only_on_fresh_excessive_lag() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let work_dir = temp_dir("test-stratum-stale-guard");
+        let runtime_db = work_dir.join("runtime.redb");
+        let mempool_db = work_dir.join("mempool.redb");
+        let pool_ledger_db = work_dir.join("pool.ledger.redb");
+        let now_unix_sec = 1_770_000_100u64;
+        let pool_ledger_state = super::StratumPoolLedgerState::new(
+            cfg.network_id.clone(),
+            runtime.tip_height(),
+            runtime.tip_hash(),
+            now_unix_sec,
+            super::POOL_DEFAULT_SHARE_RETENTION,
+            super::POOL_DEFAULT_ROUND_RETENTION,
+        );
+        let mut ctx = build_stratum_context_for_tests(
+            &cfg,
+            runtime,
+            runtime_db,
+            mempool_db,
+            pool_ledger_db,
+            pool_ledger_state,
+            super::PoolPayoutConfig::default(),
+            None,
+        );
+        let relay_telemetry = work_dir.join("relay.telemetry.jsonl");
+        ctx.relay_telemetry_path = Some(relay_telemetry.clone());
+        ctx.stale_guard_max_lag_blocks = 2;
+        ctx.stale_guard_max_snapshot_age_sec = 30;
+
+        let blocked_snapshot = super::RelayServerTelemetrySnapshot {
+            timestamp_unix_sec: now_unix_sec.saturating_sub(2),
+            active_peers: 8,
+            tip_height: 100,
+            utxo_count: 0,
+            cumulative_work: "1".to_owned(),
+            network_hashrate_hps: 1.0,
+            max_known_tip_height: 104,
+            global_sync_lag_blocks: 4,
+            tip_hash: Hash256([1; 32]).to_hex(),
+            mempool_len: 0,
+            orphan_pool_len: 0,
+            mempool_inserted_total: 0,
+            mempool_replaced_total: 0,
+            mempool_removed_by_replacement_total: 0,
+            mempool_rejected_conflict_total: 0,
+            orphan_accepted_total: 0,
+            orphan_evicted_total: 0,
+            orphan_expired_total: 0,
+            orphan_promoted_total: 0,
+            gossip_replacement_rate_limited_total: 0,
+        };
+        super::append_jsonl_record(&relay_telemetry, &blocked_snapshot, "test relay telemetry")
+            .expect("write telemetry");
+        let blocked = super::stratum_should_defer_job_issuance(&ctx, now_unix_sec)
+            .expect("stale guard decision");
+        assert!(blocked.blocked);
+        assert_eq!(blocked.lag_blocks, 4);
+
+        let stale_snapshot = super::RelayServerTelemetrySnapshot {
+            timestamp_unix_sec: now_unix_sec.saturating_sub(31),
+            ..blocked_snapshot
+        };
+        super::append_jsonl_record(&relay_telemetry, &stale_snapshot, "test relay telemetry")
+            .expect("write stale telemetry");
+        let stale_allowed = super::stratum_should_defer_job_issuance(&ctx, now_unix_sec)
+            .expect("stale guard decision");
+        assert!(
+            !stale_allowed.blocked,
+            "stale telemetry snapshot must not block job issuance"
+        );
+    }
+
+    #[test]
+    fn stratum_stale_guard_log_interval_enforces_cooldown() {
+        let mut last = 0u64;
+        assert!(super::stratum_should_log_stale_guard(10, &mut last));
+        assert_eq!(last, 10);
+        assert!(
+            !super::stratum_should_log_stale_guard(10, &mut last),
+            "same timestamp should be throttled"
+        );
+        assert!(
+            !super::stratum_should_log_stale_guard(
+                10 + super::stratum_stale_guard_log_interval_sec().saturating_sub(1),
+                &mut last
+            ),
+            "below interval should remain throttled"
+        );
+        assert!(super::stratum_should_log_stale_guard(
+            10 + super::stratum_stale_guard_log_interval_sec(),
+            &mut last
+        ));
     }
 
     #[test]
@@ -24405,6 +25079,9 @@ mod tests {
             )),
             pool_ledger_state: std::sync::Arc::new(std::sync::Mutex::new(pool_ledger_state)),
             pool_ledger_db_path,
+            relay_telemetry_path: None,
+            stale_guard_max_lag_blocks: super::STRATUM_STALE_GUARD_MAX_LAG_BLOCKS,
+            stale_guard_max_snapshot_age_sec: super::STRATUM_STALE_GUARD_MAX_SNAPSHOT_AGE_SEC,
             pool_payout_cfg: super::PoolPayoutConfig::default(),
             pool_payout_key: None,
             pool_coinbase_key_hash20: cfg.genesis_reward_key_hash20().expect("reward key"),
@@ -35081,6 +35758,166 @@ mod tests {
             vec![WireMessage::GetData {
                 items: vec![InventoryItem::Block(block_hash)],
             }]
+        );
+    }
+
+    #[test]
+    fn relay_ibd_scheduler_avoids_duplicate_inflight_block_getdata_until_timeout() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let reward_key = cfg.genesis_reward_key_hash20().expect("reward key");
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let relay = RelayAdmissionState {
+            mempool: Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip: GossipEngine::new(64).expect("gossip"),
+        };
+        let mut state = RelayServerState::new(runtime, relay);
+        let peer_id = 91;
+        state.relay.gossip.connect_peer(peer_id);
+
+        let target = state
+            .runtime
+            .expected_target_for_next_block()
+            .expect("target");
+        let template = BlockTemplate {
+            version: 1,
+            prev_block: state.runtime.tip_hash(),
+            timestamp: state
+                .runtime
+                .tip_header()
+                .timestamp
+                .saturating_add(cfg.target_block_time_sec),
+            target,
+            transactions: vec![build_coinbase_tx(
+                "ibd-scheduler-timeout".to_owned(),
+                cfg.block_subsidy,
+                reward_key,
+            )],
+        };
+        let block = mine_block(&template, 500_000).expect("mine");
+        let hash = block.header.block_hash();
+        let first = process_relay_wire_message(
+            &mut state,
+            peer_id,
+            WireMessage::Headers {
+                headers: vec![block.header.clone()],
+            },
+            10_000,
+        )
+        .expect("first request");
+        assert!(
+            first
+                .iter()
+                .any(|msg| matches!(msg, WireMessage::GetData { items } if items == &vec![InventoryItem::Block(hash)]))
+        );
+        let second = process_relay_wire_message(
+            &mut state,
+            peer_id,
+            WireMessage::Headers {
+                headers: vec![block.header.clone()],
+            },
+            10_001,
+        )
+        .expect("duplicate while inflight");
+        assert!(
+            second.is_empty(),
+            "duplicate getdata should be suppressed while inflight request is fresh"
+        );
+
+        let third = process_relay_wire_message(
+            &mut state,
+            peer_id,
+            WireMessage::Headers {
+                headers: vec![block.header.clone()],
+            },
+            10_001 + super::relay_block_request_timeout_sec() + 1,
+        )
+        .expect("retry after timeout");
+        assert!(
+            third
+                .iter()
+                .any(|msg| matches!(msg, WireMessage::GetData { items } if items == &vec![InventoryItem::Block(hash)])),
+            "expired inflight request must be retried"
+        );
+    }
+
+    #[test]
+    fn relay_notfound_clears_inflight_block_request_for_immediate_retry() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let reward_key = cfg.genesis_reward_key_hash20().expect("reward key");
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let relay = RelayAdmissionState {
+            mempool: Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip: GossipEngine::new(64).expect("gossip"),
+        };
+        let mut state = RelayServerState::new(runtime, relay);
+        let peer_id = 92;
+        state.relay.gossip.connect_peer(peer_id);
+
+        let target = state
+            .runtime
+            .expected_target_for_next_block()
+            .expect("target");
+        let template = BlockTemplate {
+            version: 1,
+            prev_block: state.runtime.tip_hash(),
+            timestamp: state
+                .runtime
+                .tip_header()
+                .timestamp
+                .saturating_add(cfg.target_block_time_sec),
+            target,
+            transactions: vec![build_coinbase_tx(
+                "ibd-notfound-retry".to_owned(),
+                cfg.block_subsidy,
+                reward_key,
+            )],
+        };
+        let block = mine_block(&template, 500_000).expect("mine");
+        let hash = block.header.block_hash();
+        let first = process_relay_wire_message(
+            &mut state,
+            peer_id,
+            WireMessage::Headers {
+                headers: vec![block.header.clone()],
+            },
+            11_000,
+        )
+        .expect("first request");
+        assert!(
+            first
+                .iter()
+                .any(|msg| matches!(msg, WireMessage::GetData { items } if items == &vec![InventoryItem::Block(hash)]))
+        );
+        process_relay_wire_message(
+            &mut state,
+            peer_id,
+            WireMessage::NotFound {
+                items: vec![InventoryItem::Block(hash)],
+            },
+            11_001,
+        )
+        .expect("notfound");
+        let retry = process_relay_wire_message(
+            &mut state,
+            peer_id,
+            WireMessage::Headers {
+                headers: vec![block.header.clone()],
+            },
+            11_002,
+        )
+        .expect("immediate retry after notfound");
+        assert!(
+            retry
+                .iter()
+                .any(|msg| matches!(msg, WireMessage::GetData { items } if items == &vec![InventoryItem::Block(hash)]))
         );
     }
 
