@@ -1191,6 +1191,53 @@ mod tests {
     }
 
     #[test]
+    fn median_time_past_for_tip_matches_internal_median_and_is_not_zero_for_recent_timestamps() {
+        let mut config: scam_core::ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        config.difficulty_adjustment_window = 50;
+        let mut runtime = ChainRuntime::from_config(config.clone()).expect("runtime");
+        let reward = config.genesis_reward_key_hash20().expect("key");
+
+        let base = runtime.tip_header().timestamp.saturating_add(10_000);
+        let offsets = [5_u64, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41];
+        for (idx, delta) in offsets.iter().copied().enumerate() {
+            let template = BlockTemplate {
+                version: 1,
+                prev_block: runtime.tip_hash(),
+                timestamp: base.saturating_add(delta),
+                target: runtime.expected_target_for_next_block().expect("target"),
+                transactions: vec![coinbase(
+                    config.block_subsidy,
+                    reward,
+                    format!("mtp-tip-{idx}").as_bytes(),
+                )],
+            };
+            let block = mine_block(&template, 200_000).expect("mine");
+            runtime.apply_next_block(block).expect("apply");
+        }
+
+        let mut expected = offsets
+            .iter()
+            .map(|delta| base.saturating_add(*delta))
+            .collect::<Vec<_>>();
+        expected.sort_unstable();
+        let expected_median = expected[expected.len() / 2];
+        let tip_mtp = runtime
+            .median_time_past_for_tip()
+            .expect("median-time-past-for-tip");
+        let direct_mtp = runtime
+            .median_time_past(runtime.tip_hash())
+            .expect("direct median-time-past");
+
+        assert_eq!(tip_mtp, expected_median);
+        assert_eq!(direct_mtp, expected_median);
+        assert!(
+            tip_mtp > 1,
+            "mtp should reflect mined timestamps, got={tip_mtp}"
+        );
+    }
+
+    #[test]
     fn block_timestamp_too_far_in_future_is_rejected() {
         let config: scam_core::ChainConfig =
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");

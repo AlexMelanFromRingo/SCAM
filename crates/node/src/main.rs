@@ -1557,6 +1557,10 @@ fn default_relay_telemetry_path(runtime_db_path: &Path) -> PathBuf {
     runtime_db_path.with_file_name("relay.telemetry.jsonl")
 }
 
+fn run_mode_relay_telemetry_enabled(run_relay: bool, relay_telemetry_path: &Path) -> bool {
+    run_relay || relay_telemetry_path.exists()
+}
+
 fn runtime_to_archive(runtime: &ChainRuntime) -> Result<ChainArchive, NodeError> {
     let blocks_by_height = runtime.main_chain_blocks()?;
     Ok(ChainArchive {
@@ -2169,7 +2173,8 @@ fn run_mode(args: RunModeArgs) -> Result<(), NodeError> {
         plan.run_relay, plan.run_rpc, plan.run_stratum, plan.run_miner
     );
     let relay_telemetry_path = default_relay_telemetry_path(&runtime_db_path);
-    let relay_telemetry_enabled = plan.run_relay || relay_telemetry_path.exists();
+    let relay_telemetry_enabled =
+        run_mode_relay_telemetry_enabled(plan.run_relay, &relay_telemetry_path);
     if relay_telemetry_enabled {
         println!("Relay telemetry path: {}", relay_telemetry_path.display());
     }
@@ -6598,6 +6603,10 @@ fn relay_register_peer_session_address(
     *updated = (*updated).max(now_unix_sec);
 }
 
+fn relay_inflight_counter_release(current: usize) -> usize {
+    current.saturating_sub(1)
+}
+
 fn relay_forget_peer_tip_height(state: &mut RelayServerState, peer_id: u64) {
     state.peer_reported_tip_heights.remove(&peer_id);
     state.peer_tip_last_update_sec.remove(&peer_id);
@@ -6632,7 +6641,7 @@ fn relay_cleanup_inflight_block_requests(state: &mut RelayServerState, now_unix_
         if let Some(request) = state.inflight_block_requests.remove(&hash)
             && let Some(peer_count) = state.peer_inflight_block_requests.get_mut(&request.peer_id)
         {
-            *peer_count = peer_count.saturating_sub(1);
+            *peer_count = relay_inflight_counter_release(*peer_count);
             if *peer_count == 0 {
                 state.peer_inflight_block_requests.remove(&request.peer_id);
             }
@@ -6644,11 +6653,15 @@ fn relay_clear_inflight_block_request(state: &mut RelayServerState, hash: Hash25
     if let Some(request) = state.inflight_block_requests.remove(&hash)
         && let Some(peer_count) = state.peer_inflight_block_requests.get_mut(&request.peer_id)
     {
-        *peer_count = peer_count.saturating_sub(1);
+        *peer_count = relay_inflight_counter_release(*peer_count);
         if *peer_count == 0 {
             state.peer_inflight_block_requests.remove(&request.peer_id);
         }
     }
+}
+
+fn relay_block_request_retry_exhausted(retries: u8, max_retries: u8) -> bool {
+    retries >= max_retries
 }
 
 fn relay_schedule_block_getdata_for_peer(
@@ -6684,7 +6697,7 @@ fn relay_schedule_block_getdata_for_peer(
             if elapsed < request_timeout {
                 continue;
             }
-            if request.retries >= max_retries {
+            if relay_block_request_retry_exhausted(request.retries, max_retries) {
                 continue;
             }
             if peer_count >= per_peer_cap {
@@ -6818,7 +6831,10 @@ fn relay_should_request_headers_catchup(
     let elapsed = now_unix_sec.saturating_sub(last);
     if peer_tip > local_tip {
         let lag = peer_tip.saturating_sub(local_tip);
-        let interval = if lag >= relay_headers_aggressive_lag_threshold() {
+        let interval = if relay_headers_should_use_aggressive_interval(
+            lag,
+            relay_headers_aggressive_lag_threshold(),
+        ) {
             relay_headers_aggressive_interval_sec()
         } else {
             relay_headers_catchup_interval_sec()
@@ -6826,6 +6842,10 @@ fn relay_should_request_headers_catchup(
         return elapsed >= interval;
     }
     elapsed >= relay_headers_probe_interval_sec()
+}
+
+fn relay_headers_should_use_aggressive_interval(lag_blocks: u64, threshold_blocks: u64) -> bool {
+    lag_blocks >= threshold_blocks
 }
 
 fn relay_peer_tip_ahead(state: &RelayServerState, peer_id: u64, now_unix_sec: u64) -> bool {
@@ -7383,13 +7403,13 @@ fn relay_sort_targets_by_known_tip(
             .peer_tip_last_update_by_address
             .get(a)
             .copied()
-            .map(|last| now_unix_sec.saturating_sub(last) <= stale_after_sec)
+            .map(|last| relay_peer_tip_update_is_fresh(now_unix_sec, last, stale_after_sec))
             .unwrap_or(false);
         let b_fresh = state
             .peer_tip_last_update_by_address
             .get(b)
             .copied()
-            .map(|last| now_unix_sec.saturating_sub(last) <= stale_after_sec)
+            .map(|last| relay_peer_tip_update_is_fresh(now_unix_sec, last, stale_after_sec))
             .unwrap_or(false);
         b_fresh
             .cmp(&a_fresh)
@@ -7426,7 +7446,7 @@ fn relay_known_ahead_targets(
                 .get(address)
                 .copied()
                 .unwrap_or(0);
-            if now_unix_sec.saturating_sub(last) > stale_after_sec {
+            if !relay_peer_tip_update_is_fresh(now_unix_sec, last, stale_after_sec) {
                 return None;
             }
             (*tip > local_tip).then_some((address.clone(), *tip))
@@ -7435,6 +7455,14 @@ fn relay_known_ahead_targets(
     ranked.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     ranked.truncate(limit);
     ranked.into_iter().map(|(address, _)| address).collect()
+}
+
+fn relay_peer_tip_update_is_fresh(
+    now_unix_sec: u64,
+    last_update_unix_sec: u64,
+    stale_after_sec: u64,
+) -> bool {
+    now_unix_sec.saturating_sub(last_update_unix_sec) <= stale_after_sec
 }
 
 fn relay_prioritize_outbound_targets(
@@ -8408,7 +8436,11 @@ fn process_relay_wire_message_inner(
             let mut out = relay_submit_incoming_block(state, block, now_unix_sec)?;
             let tip_after = state.runtime.tip_height();
             relay_record_peer_tip_height(state, peer_id, tip_after);
-            if tip_after > tip_before && relay_peer_tip_ahead(state, peer_id, now_unix_sec) {
+            if relay_should_request_followup_sync(
+                tip_before,
+                tip_after,
+                relay_peer_tip_ahead(state, peer_id, now_unix_sec),
+            ) {
                 if let Some(get_headers) =
                     relay_maybe_request_headers_catchup(state, peer_id, now_unix_sec)
                 {
@@ -8428,7 +8460,11 @@ fn process_relay_wire_message_inner(
             let mut out = relay_submit_incoming_block(state, block, now_unix_sec)?;
             let tip_after = state.runtime.tip_height();
             relay_record_peer_tip_height(state, peer_id, tip_after);
-            if tip_after > tip_before && relay_peer_tip_ahead(state, peer_id, now_unix_sec) {
+            if relay_should_request_followup_sync(
+                tip_before,
+                tip_after,
+                relay_peer_tip_ahead(state, peer_id, now_unix_sec),
+            ) {
                 if let Some(get_headers) =
                     relay_maybe_request_headers_catchup(state, peer_id, now_unix_sec)
                 {
@@ -8462,6 +8498,14 @@ fn push_inv_batches(out: &mut Vec<WireMessage>, items: Vec<InventoryItem>, max_i
             items: chunk.to_vec(),
         });
     }
+}
+
+fn relay_should_request_followup_sync(
+    tip_before: u64,
+    tip_after: u64,
+    peer_is_ahead: bool,
+) -> bool {
+    tip_after > tip_before && peer_is_ahead
 }
 
 fn relay_proactive_inventory_messages(
@@ -8936,8 +8980,9 @@ fn run_relay_outbound_supervisor(
 
         let now_unix_sec = current_unix_sec().unwrap_or(0);
         let stale_attempt_ttl = relay_outbound_target_cooldown_sec().saturating_mul(8);
-        recent_dial_attempt_unix_sec
-            .retain(|_, ts| now_unix_sec.saturating_sub(*ts) <= stale_attempt_ttl.max(1));
+        recent_dial_attempt_unix_sec.retain(|_, ts| {
+            relay_recent_dial_attempt_is_fresh(now_unix_sec, *ts, stale_attempt_ttl)
+        });
         let (effective_max_outbound_peers, effective_spawn_burst, effective_rotate_after_sec) =
             match state.lock() {
                 Ok(guard) => {
@@ -9058,10 +9103,16 @@ fn run_relay_outbound_supervisor(
                     ) {
                         continue;
                     }
-                    if workers.len() >= effective_max_outbound_peers {
+                    if relay_outbound_worker_capacity_reached(
+                        workers.len(),
+                        effective_max_outbound_peers,
+                    ) {
                         break;
                     }
-                    if spawned_this_round >= effective_spawn_burst {
+                    if relay_outbound_spawn_budget_exhausted(
+                        spawned_this_round,
+                        effective_spawn_burst,
+                    ) {
                         break;
                     }
                     let stop_clone = stop_flag.clone();
@@ -9588,6 +9639,22 @@ fn relay_outbound_target_passes_topology_guards(
     current < bucket_cap
 }
 
+fn relay_recent_dial_attempt_is_fresh(
+    now_unix_sec: u64,
+    attempted_unix_sec: u64,
+    stale_attempt_ttl: u64,
+) -> bool {
+    now_unix_sec.saturating_sub(attempted_unix_sec) <= stale_attempt_ttl.max(1)
+}
+
+fn relay_outbound_worker_capacity_reached(workers_len: usize, max_outbound_peers: usize) -> bool {
+    workers_len >= max_outbound_peers
+}
+
+fn relay_outbound_spawn_budget_exhausted(spawned: usize, spawn_burst: usize) -> bool {
+    spawned >= spawn_burst
+}
+
 fn relay_outbound_effective_max_peers_with_headroom(
     effective_max_outbound_peers: usize,
     active_peers: usize,
@@ -9987,8 +10054,9 @@ async fn run_relay_outbound_supervisor_async(
 
         let now_unix_sec = current_unix_sec().unwrap_or(0);
         let stale_attempt_ttl = relay_outbound_target_cooldown_sec().saturating_mul(8);
-        recent_dial_attempt_unix_sec
-            .retain(|_, ts| now_unix_sec.saturating_sub(*ts) <= stale_attempt_ttl.max(1));
+        recent_dial_attempt_unix_sec.retain(|_, ts| {
+            relay_recent_dial_attempt_is_fresh(now_unix_sec, *ts, stale_attempt_ttl)
+        });
         let (effective_max_outbound_peers, effective_spawn_burst, effective_rotate_after_sec) =
             match state.lock() {
                 Ok(guard) => {
@@ -10111,10 +10179,10 @@ async fn run_relay_outbound_supervisor_async(
             ) {
                 continue;
             }
-            if workers.len() >= effective_max_outbound_peers {
+            if relay_outbound_worker_capacity_reached(workers.len(), effective_max_outbound_peers) {
                 break;
             }
-            if spawned_this_round >= effective_spawn_burst {
+            if relay_outbound_spawn_budget_exhausted(spawned_this_round, effective_spawn_burst) {
                 break;
             }
             let target_key = target.clone();
@@ -10259,7 +10327,7 @@ fn run_relay_peer_session<IO: Read + Write>(
         };
         ensure_relay_peer_network(&cfg.network_id, &remote.network_id)?;
         ensure_relay_peer_consensus(&consensus_id, &remote.consensus_fingerprint)?;
-        let peer_is_ahead = remote.start_height > local_start_height;
+        let peer_is_ahead = relay_peer_is_ahead(remote.start_height, local_start_height);
         if matches!(mode, RelayPeerSessionMode::Outbound)
             && let (Some(store), Some(address)) = (anchor_store.as_ref(), peer_address)
         {
@@ -10298,7 +10366,7 @@ fn run_relay_peer_session<IO: Read + Write>(
             },
             WireMessage::GetAddr,
         ];
-        if matches!(mode, RelayPeerSessionMode::Outbound) || peer_is_ahead {
+        if relay_should_send_startup_catchup(mode, peer_is_ahead) {
             let locator = {
                 let guard = state
                     .lock()
@@ -10374,9 +10442,12 @@ fn run_relay_peer_session<IO: Read + Write>(
                 }
                 relay_messages_for_peer(&guard, peer_id, periodic)
             };
-            if relay_has_periodic_outbound(&periodic_outbound)
-                && !relay_send_messages_until_closed(stream, &periodic_outbound, &framing)?
-            {
+            let periodic_sent =
+                relay_send_messages_until_closed(stream, &periodic_outbound, &framing)?;
+            if relay_should_break_after_periodic_send(
+                relay_has_periodic_outbound(&periodic_outbound),
+                periodic_sent,
+            ) {
                 break;
             }
 
@@ -10469,8 +10540,7 @@ fn run_relay_peer_session<IO: Read + Write>(
     if let Ok(mut active_guard) = active.lock() {
         *active_guard = active_guard.saturating_sub(1);
     }
-    if result.is_err()
-        && matches!(mode, RelayPeerSessionMode::Outbound)
+    if relay_should_record_outbound_anchor_failure(mode, &result)
         && let (Some(store), Some(address)) = (anchor_store.as_ref(), peer_address)
     {
         let now_unix_sec = current_unix_sec().unwrap_or(0);
@@ -10542,7 +10612,7 @@ async fn run_relay_peer_session_async<S: AsyncRead + AsyncWrite + Unpin>(
         .await?;
         ensure_relay_peer_network(&cfg.network_id, &remote.network_id)?;
         ensure_relay_peer_consensus(&consensus_id, &remote.consensus_fingerprint)?;
-        let peer_is_ahead = remote.start_height > local_start_height;
+        let peer_is_ahead = relay_peer_is_ahead(remote.start_height, local_start_height);
         if matches!(mode, RelayPeerSessionMode::Outbound)
             && let (Some(store), Some(address)) = (anchor_store.as_ref(), peer_address)
         {
@@ -10581,7 +10651,7 @@ async fn run_relay_peer_session_async<S: AsyncRead + AsyncWrite + Unpin>(
             },
             WireMessage::GetAddr,
         ];
-        if matches!(mode, RelayPeerSessionMode::Outbound) || peer_is_ahead {
+        if relay_should_send_startup_catchup(mode, peer_is_ahead) {
             let locator = {
                 let guard = state
                     .lock()
@@ -10666,15 +10736,17 @@ async fn run_relay_peer_session_async<S: AsyncRead + AsyncWrite + Unpin>(
                 }
                 relay_messages_for_peer(&guard, peer_id, periodic)
             };
-            if relay_has_periodic_outbound(&periodic_outbound)
-                && !relay_send_messages_until_closed_async(
-                    stream,
-                    &periodic_outbound,
-                    &framing,
-                    write_timeout_sec,
-                )
-                .await?
-            {
+            let periodic_sent = relay_send_messages_until_closed_async(
+                stream,
+                &periodic_outbound,
+                &framing,
+                write_timeout_sec,
+            )
+            .await?;
+            if relay_should_break_after_periodic_send(
+                relay_has_periodic_outbound(&periodic_outbound),
+                periodic_sent,
+            ) {
                 break;
             }
 
@@ -10797,8 +10869,7 @@ async fn run_relay_peer_session_async<S: AsyncRead + AsyncWrite + Unpin>(
     if let Ok(mut active_guard) = active.lock() {
         *active_guard = active_guard.saturating_sub(1);
     }
-    if session_result.is_err()
-        && matches!(mode, RelayPeerSessionMode::Outbound)
+    if relay_should_record_outbound_anchor_failure(mode, &session_result)
         && let (Some(store), Some(address)) = (anchor_store.as_ref(), peer_address)
     {
         let now_unix_sec = current_unix_sec().unwrap_or(0);
@@ -10880,7 +10951,7 @@ async fn run_relay_state_sync_task_async(
                 &runtime_db_path,
                 &mut runtime_db_seen_mtime,
                 now_unix_sec,
-            ) && !is_runtime_db_lock_conflict(&err)
+            ) && relay_should_log_runtime_refresh_error(&err)
             {
                 eprintln!("warning: relay runtime background refresh failed: {err}");
             }
@@ -10889,7 +10960,7 @@ async fn run_relay_state_sync_task_async(
                 &mut guard.relay,
                 &mempool_db_path,
                 &mut mempool_db_seen_mtime,
-            ) && !is_mempool_db_lock_conflict(&err)
+            ) && relay_should_log_mempool_refresh_error(&err)
             {
                 eprintln!("warning: relay mempool background refresh failed: {err}");
             }
@@ -10898,6 +10969,14 @@ async fn run_relay_state_sync_task_async(
             eprintln!("warning: relay peer book background flush failed: {err}");
         }
     }
+}
+
+fn relay_should_log_runtime_refresh_error(err: &NodeError) -> bool {
+    !is_runtime_db_lock_conflict(err)
+}
+
+fn relay_should_log_mempool_refresh_error(err: &NodeError) -> bool {
+    !is_mempool_db_lock_conflict(err)
 }
 
 fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
@@ -12574,7 +12653,8 @@ fn stratum_should_defer_job_issuance(
         return Ok(StratumStaleGuardDecision::default());
     };
     let snapshot_age_sec = now_unix_sec.saturating_sub(snapshot.timestamp_unix_sec);
-    if snapshot_age_sec > ctx.stale_guard_max_snapshot_age_sec {
+    if stratum_stale_guard_snapshot_is_stale(snapshot_age_sec, ctx.stale_guard_max_snapshot_age_sec)
+    {
         return Ok(StratumStaleGuardDecision {
             blocked: false,
             lag_blocks: snapshot.global_sync_lag_blocks,
@@ -12583,10 +12663,33 @@ fn stratum_should_defer_job_issuance(
     }
     let lag_blocks = snapshot.global_sync_lag_blocks;
     Ok(StratumStaleGuardDecision {
-        blocked: lag_blocks > ctx.stale_guard_max_lag_blocks,
+        blocked: stratum_stale_guard_lag_blocks_exceed_limit(
+            lag_blocks,
+            ctx.stale_guard_max_lag_blocks,
+        ),
         lag_blocks,
         snapshot_age_sec,
     })
+}
+
+fn stratum_stale_guard_snapshot_is_stale(snapshot_age_sec: u64, max_snapshot_age_sec: u64) -> bool {
+    snapshot_age_sec > max_snapshot_age_sec
+}
+
+fn stratum_stale_guard_lag_blocks_exceed_limit(lag_blocks: u64, max_lag_blocks: u64) -> bool {
+    lag_blocks > max_lag_blocks
+}
+
+fn stratum_should_refresh_jobs_on_timeout(
+    current_tip_hash: Hash256,
+    last_tip_hash: Hash256,
+    jobs_is_empty: bool,
+) -> bool {
+    tip_changed(current_tip_hash, last_tip_hash) || jobs_is_empty
+}
+
+fn stratum_share_prev_hash_matches_tip(job_prev_hash: Hash256, runtime_tip_hash: Hash256) -> bool {
+    job_prev_hash == runtime_tip_hash
 }
 
 fn stratum_should_log_stale_guard(now_unix_sec: u64, last_log_unix_sec: &mut u64) -> bool {
@@ -12764,7 +12867,11 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
             StratumReadOutcome::Timeout => {
                 if session.is_active() {
                     let current_tip = load_runtime_tip_hash(&ctx)?;
-                    if tip_changed(current_tip, last_tip_hash) || jobs.is_empty() {
+                    if stratum_should_refresh_jobs_on_timeout(
+                        current_tip,
+                        last_tip_hash,
+                        jobs.is_empty(),
+                    ) {
                         jobs.clear();
                         if let Some(new_tip_hash) = try_issue_new_stratum_job_async(
                             &mut session,
@@ -12912,7 +13019,10 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
 
                                 {
                                     let mut runtime = lock_runtime(&ctx.runtime)?;
-                                    if work.job.prev_hash != runtime.tip_hash() {
+                                    if !stratum_share_prev_hash_matches_tip(
+                                        work.job.prev_hash,
+                                        runtime.tip_hash(),
+                                    ) {
                                         submit_failed = true;
                                         eprintln!(
                                             "warning: stale stratum block share for channel={} job={}: expected tip={}, job_prev={}",
@@ -13243,6 +13353,25 @@ fn relay_telemetry_thread_running(stop_flag: &AtomicBool) -> bool {
 
 fn should_stop_after_seen_messages(read_limit: u32, seen: u32) -> bool {
     read_limit != 0 && seen >= read_limit
+}
+
+fn relay_peer_is_ahead(remote_start_height: u64, local_start_height: u64) -> bool {
+    remote_start_height > local_start_height
+}
+
+fn relay_should_send_startup_catchup(mode: RelayPeerSessionMode, peer_is_ahead: bool) -> bool {
+    matches!(mode, RelayPeerSessionMode::Outbound) || peer_is_ahead
+}
+
+fn relay_should_break_after_periodic_send(has_outbound: bool, send_succeeded: bool) -> bool {
+    has_outbound && !send_succeeded
+}
+
+fn relay_should_record_outbound_anchor_failure(
+    mode: RelayPeerSessionMode,
+    session_result: &Result<(), NodeError>,
+) -> bool {
+    session_result.is_err() && matches!(mode, RelayPeerSessionMode::Outbound)
 }
 
 #[derive(Debug)]
@@ -18511,7 +18640,7 @@ async fn axum_fallback_handler(
 ) -> AxumResponse {
     let path = uri.path();
 
-    if method == Method::GET {
+    if axum_request_is_get(&method) {
         if path.starts_with("/txid/") {
             let txid_raw = path.trim_start_matches("/txid/");
             return axum_txid_response(&state, txid_raw);
@@ -18533,6 +18662,10 @@ async fn axum_fallback_handler(
     }
 
     axum_json_response(StatusCode::NOT_FOUND, json_error_body("unknown endpoint"))
+}
+
+fn axum_request_is_get(method: &Method) -> bool {
+    *method == Method::GET
 }
 
 fn run_rpc_serve_inner_axum(
@@ -20297,6 +20430,13 @@ mod tests {
     ) -> Result<Option<super::HttpRequest>, super::NodeError> {
         let mut cursor = std::io::Cursor::new(raw.to_vec());
         super::read_http_request(&mut cursor)
+    }
+
+    async fn axum_response_body_text(response: axum::response::Response) -> String {
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read axum response body");
+        String::from_utf8(body.to_vec()).expect("utf8 axum response body")
     }
 
     fn connect_with_retry(addr: &str) -> TcpStream {
@@ -33250,9 +33390,13 @@ mod tests {
         }
 
         let (mut server_stream, mut client_stream) = UnixStream::pair().expect("unix pair");
-        client_stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .expect("client timeout");
+        if let Err(err) = client_stream.set_read_timeout(Some(Duration::from_secs(2))) {
+            if err.kind() == std::io::ErrorKind::PermissionDenied {
+                let _ = fs::remove_dir_all(work_dir);
+                return;
+            }
+            panic!("client timeout: {err}");
+        }
 
         let server = thread::spawn({
             let state = state.clone();
@@ -33359,9 +33503,13 @@ mod tests {
         }
 
         let (mut server_stream, mut client_stream) = UnixStream::pair().expect("unix pair");
-        client_stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .expect("client timeout");
+        if let Err(err) = client_stream.set_read_timeout(Some(Duration::from_secs(2))) {
+            if err.kind() == std::io::ErrorKind::PermissionDenied {
+                let _ = fs::remove_dir_all(work_dir);
+                return;
+            }
+            panic!("client timeout: {err}");
+        }
 
         let server = thread::spawn({
             let state = state.clone();
@@ -40061,6 +40209,652 @@ mod tests {
             first, different,
             "different node identities should reshuffle equal-score peers"
         );
+    }
+
+    #[test]
+    fn relay_path_and_mode_helpers_are_boundary_strict() {
+        let runtime_db = PathBuf::from("target/demo/runtime.redb");
+        let telemetry = super::default_relay_telemetry_path(&runtime_db);
+        assert_eq!(
+            telemetry,
+            PathBuf::from("target/demo/relay.telemetry.jsonl"),
+            "telemetry path should swap runtime filename only"
+        );
+        assert!(!super::run_mode_relay_telemetry_enabled(false, &telemetry));
+        fs::create_dir_all(telemetry.parent().expect("parent")).expect("mkdir");
+        fs::write(&telemetry, "{}\n").expect("write telemetry");
+        assert!(super::run_mode_relay_telemetry_enabled(false, &telemetry));
+        assert!(super::run_mode_relay_telemetry_enabled(true, &telemetry));
+        let _ = fs::remove_file(telemetry);
+    }
+
+    #[test]
+    fn relay_scheduler_and_topology_guards_cover_retry_and_bucket_boundaries() {
+        const COOLDOWN_KEY: &str = "SCAM_RELAY_OUTBOUND_TARGET_COOLDOWN_SEC";
+        const BUCKET_KEY: &str = "SCAM_RELAY_OUTBOUND_MAX_WORKERS_PER_BUCKET";
+        const RETRIES_KEY: &str = "SCAM_RELAY_BLOCK_REQUEST_MAX_RETRIES";
+        const TIMEOUT_KEY: &str = "SCAM_RELAY_BLOCK_REQUEST_TIMEOUT_SEC";
+        const GLOBAL_INFLIGHT_KEY: &str = "SCAM_RELAY_MAX_INFLIGHT_BLOCK_REQUESTS";
+        const PER_PEER_INFLIGHT_KEY: &str = "SCAM_RELAY_MAX_INFLIGHT_BLOCK_REQUESTS_PER_PEER";
+        let saved = [
+            (COOLDOWN_KEY, std::env::var(COOLDOWN_KEY).ok()),
+            (BUCKET_KEY, std::env::var(BUCKET_KEY).ok()),
+            (RETRIES_KEY, std::env::var(RETRIES_KEY).ok()),
+            (TIMEOUT_KEY, std::env::var(TIMEOUT_KEY).ok()),
+            (GLOBAL_INFLIGHT_KEY, std::env::var(GLOBAL_INFLIGHT_KEY).ok()),
+            (
+                PER_PEER_INFLIGHT_KEY,
+                std::env::var(PER_PEER_INFLIGHT_KEY).ok(),
+            ),
+        ];
+        unsafe {
+            std::env::set_var(COOLDOWN_KEY, "3");
+            std::env::set_var(BUCKET_KEY, "1");
+            std::env::set_var(RETRIES_KEY, "2");
+            std::env::set_var(TIMEOUT_KEY, "5");
+            std::env::set_var(GLOBAL_INFLIGHT_KEY, "8");
+            std::env::set_var(PER_PEER_INFLIGHT_KEY, "2");
+        }
+        assert_eq!(super::relay_outbound_target_cooldown_sec(), 3);
+        assert_eq!(super::relay_outbound_max_workers_per_bucket(), 1);
+        assert_eq!(super::relay_block_request_max_retries(), 2);
+
+        let now = 100u64;
+        assert!(super::relay_recent_dial_attempt_is_fresh(now, 97, 3));
+        assert!(super::relay_recent_dial_attempt_is_fresh(now, 96, 4));
+        assert!(
+            !super::relay_recent_dial_attempt_is_fresh(now, 96, 3),
+            "strict freshness must reject attempts older than cooldown"
+        );
+
+        let secret = [7u8; 32];
+        let target = "127.0.0.1:19001".to_owned();
+        let mut worker_targets = HashSet::new();
+        worker_targets.insert(target.clone());
+        let mut recent = std::collections::HashMap::new();
+        recent.insert(target.clone(), now.saturating_sub(2));
+        assert!(
+            !super::relay_outbound_target_passes_topology_guards(
+                &target,
+                &worker_targets,
+                &recent,
+                now,
+                2,
+                &secret
+            ),
+            "target should be blocked while cooldown is active and alternatives exist"
+        );
+        assert!(
+            super::relay_outbound_target_passes_topology_guards(
+                &target,
+                &HashSet::new(),
+                &recent,
+                now,
+                1,
+                &secret
+            ),
+            "single-candidate pool should bypass cooldown"
+        );
+        recent.clear();
+        assert!(
+            !super::relay_outbound_target_passes_topology_guards(
+                &target,
+                &worker_targets,
+                &recent,
+                now,
+                2,
+                &secret
+            ),
+            "bucket-cap must reject when same bucket is full"
+        );
+        let other = "127.0.0.1:19002".to_owned();
+        assert_ne!(
+            super::relay_target_bucket_key_with_secret("example.org:18444", &secret),
+            String::new()
+        );
+        assert_ne!(
+            super::relay_target_bucket_key_with_secret(&target, &secret),
+            String::new()
+        );
+        assert!(
+            super::relay_outbound_target_passes_topology_guards(
+                &other,
+                &HashSet::new(),
+                &std::collections::HashMap::new(),
+                now,
+                2,
+                &secret
+            ),
+            "different target with empty worker-set should pass"
+        );
+
+        assert_eq!(
+            super::relay_outbound_effective_max_peers_with_headroom(100, 8, 70),
+            45,
+            "headroom math should keep inbound reserve and active usage"
+        );
+        assert_eq!(super::relay_inflight_counter_release(0), 0);
+        assert_eq!(super::relay_inflight_counter_release(1), 0);
+        assert!(super::relay_block_request_retry_exhausted(2, 2));
+        assert!(!super::relay_block_request_retry_exhausted(1, 2));
+        assert!(super::relay_outbound_worker_capacity_reached(4, 4));
+        assert!(!super::relay_outbound_worker_capacity_reached(3, 4));
+        assert!(super::relay_outbound_spawn_budget_exhausted(3, 3));
+        assert!(!super::relay_outbound_spawn_budget_exhausted(2, 3));
+
+        let mut state = relay_state_for_tests();
+        let peer_id = 10u64;
+        let other_peer = 11u64;
+        let target_hash = Hash256([0xAB; 32]);
+        state.inflight_block_requests.insert(
+            target_hash,
+            super::InflightBlockRequest {
+                peer_id: other_peer,
+                requested_unix_sec: now.saturating_sub(10),
+                retries: 1,
+            },
+        );
+        state.peer_inflight_block_requests.insert(other_peer, 1);
+        let scheduled =
+            super::relay_schedule_block_getdata_for_peer(&mut state, peer_id, &[target_hash], now);
+        assert_eq!(scheduled, vec![InventoryItem::Block(target_hash)]);
+        assert_eq!(
+            state
+                .inflight_block_requests
+                .get(&target_hash)
+                .expect("inflight moved")
+                .peer_id,
+            peer_id
+        );
+        assert_eq!(
+            state
+                .inflight_block_requests
+                .get(&target_hash)
+                .expect("inflight moved")
+                .retries,
+            0
+        );
+        let scheduled_again =
+            super::relay_schedule_block_getdata_for_peer(&mut state, peer_id, &[target_hash], now);
+        assert!(
+            scheduled_again.is_empty(),
+            "request with exhausted retries must not be rescheduled"
+        );
+
+        state.peer_inflight_block_requests.insert(peer_id, 1);
+        super::relay_release_inflight_block_requests_for_peer(&mut state, peer_id);
+        assert!(!state.peer_inflight_block_requests.contains_key(&peer_id));
+        assert!(!state.inflight_block_requests.contains_key(&target_hash));
+
+        let expiring = Hash256([0xBC; 32]);
+        state.inflight_block_requests.insert(
+            expiring,
+            super::InflightBlockRequest {
+                peer_id: other_peer,
+                requested_unix_sec: now.saturating_sub(10),
+                retries: 0,
+            },
+        );
+        state.peer_inflight_block_requests.insert(other_peer, 1);
+        super::relay_cleanup_inflight_block_requests(&mut state, now);
+        assert!(!state.inflight_block_requests.contains_key(&expiring));
+        assert!(!state.peer_inflight_block_requests.contains_key(&other_peer));
+
+        let clear_hash = Hash256([0xCD; 32]);
+        state.inflight_block_requests.insert(
+            clear_hash,
+            super::InflightBlockRequest {
+                peer_id,
+                requested_unix_sec: now,
+                retries: 0,
+            },
+        );
+        state.peer_inflight_block_requests.insert(peer_id, 1);
+        super::relay_clear_inflight_block_request(&mut state, clear_hash);
+        assert!(!state.inflight_block_requests.contains_key(&clear_hash));
+        assert!(!state.peer_inflight_block_requests.contains_key(&peer_id));
+
+        for (key, value) in saved {
+            if let Some(raw) = value {
+                unsafe {
+                    std::env::set_var(key, raw);
+                }
+            } else {
+                unsafe {
+                    std::env::remove_var(key);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn relay_and_stratum_predicates_cover_mutation_boundaries() {
+        assert!(super::relay_peer_is_ahead(11, 10));
+        assert!(!super::relay_peer_is_ahead(10, 10));
+        assert!(!super::relay_peer_is_ahead(9, 10));
+        assert!(super::relay_should_send_startup_catchup(
+            super::RelayPeerSessionMode::Outbound,
+            false
+        ));
+        assert!(super::relay_should_send_startup_catchup(
+            super::RelayPeerSessionMode::Inbound,
+            true
+        ));
+        assert!(!super::relay_should_send_startup_catchup(
+            super::RelayPeerSessionMode::Inbound,
+            false
+        ));
+        assert!(super::relay_should_break_after_periodic_send(true, false));
+        assert!(!super::relay_should_break_after_periodic_send(true, true));
+        assert!(!super::relay_should_break_after_periodic_send(false, false));
+        assert!(super::relay_should_request_followup_sync(10, 11, true));
+        assert!(!super::relay_should_request_followup_sync(10, 10, true));
+        assert!(!super::relay_should_request_followup_sync(10, 11, false));
+        assert!(super::relay_headers_should_use_aggressive_interval(5, 5));
+        assert!(!super::relay_headers_should_use_aggressive_interval(4, 5));
+        assert!(super::relay_peer_tip_update_is_fresh(100, 95, 5));
+        assert!(!super::relay_peer_tip_update_is_fresh(100, 94, 5));
+        assert!(super::relay_should_record_outbound_anchor_failure(
+            super::RelayPeerSessionMode::Outbound,
+            &Err(super::NodeError::Runtime("x".to_owned()))
+        ));
+        assert!(!super::relay_should_record_outbound_anchor_failure(
+            super::RelayPeerSessionMode::Inbound,
+            &Err(super::NodeError::Runtime("x".to_owned()))
+        ));
+
+        assert!(super::stratum_stale_guard_snapshot_is_stale(31, 30));
+        assert!(!super::stratum_stale_guard_snapshot_is_stale(30, 30));
+        assert!(super::stratum_stale_guard_lag_blocks_exceed_limit(3, 2));
+        assert!(!super::stratum_stale_guard_lag_blocks_exceed_limit(2, 2));
+        assert!(super::stratum_should_refresh_jobs_on_timeout(
+            Hash256([1; 32]),
+            Hash256([2; 32]),
+            false
+        ));
+        assert!(super::stratum_should_refresh_jobs_on_timeout(
+            Hash256([1; 32]),
+            Hash256([1; 32]),
+            true
+        ));
+        assert!(!super::stratum_should_refresh_jobs_on_timeout(
+            Hash256([1; 32]),
+            Hash256([1; 32]),
+            false
+        ));
+        assert!(super::stratum_share_prev_hash_matches_tip(
+            Hash256([9; 32]),
+            Hash256([9; 32])
+        ));
+        assert!(!super::stratum_share_prev_hash_matches_tip(
+            Hash256([9; 32]),
+            Hash256([8; 32])
+        ));
+        assert!(super::ensure_relay_peer_consensus("abc", "abc").is_ok());
+        assert!(super::ensure_relay_peer_consensus("abc", "def").is_err());
+    }
+
+    #[test]
+    fn run_relay_state_sync_task_async_reloads_runtime_after_db_change() {
+        const REFRESH_KEY: &str = "SCAM_RELAY_SESSION_DB_REFRESH_INTERVAL_SEC";
+        let saved_refresh = std::env::var(REFRESH_KEY).ok();
+        unsafe {
+            std::env::set_var(REFRESH_KEY, "1");
+        }
+
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let runtime_base = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let mut runtime_next = ChainRuntime::from_config(cfg.clone()).expect("runtime next");
+        super::mine_blocks_on_runtime(
+            &mut runtime_next,
+            &super::MiningLoopParams {
+                count: 1,
+                interval_sec: cfg.target_block_time_sec,
+                max_nonce: 500_000,
+                subsidy: cfg.block_subsidy,
+                miner_key_hash: cfg.genesis_reward_key_hash20().expect("key"),
+                label_prefix: "state-sync-bg",
+                print_each: false,
+            },
+        )
+        .expect("mine next runtime");
+        assert!(
+            runtime_next.tip_height() > runtime_base.tip_height(),
+            "test precondition: advanced runtime must be ahead"
+        );
+
+        let relay = RelayAdmissionState {
+            mempool: Mempool::with_policy(cfg.max_mempool_txs as usize, cfg.min_relay_fee_per_kb)
+                .expect("mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip: GossipEngine::new(64).expect("gossip"),
+        };
+        let state = Arc::new(std::sync::Mutex::new(RelayServerState::new(
+            ChainRuntime::from_config(cfg.clone()).expect("runtime state"),
+            relay,
+        )));
+
+        let work_dir = temp_dir("test-relay-sync-bg-task");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let runtime_db_path = work_dir.join("runtime.redb");
+        let mempool_db_path = work_dir.join("mempool.redb");
+        persist_runtime_db(&runtime_base, &runtime_db_path).expect("persist base runtime");
+        fs::write(&mempool_db_path, b"").expect("touch mempool db file");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        rt.block_on(async {
+            let task = tokio::spawn(super::run_relay_state_sync_task_async(
+                stop.clone(),
+                state.clone(),
+                cfg.clone(),
+                runtime_db_path.clone(),
+                mempool_db_path.clone(),
+            ));
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            persist_runtime_db(&runtime_next, &runtime_db_path).expect("persist advanced runtime");
+            tokio::time::sleep(Duration::from_millis(1_500)).await;
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .expect("sync task join timeout");
+        });
+
+        let reloaded_tip = state.lock().expect("state lock").runtime.tip_height();
+        assert_eq!(reloaded_tip, runtime_next.tip_height());
+
+        if let Some(value) = saved_refresh {
+            unsafe {
+                std::env::set_var(REFRESH_KEY, value);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var(REFRESH_KEY);
+            }
+        }
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
+    fn axum_handlers_return_structured_payloads_and_never_default_responses() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let work_dir = temp_dir("test-axum-structured-responses");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let state = super::AxumRpcState {
+            network: Network::Devnet,
+            cfg: cfg.clone(),
+            runtime_db_path: work_dir.join("runtime.redb"),
+            runtime_cache: Arc::new(std::sync::Mutex::new(super::AxumRuntimeCache {
+                runtime,
+                last_seen_mtime: None,
+            })),
+            mempool_db_path: work_dir.join("mempool.redb"),
+            relay_telemetry: None,
+            stratum_telemetry: None,
+            pool_ledger_db_path: work_dir.join("pool-ledger.redb"),
+            ui_dir: work_dir.join("ui"),
+        };
+
+        let binary = super::axum_binary_response(
+            axum::http::StatusCode::CREATED,
+            "text/plain",
+            b"ok".to_vec(),
+        );
+        assert_eq!(binary.status(), axum::http::StatusCode::CREATED);
+        assert_eq!(
+            binary
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/plain")
+        );
+
+        let invalid_txid = super::axum_txid_response(&state, "bad/path");
+        assert_eq!(invalid_txid.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            super::axum_pool_status_response(&state)
+                .expect("pool status response")
+                .status(),
+            axum::http::StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            super::axum_pool_worker_response(&state, "worker")
+                .expect("pool worker response")
+                .status(),
+            axum::http::StatusCode::NOT_FOUND
+        );
+        let events_payload = super::axum_events_snapshot_payload(&state).expect("events payload");
+        let parsed_events: serde_json::Value =
+            serde_json::from_str(&events_payload).expect("events payload json");
+        assert!(parsed_events.get("network_id").is_some());
+
+        let wallet_key = derive_wallet_key(
+            &WalletMnemonic::parse(SOAK_FLOW_MNEMONIC)
+                .expect("mnemonic")
+                .to_seed(""),
+            0,
+            0,
+        )
+        .expect("wallet key");
+        let wallet_address =
+            scam_wallet::to_address(&cfg.hrp, wallet_key.pubkey_compressed()).expect("address");
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        rt.block_on(async {
+            let health = super::axum_health_handler().await;
+            assert_eq!(health.status(), axum::http::StatusCode::OK);
+            assert!(
+                axum_response_body_text(health)
+                    .await
+                    .contains("\"ok\":true")
+            );
+
+            let status = super::axum_status_handler(super::AxumState(state.clone())).await;
+            assert_eq!(status.status(), axum::http::StatusCode::OK);
+            assert!(axum_response_body_text(status).await.contains("network_id"));
+
+            let mempool = super::axum_mempool_handler(super::AxumState(state.clone())).await;
+            assert_eq!(mempool.status(), axum::http::StatusCode::OK);
+            assert!(axum_response_body_text(mempool).await.contains("txids"));
+
+            let txid = super::axum_txid_handler(
+                super::AxumPath("not-hex".to_owned()),
+                super::AxumState(state.clone()),
+            )
+            .await;
+            assert_eq!(txid.status(), axum::http::StatusCode::BAD_REQUEST);
+
+            let events = super::axum_events_handler(super::AxumState(state.clone())).await;
+            assert_eq!(events.status(), axum::http::StatusCode::OK);
+            assert!(
+                events
+                    .headers()
+                    .get(axum::http::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .map(|value| value.starts_with("text/event-stream"))
+                    .unwrap_or(false)
+            );
+
+            let pool_status =
+                super::axum_pool_status_handler(super::AxumState(state.clone())).await;
+            assert_eq!(pool_status.status(), axum::http::StatusCode::NOT_FOUND);
+            let pool_worker = super::axum_pool_worker_handler(
+                super::AxumPath("worker".to_owned()),
+                super::AxumState(state.clone()),
+            )
+            .await;
+            assert_eq!(pool_worker.status(), axum::http::StatusCode::NOT_FOUND);
+            let pool_worker_get = super::axum_pool_worker_route_handler(
+                axum::http::Method::GET,
+                super::AxumPath("worker".to_owned()),
+                super::AxumState(state.clone()),
+            )
+            .await;
+            assert_eq!(pool_worker_get.status(), axum::http::StatusCode::NOT_FOUND);
+            let pool_worker_post = super::axum_pool_worker_route_handler(
+                axum::http::Method::POST,
+                super::AxumPath("worker".to_owned()),
+                super::AxumState(state.clone()),
+            )
+            .await;
+            assert_eq!(pool_worker_post.status(), axum::http::StatusCode::NOT_FOUND);
+            let payouts_pending =
+                super::axum_pool_payouts_pending_handler(super::AxumState(state.clone())).await;
+            assert_eq!(payouts_pending.status(), axum::http::StatusCode::NOT_FOUND);
+            let payouts_completed =
+                super::axum_pool_payouts_completed_handler(super::AxumState(state.clone())).await;
+            assert_eq!(
+                payouts_completed.status(),
+                axum::http::StatusCode::NOT_FOUND
+            );
+
+            let decode = super::axum_wallet_decode_handler(
+                super::AxumState(state.clone()),
+                super::AxumBytes::from(
+                    serde_json::json!({ "address": wallet_address })
+                        .to_string()
+                        .into_bytes(),
+                ),
+            )
+            .await;
+            assert_eq!(decode.status(), axum::http::StatusCode::OK);
+            assert!(
+                axum_response_body_text(decode)
+                    .await
+                    .contains("key_hash20_hex")
+            );
+
+            let balance_by_address = super::axum_wallet_balance_by_address_handler(
+                super::AxumState(state.clone()),
+                super::AxumBytes::from(
+                    serde_json::json!({ "address": wallet_address })
+                        .to_string()
+                        .into_bytes(),
+                ),
+            )
+            .await;
+            assert_eq!(balance_by_address.status(), axum::http::StatusCode::OK);
+            assert!(
+                axum_response_body_text(balance_by_address)
+                    .await
+                    .contains("spendable")
+            );
+
+            let balance_history = super::axum_wallet_balance_history_by_address_handler(
+                super::AxumState(state.clone()),
+                super::AxumBytes::from(
+                    serde_json::json!({ "address": wallet_address, "max_entries": 16 })
+                        .to_string()
+                        .into_bytes(),
+                ),
+            )
+            .await;
+            assert_eq!(balance_history.status(), axum::http::StatusCode::OK);
+            assert!(
+                axum_response_body_text(balance_history)
+                    .await
+                    .contains("tx_history")
+            );
+
+            let send_preview = super::axum_wallet_send_preview_handler(
+                super::AxumState(state.clone()),
+                super::AxumBytes::from(
+                    serde_json::json!({
+                        "mnemonic": SOAK_FLOW_MNEMONIC,
+                        "passphrase": "",
+                        "to": wallet_address,
+                        "amount": 0,
+                        "fee": 1,
+                        "account": 0,
+                        "index": 0
+                    })
+                    .to_string()
+                    .into_bytes(),
+                ),
+            )
+            .await;
+            assert_eq!(send_preview.status(), axum::http::StatusCode::BAD_REQUEST);
+
+            let send = super::axum_wallet_send_handler(
+                super::AxumState(state.clone()),
+                super::AxumBytes::from(
+                    serde_json::json!({
+                        "mnemonic": SOAK_FLOW_MNEMONIC,
+                        "passphrase": "",
+                        "to": wallet_address,
+                        "amount": 0,
+                        "fee": 1,
+                        "account": 0,
+                        "index": 0
+                    })
+                    .to_string()
+                    .into_bytes(),
+                ),
+            )
+            .await;
+            assert_eq!(send.status(), axum::http::StatusCode::BAD_REQUEST);
+
+            let fallback = super::axum_fallback_handler(
+                super::AxumState(state.clone()),
+                axum::http::Method::GET,
+                "/unknown".parse::<axum::http::Uri>().expect("uri"),
+            )
+            .await;
+            assert_eq!(fallback.status(), axum::http::StatusCode::NOT_FOUND);
+            assert!(
+                axum_response_body_text(fallback)
+                    .await
+                    .contains("unknown endpoint")
+            );
+            assert!(super::axum_request_is_get(&axum::http::Method::GET));
+            assert!(!super::axum_request_is_get(&axum::http::Method::POST));
+        });
+
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
+    fn run_rpc_serve_inner_legacy_rejects_invalid_bind_address() {
+        let work_dir = temp_dir("test-rpc-legacy-invalid-bind");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let config_path = work_dir.join("devnet.toml");
+        fs::write(&config_path, include_str!("../../../config/devnet.toml")).expect("write cfg");
+        let err = super::run_rpc_serve_inner_legacy(
+            RpcServeArgs {
+                network: Network::Devnet,
+                config: Some(config_path),
+                runtime_db: Some(work_dir.join("runtime.redb")),
+                bind: "not-an-addr".to_owned(),
+                ui_dir: work_dir.join("ui"),
+                relay_telemetry: None,
+                stratum_telemetry: None,
+                pool_ledger: None,
+                mine_blocks: 0,
+                interval_sec: 120,
+                max_nonce: 1000,
+                max_requests: 1,
+            },
+            Some(Arc::new(AtomicBool::new(true))),
+        )
+        .expect_err("invalid bind must fail");
+        let err_text = err.to_string();
+        assert!(
+            err_text.contains("not-an-addr")
+                || err_text.contains("bind")
+                || err_text.contains("address"),
+            "unexpected error text: {err_text}"
+        );
+        let _ = fs::remove_dir_all(work_dir);
     }
 
     #[test]
