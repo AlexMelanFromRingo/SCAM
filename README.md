@@ -7,6 +7,9 @@ Current repository status (2026-03-10, `RC3`):
 - Full mutation closure is green on current code (`stage2` closure + full `stage3` with `0 missed`, `0 timeout`).
 - Workspace quality gates are green: `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`.
 - Remaining deferred non-code gates: long-run soak, external audit, and the maximum-detail documentation pack.
+- Codebase size (approx, excluding `target/` and vendor trees):
+  - Total tracked LOC: ~79,237
+  - Rust LOC: ~62,831
 
 This README is written as an operator+developer manual: what the protocol does, how to build it, how to run node/wallet/mining, and how to validate deployments.
 
