@@ -186,7 +186,7 @@ cargo clippy --workspace --all-targets -- -D warnings
   - uploads raw binaries (no archive):
     - `scam-node-linux-x86_64`
     - `scam-node-windows-x86_64.exe`
-    - `scam-node-macos-x86_64`
+    - `scam-node-macos-aarch64`
 
 ---
 

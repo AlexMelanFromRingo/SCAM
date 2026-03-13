@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::Hasher;
 
+#[cfg(not(windows))]
 use minisketch_rs::Minisketch;
 use scam_core::{Block, Hash256, Transaction};
 use siphasher::sip::SipHasher24;
@@ -152,8 +153,11 @@ impl GossipEngine {
                 "replacement penalty must be greater than zero".to_owned(),
             ));
         }
-        Minisketch::try_new(RECON_BITS, 0, 1)
-            .map_err(|err| GossipError::Recon(format!("minisketch unsupported: {err}")))?;
+        #[cfg(not(windows))]
+        {
+            Minisketch::try_new(RECON_BITS, 0, 1)
+                .map_err(|err| GossipError::Recon(format!("minisketch unsupported: {err}")))?;
+        }
         Ok(Self {
             max_inv_items,
             ban_threshold,
@@ -221,6 +225,9 @@ impl GossipEngine {
     }
 
     pub fn peer_supports_reconciliation(&self, peer_id: PeerId) -> bool {
+        if !Self::recon_supported() {
+            return false;
+        }
         let Some(state) = self.peers.get(&peer_id) else {
             return false;
         };
@@ -240,6 +247,11 @@ impl GossipEngine {
     }
 
     pub fn build_send_recon(&self, peer_id: PeerId) -> Result<WireMessage, GossipError> {
+        if !Self::recon_supported() {
+            return Err(GossipError::Recon(
+                "reconciliation unavailable on this platform".to_owned(),
+            ));
+        }
         let Some(peer_state) = self.peers.get(&peer_id) else {
             return Err(GossipError::UnknownPeer { peer_id });
         };
@@ -489,6 +501,12 @@ impl GossipEngine {
         max_sketch_items: u32,
         max_diff_items: u32,
     ) -> Result<Vec<OutboundMessage>, GossipError> {
+        if enabled && !Self::recon_supported() {
+            self.apply_penalty(from_peer, 10);
+            return Err(GossipError::Recon(
+                "reconciliation unavailable on this platform".to_owned(),
+            ));
+        }
         if enabled && version == 0 {
             self.apply_penalty(from_peer, 10);
             return Err(GossipError::InvalidConfig(
@@ -547,6 +565,12 @@ impl GossipEngine {
         salt: u64,
         set_size: u32,
     ) -> Result<Vec<OutboundMessage>, GossipError> {
+        if !Self::recon_supported() {
+            self.apply_penalty(from_peer, 10);
+            return Err(GossipError::Recon(
+                "reconciliation unavailable on this platform".to_owned(),
+            ));
+        }
         if !self.peer_supports_reconciliation(from_peer) {
             self.apply_penalty(from_peer, 10);
             return Err(GossipError::Recon(
@@ -671,6 +695,7 @@ impl GossipEngine {
         Ok(out)
     }
 
+    #[cfg(not(windows))]
     fn handle_sketch(
         &mut self,
         from_peer: PeerId,
@@ -853,12 +878,33 @@ impl GossipEngine {
         Ok(out)
     }
 
+    #[cfg(windows)]
+    fn handle_sketch(
+        &mut self,
+        _from_peer: PeerId,
+        _salt: u64,
+        _bits: u32,
+        _capacity: u32,
+        _implementation: u32,
+        _bytes: Vec<u8>,
+    ) -> Result<Vec<OutboundMessage>, GossipError> {
+        Err(GossipError::Recon(
+            "reconciliation unavailable on this platform".to_owned(),
+        ))
+    }
+
     fn handle_req_tx(
         &mut self,
         from_peer: PeerId,
         salt: u64,
         short_ids: Vec<u64>,
     ) -> Result<Vec<OutboundMessage>, GossipError> {
+        if !Self::recon_supported() {
+            self.apply_penalty(from_peer, 10);
+            return Err(GossipError::Recon(
+                "reconciliation unavailable on this platform".to_owned(),
+            ));
+        }
         if short_ids.len() > self.max_inv_items {
             self.apply_penalty(from_peer, 25);
             return Err(GossipError::TooManyInventoryItems {
@@ -1223,6 +1269,10 @@ impl GossipEngine {
         Ok(())
     }
 
+    fn recon_supported() -> bool {
+        cfg!(not(windows))
+    }
+
     fn recon_capacity_from_requested(&self, requested: u32) -> usize {
         let requested = if requested == 0 {
             self.max_inv_items
@@ -1232,6 +1282,7 @@ impl GossipEngine {
         requested.min(self.max_inv_items).max(1)
     }
 
+    #[cfg(not(windows))]
     fn build_recon_sketch(
         &self,
         salt: u64,
@@ -1250,6 +1301,19 @@ impl GossipEngine {
             .serialize(&mut bytes)
             .map_err(|err| GossipError::Recon(format!("minisketch serialize failed: {err}")))?;
         Ok(bytes)
+    }
+
+    #[cfg(windows)]
+    fn build_recon_sketch(
+        &self,
+        _salt: u64,
+        _capacity: usize,
+        _implementation: u32,
+        _short_ids: &[u64],
+    ) -> Result<Vec<u8>, GossipError> {
+        Err(GossipError::Recon(
+            "reconciliation unavailable on this platform".to_owned(),
+        ))
     }
 
     fn build_recon_snapshot(
@@ -1376,6 +1440,7 @@ pub enum GossipError {
 }
 
 #[cfg(test)]
+#[cfg(not(windows))]
 mod tests {
     use minisketch_rs::Minisketch;
 
