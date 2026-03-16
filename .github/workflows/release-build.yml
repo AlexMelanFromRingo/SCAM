@@ -67,29 +67,33 @@ jobs:
           - os: windows-latest
             target_name: windows-x86_64
             exe: ".exe"
-          - os: macos-13
+          - os: macos-14
             target_name: macos-x86_64
+            rust_target: x86_64-apple-darwin
             exe: ""
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target || '' }}
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: scam-release-${{ runner.os }}
+          shared-key: scam-release-${{ runner.os }}-${{ matrix.target_name }}
           workspaces: |
             . -> target
       - name: Build release binary
         shell: bash
-        run: cargo build -p scam-node --release
+        run: cargo build -p scam-node --release ${{ matrix.rust_target && format('--target {0}', matrix.rust_target) || '' }}
       - name: Stage binary artifact
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p dist
-          cp "target/release/scam-node${{ matrix.exe }}" "dist/scam-node-${{ matrix.target_name }}${{ matrix.exe }}"
+          TARGET_DIR="${{ matrix.rust_target && format('target/{0}/release', matrix.rust_target) || 'target/release' }}"
+          cp "${TARGET_DIR}/scam-node${{ matrix.exe }}" "dist/scam-node-${{ matrix.target_name }}${{ matrix.exe }}"
       - name: Upload platform artifact
         uses: actions/upload-artifact@v4
         with:
