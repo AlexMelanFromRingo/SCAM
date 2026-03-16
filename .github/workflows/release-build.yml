@@ -67,8 +67,8 @@ jobs:
           - os: windows-latest
             target_name: windows-x86_64
             exe: ".exe"
-          - os: macos-14
-            target_name: macos-aarch64
+          - os: macos-13
+            target_name: macos-x86_64
             exe: ""
     runs-on: ${{ matrix.os }}
     steps:
@@ -124,4 +124,4 @@ jobs:
           files: |
             dist/**/scam-node-linux-x86_64
             dist/**/scam-node-windows-x86_64.exe
-            dist/**/scam-node-macos-aarch64
+            dist/**/scam-node-macos-x86_64
