@@ -226,49 +226,88 @@ fn validate_non_coinbase_tx(
             });
         }
 
-        let parsed_pubkey = PublicKey::from_slice(&input.pubkey_compressed).map_err(|_| {
-            TxValidationError::InvalidPubkey {
-                tx_index,
-                input_index,
-            }
-        })?;
-        let derived_hash = key_hash20_from_pubkey(input.pubkey_compressed.as_slice()).ok_or(
-            TxValidationError::InvalidPubkey {
-                tx_index,
-                input_index,
-            },
-        )?;
-        if derived_hash != utxo.key_hash20 {
-            return Err(TxValidationError::PubkeyHashMismatch {
-                tx_index,
-                input_index,
-            });
-        }
-
+        // Spend-condition dispatch: pure shape-based discrimination on
+        // the input's `pubkey_compressed` blob.
+        //
+        // - Exactly 33 bytes → legacy P2PKH (single Schnorr verify).
+        // - Multisig blob shape (tag-prefixed, structured) → k-of-n
+        //   multisig verify per `crate::multisig`.
+        //
+        // No collision risk between the two paths: legacy pubkeys are
+        // 33 bytes and start with `0x02` or `0x03`; multisig blobs are
+        // ≥ `MULTISIG_MIN_BLOB` (51) bytes and start with the
+        // `SCAM-multisig-v1` tag. The hash commitment in
+        // `utxo.key_hash20` is computed from whichever blob the spender
+        // supplies, so a spender cannot satisfy a P2PKH UTXO with a
+        // multisig blob (or vice-versa) — the hashes differ.
         let digest = tx
             .signing_digest_with_chain_domain(input_index, chain_domain)
             .map_err(|source| TxValidationError::SigningDigest { tx_index, source })?;
-        let message = Message::from_digest_slice(&digest.0).map_err(|_| {
-            TxValidationError::SigningDigest {
-                tx_index,
-                source: TxSigningError::InputOutOfBounds {
-                    index: input_index,
-                    total_inputs: tx.inputs.len(),
-                },
+
+        if crate::multisig::looks_like_multisig_blob(&input.pubkey_compressed) {
+            let descriptor = crate::multisig::MultisigDescriptor::parse(&input.pubkey_compressed)
+                .map_err(|source| TxValidationError::InvalidMultisigBlob {
+                    tx_index,
+                    input_index,
+                    source,
+                })?;
+            let derived_hash = crate::multisig::MultisigDescriptor::script_hash20(
+                &input.pubkey_compressed,
+            );
+            if derived_hash != utxo.key_hash20 {
+                return Err(TxValidationError::PubkeyHashMismatch {
+                    tx_index,
+                    input_index,
+                });
             }
-        })?;
-        let signature = Signature::from_slice(&input.signature).map_err(|_| {
-            TxValidationError::InvalidSignatureEncoding {
-                tx_index,
-                input_index,
+            crate::multisig::verify_multisig_spend(&descriptor, digest, &input.signature)
+                .map_err(|source| TxValidationError::InvalidMultisigSpend {
+                    tx_index,
+                    input_index,
+                    source,
+                })?;
+        } else {
+            // Legacy P2PKH path.
+            let parsed_pubkey =
+                PublicKey::from_slice(&input.pubkey_compressed).map_err(|_| {
+                    TxValidationError::InvalidPubkey {
+                        tx_index,
+                        input_index,
+                    }
+                })?;
+            let derived_hash = key_hash20_from_pubkey(input.pubkey_compressed.as_slice())
+                .ok_or(TxValidationError::InvalidPubkey {
+                    tx_index,
+                    input_index,
+                })?;
+            if derived_hash != utxo.key_hash20 {
+                return Err(TxValidationError::PubkeyHashMismatch {
+                    tx_index,
+                    input_index,
+                });
             }
-        })?;
-        let (xonly, _) = parsed_pubkey.x_only_public_key();
-        if secp.verify_schnorr(&signature, &message, &xonly).is_err() {
-            return Err(TxValidationError::InvalidSignature {
-                tx_index,
-                input_index,
-            });
+            let message = Message::from_digest_slice(&digest.0).map_err(|_| {
+                TxValidationError::SigningDigest {
+                    tx_index,
+                    source: TxSigningError::InputOutOfBounds {
+                        index: input_index,
+                        total_inputs: tx.inputs.len(),
+                    },
+                }
+            })?;
+            let signature = Signature::from_slice(&input.signature).map_err(|_| {
+                TxValidationError::InvalidSignatureEncoding {
+                    tx_index,
+                    input_index,
+                }
+            })?;
+            let (xonly, _) = parsed_pubkey.x_only_public_key();
+            if secp.verify_schnorr(&signature, &message, &xonly).is_err() {
+                return Err(TxValidationError::InvalidSignature {
+                    tx_index,
+                    input_index,
+                });
+            }
         }
 
         input_total = input_total
@@ -397,6 +436,18 @@ pub enum TxValidationError {
     CoinbaseRewardOverflow,
     #[error("coinbase reward too high: allowed {allowed}, got {got}")]
     CoinbaseRewardTooHigh { allowed: u128, got: u128 },
+    #[error("multisig blob malformed in tx #{tx_index} input #{input_index}: {source}")]
+    InvalidMultisigBlob {
+        tx_index: usize,
+        input_index: usize,
+        source: crate::multisig::MultisigError,
+    },
+    #[error("multisig spend rejected in tx #{tx_index} input #{input_index}: {source}")]
+    InvalidMultisigSpend {
+        tx_index: usize,
+        input_index: usize,
+        source: crate::multisig::MultisigError,
+    },
 }
 
 #[cfg(test)]
@@ -444,6 +495,211 @@ mod tests {
         let keypair = Keypair::from_secret_key(&secp, secret);
         let sig = secp.sign_schnorr_no_aux_rand(&message, &keypair);
         tx.inputs[input_index].signature = sig.as_ref().to_vec();
+    }
+
+    /// End-to-end: 2-of-3 multisig output funded by genesis, spent in
+    /// block 1 with two of three signatures. Exercises the new dispatch
+    /// in `validate_non_coinbase_tx` against the full apply pipeline.
+    #[test]
+    fn block_with_2_of_3_multisig_spend_applies() {
+        let chain_domain = b"devnet";
+        let (pk_a, _ph_a, sk_a) = key_material([100u8; 32]);
+        let (pk_b, _ph_b, _sk_b) = key_material([101u8; 32]);
+        let (pk_c, _ph_c, sk_c) = key_material([102u8; 32]);
+        let (_, receiver_key_hash, _) = key_material([103u8; 32]);
+
+        let multisig_blob =
+            crate::multisig::MultisigDescriptor::encode(2, &[pk_a, pk_b, pk_c])
+                .expect("encode 2-of-3");
+        let multisig_hash20 =
+            crate::multisig::MultisigDescriptor::script_hash20(&multisig_blob);
+
+        // Genesis funds the multisig hash (via a coinbase output).
+        let genesis_coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: OutPoint::coinbase(),
+                signature: b"genesis-multisig-fund".to_vec(),
+                pubkey_compressed: vec![],
+                sequence: u32::MAX,
+            }],
+            outputs: vec![TxOut {
+                value: 100,
+                key_hash20: multisig_hash20,
+            }],
+            lock_time: 0,
+        };
+        let genesis = make_block(
+            Hash256::ZERO,
+            100,
+            Target::MAX,
+            vec![genesis_coinbase.clone()],
+        );
+        let mut utxos = UtxoSet::new();
+        validate_and_apply_block(&genesis, 0, 100, 1, chain_domain, &mut utxos)
+            .expect("genesis applies");
+        assert_eq!(utxos.len(), 1);
+
+        // Spend the multisig output with A + C (2-of-3).
+        let mut spend = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: OutPoint {
+                    txid: genesis_coinbase.txid(),
+                    vout: 0,
+                },
+                signature: vec![],
+                pubkey_compressed: multisig_blob.clone(),
+                sequence: 0,
+            }],
+            outputs: vec![TxOut {
+                value: 90,
+                key_hash20: receiver_key_hash,
+            }],
+            lock_time: 0,
+        };
+        // Compute the per-input sighash and sign it with sk_a and sk_c.
+        let digest = spend
+            .signing_digest_with_chain_domain(0, chain_domain)
+            .expect("digest");
+        let message = Message::from_digest_slice(&digest.0).expect("msg");
+        let secp = Secp256k1::new();
+        let kp_a = Keypair::from_secret_key(&secp, &sk_a);
+        let kp_c = Keypair::from_secret_key(&secp, &sk_c);
+        let sig_a = secp.sign_schnorr_no_aux_rand(&message, &kp_a);
+        let sig_c = secp.sign_schnorr_no_aux_rand(&message, &kp_c);
+        let mut sigs = Vec::with_capacity(128);
+        sigs.extend_from_slice(sig_a.as_ref());
+        sigs.extend_from_slice(sig_c.as_ref());
+        spend.inputs[0].signature = sigs;
+
+        // Coinbase for block 1 sweeps the fee back to receiver.
+        let block1_coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: OutPoint::coinbase(),
+                signature: b"b1-multisig-spend".to_vec(),
+                pubkey_compressed: vec![],
+                sequence: u32::MAX,
+            }],
+            outputs: vec![TxOut {
+                value: 110,
+                key_hash20: receiver_key_hash,
+            }],
+            lock_time: 0,
+        };
+        let block1 = make_block(
+            genesis.header.block_hash(),
+            220,
+            Target::MAX,
+            vec![block1_coinbase, spend],
+        );
+        let applied =
+            validate_and_apply_block(&block1, 1, 100, 1, chain_domain, &mut utxos)
+                .expect("multisig-spend block must apply");
+        assert_eq!(applied.total_fees, 10);
+        // UTXO set: the multisig coin is consumed, two new outputs created.
+        assert_eq!(utxos.len(), 2);
+    }
+
+    /// Negative: 1-of-3 multisig spend submitted for a 2-of-3 output is
+    /// rejected at consensus level with a typed error.
+    #[test]
+    fn multisig_spend_below_threshold_is_rejected() {
+        let chain_domain = b"devnet";
+        let (pk_a, _ph_a, sk_a) = key_material([110u8; 32]);
+        let (pk_b, _ph_b, _) = key_material([111u8; 32]);
+        let (pk_c, _ph_c, _) = key_material([112u8; 32]);
+        let (_, receiver_key_hash, _) = key_material([113u8; 32]);
+
+        let multisig_blob =
+            crate::multisig::MultisigDescriptor::encode(2, &[pk_a, pk_b, pk_c])
+                .expect("encode 2-of-3");
+        let multisig_hash20 =
+            crate::multisig::MultisigDescriptor::script_hash20(&multisig_blob);
+
+        let genesis_coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: OutPoint::coinbase(),
+                signature: b"genesis-multisig".to_vec(),
+                pubkey_compressed: vec![],
+                sequence: u32::MAX,
+            }],
+            outputs: vec![TxOut {
+                value: 100,
+                key_hash20: multisig_hash20,
+            }],
+            lock_time: 0,
+        };
+        let genesis = make_block(
+            Hash256::ZERO,
+            100,
+            Target::MAX,
+            vec![genesis_coinbase.clone()],
+        );
+        let mut utxos = UtxoSet::new();
+        validate_and_apply_block(&genesis, 0, 100, 1, chain_domain, &mut utxos)
+            .expect("genesis applies");
+
+        let mut spend = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: OutPoint {
+                    txid: genesis_coinbase.txid(),
+                    vout: 0,
+                },
+                signature: vec![],
+                pubkey_compressed: multisig_blob.clone(),
+                sequence: 0,
+            }],
+            outputs: vec![TxOut {
+                value: 90,
+                key_hash20: receiver_key_hash,
+            }],
+            lock_time: 0,
+        };
+        // Sign with A only — k=2 required → BadSignatureLength.
+        let digest = spend
+            .signing_digest_with_chain_domain(0, chain_domain)
+            .expect("digest");
+        let message = Message::from_digest_slice(&digest.0).expect("msg");
+        let secp = Secp256k1::new();
+        let kp_a = Keypair::from_secret_key(&secp, &sk_a);
+        let sig_a = secp.sign_schnorr_no_aux_rand(&message, &kp_a);
+        spend.inputs[0].signature = sig_a.as_ref().to_vec();
+
+        let block1_coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: OutPoint::coinbase(),
+                signature: b"b1".to_vec(),
+                pubkey_compressed: vec![],
+                sequence: u32::MAX,
+            }],
+            outputs: vec![TxOut {
+                value: 110,
+                key_hash20: receiver_key_hash,
+            }],
+            lock_time: 0,
+        };
+        let block1 = make_block(
+            genesis.header.block_hash(),
+            220,
+            Target::MAX,
+            vec![block1_coinbase, spend],
+        );
+        let err = validate_and_apply_block(&block1, 1, 100, 1, chain_domain, &mut utxos)
+            .expect_err("under-threshold spend must reject");
+        match err {
+            TxValidationError::InvalidMultisigSpend { source, .. } => {
+                assert!(matches!(
+                    source,
+                    crate::multisig::MultisigError::BadSignatureLength { .. }
+                ));
+            }
+            other => panic!("expected InvalidMultisigSpend, got {other:?}"),
+        }
     }
 
     #[test]
