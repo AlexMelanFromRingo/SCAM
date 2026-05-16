@@ -1,6 +1,7 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 pub mod address;
 pub mod mnemonic;
+pub mod psbt;
 pub mod qr;
 pub mod rescan;
 pub mod signer;
@@ -11,6 +12,10 @@ pub use address::{
     key_hash20_from_compressed_pubkey, parse_address, to_address, to_multisig_address,
 };
 pub use mnemonic::{MnemonicError, WalletMnemonic, WalletSeedMode, new_mnemonic};
+pub use psbt::{
+    InspectStatus, PARTIAL_MULTISIG_TX_VERSION, PartialMultisigError, PartialMultisigInput,
+    PartialMultisigTx,
+};
 pub use qr::{QrError, qr_for_payment_uri, qr_for_text};
 pub use rescan::{
     OwnedUtxo, RescanBalance, RescanError, RescanReport, WatchedKey, derive_watched_keys,

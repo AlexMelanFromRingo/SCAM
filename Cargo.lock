@@ -1890,6 +1890,7 @@ dependencies = [
  "hex",
  "qrcodegen",
  "rand 0.8.5",
+ "scam-consensus",
  "scam-core",
  "secp256k1",
  "serde",

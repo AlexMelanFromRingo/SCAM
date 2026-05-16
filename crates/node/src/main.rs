@@ -1210,6 +1210,60 @@ enum WalletCommand {
         #[arg(long)]
         address: String,
     },
+    /// Build a fresh Partial Multisig Transaction (PMT) envelope.
+    /// Reads an unsigned tx hex blob (bincode-encoded scam_core::Transaction)
+    /// from `--tx-hex`, attaches the descriptor blobs from --multisig-input,
+    /// and prints the envelope JSON to stdout. Pipe to a file, share with
+    /// each signer, who runs `wallet multisig-partial-sign`.
+    MultisigPartialNew {
+        /// `chain_domain` for the network the spend will be broadcast on.
+        /// E.g. for devnet, the network_id is "devnet" — pass that.
+        #[arg(long)]
+        chain_domain: String,
+        /// Hex of `bincode::serialize(&Transaction)`. Same encoding used
+        /// by `/tx/submit` RPC.
+        #[arg(long)]
+        tx_hex: String,
+        /// One `input_index:descriptor_blob_hex` per multisig input.
+        /// Example: `--multisig-input 0:5343414d…`
+        #[arg(long = "multisig-input", value_name = "INDEX:BLOB_HEX")]
+        multisig_inputs: Vec<String>,
+    },
+    /// Add one party's signature to a PMT envelope. Reads the envelope
+    /// JSON from `--in`, signs every multisig input the wallet key
+    /// participates in, writes the updated envelope to `--out`.
+    MultisigPartialSign {
+        /// Path to envelope JSON (read).
+        #[arg(long, value_name = "FILE")]
+        envelope_in: String,
+        /// Path to write the updated envelope JSON.
+        #[arg(long, value_name = "FILE")]
+        envelope_out: String,
+        /// Wallet seed (mnemonic, BIP39) used to derive the signing key.
+        #[arg(long)]
+        mnemonic: String,
+        #[arg(long, default_value = "")]
+        passphrase: String,
+        #[arg(long, value_enum, default_value_t = WalletSeedModeArg::Bip39)]
+        seed_mode: WalletSeedModeArg,
+        #[arg(long, default_value_t = 0)]
+        account: u32,
+        #[arg(long, default_value_t = 0)]
+        index: u32,
+    },
+    /// Inspect a PMT envelope: per-input k/n/valid/invalid counts +
+    /// finalize-ready flag.
+    MultisigPartialInspect {
+        #[arg(long, value_name = "FILE")]
+        envelope_in: String,
+    },
+    /// Finalize a PMT envelope into a fully-signed transaction. Reads
+    /// the envelope JSON from `--in`, emits the canonical bincode-hex
+    /// tx ready for `tx/submit` to stdout.
+    MultisigPartialFinalize {
+        #[arg(long, value_name = "FILE")]
+        envelope_in: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -4049,6 +4103,122 @@ fn run_wallet_with_seed_mode(
                 }
             );
             println!("KeyHash20  : {}", hex::encode(decoded.key_hash20));
+        }
+        WalletCommand::MultisigPartialNew {
+            chain_domain,
+            tx_hex,
+            multisig_inputs,
+        } => {
+            let tx_bytes = hex::decode(tx_hex.trim())
+                .map_err(|e| NodeError::Runtime(format!("--tx-hex: {e}")))?;
+            let tx: scam_core::Transaction = bincode::deserialize(&tx_bytes)
+                .map_err(|e| NodeError::Runtime(format!("tx decode: {e}")))?;
+            let mut parsed_inputs = Vec::with_capacity(multisig_inputs.len());
+            for entry in &multisig_inputs {
+                let (idx_str, blob_hex) = entry.split_once(':').ok_or_else(|| {
+                    NodeError::Runtime(format!(
+                        "--multisig-input must be 'index:blob_hex', got '{entry}'"
+                    ))
+                })?;
+                let idx: u32 = idx_str
+                    .parse()
+                    .map_err(|_| NodeError::Runtime(format!("bad index '{idx_str}'")))?;
+                let blob = hex::decode(blob_hex.trim())
+                    .map_err(|e| NodeError::Runtime(format!("input #{idx} blob: {e}")))?;
+                parsed_inputs.push((idx, blob));
+            }
+            let pmt =
+                scam_wallet::PartialMultisigTx::new(chain_domain.as_bytes(), tx, &parsed_inputs)
+                    .map_err(|e| NodeError::Runtime(format!("pmt new: {e}")))?;
+            println!(
+                "{}",
+                pmt.to_json()
+                    .map_err(|e| NodeError::Runtime(format!("pmt encode: {e}")))?
+            );
+        }
+        WalletCommand::MultisigPartialSign {
+            envelope_in,
+            envelope_out,
+            mnemonic,
+            passphrase,
+            seed_mode,
+            account,
+            index,
+        } => {
+            let raw = fs::read_to_string(&envelope_in)
+                .map_err(|e| NodeError::Runtime(format!("read {envelope_in}: {e}")))?;
+            let mut pmt = scam_wallet::PartialMultisigTx::from_json(&raw)
+                .map_err(|e| NodeError::Runtime(format!("envelope parse: {e}")))?;
+            let seed_mode: WalletSeedMode = seed_mode.into();
+            let seed = wallet_seed_from_mnemonic(&mnemonic, &passphrase, seed_mode)?;
+            let key = derive_wallet_key(&seed, account, index)?;
+            let mut signed_inputs = 0u32;
+            // Only attempt inputs where our pubkey actually participates;
+            // sign_input errors otherwise (good for typos, bad for bulk
+            // signing). Pre-check via descriptor parse + membership.
+            let our_pubkey = key.pubkey_compressed();
+            let target_indices: Vec<u32> = pmt
+                .inputs
+                .iter()
+                .filter_map(|(idx, entry)| {
+                    let blob = hex::decode(&entry.descriptor_hex).ok()?;
+                    let descriptor = scam_consensus::MultisigDescriptor::parse(&blob).ok()?;
+                    descriptor
+                        .pubkeys
+                        .iter()
+                        .any(|pk| pk == &our_pubkey)
+                        .then_some(*idx)
+                })
+                .collect();
+            for idx in &target_indices {
+                pmt.sign_input(*idx, &key)
+                    .map_err(|e| NodeError::Runtime(format!("sign input #{idx}: {e}")))?;
+                signed_inputs += 1;
+            }
+            let json = pmt
+                .to_json()
+                .map_err(|e| NodeError::Runtime(format!("encode: {e}")))?;
+            fs::write(&envelope_out, json)
+                .map_err(|e| NodeError::Runtime(format!("write {envelope_out}: {e}")))?;
+            println!("signed inputs: {signed_inputs} → wrote envelope to {envelope_out}");
+        }
+        WalletCommand::MultisigPartialInspect { envelope_in } => {
+            let raw = fs::read_to_string(&envelope_in)
+                .map_err(|e| NodeError::Runtime(format!("read {envelope_in}: {e}")))?;
+            let pmt = scam_wallet::PartialMultisigTx::from_json(&raw)
+                .map_err(|e| NodeError::Runtime(format!("envelope parse: {e}")))?;
+            let report = pmt
+                .inspect()
+                .map_err(|e| NodeError::Runtime(format!("inspect: {e}")))?;
+            println!("envelope version : {}", pmt.version);
+            println!("chain_domain hex : {}", pmt.chain_domain_hex);
+            println!("inputs           : {}", report.len());
+            for s in report {
+                println!(
+                    "  input #{} : k={}, n={}, valid={}, invalid={}, unknown={}, ready={}",
+                    s.input_index,
+                    s.k,
+                    s.n,
+                    s.valid_sigs,
+                    s.invalid_sigs,
+                    s.unknown_pubkeys,
+                    s.threshold_reached,
+                );
+            }
+        }
+        WalletCommand::MultisigPartialFinalize { envelope_in } => {
+            let raw = fs::read_to_string(&envelope_in)
+                .map_err(|e| NodeError::Runtime(format!("read {envelope_in}: {e}")))?;
+            let pmt = scam_wallet::PartialMultisigTx::from_json(&raw)
+                .map_err(|e| NodeError::Runtime(format!("envelope parse: {e}")))?;
+            let tx = pmt
+                .finalize()
+                .map_err(|e| NodeError::Runtime(format!("finalize: {e}")))?;
+            let hex_tx = hex::encode(
+                bincode::serialize(&tx)
+                    .map_err(|e| NodeError::Runtime(format!("tx serialize: {e}")))?,
+            );
+            println!("{hex_tx}");
         }
     }
 
