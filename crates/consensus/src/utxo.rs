@@ -22,6 +22,12 @@ pub struct UtxoEntry {
     pub value: u64,
     pub key_hash20: [u8; 20],
     pub created_height: u64,
+    /// Block timestamp at the height when this UTXO was created.
+    /// Required for BIP68 (CSV) relative-time locktimes. Older redb
+    /// databases without this field will fail to deserialize and must
+    /// be rebuilt — devnet/testnet only, no live mainnet yet.
+    #[serde(default)]
+    pub created_time: u64,
     pub is_coinbase: bool,
 }
 
@@ -123,6 +129,7 @@ pub fn validate_and_apply_block_with_limits(
                     value: output.value,
                     key_hash20: output.key_hash20,
                     created_height: current_height,
+                    created_time: block.header.timestamp,
                     is_coinbase: false,
                 },
             );
@@ -151,6 +158,7 @@ pub fn validate_and_apply_block_with_limits(
                 value: output.value,
                 key_hash20: output.key_hash20,
                 created_height: current_height,
+                created_time: block.header.timestamp,
                 is_coinbase: true,
             },
         );
@@ -224,6 +232,41 @@ fn validate_non_coinbase_tx(
                 spend_height: current_height,
                 mature_height: utxo.created_height + coinbase_maturity,
             });
+        }
+
+        // BIP68 per-input relative locktime (CSV). Only meaningful when
+        // the disable bit is unset AND the value portion is non-zero,
+        // so legacy `sequence: 0` and `sequence: u32::MAX` paths are
+        // unaffected. See `crate::csv` for the full semantics.
+        let csv_value = input.sequence & crate::csv::SEQUENCE_VALUE_MASK;
+        if input.sequence & crate::csv::SEQUENCE_DISABLE_FLAG == 0 && csv_value != 0 {
+            let outcome = crate::csv::check_sequence_lock(
+                input.sequence,
+                utxo.created_height,
+                utxo.created_time,
+                current_height,
+                block_timestamp,
+            )
+            // SequenceLockError is currently an empty enum (Bitcoin-compat:
+            // reserved bits are ignored), so this `match` is total.
+            .unwrap_or(crate::csv::SequenceLockOutcome::Disabled);
+            if let crate::csv::SequenceLockOutcome::Locked {
+                kind,
+                required,
+                actual,
+            } = outcome
+            {
+                return Err(TxValidationError::SequenceLockNotMet {
+                    tx_index,
+                    input_index,
+                    kind: match kind {
+                        crate::csv::LockKind::Height => "height",
+                        crate::csv::LockKind::Time => "time",
+                    },
+                    required,
+                    actual,
+                });
+            }
         }
 
         // Spend-condition dispatch: pure shape-based discrimination on
@@ -436,6 +479,16 @@ pub enum TxValidationError {
     CoinbaseRewardOverflow,
     #[error("coinbase reward too high: allowed {allowed}, got {got}")]
     CoinbaseRewardTooHigh { allowed: u128, got: u128 },
+    #[error(
+        "tx #{tx_index} input #{input_index} CSV {kind} lock not met: required {required}, actual {actual}"
+    )]
+    SequenceLockNotMet {
+        tx_index: usize,
+        input_index: usize,
+        kind: &'static str,
+        required: u64,
+        actual: u64,
+    },
     #[error("multisig blob malformed in tx #{tx_index} input #{input_index}: {source}")]
     InvalidMultisigBlob {
         tx_index: usize,
@@ -495,6 +548,99 @@ mod tests {
         let keypair = Keypair::from_secret_key(&secp, secret);
         let sig = secp.sign_schnorr_no_aux_rand(&message, &keypair);
         tx.inputs[input_index].signature = sig.as_ref().to_vec();
+    }
+
+    /// End-to-end CSV: an output is created in block 0 (genesis) and
+    /// the spend in block 1 sets sequence = 2 (require 2 blocks
+    /// elapsed → required height 2). spend_height = 1, so the spend
+    /// must be rejected with SequenceLockNotMet.
+    #[test]
+    fn block_with_csv_height_lock_not_met_is_rejected() {
+        let chain_domain = b"devnet";
+        let (miner_pubkey, miner_key_hash, miner_secret) = key_material([150u8; 32]);
+        let (_, receiver_key_hash, _) = key_material([151u8; 32]);
+
+        let genesis_coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: OutPoint::coinbase(),
+                signature: b"genesis-csv".to_vec(),
+                pubkey_compressed: vec![],
+                sequence: u32::MAX,
+            }],
+            outputs: vec![TxOut {
+                value: 50,
+                key_hash20: miner_key_hash,
+            }],
+            lock_time: 0,
+        };
+        let genesis = make_block(
+            Hash256::ZERO,
+            100,
+            Target::MAX,
+            vec![genesis_coinbase.clone()],
+        );
+        let mut utxos = UtxoSet::new();
+        validate_and_apply_block(&genesis, 0, 50, 1, chain_domain, &mut utxos)
+            .expect("genesis applies");
+
+        // Spend with sequence = 2 → require 2 blocks elapsed (need
+        // spend_height > 0+2 = 2). Spending at height 1 must be rejected.
+        let mut spend = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: OutPoint {
+                    txid: genesis_coinbase.txid(),
+                    vout: 0,
+                },
+                signature: vec![],
+                pubkey_compressed: miner_pubkey.to_vec(),
+                sequence: 2,
+            }],
+            outputs: vec![TxOut {
+                value: 40,
+                key_hash20: receiver_key_hash,
+            }],
+            lock_time: 0,
+        };
+        sign_input(&mut spend, 0, chain_domain, &miner_secret);
+
+        let block1_coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: OutPoint::coinbase(),
+                signature: b"b1-csv".to_vec(),
+                pubkey_compressed: vec![],
+                sequence: u32::MAX,
+            }],
+            outputs: vec![TxOut {
+                value: 60,
+                key_hash20: receiver_key_hash,
+            }],
+            lock_time: 0,
+        };
+        let block1 = make_block(
+            genesis.header.block_hash(),
+            220,
+            Target::MAX,
+            vec![block1_coinbase, spend],
+        );
+
+        let err = validate_and_apply_block(&block1, 1, 50, 1, chain_domain, &mut utxos)
+            .expect_err("CSV lock not met must reject");
+        match err {
+            TxValidationError::SequenceLockNotMet {
+                kind,
+                required,
+                actual,
+                ..
+            } => {
+                assert_eq!(kind, "height");
+                assert_eq!(required, 2);
+                assert_eq!(actual, 1);
+            }
+            other => panic!("expected SequenceLockNotMet, got {other:?}"),
+        }
     }
 
     /// End-to-end: 2-of-3 multisig output funded by genesis, spent in

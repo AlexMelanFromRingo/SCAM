@@ -1,9 +1,15 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
+pub mod csv;
 pub mod difficulty;
 pub mod multisig;
 pub mod utxo;
 pub mod validate;
 
+pub use csv::{
+    LockKind, SEQUENCE_DISABLE_FLAG, SEQUENCE_RESERVED_MASK, SEQUENCE_TIME_GRANULARITY_SHIFT,
+    SEQUENCE_TYPE_FLAG, SEQUENCE_VALUE_MASK, SequenceLockError, SequenceLockOutcome,
+    check_sequence_lock,
+};
 pub use difficulty::{asert_next, chainwork_for_target, lwma_next, retarget_next};
 pub use multisig::{
     MAX_PARTICIPANTS, MULTISIG_MAX_BLOB, MULTISIG_MIN_BLOB, MULTISIG_TAG, MultisigDescriptor,

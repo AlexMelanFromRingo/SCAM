@@ -1207,6 +1207,7 @@ mod tests {
                 value: 50,
                 key_hash20: [1u8; 20],
                 created_height: 0,
+                created_time: 0,
                 is_coinbase: true,
             },
         );
@@ -1250,6 +1251,7 @@ mod tests {
                 value: 100,
                 key_hash20: [2u8; 20],
                 created_height: 7,
+                created_time: 0,
                 is_coinbase: false,
             },
         );
@@ -1292,6 +1294,7 @@ mod tests {
                 value: 1,
                 key_hash20: [0u8; 20],
                 created_height: 0,
+                created_time: 0,
                 is_coinbase: false,
             },
         };
