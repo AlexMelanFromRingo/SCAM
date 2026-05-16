@@ -186,6 +186,78 @@ Recording these so future audits know the surface was checked:
 
 ---
 
+## F-8. P2P transport posture — checked, no findings to fix
+
+- **Severity**: n/a (audit observation).
+- **Status**: clean.
+- **Where**: `crates/p2p/src/transport.rs`, `crates/p2p/src/wire.rs`.
+- **Detail**: walked the framing/handshake path against the standard
+  network DoS checklist:
+  - Magic check before length-decoding: yes (`ScamWireCodec::decode`).
+  - Size cap enforced *before* allocation: yes — `read_message_async`
+    rejects oversize `payload_len` prior to `vec![0u8; payload_len]`.
+  - Bincode decode uses `with_limit(...)` *and* `reject_trailing_bytes()`:
+    yes (`wire.rs::decode_message`). Both are belt-and-suspenders for
+    fuzz robustness.
+  - Consensus fingerprint validated by caller in
+    `client_handshake_async` flow (`main.rs:4946`,
+    `ensure_consensus_fingerprint_match`).
+  - Connect + handshake wrapped in `tokio::time::timeout` in the live
+    feeler/outbound path (`main.rs:9520, 9541`).
+- The default `max_message_size` is `8 * 1024 * 1024`. With ~1000 peers
+  that's an 8 GB *peak* worst-case allocation if everyone sends max-size
+  frames simultaneously. Bounded but worth a per-peer in-flight budget
+  if SCAM ever opens to a large peer set; out of scope here.
+
+---
+
+## F-9. Wallet vault + signer posture — checked, no findings to fix
+
+- **Severity**: n/a (audit observation).
+- **Status**: clean.
+- **Where**: `crates/wallet/src/{signer.rs,vault.rs}`.
+- **Detail**:
+  - `sign_digest` uses `sign_schnorr_no_aux_rand` → deterministic BIP340
+    nonce (no malleability from RNG, no side-channel on aux randomness).
+  - `verify_digest` parses a strict 64-byte Schnorr signature
+    (`Signature::from_slice`) and uses `verify_schnorr` against the
+    x-only pubkey — no `0x02/0x03` parity ambiguity.
+  - `Message::from_digest_slice(&digest32)` enforces 32-byte input.
+  - Argon2id at m=32 MiB / t=2 / p=1. Above OWASP 2023 minimum
+    (m=19 MiB / t=2 / p=1).
+  - XChaCha20Poly1305 with 24-byte nonce from `OsRng` per encryption —
+    no nonce-reuse risk.
+  - Vault version + KDF algorithm name pinned and verified on decrypt.
+- Minor: `SecretKey` and `secret_key_bytes() -> [u8; 32]` do not zeroize
+  on drop. Acceptable for an in-process wallet but worth noting for
+  threat models that include process-memory forensics.
+
+---
+
+## F-10. XSS via unescaped RPC payload in `renderLatestBlocks`
+
+- **Severity**: medium (DNS rebinding + browser cache turns an RPC bug
+  into in-browser code execution under loopback origin).
+- **Status**: fixed-in-branch.
+- **Where**: `web/app.js::renderLatestBlocks`.
+- **Detail**: every other render path in `web/app.js` walks through
+  `escapeHtml(...)` before inlining into innerHTML. The
+  `renderLatestBlocks` loop missed it for `block.hash`, `block.target`,
+  `block.height`, `block.tx_count`, `block.timestamp`. The hash and
+  target fields go into both the cell text and the `title=""`
+  attribute, giving an attacker the easier attribute-injection variant
+  too. The path is reached on every dashboard refresh.
+- **Threat**: F-5 already noted that the RPC binds to localhost. A
+  malicious RPC mock under a DNS-rebound hostname (or a same-host
+  process bound to a stale port) can return crafted JSON; the page
+  is loaded over `http://127.0.0.1:18080`, so the script runs with
+  same-origin trust over every other localhost service the user has
+  open. Defense-in-depth: never inline RPC payload bytes into HTML.
+- **Fix**: wrap every interpolated field in `escapeHtml(...)`. Added
+  a comment in the code so future contributors don't regress it.
+
+---
+
 ## Items deferred (not closed, just out of scope for this branch)
 
 - Stratum / SV2 transport: cancel-safety review of the async session

@@ -11730,6 +11730,8 @@ fn run_soak(args: SoakArgs) -> Result<(), NodeError> {
         }
         Some(RelayAdmissionState {
             mempool: build_mempool_from_cfg(&cfg)?,
+            // note: borrowing &cfg into the Borrow helper avoids cloning the
+            // chain config on this fairly hot path (soak runtime).
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)?,
             gossip,
         })
@@ -20145,6 +20147,7 @@ mod tests {
     use scam_chain::ChainRuntime;
     use scam_core::{ChainConfig, Hash256, OutPoint, Target, Transaction, TxIn, TxOut};
     use scam_mempool::{Mempool, OrphanPool};
+    use super::build_mempool_from_cfg;
     use scam_miner::{BlockTemplate, mine_block};
     use scam_p2p::{
         FramingConfig, GossipEngine, InventoryItem, LocalHandshake, ReplacementRateLimit,
@@ -20412,7 +20415,7 @@ mod tests {
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
         let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
         let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -22366,7 +22369,7 @@ mod tests {
         let confirmed_txid = signed.tx.txid();
 
         let mut mempool =
-            build_mempool_from_cfg(cfg)
+            build_mempool_from_cfg(&cfg)
                 .expect("mempool");
         mempool
             .insert_with_fee(signed.tx.clone(), fee)
@@ -22466,7 +22469,7 @@ mod tests {
         let stale_child_txid = stale_child.txid();
 
         let mut mempool =
-            build_mempool_from_cfg(cfg)
+            build_mempool_from_cfg(&cfg)
                 .expect("mempool");
         mempool
             .insert_with_fee(stale_parent, 10_000)
@@ -22553,7 +22556,7 @@ mod tests {
         let stale_child_txid = stale_child.txid();
 
         let mut mempool =
-            build_mempool_from_cfg(cfg)
+            build_mempool_from_cfg(&cfg)
                 .expect("mempool");
         mempool
             .insert_with_fee(stale_parent, 10_000)
@@ -24601,7 +24604,7 @@ mod tests {
         )
         .expect("signed tx");
         let mut mempool =
-            build_mempool_from_cfg(cfg)
+            build_mempool_from_cfg(&cfg)
                 .expect("mempool");
         mempool
             .insert_with_fee(signed.tx.clone(), fee)
@@ -25170,7 +25173,7 @@ mod tests {
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
         let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
         let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -25782,7 +25785,7 @@ mod tests {
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
         let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
         let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -25805,7 +25808,7 @@ mod tests {
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
         let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
         let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -25837,7 +25840,7 @@ mod tests {
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
         let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
         let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -25927,7 +25930,7 @@ mod tests {
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
         let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
         let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -28993,7 +28996,7 @@ mod tests {
         )
         .expect("signed transfer");
         let mut mempool =
-            build_mempool_from_cfg(cfg)
+            build_mempool_from_cfg(&cfg)
                 .expect("mempool");
         mempool
             .insert_with_fee(signed.tx.clone(), fee)
@@ -31179,7 +31182,7 @@ mod tests {
         persist_runtime_db(&producer, &runtime_db_path).expect("persist runtime");
 
         let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -31633,7 +31636,7 @@ mod tests {
         };
 
         let mut disk_mempool =
-            build_mempool_from_cfg(cfg)
+            build_mempool_from_cfg(&cfg)
                 .expect("disk mempool");
         disk_mempool
             .insert_with_fee(tx.clone(), 2_000)
@@ -31642,7 +31645,7 @@ mod tests {
         save_mempool_db(&mempool_db_path, &snapshot).expect("save mempool");
 
         let mut relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("relay mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -31769,7 +31772,7 @@ mod tests {
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
         let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
         let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -31984,7 +31987,7 @@ mod tests {
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
         let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
         let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -32033,7 +32036,7 @@ mod tests {
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
         let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
         let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -32087,7 +32090,7 @@ mod tests {
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
         let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
         let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -32160,7 +32163,7 @@ mod tests {
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
         let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
         let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -32244,7 +32247,7 @@ mod tests {
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
         let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
         let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -32353,7 +32356,7 @@ mod tests {
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
         let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
         let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -32436,7 +32439,7 @@ mod tests {
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
         let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
         let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -33000,7 +33003,7 @@ mod tests {
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
         let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
         let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -33049,7 +33052,7 @@ mod tests {
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
         let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
         let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -33140,7 +33143,7 @@ mod tests {
         let txid = tx.txid();
 
         let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -33261,7 +33264,7 @@ mod tests {
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
         let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
         let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -33316,7 +33319,7 @@ mod tests {
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
         let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
         let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -33399,7 +33402,7 @@ mod tests {
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
         let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
         let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -33512,7 +33515,7 @@ mod tests {
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
         let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
         let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -33611,7 +33614,7 @@ mod tests {
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
         let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
         let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -33755,7 +33758,7 @@ mod tests {
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
         let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
         let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -33889,7 +33892,7 @@ mod tests {
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
         let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
         let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -34006,7 +34009,7 @@ mod tests {
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
         let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
         let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -34568,7 +34571,7 @@ mod tests {
         )
         .expect("build signed transfer");
         let mut mempool =
-            build_mempool_from_cfg(cfg)
+            build_mempool_from_cfg(&cfg)
                 .expect("mempool");
         mempool
             .insert_with_fee(signed.tx.clone(), fee)
@@ -34752,7 +34755,7 @@ mod tests {
         )
         .expect("mine blocks");
 
-        let mempool = build_mempool_from_cfg(cfg)
+        let mempool = build_mempool_from_cfg(&cfg)
             .expect("mempool");
         let valid_fee = 500u64;
         let signed = build_signed_transfer_tx(
@@ -35110,7 +35113,7 @@ mod tests {
         assert_ne!(bogus_fee, expected_fee);
 
         let mut mempool =
-            build_mempool_from_cfg(cfg)
+            build_mempool_from_cfg(&cfg)
                 .expect("mempool");
         let _ = mempool
             .insert_with_fee(tx.clone(), bogus_fee)
@@ -35156,7 +35159,7 @@ mod tests {
         };
 
         let mut mempool =
-            build_mempool_from_cfg(cfg)
+            build_mempool_from_cfg(&cfg)
                 .expect("mempool");
         let _ = mempool.insert_with_fee(tx, 1_000).expect("insert");
         super::persist_mempool_db(&cfg, &mempool, &mempool_db).expect("persist");
@@ -35484,7 +35487,7 @@ mod tests {
         let tx = signed.tx;
 
         let mut mempool =
-            build_mempool_from_cfg(cfg)
+            build_mempool_from_cfg(&cfg)
                 .expect("mempool");
         mempool.insert_with_fee(tx.clone(), 500).expect("insert");
         let template_params = super::MempoolTemplateParams {
@@ -35563,7 +35566,7 @@ mod tests {
         let self_txid = self_signed.tx.txid();
 
         let mut mempool =
-            build_mempool_from_cfg(cfg)
+            build_mempool_from_cfg(&cfg)
                 .expect("mempool");
         mempool
             .insert_with_fee(self_signed.tx, 0)
@@ -35639,7 +35642,7 @@ mod tests {
         let outgoing_txid = outgoing_only.tx.txid();
 
         let mut mempool =
-            build_mempool_from_cfg(cfg)
+            build_mempool_from_cfg(&cfg)
                 .expect("mempool");
         mempool
             .insert_with_fee(outgoing_only.tx, fee)
@@ -35715,7 +35718,7 @@ mod tests {
         let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
 
         let mut relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -35807,7 +35810,7 @@ mod tests {
             .expect("previous tip");
 
         let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -35839,7 +35842,7 @@ mod tests {
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
         let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
         let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -35890,7 +35893,7 @@ mod tests {
         let reward_key = cfg.genesis_reward_key_hash20().expect("reward key");
         let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
         let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -35945,7 +35948,7 @@ mod tests {
         let reward_key = cfg.genesis_reward_key_hash20().expect("reward key");
         let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
         let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -36028,7 +36031,7 @@ mod tests {
         let reward_key = cfg.genesis_reward_key_hash20().expect("reward key");
         let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
         let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -36104,7 +36107,7 @@ mod tests {
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
         let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
         let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -36148,7 +36151,7 @@ mod tests {
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
         let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
         let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -36193,7 +36196,7 @@ mod tests {
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
         let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
         let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -36302,7 +36305,7 @@ mod tests {
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
         let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
         let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -36388,7 +36391,7 @@ mod tests {
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
         let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
         let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -36450,7 +36453,7 @@ mod tests {
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
         let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
         let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -36480,7 +36483,7 @@ mod tests {
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
         let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
         let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -36508,7 +36511,7 @@ mod tests {
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
         let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
         let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -36611,7 +36614,7 @@ mod tests {
         let compact = super::relay_compact_block_from_block(&block);
 
         let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -36656,7 +36659,7 @@ mod tests {
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
         let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
         let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -36703,7 +36706,7 @@ mod tests {
         let cfg: ChainConfig =
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
         let mut mempool =
-            build_mempool_from_cfg(cfg)
+            build_mempool_from_cfg(&cfg)
                 .expect("mempool");
 
         let tx_a = relay_tx(
@@ -36751,7 +36754,7 @@ mod tests {
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
         let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
         let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -36820,7 +36823,7 @@ mod tests {
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
         let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
         let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -36898,7 +36901,7 @@ mod tests {
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
         let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
         let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -37749,7 +37752,7 @@ mod tests {
             }],
             lock_time: 0,
         };
-        let mempool = build_mempool_from_cfg(cfg)
+        let mempool = build_mempool_from_cfg(&cfg)
             .expect("mempool");
         let missing_outpoints = super::detect_missing_outpoints(&runtime, &mempool, &tx);
         assert_eq!(missing_outpoints, vec![missing]);
@@ -37761,7 +37764,7 @@ mod tests {
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
         let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
         let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -37823,7 +37826,7 @@ mod tests {
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
         let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
         let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -37890,7 +37893,7 @@ mod tests {
         gossip.connect_peer(1);
 
         let mut relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -37937,7 +37940,7 @@ mod tests {
         gossip.connect_peer(1);
 
         let mut relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -37990,7 +37993,7 @@ mod tests {
         .expect("gossip");
         gossip.connect_peer(7);
         let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -38057,7 +38060,7 @@ mod tests {
         let txid = tx.txid();
 
         let mut relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -38128,7 +38131,7 @@ mod tests {
 
         let runtime = ChainRuntime::from_config(cfg.clone()).expect("consumer runtime");
         let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -38190,7 +38193,7 @@ mod tests {
 
         let runtime = ChainRuntime::from_config(cfg.clone()).expect("consumer runtime");
         let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -38245,7 +38248,7 @@ mod tests {
         .expect("gossip");
         gossip.connect_peer(10);
         let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -38275,7 +38278,7 @@ mod tests {
         let mut gossip = GossipEngine::new(64).expect("gossip");
         gossip.connect_peer(77);
         let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -38342,7 +38345,7 @@ mod tests {
         .expect("gossip");
         gossip.connect_peer(42);
         let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -38394,7 +38397,7 @@ mod tests {
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
         let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
         let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -38441,7 +38444,7 @@ mod tests {
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
         let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
         let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -38472,7 +38475,7 @@ mod tests {
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
         let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
         let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -38541,7 +38544,7 @@ mod tests {
 
         let runtime = ChainRuntime::from_config(cfg.clone()).expect("consumer runtime");
         let mut relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -38608,7 +38611,7 @@ mod tests {
         let confirmed_txid = signed.tx.txid();
 
         let mut tx_block_mempool =
-            build_mempool_from_cfg(cfg)
+            build_mempool_from_cfg(&cfg)
                 .expect("mempool");
         tx_block_mempool
             .insert_with_fee(signed.tx, fee)
@@ -38686,7 +38689,7 @@ mod tests {
         .expect("gossip");
         gossip.connect_peer(77);
         let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -38772,7 +38775,7 @@ mod tests {
         let txid = tx.txid();
 
         let mut mined_mempool =
-            build_mempool_from_cfg(cfg)
+            build_mempool_from_cfg(&cfg)
                 .expect("mempool");
         mined_mempool
             .insert_with_fee(tx.clone(), fee)
@@ -38796,7 +38799,7 @@ mod tests {
         runtime.apply_next_block(mined).expect("apply");
 
         let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("relay mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -39366,7 +39369,7 @@ mod tests {
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
         let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
         let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
@@ -40554,7 +40557,7 @@ mod tests {
         );
 
         let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(cfg)
+            mempool: build_mempool_from_cfg(&cfg)
                 .expect("mempool"),
             orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
                 .expect("orphan"),
