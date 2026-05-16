@@ -86,10 +86,13 @@ impl ChainRuntime {
     pub fn new(config: ChainConfig, genesis: Block) -> Result<Self, ChainError> {
         let mut utxos = UtxoSet::new();
         let limits = BlockSizeLimits::from_chain_config(&config);
+        // Subsidy at height 0 — `subsidy_at_height(0)` is by definition
+        // `block_subsidy` for any valid config, but routing through the
+        // helper keeps the rule in one place.
         let applied = validate_and_apply_block_with_limits(
             &genesis,
             0,
-            config.block_subsidy,
+            config.subsidy_at_height(0),
             config.coinbase_maturity as u64,
             config.network_id.as_bytes(),
             limits,
@@ -345,7 +348,7 @@ impl ChainRuntime {
         let summary = validate_and_apply_block_with_limits(
             &block,
             height,
-            self.config.block_subsidy,
+            self.config.subsidy_at_height(height),
             self.config.coinbase_maturity as u64,
             self.config.network_id.as_bytes(),
             BlockSizeLimits::from_chain_config(&self.config),
@@ -543,7 +546,7 @@ impl ChainRuntime {
         validate_and_apply_block_with_limits(
             &block,
             next_height,
-            self.config.block_subsidy,
+            self.config.subsidy_at_height(next_height),
             self.config.coinbase_maturity as u64,
             self.config.network_id.as_bytes(),
             BlockSizeLimits::from_chain_config(&self.config),

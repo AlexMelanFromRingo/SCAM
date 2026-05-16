@@ -318,6 +318,14 @@ struct ConfigScaffoldArgs {
     wallet_min_spendable_confirmations: u32,
     #[arg(long, default_value_t = 5_000_000_000)]
     block_subsidy: u64,
+    /// Number of blocks between subsidy halvings (`0` disables halvings).
+    /// See `docs/PROTOCOL_DESIGN.md` §1.
+    #[arg(long, default_value_t = 0)]
+    halving_interval_blocks: u64,
+    /// Per-block subsidy floor after halvings (`0` means "no floor; reward
+    /// reaches 0 like Bitcoin"). Must be ≤ `block_subsidy`.
+    #[arg(long, default_value_t = 0)]
+    tail_emission: u64,
     #[arg(
         long,
         default_value = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
@@ -2557,6 +2565,8 @@ fn run_config_scaffold(args: ConfigScaffoldArgs) -> Result<(), NodeError> {
         coinbase_maturity: args.coinbase_maturity,
         wallet_min_spendable_confirmations: args.wallet_min_spendable_confirmations,
         block_subsidy: args.block_subsidy,
+        halving_interval_blocks: args.halving_interval_blocks,
+        tail_emission: args.tail_emission,
         hrp: args.hrp.clone(),
         stratum_share_target: args.stratum_share_target.clone(),
         stratum_min_share_target: args.stratum_min_share_target.clone(),
@@ -34182,6 +34192,8 @@ mod tests {
             coinbase_maturity: 100,
             wallet_min_spendable_confirmations: 1,
             block_subsidy: 5_000_000_000,
+            halving_interval_blocks: 0,
+            tail_emission: 0,
             stratum_share_target:
                 "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_owned(),
             stratum_min_share_target:

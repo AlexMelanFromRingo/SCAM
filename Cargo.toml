@@ -19,6 +19,8 @@ resolver = "2"
 version = "0.3.0-rc3"
 edition = "2024"
 license = "MIT OR Apache-2.0"
+# Minimum-supported rustc. Bump in sync with rust-toolchain.toml.
+rust-version = "1.95"
 
 [workspace.dependencies]
 axum = "0.8"
