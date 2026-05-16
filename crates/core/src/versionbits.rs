@@ -232,12 +232,12 @@ mod tests {
         let d = dep(3, 200, 2_000);
         // history of (bit_count, mtp) per window
         let history = [
-            (0, 100),    // before start → DEFINED
-            (0, 250),    // started
-            (50, 400),   // still started (5 < threshold 10)
-            (10, 600),   // locked in (10 >= 10)
-            (0, 800),    // active
-            (0, 5_000),  // active stays terminal
+            (0, 100),   // before start → DEFINED
+            (0, 250),   // started
+            (50, 400),  // still started (5 < threshold 10)
+            (10, 600),  // locked in (10 >= 10)
+            (0, 800),   // active
+            (0, 5_000), // active stays terminal
         ];
         assert_eq!(
             evaluate_from_history(&d, 10, 100, &history),
@@ -249,11 +249,11 @@ mod tests {
     fn end_to_end_failure_path() {
         let d = dep(3, 200, 1_000);
         let history = [
-            (0, 100),  // defined
-            (0, 250),  // started
-            (5, 500),  // still started
-            (5, 999),  // still started (just under timeout)
-            (5, 1_000), // failed at timeout
+            (0, 100),    // defined
+            (0, 250),    // started
+            (5, 500),    // still started
+            (5, 999),    // still started (just under timeout)
+            (5, 1_000),  // failed at timeout
             (50, 1_500), // stays failed
         ];
         assert_eq!(

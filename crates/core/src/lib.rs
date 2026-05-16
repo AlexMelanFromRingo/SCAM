@@ -15,7 +15,7 @@ pub use pow::{block_meets_pow, header_meets_pow};
 pub use target::Target;
 pub use types::{Block, BlockHeader, OutPoint, Transaction, TxIn, TxOut, TxSigningError};
 pub use versionbits::{
-    Deployment, DeploymentState, deployment_bit_signaled, evaluate_from_history, next_state,
-    VERSIONBITS_MAX_BIT, VERSIONBITS_TOP_BITS, VERSIONBITS_TOP_MASK,
+    Deployment, DeploymentState, VERSIONBITS_MAX_BIT, VERSIONBITS_TOP_BITS, VERSIONBITS_TOP_MASK,
+    deployment_bit_signaled, evaluate_from_history, next_state,
 };
 pub use visual::{HashBitmap16, render_hash_bitmap_16x16};

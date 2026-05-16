@@ -7,7 +7,8 @@ pub mod signer;
 pub mod vault;
 
 pub use address::{
-    AddressError, DecodedAddress, key_hash20_from_compressed_pubkey, parse_address, to_address,
+    AddressError, AddressKind, DecodedAddress, MULTISIG_ADDRESS_DISCRIMINATOR,
+    key_hash20_from_compressed_pubkey, parse_address, to_address, to_multisig_address,
 };
 pub use mnemonic::{MnemonicError, WalletMnemonic, WalletSeedMode, new_mnemonic};
 pub use qr::{QrError, qr_for_payment_uri, qr_for_text};

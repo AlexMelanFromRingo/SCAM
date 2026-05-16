@@ -247,39 +247,39 @@ fn validate_non_coinbase_tx(
         if crate::multisig::looks_like_multisig_blob(&input.pubkey_compressed) {
             let descriptor = crate::multisig::MultisigDescriptor::parse(&input.pubkey_compressed)
                 .map_err(|source| TxValidationError::InvalidMultisigBlob {
-                    tx_index,
-                    input_index,
-                    source,
-                })?;
-            let derived_hash = crate::multisig::MultisigDescriptor::script_hash20(
-                &input.pubkey_compressed,
-            );
+                tx_index,
+                input_index,
+                source,
+            })?;
+            let derived_hash =
+                crate::multisig::MultisigDescriptor::script_hash20(&input.pubkey_compressed);
             if derived_hash != utxo.key_hash20 {
                 return Err(TxValidationError::PubkeyHashMismatch {
                     tx_index,
                     input_index,
                 });
             }
-            crate::multisig::verify_multisig_spend(&descriptor, digest, &input.signature)
-                .map_err(|source| TxValidationError::InvalidMultisigSpend {
+            crate::multisig::verify_multisig_spend(&descriptor, digest, &input.signature).map_err(
+                |source| TxValidationError::InvalidMultisigSpend {
                     tx_index,
                     input_index,
                     source,
-                })?;
+                },
+            )?;
         } else {
             // Legacy P2PKH path.
-            let parsed_pubkey =
-                PublicKey::from_slice(&input.pubkey_compressed).map_err(|_| {
-                    TxValidationError::InvalidPubkey {
-                        tx_index,
-                        input_index,
-                    }
-                })?;
-            let derived_hash = key_hash20_from_pubkey(input.pubkey_compressed.as_slice())
-                .ok_or(TxValidationError::InvalidPubkey {
+            let parsed_pubkey = PublicKey::from_slice(&input.pubkey_compressed).map_err(|_| {
+                TxValidationError::InvalidPubkey {
                     tx_index,
                     input_index,
-                })?;
+                }
+            })?;
+            let derived_hash = key_hash20_from_pubkey(input.pubkey_compressed.as_slice()).ok_or(
+                TxValidationError::InvalidPubkey {
+                    tx_index,
+                    input_index,
+                },
+            )?;
             if derived_hash != utxo.key_hash20 {
                 return Err(TxValidationError::PubkeyHashMismatch {
                     tx_index,
@@ -508,11 +508,9 @@ mod tests {
         let (pk_c, _ph_c, sk_c) = key_material([102u8; 32]);
         let (_, receiver_key_hash, _) = key_material([103u8; 32]);
 
-        let multisig_blob =
-            crate::multisig::MultisigDescriptor::encode(2, &[pk_a, pk_b, pk_c])
-                .expect("encode 2-of-3");
-        let multisig_hash20 =
-            crate::multisig::MultisigDescriptor::script_hash20(&multisig_blob);
+        let multisig_blob = crate::multisig::MultisigDescriptor::encode(2, &[pk_a, pk_b, pk_c])
+            .expect("encode 2-of-3");
+        let multisig_hash20 = crate::multisig::MultisigDescriptor::script_hash20(&multisig_blob);
 
         // Genesis funds the multisig hash (via a coinbase output).
         let genesis_coinbase = Transaction {
@@ -594,9 +592,8 @@ mod tests {
             Target::MAX,
             vec![block1_coinbase, spend],
         );
-        let applied =
-            validate_and_apply_block(&block1, 1, 100, 1, chain_domain, &mut utxos)
-                .expect("multisig-spend block must apply");
+        let applied = validate_and_apply_block(&block1, 1, 100, 1, chain_domain, &mut utxos)
+            .expect("multisig-spend block must apply");
         assert_eq!(applied.total_fees, 10);
         // UTXO set: the multisig coin is consumed, two new outputs created.
         assert_eq!(utxos.len(), 2);
@@ -612,11 +609,9 @@ mod tests {
         let (pk_c, _ph_c, _) = key_material([112u8; 32]);
         let (_, receiver_key_hash, _) = key_material([113u8; 32]);
 
-        let multisig_blob =
-            crate::multisig::MultisigDescriptor::encode(2, &[pk_a, pk_b, pk_c])
-                .expect("encode 2-of-3");
-        let multisig_hash20 =
-            crate::multisig::MultisigDescriptor::script_hash20(&multisig_blob);
+        let multisig_blob = crate::multisig::MultisigDescriptor::encode(2, &[pk_a, pk_b, pk_c])
+            .expect("encode 2-of-3");
+        let multisig_hash20 = crate::multisig::MultisigDescriptor::script_hash20(&multisig_blob);
 
         let genesis_coinbase = Transaction {
             version: 1,
@@ -1615,11 +1610,7 @@ mod tests {
             lock_time: u32::MAX,
         };
         assert!(super::tx_is_final_for_block(&final_tx, 0, 0));
-        assert!(super::tx_is_final_for_block(
-            &final_tx,
-            u64::MAX,
-            u64::MAX
-        ));
+        assert!(super::tx_is_final_for_block(&final_tx, u64::MAX, u64::MAX));
     }
 
     /// BIP65: ANY single non-MAX sequence activates the lock_time check.

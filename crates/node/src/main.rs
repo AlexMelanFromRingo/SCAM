@@ -1180,6 +1180,36 @@ enum WalletCommand {
         #[arg(long)]
         label: Option<String>,
     },
+    /// Encode a k-of-n multisig descriptor as a bech32m address.
+    /// Pubkeys may be supplied either as hex via `--pubkey` (repeatable)
+    /// or as bech32m legacy addresses via `--from-address` (repeatable).
+    /// The latter is *not* sufficient on its own — bech32m addresses
+    /// commit to a key HASH, not the pubkey itself, so spends from the
+    /// resulting multisig would not have the actual pubkeys to sign
+    /// against. Use --pubkey for live use; --from-address is only an
+    /// aliasing convenience that errors clearly.
+    MultisigEncode {
+        /// Required signature count.
+        #[arg(long)]
+        k: u8,
+        /// Participant pubkeys (compressed, 33-byte hex). Repeat for
+        /// each of the n participants. Pubkeys are NOT auto-sorted;
+        /// rearranging participants produces a different address (see
+        /// `script_hash20_changes_with_pubkey_order` test in the
+        /// scam-consensus crate).
+        #[arg(long = "pubkey", value_name = "HEX")]
+        pubkeys_hex: Vec<String>,
+        /// HRP for the bech32m address (default: derived from
+        /// `--network` if a config is loaded; falls back to "sd").
+        #[arg(long, default_value = "sd")]
+        hrp: String,
+    },
+    /// Decode a bech32m address and report whether it's P2PKH or
+    /// multisig, plus the 20-byte hash.
+    MultisigDecode {
+        #[arg(long)]
+        address: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -3975,6 +4005,50 @@ fn run_wallet_with_seed_mode(
         } => {
             let ascii = qr_for_payment_uri(&address, amount, label.as_deref())?;
             println!("{ascii}");
+        }
+        WalletCommand::MultisigEncode {
+            k,
+            pubkeys_hex,
+            hrp,
+        } => {
+            if pubkeys_hex.is_empty() {
+                return Err(NodeError::Runtime(
+                    "at least one --pubkey is required".to_owned(),
+                ));
+            }
+            let mut pubkeys = Vec::with_capacity(pubkeys_hex.len());
+            for (i, hex_str) in pubkeys_hex.iter().enumerate() {
+                let pk = decode_fixed_hex::<33>("pubkey", hex_str.trim())
+                    .map_err(|e| NodeError::Runtime(format!("--pubkey #{i}: {e}")))?;
+                pubkeys.push(pk);
+            }
+            let blob = scam_consensus::MultisigDescriptor::encode(k, &pubkeys)
+                .map_err(|e| NodeError::Runtime(format!("multisig encode: {e}")))?;
+            let script_hash20 = scam_consensus::MultisigDescriptor::script_hash20(&blob);
+            let address = scam_wallet::to_multisig_address(&hrp, script_hash20)
+                .map_err(|e| NodeError::Runtime(format!("address encode: {e}")))?;
+            println!("k                : {k}");
+            println!("n                : {}", pubkeys.len());
+            println!("blob (hex)       : {}", hex::encode(&blob));
+            println!("blob len         : {} bytes", blob.len());
+            println!("script_hash20    : {}", hex::encode(script_hash20));
+            println!("address          : {address}");
+            println!();
+            println!("Funding info: send to this address. Spending requires");
+            println!("k Schnorr signatures over the spending tx's sighash, ");
+            println!("plus the FULL multisig blob (above) in TxIn.pubkey_compressed.");
+        }
+        WalletCommand::MultisigDecode { address } => {
+            let decoded = parse_address(&address)?;
+            println!("HRP        : {}", decoded.hrp);
+            println!(
+                "Kind       : {}",
+                match decoded.kind {
+                    scam_wallet::AddressKind::P2pkh => "P2PKH (single-key)",
+                    scam_wallet::AddressKind::MultiSig => "MultiSig (k-of-n)",
+                }
+            );
+            println!("KeyHash20  : {}", hex::encode(decoded.key_hash20));
         }
     }
 
@@ -34199,9 +34273,6 @@ mod tests {
             block_subsidy: 5_000_000_000,
             halving_interval_blocks: 0,
             tail_emission: 0,
-            versionbits_window_blocks: 0,
-            versionbits_threshold: 0,
-            deployments: Vec::new(),
             stratum_share_target:
                 "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_owned(),
             stratum_min_share_target:

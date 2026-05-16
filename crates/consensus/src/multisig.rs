@@ -64,8 +64,7 @@ pub const SIG_LEN: usize = 64;
 /// degenerate case.
 pub const MULTISIG_MIN_BLOB: usize = MULTISIG_TAG.len() + 1 + 1 + PUBKEY_LEN;
 /// Largest legal multisig blob.
-pub const MULTISIG_MAX_BLOB: usize =
-    MULTISIG_TAG.len() + 1 + 1 + MAX_PARTICIPANTS * PUBKEY_LEN;
+pub const MULTISIG_MAX_BLOB: usize = MULTISIG_TAG.len() + 1 + 1 + MAX_PARTICIPANTS * PUBKEY_LEN;
 
 /// Parsed multisig descriptor extracted from a `TxIn::pubkey_compressed`
 /// blob. All invariants enforced in `parse`.
@@ -102,8 +101,7 @@ impl MultisigDescriptor {
                 return Err(MultisigError::InvalidPubkey { index: i });
             }
         }
-        let mut blob =
-            Vec::with_capacity(MULTISIG_TAG.len() + 2 + (n * PUBKEY_LEN));
+        let mut blob = Vec::with_capacity(MULTISIG_TAG.len() + 2 + (n * PUBKEY_LEN));
         blob.extend_from_slice(MULTISIG_TAG);
         blob.push(k);
         blob.push(n as u8);
@@ -150,8 +148,8 @@ impl MultisigDescriptor {
             if PublicKey::from_slice(&pk).is_err() {
                 return Err(MultisigError::InvalidPubkey { index: i });
             }
-            for j in 0..pubkeys.len() {
-                if pubkeys[j] == pk {
+            for existing in &pubkeys {
+                if *existing == pk {
                     return Err(MultisigError::DuplicatePubkey { index: i });
                 }
             }
@@ -169,9 +167,7 @@ impl MultisigDescriptor {
 /// begins with `MULTISIG_TAG`. False for any 33-byte input (legacy
 /// P2PKH) and for any malformed length.
 pub fn looks_like_multisig_blob(pubkey_compressed: &[u8]) -> bool {
-    if pubkey_compressed.len() < MULTISIG_MIN_BLOB
-        || pubkey_compressed.len() > MULTISIG_MAX_BLOB
-    {
+    if pubkey_compressed.len() < MULTISIG_MIN_BLOB || pubkey_compressed.len() > MULTISIG_MAX_BLOB {
         return false;
     }
     &pubkey_compressed[..MULTISIG_TAG.len()] == MULTISIG_TAG
@@ -206,10 +202,8 @@ pub fn verify_multisig_spend(
     let mut used = vec![false; descriptor.pubkeys.len()];
     for sig_idx in 0..(descriptor.k as usize) {
         let raw = &signature_blob[sig_idx * SIG_LEN..(sig_idx + 1) * SIG_LEN];
-        let signature =
-            Signature::from_slice(raw).map_err(|_| MultisigError::InvalidSignatureEncoding {
-                sig_index: sig_idx,
-            })?;
+        let signature = Signature::from_slice(raw)
+            .map_err(|_| MultisigError::InvalidSignatureEncoding { sig_index: sig_idx })?;
         let mut matched = None;
         for (pk_idx, pk_bytes) in descriptor.pubkeys.iter().enumerate() {
             if used[pk_idx] {
@@ -299,8 +293,7 @@ mod tests {
         let (_, pk_a) = keypair_from_seed(2);
         let (_, pk_b) = keypair_from_seed(3);
         let (_, pk_c) = keypair_from_seed(4);
-        let blob =
-            MultisigDescriptor::encode(2, &[pk_a, pk_b, pk_c]).expect("encode 2-of-3");
+        let blob = MultisigDescriptor::encode(2, &[pk_a, pk_b, pk_c]).expect("encode 2-of-3");
         let d = MultisigDescriptor::parse(&blob).expect("parse");
         assert_eq!(d.k, 2);
         assert_eq!(d.n, 3);
@@ -335,8 +328,7 @@ mod tests {
             MultisigDescriptor::parse(&[0u8; 10]),
             Err(MultisigError::BadLength { .. })
         ));
-        let mut blob =
-            MultisigDescriptor::encode(1, &[keypair_from_seed(7).1]).expect("encode");
+        let mut blob = MultisigDescriptor::encode(1, &[keypair_from_seed(7).1]).expect("encode");
         blob[0] = blob[0].wrapping_add(1); // tamper tag
         assert!(matches!(
             MultisigDescriptor::parse(&blob),

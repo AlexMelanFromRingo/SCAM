@@ -223,11 +223,11 @@ impl ChainRuntime {
                 }
             }
             // MTP at the boundary block (last block of the window).
-            let boundary_hash = self
-                .block_hash_at_height(window_start + window - 1)
-                .ok_or(ChainError::MissingHeader {
+            let boundary_hash = self.block_hash_at_height(window_start + window - 1).ok_or(
+                ChainError::MissingHeader {
                     block_hash: scam_core::Hash256::ZERO,
-                })?;
+                },
+            )?;
             let boundary_mtp = self.median_time_past(boundary_hash)?;
             state = scam_core::next_state(
                 state,

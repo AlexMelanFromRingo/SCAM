@@ -19,14 +19,12 @@ use scam_core::{ChainConfig, Target, block_meets_pow};
 /// Mild enough to grind in a few seconds at debug build speed, real
 /// enough that a chain replay attacker can't trivially construct
 /// alternate genesis blocks of equivalent work.
-const FROZEN_TARGET_HEX: &str =
-    "00000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+const FROZEN_TARGET_HEX: &str = "00000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
 
 /// Visible commitment to the bootstrap context. Bitcoin's genesis
 /// embedded a newspaper headline; we embed the audit branch + ISO date
 /// so the genesis is timestamped against an external reference.
-const FROZEN_MESSAGE: &str =
-    "SCAM mainnet bootstrap @ audit/hardening-tui 2026-05-16";
+const FROZEN_MESSAGE: &str = "SCAM mainnet bootstrap @ audit/hardening-tui 2026-05-16";
 
 fn main() {
     let mut cfg: ChainConfig = toml::from_str(include_str!("../../../config/mainnet.toml"))
@@ -69,14 +67,12 @@ fn main() {
             return;
         }
         nonce = nonce.checked_add(1).expect("nonce overflow before solving");
-        if nonce % 1_000_000 == 0 {
+        if nonce.is_multiple_of(1_000_000) {
             eprintln!("...still grinding, nonce = {nonce}");
         }
         // Sanity ceiling: a 20-bit target should solve well before u32::MAX.
         if nonce > 1u64 << 30 {
-            panic!(
-                "target {FROZEN_TARGET_HEX} not solved after 2^30 nonces — check target"
-            );
+            panic!("target {FROZEN_TARGET_HEX} not solved after 2^30 nonces — check target");
         }
     }
     // unreachable (loop always returns or panics).
