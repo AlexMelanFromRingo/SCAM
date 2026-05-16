@@ -178,6 +178,68 @@ This keeps "single tx format" and unbreaks no existing test.
 
 ---
 
+## 4.5. MuSig2 — considered, deliberately deferred
+
+### Why it would be valuable
+
+- Single 64-byte aggregated Schnorr signature on chain, regardless of
+  N participants. Indistinguishable from a plain P2PKH spend.
+- Cheaper verification (one Schnorr verify, not k).
+- Privacy: on-chain analysis cannot tell a multisig spend from a
+  single-key spend.
+- Aligns with SCAM's "single tx format, no script" philosophy: MuSig2
+  is the way to do multisig without needing on-chain scripts.
+
+### Why this branch does NOT ship it
+
+1. **No stable crates.io secp256k1 supports MuSig2.** The reference
+   implementation lives in `secp256k1-zkp` (a git-only library
+   tracking the upstream `libsecp256k1` PR series for BIP327). Pulling
+   a git dep ties SCAM's reproducible build to a specific commit on
+   an upstream branch that may rebase. We refuse to make the
+   workspace's reproducibility depend on a third-party git history.
+
+2. **Re-implementing BIP327 from scratch is dangerous.** MuSig2's
+   nonce-aggregation step is exactly the surface that Wagner's
+   k-list attack targeted on MuSig1. BIP327 specifies countermeasures
+   (binding factor `b`, nonce coefficient derivation, blame-checking
+   on signing-session abort) that *must* be implemented exactly to
+   the spec or the whole scheme is broken — silently, in a way
+   normal unit tests do NOT catch. Production-grade MuSig2
+   implementations have all had multiple iterations of cryptography
+   review. We don't have that here.
+
+3. **No silver-bullet alternative.** Older Schnorr aggregation
+   schemes (MuSig1, BN-style) have known attacks. FROST is
+   threshold-signature flavor with comparable complexity. None of
+   them are "MuSig2 minus the hard parts".
+
+### Conditions under which this branch's call would change
+
+Any one of:
+
+- `secp256k1-zkp` ships a tagged crates.io release with MuSig2 in
+  a stable namespace.
+- A second independent codebase audits SCAM's would-be MuSig2
+  implementation (and pays for the review).
+- The chain successfully runs without aggregated multisig for long
+  enough that the on-chain footprint becomes a real bottleneck
+  worth the risk delta.
+
+### What ships instead
+
+- **Naïve k-of-n** at consensus level (`crates/consensus/src/multisig.rs`,
+  shipped in this branch). On chain a spend carries k * 64 bytes of
+  Schnorr signatures, one per participating key, plus the descriptor
+  blob. Larger on chain than MuSig2; same security model on the
+  Schnorr-verify primitive.
+- **PartialMultisigTx (PSBT-lite)** in `crates/wallet/src/psbt.rs`
+  for off-chain coordination, also this branch. Forward-compatible:
+  the JSON envelope is versioned, so a future MuSig2 deployment
+  ships as `version: 2` and v1 wallets cleanly refuse the new format.
+
+---
+
 ## 4. Multisig — design note only, full implementation deferred
 
 ### Two viable shapes

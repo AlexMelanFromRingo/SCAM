@@ -1,8 +1,10 @@
 # `audit/hardening-tui` — branch summary
 
-Branch base: `master` @ `23eec19`. Ten commits, all green on the full
-quality gate, with the scope expanded mid-session from audit-only to
-also include the major protocol gaps the audit identified.
+Branch base: `master` @ `23eec19`. **Fourteen commits**, all green
+on the full quality gate, with the scope expanded twice mid-session:
+first from audit-only to also include the major protocol gaps the
+audit identified, then again from those MVPs to full implementations
+(PSBT-lite, MTP-correct CSV).
 
 ## Quality gates at branch tip
 
@@ -11,10 +13,11 @@ also include the major protocol gaps the audit identified.
 | `cargo fmt --all -- --check` | clean |
 | `cargo check --workspace` | clean |
 | `cargo clippy --workspace --all-targets -- -D warnings` | clean on **pinned rustc 1.95.0** (`rust-toolchain.toml`) |
-| `cargo test --workspace --exclude scam-node` | **365 passed, 0 failed** (was 285 at branch start) |
+| `cargo test --workspace --exclude scam-node` | **451 passed, 0 failed** (was 285 at branch start) |
 | `cargo test -p scam-node --bin scam-node -- --test-threads=1` | **360 passed, 0 failed** |
 | `cargo test -p scam-tui` | 19 passed, 0 failed |
-| `cargo test -p scam-consensus` | 65 passed, 0 failed |
+| `cargo test -p scam-consensus` | **66 passed, 0 failed** |
+| `cargo test -p scam-wallet` | **44 passed, 0 failed** (was 36 — +8 PSBT-lite tests) |
 
 `master` was not actually green at branch start: `clippy -D warnings`
 failed on six lint regressions introduced by rustc 1.95.0. That is
@@ -55,6 +58,8 @@ mid-session ("full impl, not MVP") and they are now landed:
 | **k-of-n multisig (consensus)** | `crates/consensus/src/multisig.rs` + dispatch in `validate_non_coinbase_tx` | 15 (12 module + 1 distinguisher + 2 end-to-end) | Input-side dispatch on `pubkey_compressed` shape — 33 bytes → P2PKH, ≥51 bytes with `SCAM-multisig-v1` tag → multisig. Zero changes to TxOut. |
 | **k-of-n multisig (wallet+CLI)** | `crates/wallet/src/address.rs` + `WalletCommand::Multisig{Encode,Decode}` | 3 | `to_multisig_address` bech32m with `0xCA` discriminator byte. CLI smoke-tested live. |
 | **BIP68 relative locktime (CSV)** | `crates/consensus/src/csv.rs` + dispatch in `validate_non_coinbase_tx` | 7 (6 module + 1 end-to-end) | `UtxoEntry::created_time` added (devnet/testnet require rebuild — no live mainnet yet). DISABLE bit + tx-final-bypass preserve legacy `sequence: 0` and `u32::MAX` paths. |
+| **BIP68 MTP wiring** | New `BlockApplyContext` + `validate_and_apply_block_with_context`; chain runtime supplies real MTP | 8 total CSV (1 new MTP-override test) | Time-based CSV now compares against median-time-past of prior 11 headers per BIP68, not raw header timestamp. New test proves MTP overrides header timestamp at consensus level. |
+| **PartialMultisigTx (PSBT-lite)** | `crates/wallet/src/psbt.rs` + 4 new CLI subcommands | 8 (incl. `finalize_produces_consensus_verifiable_tx` which runs the chain validator against the output) | Coordinated k-of-n multisig signing across N parties. JSON-versioned envelope. Sign rejects non-participant keys early; finalize re-orders signatures to descriptor order and verifies each before emitting. |
 | **End-to-end smoke** | `docs/E2E_SMOKE_LOG.md` | live transcript | RPC routes, wallet CLI, multisig CLI all verified against a running `rpc-serve` instance. F-11 Host allow-list confirmed to issue HTTP 403 on `Host: evil.attacker.tld`. |
 
 ## What was added (not just fixed)
@@ -103,38 +108,39 @@ Still outside this branch (process work, not code):
 
 ## Suggested follow-ups for the next branch
 
-Each item is sized for a single session and closes a real gap:
+Items 2 and 4 from the original follow-up list are **closed in this
+branch** (PSBT-lite landed, MTP wired). The remaining items:
 
-1. **MuSig2 / Schnorr key aggregation** for the multisig path. The
-   k-of-n verifier already accepts aggregated single signatures
-   (it just sees one signature against one pubkey); a
-   `wallet multisig-aggregate` subcommand that runs the MuSig2 nonce
-   exchange would let parties produce a single 64-byte signature
-   indistinguishable from a P2PKH spend on chain.
-2. **PSBT-style partial signing** for the explicit k-of-n path.
-   Today, the k signers must each compute and concatenate
-   signatures independently; a `wallet multisig-partial-sign --psbt`
-   subcommand wraps that flow.
-3. **First real versionbits deployment**. Pick a non-trivial
+1. **MuSig2 / Schnorr key aggregation** — *deliberately deferred*.
+   See `docs/PROTOCOL_DESIGN.md` §4.5 for the full reasoning:
+   - no stable crates.io `secp256k1-zkp` release,
+   - re-implementing BIP327 without crypto review is the Wagner-
+     k-list-attack surface,
+   - PSBT-lite (shipped) already covers the k-of-n coordination
+     workflow with versioned JSON so a future v2 envelope can
+     carry aggregated single sigs.
+   Will revisit when `secp256k1-zkp` ships a tagged release OR a
+   crypto firm reviews a from-scratch impl.
+2. **First real versionbits deployment**. Pick a non-trivial
    protocol change (e.g. larger block size for capacity, or
    per-output CLTV via a new SpendCondition variant), define it as
    a `Deployment`, and exercise the activation path on a synthetic
    chain.
-4. **MTP-based time** in CSV's time-lock check. Currently passes
-   `block_timestamp` to `check_sequence_lock`; BIP68 uses MTP.
-   Already noted in the `csv.rs` doc comment.
-5. **`secret_key_bytes() -> [u8; 32]`** wrapped in a `zeroize`
+3. **`secret_key_bytes() -> [u8; 32]`** wrapped in a `zeroize`
    on-drop type (F-9 minor noted in the original audit).
 
 ## Commit history on this branch
 
 ```
+c0be70f proto: BIP68 — wire median-time-past through CSV time-lock
+57513e5 proto: PSBT-lite (PartialMultisigTx) for k-of-n coordination
+95abf80 docs: E2E smoke log + refreshed branch summary
 8f7d43d proto: BIP68 per-input relative locktime (CSV)
 350c48c proto: multisig wallet integration — addresses + CLI commands
 05f7d8e proto: k-of-n multisig at consensus level (full impl)
-[1 commit: mainnet freeze + operator runbook + MULTISIG_MVP doc]
+f7212d6 proto: freeze mainnet genesis + operator runbook
 830c206 proto: BIP9 versionbits soft-fork state machine
-[1 commit: halving + Monero-style tail emission as monetary policy]
+f294bd2 proto: halving + Monero-style tail emission as monetary policy
 9bb6f49 docs: AUDIT_BRANCH_SUMMARY for audit/hardening-tui
 7628352 audit: F-5/F-11 — DNS-rebinding protection via Host header
         allow-list
