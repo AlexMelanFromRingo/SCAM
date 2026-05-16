@@ -8,7 +8,14 @@ use thiserror::Error;
 
 use crate::validate::{BlockSizeLimits, BlockValidationError, validate_block_basic};
 
-const LOCKTIME_THRESHOLD: u32 = 500_000_000;
+/// Threshold (in `tx.lock_time` units) that selects the comparison axis:
+/// values below it are block heights, values at-or-above are unix epoch
+/// seconds. Matches BIP65 / Bitcoin Core's `LOCKTIME_THRESHOLD` exactly
+/// (the original "no real timestamp will ever be below 500M" reasoning,
+/// = 1985-11-05 UTC). Exposed so external tooling — wallet UI, RPC
+/// payload formatters — can label a lock_time correctly without
+/// reimplementing the split.
+pub const LOCKTIME_THRESHOLD: u32 = 500_000_000;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct UtxoEntry {
@@ -285,6 +292,26 @@ fn tx_output_total(tx: &Transaction) -> u128 {
     tx.outputs.iter().map(|out| out.value as u128).sum()
 }
 
+/// BIP65-equivalent transaction-level absolute lock check.
+///
+/// Behavior (matches the BIP65 CLTV "transaction is final" rule used in
+/// Bitcoin Core's `IsFinalTx`):
+///
+/// - `tx.lock_time == 0`     → always final (no lock).
+/// - All inputs have `sequence == u32::MAX` → always final (the
+///   sequence-final-bypass). Setting any input sequence below MAX
+///   activates the lock_time check.
+/// - Otherwise: split on [`LOCKTIME_THRESHOLD`] —
+///   - `lock_time <  THRESHOLD` → treated as a block height; final iff
+///     `lock_time <= block_height`.
+///   - `lock_time >= THRESHOLD` → treated as unix seconds; final iff
+///     `lock_time <= block_time`.
+///
+/// Note: SCAM does not have an on-chain script VM, so there is no
+/// per-output CLTV opcode. The existing semantics covers the
+/// transaction-level case; per-input relative locktime (BIP68 / CSV)
+/// is queued for a versionbits-gated follow-up — see
+/// `docs/PROTOCOL_DESIGN.md` §3.
 pub fn tx_is_final_for_block(tx: &Transaction, block_height: u64, block_time: u64) -> bool {
     if tx.lock_time == 0 {
         return true;
@@ -1294,5 +1321,120 @@ mod tests {
             ),
             "lock_time at threshold must use time-based finality, not height-based"
         );
+    }
+
+    /// BIP65: sequence-final-bypass. If ALL inputs have sequence ==
+    /// u32::MAX, the tx is final regardless of lock_time. This is the
+    /// rule that lets a non-time-locked tx coexist with a non-zero
+    /// lock_time (legacy compatibility surface).
+    #[test]
+    fn tx_is_final_when_all_sequences_are_max_even_with_future_locktime() {
+        let final_tx = Transaction {
+            version: 1,
+            inputs: vec![
+                TxIn {
+                    prev_out: OutPoint {
+                        txid: Hash256([0x44; 32]),
+                        vout: 0,
+                    },
+                    signature: vec![],
+                    pubkey_compressed: vec![0x02; 33],
+                    sequence: u32::MAX,
+                },
+                TxIn {
+                    prev_out: OutPoint {
+                        txid: Hash256([0x55; 32]),
+                        vout: 1,
+                    },
+                    signature: vec![],
+                    pubkey_compressed: vec![0x03; 33],
+                    sequence: u32::MAX,
+                },
+            ],
+            outputs: vec![TxOut {
+                value: 1,
+                key_hash20: [0x66; 20],
+            }],
+            // Far-future lock_time; bypass must still kick in.
+            lock_time: u32::MAX,
+        };
+        assert!(super::tx_is_final_for_block(&final_tx, 0, 0));
+        assert!(super::tx_is_final_for_block(
+            &final_tx,
+            u64::MAX,
+            u64::MAX
+        ));
+    }
+
+    /// BIP65: ANY single non-MAX sequence activates the lock_time check.
+    /// This is the rule attackers used to "look final" without being
+    /// final pre-fix.
+    #[test]
+    fn tx_is_not_final_when_any_input_sequence_below_max() {
+        let mostly_final = Transaction {
+            version: 1,
+            inputs: vec![
+                TxIn {
+                    prev_out: OutPoint {
+                        txid: Hash256([0x77; 32]),
+                        vout: 0,
+                    },
+                    signature: vec![],
+                    pubkey_compressed: vec![0x02; 33],
+                    sequence: u32::MAX,
+                },
+                TxIn {
+                    prev_out: OutPoint {
+                        txid: Hash256([0x88; 32]),
+                        vout: 0,
+                    },
+                    signature: vec![],
+                    pubkey_compressed: vec![0x03; 33],
+                    // One input below MAX → bypass not engaged.
+                    sequence: u32::MAX - 1,
+                },
+            ],
+            outputs: vec![TxOut {
+                value: 1,
+                key_hash20: [0x99; 20],
+            }],
+            lock_time: 100,
+        };
+        assert!(!super::tx_is_final_for_block(&mostly_final, 99, 0));
+        assert!(super::tx_is_final_for_block(&mostly_final, 100, 0));
+    }
+
+    /// Edge: `lock_time == THRESHOLD - 1` is height-based by spec.
+    #[test]
+    fn tx_lock_time_one_below_threshold_uses_height_axis() {
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: OutPoint {
+                    txid: Hash256([0xaa; 32]),
+                    vout: 0,
+                },
+                signature: vec![],
+                pubkey_compressed: vec![0x02; 33],
+                sequence: 0,
+            }],
+            outputs: vec![TxOut {
+                value: 1,
+                key_hash20: [0xbb; 20],
+            }],
+            lock_time: super::LOCKTIME_THRESHOLD - 1,
+        };
+        // height-based: huge block_time must not satisfy it.
+        assert!(!super::tx_is_final_for_block(
+            &tx,
+            (super::LOCKTIME_THRESHOLD as u64) - 2,
+            u64::MAX
+        ));
+        // exact height equality must satisfy it.
+        assert!(super::tx_is_final_for_block(
+            &tx,
+            (super::LOCKTIME_THRESHOLD as u64) - 1,
+            0
+        ));
     }
 }
