@@ -16,7 +16,8 @@ pub use multisig::{
     MultisigError, PUBKEY_LEN, SIG_LEN, looks_like_multisig_blob, verify_multisig_spend,
 };
 pub use utxo::{
-    BlockApplySummary, TxValidationError, UtxoEntry, UtxoSet, tx_is_final_for_block,
-    validate_and_apply_block, validate_and_apply_block_with_limits,
+    BlockApplyContext, BlockApplySummary, TxValidationError, UtxoEntry, UtxoSet,
+    tx_is_final_for_block, validate_and_apply_block, validate_and_apply_block_with_context,
+    validate_and_apply_block_with_limits,
 };
 pub use validate::{BlockSizeLimits, BlockValidationError, validate_block_basic};

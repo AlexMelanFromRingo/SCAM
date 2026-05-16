@@ -51,21 +51,27 @@ pub fn validate_and_apply_block(
     chain_domain: &[u8],
     utxos: &mut UtxoSet,
 ) -> Result<BlockApplySummary, TxValidationError> {
-    validate_and_apply_block_with_limits(
+    validate_and_apply_block_with_context(
         block,
-        current_height,
-        block_subsidy,
-        coinbase_maturity,
-        chain_domain,
-        BlockSizeLimits::UNBOUNDED,
+        BlockApplyContext {
+            current_height,
+            block_subsidy,
+            coinbase_maturity,
+            chain_domain,
+            limits: BlockSizeLimits::UNBOUNDED,
+            // When the caller can't supply MTP we fall back to the
+            // block header timestamp. This matches the historical
+            // SCAM behavior; BIP68 time-locks degrade to "satisfied
+            // against header time" instead of MTP.
+            median_time_past: None,
+        },
         utxos,
     )
 }
 
-/// Same as [`validate_and_apply_block`] but enforces the consensus-level
-/// block/tx size caps. Prefer this variant on hot paths; the unbounded
-/// wrapper exists so unit tests that pre-date the size enforcement keep
-/// compiling.
+/// Back-compat wrapper. Prefer [`validate_and_apply_block_with_context`]
+/// for new code so MTP and any future per-block parameters can be added
+/// without further signature changes.
 pub fn validate_and_apply_block_with_limits(
     block: &Block,
     current_height: u64,
@@ -75,7 +81,49 @@ pub fn validate_and_apply_block_with_limits(
     limits: BlockSizeLimits,
     utxos: &mut UtxoSet,
 ) -> Result<BlockApplySummary, TxValidationError> {
-    validate_block_basic(block, limits).map_err(TxValidationError::InvalidBlockStructure)?;
+    validate_and_apply_block_with_context(
+        block,
+        BlockApplyContext {
+            current_height,
+            block_subsidy,
+            coinbase_maturity,
+            chain_domain,
+            limits,
+            median_time_past: None,
+        },
+        utxos,
+    )
+}
+
+/// Per-block context shared between the validator and the per-tx
+/// machinery. Borrowed-only fields here intentionally (caller owns
+/// the storage), so the struct never escapes the call.
+#[derive(Clone, Copy, Debug)]
+pub struct BlockApplyContext<'a> {
+    pub current_height: u64,
+    pub block_subsidy: u64,
+    pub coinbase_maturity: u64,
+    pub chain_domain: &'a [u8],
+    pub limits: BlockSizeLimits,
+    /// BIP68: time-based sequence locks compare against the MTP
+    /// (median-time-past of the prior 11 headers), not the raw
+    /// block header timestamp — to make the chain clock monotonic
+    /// and resistant to a miner stamping a future-dated header to
+    /// unlock funds early. When `None` we fall back to the header
+    /// timestamp; chain runtime always supplies the real MTP.
+    pub median_time_past: Option<u64>,
+}
+
+/// Full-fidelity entry point. Takes a `BlockApplyContext` so new
+/// per-block parameters can be added without further breaking the
+/// signature; the old `*_with_limits` and bare wrappers remain for
+/// callers that don't care.
+pub fn validate_and_apply_block_with_context(
+    block: &Block,
+    ctx: BlockApplyContext<'_>,
+    utxos: &mut UtxoSet,
+) -> Result<BlockApplySummary, TxValidationError> {
+    validate_block_basic(block, ctx.limits).map_err(TxValidationError::InvalidBlockStructure)?;
     if !block_meets_pow(block) {
         return Err(TxValidationError::PowMismatch);
     }
@@ -89,13 +137,15 @@ pub fn validate_and_apply_block_with_limits(
     let mut spent_count = 0usize;
     let mut created_count = 0usize;
 
+    let csv_time = ctx.median_time_past.unwrap_or(block.header.timestamp);
+
     for (tx_index, tx) in block.transactions.iter().enumerate().skip(1) {
         let (input_total, output_total) = validate_non_coinbase_tx(
             tx,
             tx_index,
-            (current_height, block.header.timestamp),
-            coinbase_maturity,
-            chain_domain,
+            (ctx.current_height, block.header.timestamp, csv_time),
+            ctx.coinbase_maturity,
+            ctx.chain_domain,
             &mut spent_in_block,
             &staged,
         )?;
@@ -128,7 +178,7 @@ pub fn validate_and_apply_block_with_limits(
                 UtxoEntry {
                     value: output.value,
                     key_hash20: output.key_hash20,
-                    created_height: current_height,
+                    created_height: ctx.current_height,
                     created_time: block.header.timestamp,
                     is_coinbase: false,
                 },
@@ -137,7 +187,7 @@ pub fn validate_and_apply_block_with_limits(
         }
     }
 
-    let max_coinbase_value = (block_subsidy as u128)
+    let max_coinbase_value = (ctx.block_subsidy as u128)
         .checked_add(total_fees)
         .ok_or(TxValidationError::CoinbaseRewardOverflow)?;
     if coinbase_value > max_coinbase_value {
@@ -157,7 +207,7 @@ pub fn validate_and_apply_block_with_limits(
             UtxoEntry {
                 value: output.value,
                 key_hash20: output.key_hash20,
-                created_height: current_height,
+                created_height: ctx.current_height,
                 created_time: block.header.timestamp,
                 is_coinbase: true,
             },
@@ -177,16 +227,21 @@ pub fn validate_and_apply_block_with_limits(
     })
 }
 
+// `block_context = (current_height, raw_block_time, csv_time_clock)`.
+// `raw_block_time` is the header timestamp; used by the transaction-level
+// `tx_is_final_for_block` BIP65 check. `csv_time_clock` is the BIP68 clock
+// for time-based per-input sequence locks — chain runtime passes MTP here,
+// fallback wrappers pass `raw_block_time`.
 fn validate_non_coinbase_tx(
     tx: &Transaction,
     tx_index: usize,
-    block_context: (u64, u64),
+    block_context: (u64, u64, u64),
     coinbase_maturity: u64,
     chain_domain: &[u8],
     spent_in_block: &mut HashSet<OutPoint>,
     utxos: &UtxoSet,
 ) -> Result<(u128, u128), TxValidationError> {
-    let (current_height, block_timestamp) = block_context;
+    let (current_height, block_timestamp, csv_time_clock) = block_context;
     if tx.is_coinbase() {
         return Err(TxValidationError::UnexpectedCoinbase { tx_index });
     }
@@ -245,7 +300,7 @@ fn validate_non_coinbase_tx(
                 utxo.created_height,
                 utxo.created_time,
                 current_height,
-                block_timestamp,
+                csv_time_clock,
             )
             // SequenceLockError is currently an empty enum (Bitcoin-compat:
             // reserved bits are ignored), so this `match` is total.
@@ -641,6 +696,139 @@ mod tests {
             }
             other => panic!("expected SequenceLockNotMet, got {other:?}"),
         }
+    }
+
+    /// MTP wiring: BIP68 time-based sequence locks must compare against
+    /// the supplied `median_time_past`, NOT the block header timestamp.
+    /// We construct two `BlockApplyContext`s differing only in MTP and
+    /// assert the lock outcome differs accordingly.
+    ///
+    /// Setup: a UTXO created at `t=1_000_000`, spent with sequence =
+    /// TYPE | 1 → require 512s elapsed → required_time = 1_000_512.
+    /// Header timestamp at spend is `1_005_000` (would satisfy if used).
+    /// Two MTP candidates:
+    ///   - MTP = 1_000_400 → still locked (1_000_400 < 1_000_512). Reject.
+    ///   - MTP = 1_001_000 → satisfied. Accept.
+    ///
+    /// The second case proves MTP overrides the header timestamp.
+    #[test]
+    fn csv_time_lock_compares_against_supplied_mtp_not_header_timestamp() {
+        use super::{BlockApplyContext, validate_and_apply_block_with_context};
+
+        let chain_domain = b"devnet";
+        let (miner_pubkey, miner_key_hash, miner_secret) = key_material([170u8; 32]);
+        let (_, receiver_key_hash, _) = key_material([171u8; 32]);
+
+        // Genesis at t=1_000_000.
+        let genesis_coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: OutPoint::coinbase(),
+                signature: b"g".to_vec(),
+                pubkey_compressed: vec![],
+                sequence: u32::MAX,
+            }],
+            outputs: vec![TxOut {
+                value: 50,
+                key_hash20: miner_key_hash,
+            }],
+            lock_time: 0,
+        };
+        let genesis = make_block(
+            Hash256::ZERO,
+            1_000_000,
+            Target::MAX,
+            vec![genesis_coinbase.clone()],
+        );
+        let mut utxos = UtxoSet::new();
+        let ctx_genesis = BlockApplyContext {
+            current_height: 0,
+            block_subsidy: 50,
+            coinbase_maturity: 1,
+            chain_domain,
+            limits: super::BlockSizeLimits::UNBOUNDED,
+            median_time_past: Some(1_000_000),
+        };
+        validate_and_apply_block_with_context(&genesis, ctx_genesis, &mut utxos)
+            .expect("genesis applies");
+
+        // Spend with TIME-typed CSV value=1 → require 512s gap.
+        let csv_seq = super::super::csv::SEQUENCE_TYPE_FLAG | 1;
+        let mut spend = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: OutPoint {
+                    txid: genesis_coinbase.txid(),
+                    vout: 0,
+                },
+                signature: vec![],
+                pubkey_compressed: miner_pubkey.to_vec(),
+                sequence: csv_seq,
+            }],
+            outputs: vec![TxOut {
+                value: 40,
+                key_hash20: receiver_key_hash,
+            }],
+            lock_time: 0,
+        };
+        sign_input(&mut spend, 0, chain_domain, &miner_secret);
+        let block1_coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: OutPoint::coinbase(),
+                signature: b"b1".to_vec(),
+                pubkey_compressed: vec![],
+                sequence: u32::MAX,
+            }],
+            outputs: vec![TxOut {
+                value: 60,
+                key_hash20: receiver_key_hash,
+            }],
+            lock_time: 0,
+        };
+        // Block header timestamp set to a value that would satisfy the
+        // lock if used (5_000s elapsed > 512s required). We rely on
+        // MTP to *correctly* reject when MTP says only 400s elapsed.
+        let block1 = make_block(
+            genesis.header.block_hash(),
+            1_005_000,
+            Target::MAX,
+            vec![block1_coinbase, spend],
+        );
+
+        // Case A: MTP = 1_000_400 (only 400s elapsed) → lock not met
+        // even though header timestamp would have satisfied it. This
+        // is the BIP68 attack-mitigation: a miner can't stamp a
+        // future-dated header to unlock CSV early.
+        let mut utxos_a = utxos.clone();
+        let ctx_a = BlockApplyContext {
+            current_height: 1,
+            block_subsidy: 50,
+            coinbase_maturity: 1,
+            chain_domain,
+            limits: super::BlockSizeLimits::UNBOUNDED,
+            median_time_past: Some(1_000_400),
+        };
+        let err = validate_and_apply_block_with_context(&block1, ctx_a, &mut utxos_a)
+            .expect_err("MTP=1_000_400 < required_time=1_000_512 must reject");
+        match err {
+            TxValidationError::SequenceLockNotMet { kind, .. } => assert_eq!(kind, "time"),
+            other => panic!("expected SequenceLockNotMet(time), got {other:?}"),
+        }
+
+        // Case B: MTP = 1_001_000 (1000s elapsed) → satisfied. Same
+        // block, same header timestamp, only the MTP differs.
+        let mut utxos_b = utxos.clone();
+        let ctx_b = BlockApplyContext {
+            current_height: 1,
+            block_subsidy: 50,
+            coinbase_maturity: 1,
+            chain_domain,
+            limits: super::BlockSizeLimits::UNBOUNDED,
+            median_time_past: Some(1_001_000),
+        };
+        validate_and_apply_block_with_context(&block1, ctx_b, &mut utxos_b)
+            .expect("MTP=1_001_000 > required_time=1_000_512 must accept");
     }
 
     /// End-to-end: 2-of-3 multisig output funded by genesis, spent in

@@ -4,9 +4,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use num_bigint::BigUint;
 use scam_consensus::{
-    BlockApplySummary, BlockSizeLimits, BlockValidationError, UtxoEntry, UtxoSet, asert_next,
-    chainwork_for_target, lwma_next, retarget_next, validate_and_apply_block_with_limits,
-    validate_block_basic,
+    BlockApplyContext, BlockApplySummary, BlockSizeLimits, BlockValidationError, UtxoEntry,
+    UtxoSet, asert_next, chainwork_for_target, lwma_next, retarget_next,
+    validate_and_apply_block_with_context, validate_block_basic,
 };
 use scam_core::{Block, BlockHeader, ChainConfig, DifficultyAlgorithm, Hash256, Target};
 use thiserror::Error;
@@ -89,15 +89,19 @@ impl ChainRuntime {
         // Subsidy at height 0 — `subsidy_at_height(0)` is by definition
         // `block_subsidy` for any valid config, but routing through the
         // helper keeps the rule in one place.
-        let applied = validate_and_apply_block_with_limits(
-            &genesis,
-            0,
-            config.subsidy_at_height(0),
-            config.coinbase_maturity as u64,
-            config.network_id.as_bytes(),
+        // Genesis MTP: no predecessors, so the only available clock is
+        // the genesis header timestamp itself. Any CSV time-lock against
+        // genesis would be unsatisfiable in the height-since-genesis<11
+        // window regardless of MTP semantics, so this fallback is safe.
+        let ctx = BlockApplyContext {
+            current_height: 0,
+            block_subsidy: config.subsidy_at_height(0),
+            coinbase_maturity: config.coinbase_maturity as u64,
+            chain_domain: config.network_id.as_bytes(),
             limits,
-            &mut utxos,
-        )?;
+            median_time_past: Some(genesis.header.timestamp),
+        };
+        let applied = validate_and_apply_block_with_context(&genesis, ctx, &mut utxos)?;
 
         let genesis_hash = applied.block_hash;
         let genesis_header = genesis.header.clone();
@@ -404,15 +408,19 @@ impl ChainRuntime {
 
         let height = self.tip_height() + 1;
         let undo = self.collect_block_undo(&block)?;
-        let summary = validate_and_apply_block_with_limits(
-            &block,
-            height,
-            self.config.subsidy_at_height(height),
-            self.config.coinbase_maturity as u64,
-            self.config.network_id.as_bytes(),
-            BlockSizeLimits::from_chain_config(&self.config),
-            &mut self.utxos,
-        )?;
+        // BIP68: time-locked sequences compare against MTP of the
+        // prior-11-headers. The new block isn't applied yet, so MTP
+        // is computed from the parent (current tip).
+        let mtp = self.median_time_past(self.tip_hash())?;
+        let ctx = BlockApplyContext {
+            current_height: height,
+            block_subsidy: self.config.subsidy_at_height(height),
+            coinbase_maturity: self.config.coinbase_maturity as u64,
+            chain_domain: self.config.network_id.as_bytes(),
+            limits: BlockSizeLimits::from_chain_config(&self.config),
+            median_time_past: Some(mtp),
+        };
+        let summary = validate_and_apply_block_with_context(&block, ctx, &mut self.utxos)?;
         let block_hash = summary.block_hash;
         self.headers.insert(block_hash, block.header.clone());
         self.blocks.insert(block_hash, block.clone());
@@ -602,15 +610,18 @@ impl ChainRuntime {
 
         let undo = self.collect_block_undo(&block)?;
         let next_height = self.tip_height().saturating_add(1);
-        validate_and_apply_block_with_limits(
-            &block,
-            next_height,
-            self.config.subsidy_at_height(next_height),
-            self.config.coinbase_maturity as u64,
-            self.config.network_id.as_bytes(),
-            BlockSizeLimits::from_chain_config(&self.config),
-            &mut self.utxos,
-        )?;
+        // Reorg-side apply: MTP of the parent block under the alternate
+        // branch (the just-pushed branch tip).
+        let mtp = self.median_time_past(self.tip_hash())?;
+        let ctx = BlockApplyContext {
+            current_height: next_height,
+            block_subsidy: self.config.subsidy_at_height(next_height),
+            coinbase_maturity: self.config.coinbase_maturity as u64,
+            chain_domain: self.config.network_id.as_bytes(),
+            limits: BlockSizeLimits::from_chain_config(&self.config),
+            median_time_past: Some(mtp),
+        };
+        validate_and_apply_block_with_context(&block, ctx, &mut self.utxos)?;
         self.main_chain.push(block_hash);
         self.undo_data.insert(block_hash, undo);
         Ok(())
