@@ -11,6 +11,14 @@ const DEFAULT_MAX_REPLACEMENT_DESCENDANTS: usize = 25;
 #[derive(Debug, Clone)]
 pub struct Mempool {
     max_txs: usize,
+    /// Audit F-7 (anti-DoS). When `Some(n)`, reject any tx whose canonical
+    /// serialized size exceeds `n` bytes *at mempool admission*, before any
+    /// signature verification or fee math. Defense-in-depth against a peer
+    /// that propagates oversize txs to exhaust RAM bounded by `max_txs`.
+    /// Consensus-level `BlockSizeLimits` still applies at block time;
+    /// this just refuses to *hold* them. Default `None` preserves
+    /// backwards-compatible behavior for tests.
+    max_tx_bytes: Option<usize>,
     min_relay_fee_per_kb: u64,
     min_replacement_fee_delta: u64,
     max_replacement_descendants: usize,
@@ -113,6 +121,7 @@ impl Mempool {
 
         Ok(Self {
             max_txs,
+            max_tx_bytes: None,
             min_relay_fee_per_kb,
             min_replacement_fee_delta,
             max_replacement_descendants,
@@ -182,6 +191,16 @@ impl Mempool {
         removed
     }
 
+    /// Audit F-7 opt-in: enable per-tx size cap. Pass `None` to disable.
+    /// `0` is treated as "reject everything" — useful for tests.
+    pub fn set_max_tx_bytes(&mut self, cap: Option<usize>) {
+        self.max_tx_bytes = cap;
+    }
+
+    pub fn max_tx_bytes(&self) -> Option<usize> {
+        self.max_tx_bytes
+    }
+
     pub fn insert(&mut self, tx: Transaction) -> Result<InsertOutcome, MempoolError> {
         self.insert_with_fee(tx, 0)
     }
@@ -220,6 +239,15 @@ impl Mempool {
             return Ok(InsertOutcome::AlreadyPresent { txid });
         }
         let serialized_size = tx.encode_for_hash().len();
+        if let Some(cap) = self.max_tx_bytes
+            && serialized_size > cap
+        {
+            return Err(MempoolError::TxTooLarge {
+                incoming: txid,
+                bytes: serialized_size,
+                max_bytes: cap,
+            });
+        }
         let required_fee = required_fee_for_size(serialized_size, self.min_relay_fee_per_kb)?;
         if fee < required_fee {
             return Err(MempoolError::FeeTooLow {
@@ -615,7 +643,7 @@ impl OrphanPool {
                 });
             }
         }
-        ready.sort_unstable_by(|a, b| a.txid.cmp(&b.txid));
+        ready.sort_unstable_by_key(|r| r.txid);
         self.telemetry.promoted_total = self
             .telemetry
             .promoted_total
@@ -804,6 +832,12 @@ pub enum MempoolError {
     },
     #[error("transaction {txid} has zero-value output at index #{output_index}")]
     ZeroValueOutput { txid: Hash256, output_index: usize },
+    #[error("transaction {incoming} is {bytes} bytes, exceeds mempool tx-size cap of {max_bytes}")]
+    TxTooLarge {
+        incoming: Hash256,
+        bytes: usize,
+        max_bytes: usize,
+    },
     #[error("orphan transaction {txid} must include at least one missing outpoint")]
     OrphanMissingOutpoints { txid: Hash256 },
     #[error("mempool full (limit={limit}), incoming txid={incoming}")]
@@ -902,6 +936,40 @@ mod tests {
             }],
             lock_time: 0,
         }
+    }
+
+    /// F-7: oversize tx is rejected at admission, before fee/signature work.
+    #[test]
+    fn oversize_tx_is_rejected_at_admission() {
+        let mut mempool = Mempool::with_policy(100, 0).expect("mempool init");
+        mempool.set_max_tx_bytes(Some(64));
+        let mut tx = mk_tx([7u8; 32], 0, b"sig", 9);
+        tx.inputs[0].signature = vec![0u8; 4096];
+        let txid = tx.txid();
+        match mempool.insert(tx) {
+            Err(MempoolError::TxTooLarge {
+                incoming,
+                bytes,
+                max_bytes,
+            }) => {
+                assert_eq!(incoming, txid);
+                assert!(bytes > max_bytes, "expected bytes > cap");
+                assert_eq!(max_bytes, 64);
+            }
+            other => panic!("expected TxTooLarge, got {other:?}"),
+        }
+        assert_eq!(mempool.len(), 0, "rejected tx must not be stored");
+    }
+
+    /// F-7: cap disabled (None) → unbounded behavior preserved.
+    #[test]
+    fn no_size_cap_means_unbounded() {
+        let mut mempool = Mempool::with_policy(100, 0).expect("mempool init");
+        mempool.set_max_tx_bytes(None);
+        let mut tx = mk_tx([8u8; 32], 0, b"sig", 10);
+        tx.inputs[0].signature = vec![0u8; 4096];
+        mempool.insert(tx).expect("must accept when no cap set");
+        assert_eq!(mempool.len(), 1);
     }
 
     #[test]

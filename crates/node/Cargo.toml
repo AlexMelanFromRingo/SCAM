@@ -19,6 +19,7 @@ scam-p2p = { path = "../p2p" }
 scam-rpc = { path = "../rpc" }
 scam-storage = { path = "../storage" }
 scam-stratum = { path = "../stratum" }
+scam-tui = { path = "../tui" }
 scam-wallet = { path = "../wallet" }
 serde.workspace = true
 serde_json.workspace = true

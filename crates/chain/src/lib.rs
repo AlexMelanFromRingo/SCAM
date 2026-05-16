@@ -4,8 +4,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use num_bigint::BigUint;
 use scam_consensus::{
-    BlockApplySummary, BlockValidationError, UtxoEntry, UtxoSet, asert_next, chainwork_for_target,
-    lwma_next, retarget_next, validate_and_apply_block, validate_block_basic,
+    BlockApplySummary, BlockSizeLimits, BlockValidationError, UtxoEntry, UtxoSet, asert_next,
+    chainwork_for_target, lwma_next, retarget_next, validate_and_apply_block_with_limits,
+    validate_block_basic,
 };
 use scam_core::{Block, BlockHeader, ChainConfig, DifficultyAlgorithm, Hash256, Target};
 use thiserror::Error;
@@ -84,12 +85,14 @@ impl ChainRuntime {
 
     pub fn new(config: ChainConfig, genesis: Block) -> Result<Self, ChainError> {
         let mut utxos = UtxoSet::new();
-        let applied = validate_and_apply_block(
+        let limits = BlockSizeLimits::from_chain_config(&config);
+        let applied = validate_and_apply_block_with_limits(
             &genesis,
             0,
             config.block_subsidy,
             config.coinbase_maturity as u64,
             config.network_id.as_bytes(),
+            limits,
             &mut utxos,
         )?;
 
@@ -339,12 +342,13 @@ impl ChainRuntime {
 
         let height = self.tip_height() + 1;
         let undo = self.collect_block_undo(&block)?;
-        let summary = validate_and_apply_block(
+        let summary = validate_and_apply_block_with_limits(
             &block,
             height,
             self.config.block_subsidy,
             self.config.coinbase_maturity as u64,
             self.config.network_id.as_bytes(),
+            BlockSizeLimits::from_chain_config(&self.config),
             &mut self.utxos,
         )?;
         let block_hash = summary.block_hash;
@@ -364,7 +368,8 @@ impl ChainRuntime {
     }
 
     pub fn submit_block(&mut self, block: Block) -> Result<BlockSubmissionOutcome, ChainError> {
-        validate_block_basic(&block).map_err(ChainError::InvalidBlockStructure)?;
+        validate_block_basic(&block, BlockSizeLimits::from_chain_config(&self.config))
+            .map_err(ChainError::InvalidBlockStructure)?;
 
         let block_hash = block.header.block_hash();
         if self.headers.contains_key(&block_hash) {
@@ -535,12 +540,13 @@ impl ChainRuntime {
 
         let undo = self.collect_block_undo(&block)?;
         let next_height = self.tip_height().saturating_add(1);
-        validate_and_apply_block(
+        validate_and_apply_block_with_limits(
             &block,
             next_height,
             self.config.block_subsidy,
             self.config.coinbase_maturity as u64,
             self.config.network_id.as_bytes(),
+            BlockSizeLimits::from_chain_config(&self.config),
             &mut self.utxos,
         )?;
         self.main_chain.push(block_hash);

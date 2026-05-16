@@ -10,6 +10,7 @@ members = [
     "crates/storage",
     "crates/wallet",
     "crates/stratum",
+    "crates/tui",
     "crates/node",
 ]
 resolver = "2"

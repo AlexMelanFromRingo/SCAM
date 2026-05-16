@@ -6,7 +6,7 @@ use secp256k1::{Message, PublicKey, Secp256k1};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::validate::{BlockValidationError, validate_block_basic};
+use crate::validate::{BlockSizeLimits, BlockValidationError, validate_block_basic};
 
 const LOCKTIME_THRESHOLD: u32 = 500_000_000;
 
@@ -38,7 +38,31 @@ pub fn validate_and_apply_block(
     chain_domain: &[u8],
     utxos: &mut UtxoSet,
 ) -> Result<BlockApplySummary, TxValidationError> {
-    validate_block_basic(block).map_err(TxValidationError::InvalidBlockStructure)?;
+    validate_and_apply_block_with_limits(
+        block,
+        current_height,
+        block_subsidy,
+        coinbase_maturity,
+        chain_domain,
+        BlockSizeLimits::UNBOUNDED,
+        utxos,
+    )
+}
+
+/// Same as [`validate_and_apply_block`] but enforces the consensus-level
+/// block/tx size caps. Prefer this variant on hot paths; the unbounded
+/// wrapper exists so unit tests that pre-date the size enforcement keep
+/// compiling.
+pub fn validate_and_apply_block_with_limits(
+    block: &Block,
+    current_height: u64,
+    block_subsidy: u64,
+    coinbase_maturity: u64,
+    chain_domain: &[u8],
+    limits: BlockSizeLimits,
+    utxos: &mut UtxoSet,
+) -> Result<BlockApplySummary, TxValidationError> {
+    validate_block_basic(block, limits).map_err(TxValidationError::InvalidBlockStructure)?;
     if !block_meets_pow(block) {
         return Err(TxValidationError::PowMismatch);
     }

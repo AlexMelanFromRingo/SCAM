@@ -656,7 +656,7 @@ pub fn save_mempool_db(path: &Path, snapshot: &MempoolSnapshot) -> Result<(), St
         dedup.insert(entry.txid, entry.clone());
     }
     let mut entries = dedup.into_values().collect::<Vec<_>>();
-    entries.sort_by(|a, b| a.txid.cmp(&b.txid));
+    entries.sort_by_key(|e| e.txid);
 
     let db = Database::create(&tmp_path).map_err(|e| StorageError::Db(e.to_string()))?;
     let write_txn = db
@@ -735,7 +735,7 @@ pub fn load_mempool_db(path: &Path) -> Result<MempoolSnapshot, StorageError> {
             fee: stored.fee,
         });
     }
-    entries.sort_by(|a, b| a.txid.cmp(&b.txid));
+    entries.sort_by_key(|e| e.txid);
     Ok(MempoolSnapshot {
         network_id,
         entries,
