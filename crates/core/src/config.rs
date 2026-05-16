@@ -68,6 +68,17 @@ pub struct ChainConfig {
     /// Must be `<= block_subsidy` to avoid an initial-jump invariant break.
     #[serde(default)]
     pub tail_emission: u64,
+    /// BIP9-style versionbits retarget window (blocks). `0` disables
+    /// versionbits evaluation entirely (no deployments can activate).
+    #[serde(default)]
+    pub versionbits_window_blocks: u64,
+    /// Minimum number of signaling headers within a retarget window to
+    /// trigger STARTED → LOCKED_IN. Typically 95% of window. `0` = unset.
+    #[serde(default)]
+    pub versionbits_threshold: u32,
+    /// Optional list of soft-fork deployments. Default empty.
+    #[serde(default)]
+    pub deployments: Vec<crate::versionbits::Deployment>,
     pub hrp: String,
     #[serde(default = "default_stratum_share_target")]
     pub stratum_share_target: String,
@@ -162,6 +173,45 @@ impl ChainConfig {
             return Err(ChainConfigError::InvalidField(
                 "tail_emission must be <= block_subsidy".to_owned(),
             ));
+        }
+        // Versionbits config sanity. We don't require the feature to be
+        // enabled (a chain may legitimately ship without any deployments),
+        // but if any deployments are configured, the window + threshold +
+        // bit positions must all be valid or activation is impossible.
+        if !self.deployments.is_empty() {
+            if self.versionbits_window_blocks == 0 {
+                return Err(ChainConfigError::InvalidField(
+                    "deployments present but versionbits_window_blocks = 0".to_owned(),
+                ));
+            }
+            if self.versionbits_threshold == 0
+                || self.versionbits_threshold as u64 > self.versionbits_window_blocks
+            {
+                return Err(ChainConfigError::InvalidField(
+                    "versionbits_threshold must be in 1..=versionbits_window_blocks".to_owned(),
+                ));
+            }
+            let mut seen_bits = std::collections::HashSet::new();
+            for d in &self.deployments {
+                if !d.is_valid_bit() {
+                    return Err(ChainConfigError::InvalidField(format!(
+                        "deployment '{}' bit {} out of range (max 28)",
+                        d.name, d.bit
+                    )));
+                }
+                if d.timeout_unix <= d.start_unix {
+                    return Err(ChainConfigError::InvalidField(format!(
+                        "deployment '{}' timeout must be > start",
+                        d.name
+                    )));
+                }
+                if !seen_bits.insert(d.bit) {
+                    return Err(ChainConfigError::InvalidField(format!(
+                        "deployment bit {} reused (only one deployment per bit)",
+                        d.bit
+                    )));
+                }
+            }
         }
         if self.max_mempool_txs == 0 {
             return Err(ChainConfigError::InvalidField(
@@ -611,6 +661,9 @@ mod tests {
             block_subsidy: 5_000_000_000,
             halving_interval_blocks: 0,
             tail_emission: 0,
+            versionbits_window_blocks: 0,
+            versionbits_threshold: 0,
+            deployments: Vec::new(),
             hrp: "sd".to_owned(),
             stratum_share_target:
                 "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_owned(),
@@ -676,6 +729,9 @@ mod tests {
             block_subsidy: 5_000_000_000,
             halving_interval_blocks: 0,
             tail_emission: 0,
+            versionbits_window_blocks: 0,
+            versionbits_threshold: 0,
+            deployments: Vec::new(),
             hrp: "sd".to_owned(),
             stratum_share_target:
                 "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_owned(),

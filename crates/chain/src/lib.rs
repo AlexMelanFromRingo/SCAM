@@ -183,6 +183,65 @@ impl ChainRuntime {
         self.median_time_past(self.tip_hash())
     }
 
+    /// Evaluate a single BIP9-style deployment against the current main
+    /// chain. Walks retarget windows from genesis forward, tallying
+    /// signaling bit-count per window and stepping the state machine.
+    /// Returns the state observable at the tip.
+    ///
+    /// O(tip_height) and recomputed every call. For production hot
+    /// paths cache the result keyed by (deployment.bit, window_index of
+    /// tip). For audit / RPC / TUI display this is fine.
+    pub fn versionbits_state(
+        &self,
+        deployment: &scam_core::Deployment,
+    ) -> Result<scam_core::DeploymentState, ChainError> {
+        let window = self.config.versionbits_window_blocks;
+        let threshold = self.config.versionbits_threshold;
+        if window == 0 || threshold == 0 {
+            return Ok(scam_core::DeploymentState::Defined);
+        }
+
+        let tip_h = self.tip_height();
+        let mut state = scam_core::DeploymentState::Defined;
+        let mut window_start: u64 = 0;
+        while window_start + window <= tip_h.saturating_add(1) {
+            // Count signaling headers in the just-completed window
+            // [window_start, window_start + window).
+            let mut signal_count: u32 = 0;
+            for h in window_start..(window_start + window) {
+                let Some(hash) = self.block_hash_at_height(h) else {
+                    return Err(ChainError::MissingHeader {
+                        block_hash: scam_core::Hash256::ZERO,
+                    });
+                };
+                let header = self
+                    .headers
+                    .get(&hash)
+                    .ok_or(ChainError::MissingHeader { block_hash: hash })?;
+                if scam_core::deployment_bit_signaled(header.version, deployment.bit) {
+                    signal_count = signal_count.saturating_add(1);
+                }
+            }
+            // MTP at the boundary block (last block of the window).
+            let boundary_hash = self
+                .block_hash_at_height(window_start + window - 1)
+                .ok_or(ChainError::MissingHeader {
+                    block_hash: scam_core::Hash256::ZERO,
+                })?;
+            let boundary_mtp = self.median_time_past(boundary_hash)?;
+            state = scam_core::next_state(
+                state,
+                signal_count,
+                boundary_mtp,
+                deployment,
+                threshold,
+                window,
+            );
+            window_start += window;
+        }
+        Ok(state)
+    }
+
     fn median_time_past(&self, parent_hash: Hash256) -> Result<u64, ChainError> {
         let mut timestamps = Vec::with_capacity(MEDIAN_TIME_PAST_WINDOW);
         let mut cursor = Some(parent_hash);

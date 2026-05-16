@@ -2567,6 +2567,11 @@ fn run_config_scaffold(args: ConfigScaffoldArgs) -> Result<(), NodeError> {
         block_subsidy: args.block_subsidy,
         halving_interval_blocks: args.halving_interval_blocks,
         tail_emission: args.tail_emission,
+        // Versionbits scaffolding ships empty; first real deployment is
+        // a per-fork decision made by editing the generated config.
+        versionbits_window_blocks: 0,
+        versionbits_threshold: 0,
+        deployments: Vec::new(),
         hrp: args.hrp.clone(),
         stratum_share_target: args.stratum_share_target.clone(),
         stratum_min_share_target: args.stratum_min_share_target.clone(),
@@ -34194,6 +34199,9 @@ mod tests {
             block_subsidy: 5_000_000_000,
             halving_interval_blocks: 0,
             tail_emission: 0,
+            versionbits_window_blocks: 0,
+            versionbits_threshold: 0,
+            deployments: Vec::new(),
             stratum_share_target:
                 "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_owned(),
             stratum_min_share_target:
