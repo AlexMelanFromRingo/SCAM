@@ -10,17 +10,17 @@ pub mod model;
 pub mod render;
 
 use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
 use thiserror::Error;
 
 use crate::http::HttpError;
@@ -49,10 +49,7 @@ pub fn run(endpoint: &str, poll_interval: Duration) -> Result<(), TuiError> {
     result
 }
 
-fn event_loop<B>(
-    terminal: &mut Terminal<B>,
-    state: &mut AppState,
-) -> Result<(), TuiError>
+fn event_loop<B>(terminal: &mut Terminal<B>, state: &mut AppState) -> Result<(), TuiError>
 where
     B: ratatui::backend::Backend,
 {

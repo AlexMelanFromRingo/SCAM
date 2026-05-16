@@ -83,8 +83,12 @@ pub fn get_text(endpoint: &Endpoint, path: &str, timeout: Duration) -> Result<St
     }
     let addr = first_addr(&endpoint.host, endpoint.port)?;
     let mut stream = TcpStream::connect_timeout(&addr, timeout).map_err(HttpError::Connect)?;
-    stream.set_read_timeout(Some(timeout)).map_err(HttpError::Io)?;
-    stream.set_write_timeout(Some(timeout)).map_err(HttpError::Io)?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(HttpError::Io)?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(HttpError::Io)?;
 
     let req = format!(
         "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nUser-Agent: scam-tui/0.3\r\nAccept: application/json\r\nConnection: close\r\n\r\n",

@@ -139,11 +139,10 @@ identical bug; they say "we deliberately looked for this pattern".
 
 ---
 
-## F-5. RPC server has no authentication, CORS, or origin check
+## F-5 / F-11. RPC origin / DNS rebinding protection
 
-- **Severity**: medium for prod; low for dev (binds to `127.0.0.1`).
-- **Status**: noted, no code change (existing security boundary is
-  documented in the README; deferred to operator runbook).
+- **Severity**: medium for any non-loopback bind.
+- **Status**: fixed-in-branch (Host allow-list middleware).
 - **Where**: `crates/node/src/main.rs::run_rpc_serve_inner_axum` and
   the legacy handler.
 - **Detail**: there is no `tower_http::cors::CorsLayer`, no
@@ -154,13 +153,19 @@ identical bug; they say "we deliberately looked for this pattern".
   browser tab on the same host via a misconfigured proxy or a malicious
   page using DNS rebinding — can drain `/wallet/send` if a mnemonic is
   presented in the body. The web console assumes loopback.
-- **Recommendation** (not implemented in this branch — design decision):
-  1. Add `Host` header allow-list (reject anything that is not
-     `127.0.0.1[:port]` or `localhost[:port]`) — defeats DNS rebinding.
-  2. Add an optional `--rpc-auth-token` whose value must appear in an
-     `Authorization: Bearer` header for `POST` routes.
-  3. Document loud-and-clear in `WEB_CONSOLE.md` that exposing RPC on a
-     non-loopback bind without auth is unsafe.
+- **Fix in this branch (F-11)**: `enforce_loopback_host_header` middleware
+  in `crates/node/src/main.rs` rejects any request whose `Host` header is
+  not `127.0.0.1`, `::1`, or `localhost` (with or without a port). Wired
+  via `Router::layer(axum_middleware::from_fn(...))`. Test:
+  `rpc_host_header_allowlist_accepts_loopback_and_rejects_others`.
+  This is the same posture as Bitcoin Core's `-rpcallowip`.
+- **Still recommended, not implemented here** (design decisions):
+  1. Optional `--rpc-auth-token` whose value must appear in an
+     `Authorization: Bearer` header for `POST` routes — gives a real
+     credential check for non-loopback binds.
+  2. Document loud-and-clear in `WEB_CONSOLE.md` that exposing RPC on
+     a non-loopback bind, even with the Host allow-list, requires the
+     bearer token.
 
 ---
 

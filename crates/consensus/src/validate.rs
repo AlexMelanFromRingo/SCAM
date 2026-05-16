@@ -134,9 +134,7 @@ pub enum BlockValidationError {
     DuplicateInputInTx { tx_index: usize },
     #[error("transaction #{tx_index} duplicates an earlier txid in the same block")]
     DuplicateTxInBlock { tx_index: usize },
-    #[error(
-        "transaction #{tx_index} is {bytes} bytes, exceeds consensus cap of {max_bytes} bytes"
-    )]
+    #[error("transaction #{tx_index} is {bytes} bytes, exceeds consensus cap of {max_bytes} bytes")]
     TxTooLarge {
         tx_index: usize,
         bytes: usize,
@@ -205,7 +203,8 @@ mod tests {
             transactions: vec![coinbase, tx2],
         };
 
-        let err = validate_block_basic(&block, BlockSizeLimits::UNBOUNDED).expect_err("should fail");
+        let err =
+            validate_block_basic(&block, BlockSizeLimits::UNBOUNDED).expect_err("should fail");
         assert!(matches!(err, BlockValidationError::MultipleCoinbase));
     }
 

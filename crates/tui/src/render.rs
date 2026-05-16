@@ -1,14 +1,14 @@
 //! ratatui frame composition. Kept in a separate module so unit tests can
 //! exercise rendering against a `TestBackend` without booting a terminal.
 
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
-use ratatui::Frame;
 
 use crate::model::{
-    format_count, format_hashrate, local_clock_24h, truncate_hash, AppState, PollOutcome,
+    AppState, PollOutcome, format_count, format_hashrate, local_clock_24h, truncate_hash,
 };
 
 pub fn draw(frame: &mut Frame<'_>, state: &AppState) {
@@ -128,7 +128,9 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     };
 
     frame.render_widget(
-        Paragraph::new(lines).block(block).wrap(Wrap { trim: false }),
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
         area,
     );
 }
@@ -266,8 +268,8 @@ fn compact_work(raw: &str) -> String {
 mod tests {
     use super::*;
     use crate::model::{MempoolSnapshot, PollSnapshot, StatusSnapshot};
-    use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
     use std::time::{Duration, Instant};
 
     fn populated_state() -> AppState {
