@@ -63,7 +63,7 @@ Baseline at start: `fmt`/`clippy -D warnings`/`cargo test --workspace
 | P6 | high | Bans keyed by per-connection id / `ip:port`; no ban check on accept; invalid blocks/txs not penalized; Addr re-announce lowers ban score. | `gossip.rs`, `main.rs` | fixed (24 h IP bans checked at accept; only context-free invalid data punished; context-dependent tx failures dropped quietly) |
 | P7 | high | Addr: unbounded peer book, no address validation/length cap, stamps `max(seen, now)`, string-sorted truncation ⇒ eclipse aid; O(n²) rewrite per message. | `main.rs` addr handling | partially fixed (validation, timestamp clamp, keyed-random eviction); source-group bucketing and peer-book rewrite cost open |
 | P8 | medium | Per-peer `known_inventory` unbounded. | `gossip.rs` | fixed (50k per peer, oldest evicted) |
-| P9 | medium | O(chain)/O(mempool) work under the global mutex per message (GetHeaders clones all headers, mempool sorted per 250 ms poll). | `main.rs` | open |
+| P9 | medium | O(chain)/O(mempool) work under the global mutex per message (GetHeaders clones all headers, mempool sorted per 250 ms poll). | `main.rs` | fixed (header/hash selection via runtime indexes; per-session mempool rescan only when its revision changes) |
 | P10 | medium | Peer tip height trusted from Version/Inv/unchecked headers ⇒ forced outbound churn ("lag mode"). | `main.rs` | open |
 | P11 | medium | `--max-clients N` is a lifetime connection limit; relay exits after N connections. | `main.rs` accept loop | open |
 | P12 | medium | Compact short ids unsalted (8-byte txid prefix); no fallback to full block; BlockTxn accepted from any peer. | `main.rs` | open |

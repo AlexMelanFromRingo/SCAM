@@ -9,7 +9,10 @@ pub use discovery::{PeerCandidate, select_outbound_peers};
 pub use gossip::{
     GossipEngine, GossipError, GossipTelemetry, OutboundMessage, PeerId, ReplacementRateLimit,
 };
-pub use sync::{build_block_locator, select_block_hashes_for_peer, select_headers_for_peer};
+pub use sync::{
+    build_block_locator, select_block_hashes_for_peer, select_block_hashes_with_lookup,
+    select_headers_for_peer, select_headers_with_lookup,
+};
 pub use transport::{
     FrameReader, FramingConfig, LocalHandshake, RemoteHandshake, TransportError, client_handshake,
     client_handshake_async, read_message, read_message_async, request_blocks, request_blocks_async,

@@ -45,8 +45,9 @@ use scam_p2p::{
     LocalHandshake, PeerAddress, PeerCandidate, PrefilledTxn, RemoteHandshake,
     ReplacementRateLimit, TransportError, WireMessage, build_block_locator, client_handshake,
     client_handshake_async, read_message, request_blocks, request_headers,
-    select_block_hashes_for_peer, select_headers_for_peer, select_outbound_peers, send_message,
-    send_message_async, server_handshake, server_handshake_async,
+    select_block_hashes_for_peer, select_block_hashes_with_lookup, select_headers_for_peer,
+    select_headers_with_lookup, select_outbound_peers, send_message, send_message_async,
+    server_handshake, server_handshake_async,
 };
 use scam_rpc::{
     StatusResponse, TxResponse, TxSubmitRpcRequest, decode_tx_submit_request,
@@ -7722,6 +7723,12 @@ fn relay_mempool_short_txid_index(mempool: &Mempool) -> HashMap<u64, Hash256> {
 
 /// Cheap header gate for block announcements from peers: PoW must hold, and
 /// if the parent is known the target must be the one its branch requires.
+/// Height of `hash` if it is on the runtime's main chain.
+fn relay_main_chain_height(runtime: &ChainRuntime, hash: &Hash256) -> Option<usize> {
+    let height = runtime.height_of(hash)?;
+    (runtime.block_hash_at_height(height) == Some(*hash)).then_some(height as usize)
+}
+
 fn relay_check_announced_header(
     runtime: &ChainRuntime,
     header: &scam_core::BlockHeader,
@@ -8742,15 +8749,13 @@ fn process_relay_wire_message_inner(
                     ),
                 ));
             }
-            let mut headers_by_hash = HashMap::new();
-            for hash in state.runtime.block_hashes() {
-                if let Some(header) = state.runtime.header_by_hash(hash) {
-                    headers_by_hash.insert(*hash, header.clone());
-                }
-            }
-            let headers = select_headers_for_peer(
-                state.runtime.block_hashes(),
-                &headers_by_hash,
+            // Served from the runtime's own indexes: no whole-chain copies
+            // under the relay lock per request.
+            let runtime = &state.runtime;
+            let headers = select_headers_with_lookup(
+                runtime.block_hashes(),
+                |hash| relay_main_chain_height(runtime, hash),
+                |hash| runtime.header_by_hash(hash).cloned(),
                 &locator,
                 stop,
                 2_000,
@@ -8770,8 +8775,14 @@ fn process_relay_wire_message_inner(
                     ),
                 ));
             }
-            let hashes =
-                select_block_hashes_for_peer(state.runtime.block_hashes(), &locator, stop, 2_000);
+            let runtime = &state.runtime;
+            let hashes = select_block_hashes_with_lookup(
+                runtime.block_hashes(),
+                |hash| relay_main_chain_height(runtime, hash),
+                &locator,
+                stop,
+                2_000,
+            );
             let items = hashes.into_iter().map(InventoryItem::Block).collect();
             Ok(vec![WireMessage::Inv { items }])
         }
@@ -9164,6 +9175,7 @@ fn relay_proactive_inventory_messages(
     state: &RelayServerState,
     last_tip_announced: &mut Option<Hash256>,
     announced_txids: &mut HashSet<Hash256>,
+    announced_mempool_revision: &mut Option<u64>,
     max_inv_items: usize,
 ) -> Vec<WireMessage> {
     let mut out = Vec::<WireMessage>::new();
@@ -9173,15 +9185,11 @@ fn relay_proactive_inventory_messages(
             && previous_tip != tip
         {
             let locator = [previous_tip];
-            let mut headers_by_hash = HashMap::new();
-            for hash in state.runtime.block_hashes() {
-                if let Some(header) = state.runtime.header_by_hash(hash) {
-                    headers_by_hash.insert(*hash, header.clone());
-                }
-            }
-            let headers = select_headers_for_peer(
-                state.runtime.block_hashes(),
-                &headers_by_hash,
+            let runtime = &state.runtime;
+            let headers = select_headers_with_lookup(
+                runtime.block_hashes(),
+                |hash| relay_main_chain_height(runtime, hash),
+                |hash| runtime.header_by_hash(hash).cloned(),
                 &locator,
                 None,
                 RELAY_MAX_HEADERS_PER_ANNOUNCEMENT,
@@ -9194,6 +9202,13 @@ fn relay_proactive_inventory_messages(
         *last_tip_announced = Some(tip);
     }
 
+    // Each session polls every ~250 ms; only rescan (and sort) the mempool
+    // when it actually changed.
+    let revision = state.relay.mempool.revision();
+    if *announced_mempool_revision == Some(revision) {
+        return out;
+    }
+    *announced_mempool_revision = Some(revision);
     let current_txids = state.relay.mempool.txids_by_feerate_desc();
     let current_set = current_txids.iter().copied().collect::<HashSet<_>>();
     announced_txids.retain(|txid| current_set.contains(txid));
@@ -11046,6 +11061,7 @@ fn run_relay_peer_session<IO: Read + Write>(
         let mut seen = 0u32;
         let mut last_tip_announced = None::<Hash256>;
         let mut announced_txids = HashSet::<Hash256>::new();
+        let mut announced_mempool_revision = None::<u64>;
         let mut timeout_streak = 0u32;
         let mut last_discovery_request_unix_sec = current_unix_sec().unwrap_or(0);
         loop {
@@ -11064,6 +11080,7 @@ fn run_relay_peer_session<IO: Read + Write>(
                     &guard,
                     &mut last_tip_announced,
                     &mut announced_txids,
+                    &mut announced_mempool_revision,
                     max_inv_items,
                 );
                 let recon = guard
@@ -11353,6 +11370,7 @@ async fn run_relay_peer_session_async<S: AsyncRead + AsyncWrite + Unpin>(
         let mut seen = 0u32;
         let mut last_tip_announced = None::<Hash256>;
         let mut announced_txids = HashSet::<Hash256>::new();
+        let mut announced_mempool_revision = None::<u64>;
         let mut timeout_streak = 0u32;
         let read_poll_interval_ms = relay_async_read_poll_interval_ms(read_timeout_sec);
         let timeout_streak_limit =
@@ -11374,6 +11392,7 @@ async fn run_relay_peer_session_async<S: AsyncRead + AsyncWrite + Unpin>(
                     &guard,
                     &mut last_tip_announced,
                     &mut announced_txids,
+                    &mut announced_mempool_revision,
                     max_inv_items,
                 );
                 let recon = guard
@@ -37596,10 +37615,12 @@ mod tests {
         let state = RelayServerState::new(runtime, relay);
         let mut last_tip_announced = None;
         let mut announced_txids = std::collections::HashSet::<Hash256>::new();
+        let mut announced_mempool_revision = None::<u64>;
         let first = super::relay_proactive_inventory_messages(
             &state,
             &mut last_tip_announced,
             &mut announced_txids,
+            &mut announced_mempool_revision,
             128,
         );
         assert!(
@@ -37625,6 +37646,7 @@ mod tests {
             &state,
             &mut last_tip_announced,
             &mut announced_txids,
+            &mut announced_mempool_revision,
             128,
         );
         assert!(
@@ -37663,11 +37685,13 @@ mod tests {
         };
         let state = RelayServerState::new(runtime, relay);
         let mut announced_txids = std::collections::HashSet::<Hash256>::new();
+        let mut announced_mempool_revision = None::<u64>;
         let mut last_tip_announced = Some(previous_tip);
         let messages = super::relay_proactive_inventory_messages(
             &state,
             &mut last_tip_announced,
             &mut announced_txids,
+            &mut announced_mempool_revision,
             128,
         );
         let headers = messages
