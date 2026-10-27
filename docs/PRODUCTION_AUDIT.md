@@ -77,7 +77,7 @@ Baseline at start: `fmt`/`clippy -D warnings`/`cargo test --workspace
 | S2 | high | Relay drops the mutex between `submit_block` and persist; background refresh can reload in between and the session then persists the older chain. | `main.rs` relay session | mitigated (refresh now merges instead of replacing, so the new block survives) |
 | S3 | high | Every tip change rewrites the entire archive (O(H²) bytes during sync). | `storage::save_chain_archive_db` callers | fixed (`persist_chain_archive_incremental_db`: one redb txn, only new blocks) |
 | S4 | high | Every start/refresh replays all blocks with full signature checks (relay ~1 s after any write, RPC cache, each SSE conn, each payout). | `main.rs::load_runtime_from_db_or_genesis` | partially fixed (refresh reads tip meta, then only the tail, validating only unknown blocks); cold start still replays — persisted UTXO set needed |
-| S5 | medium | Mempool DB: load-modify-rewrite from RPC, relay and stratum ⇒ lost updates; `GET /mempool` writes. | `main.rs` | open |
+| S5 | medium | Mempool DB: load-modify-rewrite from RPC, relay and stratum ⇒ lost updates; `GET /mempool` writes. | `main.rs` | fixed (mempool tracks its own delta; `apply_mempool_delta_db` writes only inserts/removals in one txn; relay refresh merges instead of replacing) |
 | S6 | medium | redb exclusive open per access; nested retry sleeps while holding locks / in async tasks. | `main.rs` | open |
 | S7 | low | No on-disk schema version; `#[serde(default)]` useless under bincode. | `storage` | fixed (`schema_version` in every store; unknown versions refused; pool ledger requires v2) |
 | S8 | low | Temp files leaked on error; rename while temp DB still open. | `storage` | fixed for the runtime archive (no temp file anymore) |

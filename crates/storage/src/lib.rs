@@ -1047,6 +1047,80 @@ pub fn save_mempool_db(path: &Path, snapshot: &MempoolSnapshot) -> Result<(), St
     Ok(())
 }
 
+/// Apply an incremental change set to the mempool DB in one write
+/// transaction: insert/replace `upserts`, delete `removes`. Unlike
+/// [`save_mempool_db`] it never drops entries written by other processes.
+pub fn apply_mempool_delta_db(
+    path: &Path,
+    network_id: &str,
+    upserts: &[MempoolTxRecord],
+    removes: &[Hash256],
+) -> Result<(), StorageError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|source| StorageError::CreateDir {
+            path: parent.display().to_string(),
+            source,
+        })?;
+    }
+    for entry in upserts {
+        let computed = entry.tx.txid();
+        if computed != entry.txid {
+            return Err(StorageError::InvalidMempool(format!(
+                "txid mismatch in mempool delta: provided={}, computed={}",
+                entry.txid, computed
+            )));
+        }
+    }
+    let db = Database::create(path).map_err(|e| StorageError::Db(e.to_string()))?;
+    let write_txn = db
+        .begin_write()
+        .map_err(|e| StorageError::Db(e.to_string()))?;
+    {
+        let mut table = write_txn
+            .open_table(MEMPOOL_TABLE)
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+        for txid in removes {
+            table
+                .remove(txid.0.as_slice())
+                .map_err(|e| StorageError::Db(e.to_string()))?;
+        }
+        for entry in upserts {
+            let value = MempoolStoredValue {
+                tx: entry.tx.clone(),
+                fee: entry.fee,
+            };
+            let value_bytes = bincode::serialize(&value).map_err(StorageError::Encode)?;
+            table
+                .insert(entry.txid.0.as_slice(), value_bytes.as_slice())
+                .map_err(|e| StorageError::Db(e.to_string()))?;
+        }
+        let count = redb::ReadableTableMetadata::len(&table)
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+        let mut meta = write_txn
+            .open_table(META_TABLE)
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+        if let Some(existing) = meta
+            .get("network_id")
+            .map_err(|e| StorageError::Db(e.to_string()))?
+            && existing.value() != network_id.as_bytes()
+        {
+            return Err(StorageError::InvalidMempool(format!(
+                "mempool db network '{}' does not match writer network '{network_id}'",
+                String::from_utf8_lossy(existing.value())
+            )));
+        }
+        meta.insert("network_id", network_id.as_bytes())
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+        write_schema_version(&mut meta, STORE_SCHEMA_VERSION)?;
+        meta.insert("tx_count", count.to_le_bytes().as_slice())
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+    }
+    write_txn
+        .commit()
+        .map_err(|e| StorageError::Db(e.to_string()))?;
+    Ok(())
+}
+
 pub fn load_mempool_db(path: &Path) -> Result<MempoolSnapshot, StorageError> {
     let db = Database::open(path).map_err(|e| StorageError::Db(e.to_string()))?;
     let read_txn = db

@@ -52,13 +52,15 @@ use scam_rpc::{
     StatusResponse, TxResponse, TxSubmitRpcRequest, decode_tx_submit_request,
     header_to_block_response, to_pretty_json,
 };
+#[cfg(test)]
+use scam_storage::MempoolSnapshot;
 use scam_storage::{
-    ChainStateSnapshot, MempoolSnapshot, MempoolTxRecord, PeerAddressBook, PeerAddressRecord,
-    PoolLedgerSnapshot, PoolPayoutRecord, PoolRoundCredit, PoolRoundRecord, PoolShareRecord,
-    PoolWorkerAccrualRecord, StorageError, load_block_by_hash_db, load_chain_archive_db,
+    ChainStateSnapshot, MempoolTxRecord, PeerAddressBook, PeerAddressRecord, PoolLedgerSnapshot,
+    PoolPayoutRecord, PoolRoundCredit, PoolRoundRecord, PoolShareRecord, PoolWorkerAccrualRecord,
+    StorageError, apply_mempool_delta_db, load_block_by_hash_db, load_chain_archive_db,
     load_chain_archive_range_db, load_chain_archive_tip_db, load_mempool_db, load_peer_book_db,
     load_pool_ledger_db, load_snapshot, load_snapshot_db, persist_chain_archive_incremental_db,
-    save_mempool_db, save_peer_book_db, save_pool_ledger_db, save_snapshot, save_snapshot_db,
+    save_peer_book_db, save_pool_ledger_db, save_snapshot, save_snapshot_db,
 };
 use scam_stratum::{
     IdentityTranslator, JobDeclarator, MiningJob, MiningTemplate, NoiseSv2Transport,
@@ -1813,6 +1815,7 @@ fn persist_runtime_db(runtime: &ChainRuntime, runtime_db_path: &Path) -> Result<
     }
 }
 
+#[cfg(test)]
 fn mempool_snapshot_from_pool(cfg: &ChainConfig, mempool: &Mempool) -> MempoolSnapshot {
     let mut entries = mempool
         .txids_by_feerate_desc()
@@ -1834,15 +1837,30 @@ fn mempool_snapshot_from_pool(cfg: &ChainConfig, mempool: &Mempool) -> MempoolSn
     }
 }
 
+/// Persist only what changed in `mempool` since it was loaded or last
+/// persisted. RPC, relay and stratum all write this DB; rewriting the whole
+/// snapshot made each writer erase transactions the others had added.
 fn persist_mempool_db(
     cfg: &ChainConfig,
-    mempool: &Mempool,
+    mempool: &mut Mempool,
     mempool_db_path: &Path,
 ) -> Result<(), NodeError> {
     #[cfg(test)]
     MEMPOOL_PERSIST_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let snapshot = mempool_snapshot_from_pool(cfg, mempool);
-    save_mempool_db(mempool_db_path, &snapshot)?;
+    let delta = mempool.persist_delta();
+    let upserts = delta
+        .inserted
+        .iter()
+        .filter_map(|txid| {
+            mempool.get_with_fee(txid).map(|(tx, fee)| MempoolTxRecord {
+                txid: *txid,
+                tx: tx.clone(),
+                fee,
+            })
+        })
+        .collect::<Vec<_>>();
+    apply_mempool_delta_db(mempool_db_path, &cfg.network_id, &upserts, &delta.removed)?;
+    mempool.clear_persist_delta();
     Ok(())
 }
 
@@ -1884,6 +1902,8 @@ fn load_mempool_from_db_or_empty(
     for entry in snapshot.entries {
         let _ = mempool.insert_with_fee(entry.tx, entry.fee);
     }
+    // What was just loaded is already stored.
+    mempool.clear_persist_delta();
     Ok(mempool)
 }
 
@@ -1926,6 +1946,8 @@ fn load_mempool_from_db_or_empty_strict_with_retry(
     for entry in snapshot.entries {
         let _ = mempool.insert_with_fee(entry.tx, entry.fee);
     }
+    // What was just loaded is already stored.
+    mempool.clear_persist_delta();
     Ok(mempool)
 }
 
@@ -1976,7 +1998,7 @@ fn remove_confirmed_txids_from_mempool_db(
     if removed.is_empty() && !mempool_db_path.exists() {
         return Ok(0);
     }
-    persist_mempool_db_with_retry(cfg, &mempool, mempool_db_path, 80, 25)?;
+    persist_mempool_db_with_retry(cfg, &mut mempool, mempool_db_path, 80, 25)?;
     Ok(removed.len())
 }
 
@@ -2170,7 +2192,7 @@ fn persist_runtime_db_with_retry(
 
 fn persist_mempool_db_with_retry(
     cfg: &ChainConfig,
-    mempool: &Mempool,
+    mempool: &mut Mempool,
     mempool_db_path: &Path,
     attempts: usize,
     backoff_ms: u64,
@@ -11134,10 +11156,16 @@ fn run_relay_peer_session<IO: Read + Write>(
                 persist_runtime_db_with_retry(&guard.runtime, runtime_db_path, 80, 25)?;
             }
             if mempool_changed {
-                let guard = state
+                let mut guard = state
                     .lock()
                     .map_err(|_| NodeError::Runtime("relay state mutex poisoned".to_owned()))?;
-                persist_mempool_db_with_retry(cfg, &guard.relay.mempool, mempool_db_path, 80, 25)?;
+                persist_mempool_db_with_retry(
+                    cfg,
+                    &mut guard.relay.mempool,
+                    mempool_db_path,
+                    80,
+                    25,
+                )?;
             }
             if let Err(err) = relay_flush_pending_peer_book_updates(state) {
                 eprintln!("warning: cannot flush discovered peer addresses: {err}");
@@ -11465,10 +11493,16 @@ async fn run_relay_peer_session_async<S: AsyncRead + AsyncWrite + Unpin>(
                 persist_runtime_db_with_retry(&guard.runtime, runtime_db_path, 80, 25)?;
             }
             if mempool_changed {
-                let guard = state
+                let mut guard = state
                     .lock()
                     .map_err(|_| NodeError::Runtime("relay state mutex poisoned".to_owned()))?;
-                persist_mempool_db_with_retry(cfg, &guard.relay.mempool, mempool_db_path, 80, 25)?;
+                persist_mempool_db_with_retry(
+                    cfg,
+                    &mut guard.relay.mempool,
+                    mempool_db_path,
+                    80,
+                    25,
+                )?;
             }
             if let Err(err) = relay_flush_pending_peer_book_updates(state) {
                 eprintln!("warning: cannot flush discovered peer addresses: {err}");
@@ -11670,7 +11704,7 @@ fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
     let mut startup_mempool = load_mempool_from_db_or_empty(&cfg, &mempool_db_path)?;
     let removed_confirmed_startup = cleanup_mempool_against_chain(&runtime, &mut startup_mempool);
     if should_persist_startup_mempool_cleanup(removed_confirmed_startup) {
-        persist_mempool_db_with_retry(&cfg, &startup_mempool, &mempool_db_path, 80, 25)?;
+        persist_mempool_db_with_retry(&cfg, &mut startup_mempool, &mempool_db_path, 80, 25)?;
         println!(
             "Mempool startup cleanup: removed {} already-confirmed tx(s)",
             removed_confirmed_startup
@@ -11738,10 +11772,10 @@ fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
     );
     println!("I/O model: async tokio");
     {
-        let guard = state
+        let mut guard = state
             .lock()
             .map_err(|_| NodeError::Runtime("relay state mutex poisoned".to_owned()))?;
-        persist_mempool_db_with_retry(&cfg, &guard.relay.mempool, &mempool_db_path, 20, 25)?;
+        persist_mempool_db_with_retry(&cfg, &mut guard.relay.mempool, &mempool_db_path, 20, 25)?;
     }
 
     let stop_flag = Arc::new(AtomicBool::new(false));
@@ -15060,7 +15094,7 @@ fn submit_tx_via_mempool_db_for_runtime(
     let outcome = mempool.insert_with_fee(tx, fee)?;
     persist_mempool_db_with_retry(
         cfg,
-        &mempool,
+        &mut mempool,
         mempool_db_path,
         retry_attempts,
         retry_backoff_ms,
@@ -18337,8 +18371,19 @@ fn refresh_mempool_from_db_if_changed(
     let fresh = load_with_retry(10, 25, is_mempool_db_lock_conflict, || {
         load_mempool_from_db_or_empty(cfg, mempool_db_path)
     })?;
-    if let Some(mempool) = fresh {
-        relay.mempool = mempool;
+    if let Some(disk) = fresh {
+        // Merge, don't replace: replacing dropped transactions the relay had
+        // admitted but not yet written. The DB is written only by this node's
+        // own validated admission paths; templates and block connection
+        // re-validate anyway.
+        for txid in disk.txids_by_feerate_desc() {
+            if relay.mempool.contains(&txid) {
+                continue;
+            }
+            if let Some((tx, fee)) = disk.get_with_fee(&txid) {
+                let _ = relay.mempool.insert_with_fee(tx.clone(), fee);
+            }
+        }
         *last_seen_mtime = current_mtime;
     }
     Ok(())
@@ -19203,7 +19248,7 @@ async fn axum_mempool_handler(AxumState(state): AxumState<AxumRpcState>) -> Axum
                 if should_persist_startup_mempool_cleanup(removed_confirmed)
                     && let Err(err) = persist_mempool_db_with_retry(
                         &state.cfg,
-                        &mempool,
+                        &mut mempool,
                         &state.mempool_db_path,
                         rpc_db_retry_attempts(),
                         rpc_db_retry_backoff_ms(),
@@ -20469,7 +20514,7 @@ fn run_rpc_serve_inner_legacy(
                         if should_persist_startup_mempool_cleanup(removed_confirmed)
                             && let Err(err) = persist_mempool_db_with_retry(
                                 &cfg,
-                                &mempool,
+                                &mut mempool,
                                 &mempool_db_path,
                                 rpc_db_retry_attempts(),
                                 rpc_db_retry_backoff_ms(),
@@ -24276,6 +24321,11 @@ mod tests {
         )
         .expect("save snapshot");
 
+        // Writes are incremental (in place), so make the DB file itself
+        // read-only: the persist attempt must surface the failure.
+        let mut file_perms = fs::metadata(&mempool_db).expect("metadata").permissions();
+        file_perms.set_mode(0o444);
+        fs::set_permissions(&mempool_db, file_perms).expect("set readonly file");
         let mut dir_perms = fs::metadata(&readonly_dir).expect("metadata").permissions();
         dir_perms.set_mode(0o555);
         fs::set_permissions(&readonly_dir, dir_perms).expect("set readonly dir");
@@ -33438,6 +33488,57 @@ mod tests {
         let _ = fs::remove_dir_all(work_dir);
     }
 
+    /// S5: two processes writing the mempool DB no longer erase each
+    /// other's transactions (each persists only its own delta), and the
+    /// relay merges the DB instead of replacing its in-memory pool.
+    #[test]
+    fn mempool_db_writers_do_not_erase_each_other() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let work_dir = temp_dir("test-mempool-delta-writers");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let db = work_dir.join("mempool.redb");
+        let mk = |seed: u8| Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: OutPoint {
+                    txid: Hash256([seed; 32]),
+                    vout: 0,
+                },
+                signature: vec![seed; 64],
+                pubkey_compressed: vec![0x02; 33],
+                sequence: 0,
+            }],
+            outputs: vec![TxOut {
+                value: 1_000,
+                key_hash20: [seed; 20],
+            }],
+            lock_time: 0,
+        };
+        // "RPC" and "relay" both start from the same (empty) DB state.
+        let mut rpc = super::load_mempool_from_db_or_empty(&cfg, &db).expect("rpc load");
+        let mut relay = super::load_mempool_from_db_or_empty(&cfg, &db).expect("relay load");
+        rpc.insert_with_fee(mk(1), 5_000).expect("rpc tx");
+        relay.insert_with_fee(mk(2), 5_000).expect("relay tx");
+        super::persist_mempool_db(&cfg, &mut rpc, &db).expect("rpc persist");
+        super::persist_mempool_db(&cfg, &mut relay, &db).expect("relay persist");
+
+        let on_disk = super::load_mempool_from_db_or_empty(&cfg, &db).expect("reload");
+        assert!(
+            on_disk.contains(&mk(1).txid()),
+            "relay persist kept the RPC tx"
+        );
+        assert!(on_disk.contains(&mk(2).txid()));
+
+        // A removal is persisted as a removal, not by rewriting everything.
+        relay.remove_confirmed_txids(&[mk(2).txid()]);
+        super::persist_mempool_db(&cfg, &mut relay, &db).expect("relay persist removal");
+        let on_disk = super::load_mempool_from_db_or_empty(&cfg, &db).expect("reload");
+        assert!(on_disk.contains(&mk(1).txid()));
+        assert!(!on_disk.contains(&mk(2).txid()));
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
     #[test]
     fn load_relay_outbound_targets_returns_sorted_and_deduped_peer_addresses() {
         let peers_dir = temp_dir("test-relay-outbound-targets");
@@ -36916,7 +37017,7 @@ mod tests {
 
         let mut mempool = build_mempool_from_cfg(&cfg).expect("mempool");
         let _ = mempool.insert_with_fee(tx, 1_000).expect("insert");
-        super::persist_mempool_db(&cfg, &mempool, &mempool_db).expect("persist");
+        super::persist_mempool_db(&cfg, &mut mempool, &mempool_db).expect("persist");
 
         let loaded =
             super::load_wallet_reserved_outpoints(&cfg, &mempool_db).expect("load reserved");

@@ -27,6 +27,19 @@ pub struct Mempool {
     spent_outpoints: HashMap<OutPoint, Hash256>,
     feerate_index: BTreeSet<(u128, Reverse<Hash256>)>,
     telemetry: MempoolTelemetry,
+    /// Changes since the last [`Mempool::clear_persist_delta`]. Several
+    /// processes share the mempool DB; persisting only this delta (instead
+    /// of rewriting the whole snapshot) keeps writers from erasing each
+    /// other's transactions.
+    pending_inserted: HashSet<Hash256>,
+    pending_removed: HashSet<Hash256>,
+}
+
+/// Transactions added and removed since the last persist.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MempoolPersistDelta {
+    pub inserted: Vec<Hash256>,
+    pub removed: Vec<Hash256>,
 }
 
 #[derive(Debug, Clone)]
@@ -137,6 +150,8 @@ impl Mempool {
             spent_outpoints: HashMap::new(),
             feerate_index: BTreeSet::new(),
             telemetry: MempoolTelemetry::default(),
+            pending_inserted: HashSet::new(),
+            pending_removed: HashSet::new(),
         })
     }
 
@@ -501,6 +516,8 @@ impl Mempool {
         let rate = feerate_key(entry.fee, entry.serialized_size);
         self.feerate_index.insert((rate, Reverse(txid)));
         self.txs.insert(txid, entry);
+        self.pending_removed.remove(&txid);
+        self.pending_inserted.insert(txid);
     }
 
     fn remove_entry(&mut self, txid: Hash256) -> Option<MempoolEntry> {
@@ -510,7 +527,27 @@ impl Mempool {
         }
         let rate = feerate_key(entry.fee, entry.serialized_size);
         self.feerate_index.remove(&(rate, Reverse(txid)));
+        // Always record the removal: the tx may also exist in storage (e.g.
+        // written by another process), and deleting a missing key is a no-op.
+        self.pending_inserted.remove(&txid);
+        self.pending_removed.insert(txid);
         Some(entry)
+    }
+
+    /// Changes made since the last [`Mempool::clear_persist_delta`]. Call
+    /// `clear_persist_delta` once they are durably stored.
+    pub fn persist_delta(&self) -> MempoolPersistDelta {
+        let mut inserted = self.pending_inserted.iter().copied().collect::<Vec<_>>();
+        let mut removed = self.pending_removed.iter().copied().collect::<Vec<_>>();
+        inserted.sort_unstable();
+        removed.sort_unstable();
+        MempoolPersistDelta { inserted, removed }
+    }
+
+    /// Forget pending changes, e.g. right after loading from storage.
+    pub fn clear_persist_delta(&mut self) {
+        self.pending_inserted.clear();
+        self.pending_removed.clear();
     }
 
     fn total_fee_for_set(&self, txids: &[Hash256]) -> Result<u128, MempoolError> {
