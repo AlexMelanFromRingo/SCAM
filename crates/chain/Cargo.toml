@@ -11,6 +11,7 @@ scam-core = { path = "../core" }
 thiserror.workspace = true
 
 [dev-dependencies]
+secp256k1.workspace = true
 scam-miner = { path = "../miner" }
 scam-p2p = { path = "../p2p" }
 toml.workspace = true

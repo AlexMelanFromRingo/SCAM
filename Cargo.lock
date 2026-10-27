@@ -1731,6 +1731,7 @@ dependencies = [
  "scam-core",
  "scam-miner",
  "scam-p2p",
+ "secp256k1",
  "thiserror 2.0.18",
  "toml",
 ]

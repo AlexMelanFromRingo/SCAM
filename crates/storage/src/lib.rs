@@ -424,6 +424,288 @@ pub fn save_chain_archive_db(path: &Path, archive: &ChainArchive) -> Result<(), 
     Ok(())
 }
 
+/// Tip recorded in a chain archive's metadata.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArchiveTip {
+    pub network_id: String,
+    pub height: u64,
+    pub hash: Hash256,
+    /// Big-endian cumulative chain work of the tip; `None` for archives
+    /// written before work was recorded.
+    pub work_be: Option<Vec<u8>>,
+}
+
+/// Result of [`persist_chain_archive_incremental_db`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArchivePersistOutcome {
+    /// First height whose index entry was (re)written; `None` if the archive
+    /// already matched.
+    pub first_written_height: Option<u64>,
+    pub blocks_written: usize,
+}
+
+/// Compare two big-endian unsigned integers given as bytes.
+fn cmp_be_uint(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+    let a = &a[a.iter().position(|byte| *byte != 0).unwrap_or(a.len())..];
+    let b = &b[b.iter().position(|byte| *byte != 0).unwrap_or(b.len())..];
+    a.len().cmp(&b.len()).then_with(|| a.cmp(b))
+}
+
+fn read_archive_tip<T: redb::ReadableTable<&'static str, &'static [u8]>>(
+    meta: &T,
+) -> Result<Option<ArchiveTip>, StorageError> {
+    let (Some(height_raw), Some(hash_raw)) = (
+        meta.get("tip_height")
+            .map_err(|e| StorageError::Db(e.to_string()))?,
+        meta.get("tip_hash")
+            .map_err(|e| StorageError::Db(e.to_string()))?,
+    ) else {
+        return Ok(None);
+    };
+    let height_bytes: [u8; 8] =
+        height_raw
+            .value()
+            .try_into()
+            .map_err(|_| StorageError::InvalidMetaFormat {
+                key: "tip_height".to_owned(),
+                details: "expected 8 bytes".to_owned(),
+            })?;
+    let hash = bytes_to_hash(hash_raw.value(), "tip_hash")?;
+    let network_id = meta
+        .get("network_id")
+        .map_err(|e| StorageError::Db(e.to_string()))?
+        .map(|raw| std::str::from_utf8(raw.value()).map(str::to_owned))
+        .transpose()
+        .map_err(StorageError::InvalidUtf8)?
+        .unwrap_or_default();
+    let work_be = meta
+        .get("tip_work")
+        .map_err(|e| StorageError::Db(e.to_string()))?
+        .map(|raw| raw.value().to_vec());
+    Ok(Some(ArchiveTip {
+        network_id,
+        height: u64::from_le_bytes(height_bytes),
+        hash,
+        work_be,
+    }))
+}
+
+/// Read only the tip metadata of a chain archive.
+pub fn load_chain_archive_tip_db(path: &Path) -> Result<Option<ArchiveTip>, StorageError> {
+    let db = Database::open(path).map_err(|e| StorageError::Db(e.to_string()))?;
+    let read_txn = db
+        .begin_read()
+        .map_err(|e| StorageError::Db(e.to_string()))?;
+    let meta = read_txn
+        .open_table(META_TABLE)
+        .map_err(|e| StorageError::Db(e.to_string()))?;
+    read_archive_tip(&meta)
+}
+
+/// Load the main-chain blocks at heights `>= from_height`, in order.
+pub fn load_chain_archive_range_db(
+    path: &Path,
+    from_height: u64,
+) -> Result<(String, Vec<(u64, Block)>), StorageError> {
+    let db = Database::open(path).map_err(|e| StorageError::Db(e.to_string()))?;
+    let read_txn = db
+        .begin_read()
+        .map_err(|e| StorageError::Db(e.to_string()))?;
+    let network_id = {
+        let meta = read_txn
+            .open_table(META_TABLE)
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+        let raw = meta
+            .get("network_id")
+            .map_err(|e| StorageError::Db(e.to_string()))?
+            .ok_or_else(|| StorageError::MissingMeta("network_id".to_owned()))?;
+        std::str::from_utf8(raw.value())
+            .map_err(StorageError::InvalidUtf8)?
+            .to_owned()
+    };
+    let index_table = read_txn
+        .open_table(BLOCK_INDEX_TABLE)
+        .map_err(|e| StorageError::Db(e.to_string()))?;
+    let blocks_table = read_txn
+        .open_table(BLOCK_TABLE)
+        .map_err(|e| StorageError::Db(e.to_string()))?;
+    let mut out = Vec::new();
+    for row in index_table
+        .range(from_height..)
+        .map_err(|e| StorageError::Db(e.to_string()))?
+    {
+        let (height, hash_raw) = row.map_err(|e| StorageError::Db(e.to_string()))?;
+        let hash = bytes_to_hash(hash_raw.value(), "block_index hash")?;
+        let block_raw = blocks_table
+            .get(hash.0.as_slice())
+            .map_err(|e| StorageError::Db(e.to_string()))?
+            .ok_or_else(|| StorageError::MissingArchiveRecord {
+                table: "blocks_by_hash",
+                key: hash.to_string(),
+            })?;
+        let block: Block = bincode::deserialize(block_raw.value()).map_err(StorageError::Decode)?;
+        out.push((height.value(), block));
+    }
+    Ok((network_id, out))
+}
+
+/// Persist the main chain into the archive at `path` incrementally, in one
+/// redb write transaction (crash-atomic; no full rewrite, no temp file).
+///
+/// `main_chain` is the writer's main chain by height and `tip_work_be` its
+/// cumulative work. Only blocks above the first height where the archive
+/// differs are written; stale index entries above the new tip are removed.
+///
+/// Several processes share this file. To make a lagging writer unable to
+/// roll the chain back, the write is refused with
+/// [`StorageError::StaleArchiveWriter`] when the archive's tip is not on the
+/// writer's main chain and carries at least as much work (or, for legacy
+/// archives without recorded work, is higher).
+pub fn persist_chain_archive_incremental_db(
+    path: &Path,
+    network_id: &str,
+    main_chain: &[Hash256],
+    tip_work_be: &[u8],
+    get_block: &dyn Fn(&Hash256) -> Option<Block>,
+) -> Result<ArchivePersistOutcome, StorageError> {
+    let Some(new_tip_hash) = main_chain.last().copied() else {
+        return Err(StorageError::InvalidArchive(
+            "main chain cannot be empty".to_owned(),
+        ));
+    };
+    let new_tip_height = (main_chain.len() - 1) as u64;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|source| StorageError::CreateDir {
+            path: parent.display().to_string(),
+            source,
+        })?;
+    }
+    let db = Database::create(path).map_err(|e| StorageError::Db(e.to_string()))?;
+    let write_txn = db
+        .begin_write()
+        .map_err(|e| StorageError::Db(e.to_string()))?;
+    let outcome = {
+        let mut meta = write_txn
+            .open_table(META_TABLE)
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+        if let Some(existing) = meta
+            .get("network_id")
+            .map_err(|e| StorageError::Db(e.to_string()))?
+        {
+            let existing = std::str::from_utf8(existing.value())
+                .map_err(StorageError::InvalidUtf8)?
+                .to_owned();
+            if existing != network_id {
+                return Err(StorageError::InvalidArchive(format!(
+                    "archive network '{existing}' does not match writer network '{network_id}'"
+                )));
+            }
+        }
+        let disk_tip = read_archive_tip(&meta)?;
+
+        let mut index_table = write_txn
+            .open_table(BLOCK_INDEX_TABLE)
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+        let index_hash_at = |table: &redb::Table<u64, &[u8]>, height: u64| {
+            table
+                .get(height)
+                .map_err(|e| StorageError::Db(e.to_string()))?
+                .map(|raw| bytes_to_hash(raw.value(), "block_index hash"))
+                .transpose()
+        };
+
+        // First height at which the archive's index differs from ours.
+        let first_diff = match &disk_tip {
+            None => 0,
+            Some(tip) => {
+                let tip_on_our_chain = main_chain.get(tip.height as usize) == Some(&tip.hash);
+                if !tip_on_our_chain {
+                    let disk_wins = match &tip.work_be {
+                        Some(work) => cmp_be_uint(work, tip_work_be).is_ge(),
+                        None => tip.height >= new_tip_height,
+                    };
+                    if disk_wins {
+                        return Err(StorageError::StaleArchiveWriter {
+                            disk_tip: tip.hash,
+                            disk_height: tip.height,
+                        });
+                    }
+                }
+                let mut height = tip.height.min(new_tip_height);
+                loop {
+                    let ours = main_chain.get(height as usize);
+                    if index_hash_at(&index_table, height)?.as_ref() == ours {
+                        break height + 1;
+                    }
+                    if height == 0 {
+                        break 0;
+                    }
+                    height -= 1;
+                }
+            }
+        };
+
+        let mut blocks_table = write_txn
+            .open_table(BLOCK_TABLE)
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+        let mut headers_table = write_txn
+            .open_table(HEADER_TABLE)
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+        let mut blocks_written = 0usize;
+        for height in first_diff..=new_tip_height {
+            let hash = main_chain[height as usize];
+            let already_stored = blocks_table
+                .get(hash.0.as_slice())
+                .map_err(|e| StorageError::Db(e.to_string()))?
+                .is_some();
+            if !already_stored {
+                let block = get_block(&hash).ok_or_else(|| StorageError::MissingArchiveRecord {
+                    table: "writer main chain",
+                    key: hash.to_string(),
+                })?;
+                let block_bytes = bincode::serialize(&block).map_err(StorageError::Encode)?;
+                let header_bytes =
+                    bincode::serialize(&block.header).map_err(StorageError::Encode)?;
+                blocks_table
+                    .insert(hash.0.as_slice(), block_bytes.as_slice())
+                    .map_err(|e| StorageError::Db(e.to_string()))?;
+                headers_table
+                    .insert(hash.0.as_slice(), header_bytes.as_slice())
+                    .map_err(|e| StorageError::Db(e.to_string()))?;
+                blocks_written += 1;
+            }
+            index_table
+                .insert(height, hash.0.as_slice())
+                .map_err(|e| StorageError::Db(e.to_string()))?;
+        }
+        if let Some(tip) = &disk_tip {
+            for height in (new_tip_height + 1)..=tip.height.max(new_tip_height) {
+                index_table
+                    .remove(height)
+                    .map_err(|e| StorageError::Db(e.to_string()))?;
+            }
+        }
+
+        meta.insert("network_id", network_id.as_bytes())
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+        meta.insert("tip_height", new_tip_height.to_le_bytes().as_slice())
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+        meta.insert("tip_hash", new_tip_hash.0.as_slice())
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+        meta.insert("tip_work", tip_work_be)
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+
+        ArchivePersistOutcome {
+            first_written_height: (first_diff <= new_tip_height).then_some(first_diff),
+            blocks_written,
+        }
+    };
+    write_txn
+        .commit()
+        .map_err(|e| StorageError::Db(e.to_string()))?;
+    Ok(outcome)
+}
+
 pub fn load_chain_archive_db(path: &Path) -> Result<ChainArchive, StorageError> {
     let db = Database::open(path).map_err(|e| StorageError::Db(e.to_string()))?;
     let read_txn = db
@@ -1145,6 +1427,10 @@ pub enum StorageError {
     InvalidMempool(String),
     #[error("invalid pool ledger snapshot: {0}")]
     InvalidPoolLedger(String),
+    #[error(
+        "refusing to overwrite archive: its tip {disk_tip} at height {disk_height} is not on this writer's chain and has at least as much work"
+    )]
+    StaleArchiveWriter { disk_tip: Hash256, disk_height: u64 },
 }
 
 #[cfg(test)]
@@ -1342,6 +1628,117 @@ mod tests {
         assert_eq!(loaded.blocks_by_height.len(), 2);
         assert_eq!(loaded.blocks_by_height[0], genesis);
         assert_eq!(loaded.blocks_by_height[1], block1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn chain_of(parent: Hash256, len: usize, salt: u64) -> Vec<Block> {
+        let mut out = Vec::new();
+        let mut prev = parent;
+        for i in 0..len {
+            let block = Block {
+                header: BlockHeader {
+                    version: 1,
+                    prev_block: prev,
+                    merkle_root: Hash256::ZERO,
+                    timestamp: 1_770_763_200 + i as u64,
+                    target: Target::MAX,
+                    nonce: salt * 1_000 + i as u64,
+                },
+                transactions: vec![],
+            };
+            prev = block.header.block_hash();
+            out.push(block);
+        }
+        out
+    }
+
+    fn persist(
+        path: &std::path::Path,
+        blocks: &[Block],
+        work: u64,
+    ) -> Result<crate::ArchivePersistOutcome, crate::StorageError> {
+        let hashes = blocks
+            .iter()
+            .map(|b| b.header.block_hash())
+            .collect::<Vec<_>>();
+        let lookup = |hash: &Hash256| {
+            blocks
+                .iter()
+                .find(|b| b.header.block_hash() == *hash)
+                .cloned()
+        };
+        crate::persist_chain_archive_incremental_db(
+            path,
+            "devnet",
+            &hashes,
+            &work.to_be_bytes(),
+            &lookup,
+        )
+    }
+
+    /// S3: persisting writes only blocks above what the archive already has.
+    #[test]
+    fn incremental_archive_persist_appends_only_new_blocks() {
+        let path = temp_test_file("archive-incremental", "redb");
+        let chain = chain_of(Hash256::ZERO, 5, 1);
+        let first = persist(&path, &chain[..3], 3).expect("first persist");
+        assert_eq!(first.blocks_written, 3);
+        let second = persist(&path, &chain, 5).expect("second persist");
+        assert_eq!(second.first_written_height, Some(3));
+        assert_eq!(second.blocks_written, 2);
+        let again = persist(&path, &chain, 5).expect("no-op persist");
+        assert_eq!(again.blocks_written, 0);
+        assert_eq!(again.first_written_height, None);
+
+        let loaded = load_chain_archive_db(&path).expect("load");
+        assert_eq!(loaded.blocks_by_height, chain);
+        let tip = crate::load_chain_archive_tip_db(&path)
+            .expect("tip")
+            .expect("some");
+        assert_eq!(tip.height, 4);
+        assert_eq!(tip.hash, chain[4].header.block_hash());
+        let (_, tail) = crate::load_chain_archive_range_db(&path, 3).expect("range");
+        assert_eq!(tail.len(), 2);
+        assert_eq!(tail[0].0, 3);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// S1: a writer whose chain is behind (or on a lighter fork) must not be
+    /// able to roll the shared archive back.
+    #[test]
+    fn incremental_archive_persist_refuses_stale_writer_but_accepts_heavier_fork() {
+        let path = temp_test_file("archive-stale-writer", "redb");
+        let main = chain_of(Hash256::ZERO, 5, 2);
+        persist(&path, &main, 5).expect("relay persists height 4");
+
+        // A process still at height 2 tries to persist its view.
+        let err = persist(&path, &main[..3], 3).expect_err("stale prefix must be refused");
+        assert!(matches!(
+            err,
+            crate::StorageError::StaleArchiveWriter { .. }
+        ));
+        // A lighter fork from height 1 is refused too.
+        let mut light = main[..2].to_vec();
+        light.extend(chain_of(main[1].header.block_hash(), 2, 3));
+        assert!(matches!(
+            persist(&path, &light, 4),
+            Err(crate::StorageError::StaleArchiveWriter { .. })
+        ));
+        assert_eq!(
+            load_chain_archive_db(&path).expect("load").blocks_by_height,
+            main
+        );
+
+        // A heavier, shorter fork is a legitimate reorg: index rewritten and
+        // entries above the new tip removed.
+        let mut heavy = main[..2].to_vec();
+        heavy.extend(chain_of(main[1].header.block_hash(), 2, 4));
+        let outcome = persist(&path, &heavy, 9).expect("heavier fork wins");
+        assert_eq!(outcome.first_written_height, Some(2));
+        assert_eq!(
+            load_chain_archive_db(&path).expect("load").blocks_by_height,
+            heavy
+        );
         let _ = std::fs::remove_file(path);
     }
 

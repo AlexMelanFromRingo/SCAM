@@ -105,6 +105,19 @@ impl PartialMultisigTx {
                 source,
             })?;
         }
+        // The sighash commits to the spending input's `pubkey_compressed`,
+        // which for multisig is the descriptor blob. Fill it in *before*
+        // anyone signs; otherwise the signatures cover a different digest
+        // than the finalized transaction and consensus rejects it.
+        let mut tx = tx;
+        for (idx, blob) in multisig_inputs {
+            let input = tx
+                .inputs
+                .get_mut(*idx as usize)
+                .ok_or(PartialMultisigError::UnknownInput { input_index: *idx })?;
+            input.pubkey_compressed = blob.clone();
+            input.signature.clear();
+        }
         let mut inputs = BTreeMap::new();
         for (idx, blob) in multisig_inputs {
             inputs.insert(
@@ -123,10 +136,42 @@ impl PartialMultisigTx {
         })
     }
 
+    /// Chain domain (network id bytes) the envelope's signatures commit to.
+    /// Signers should compare it with the network they intend to sign for.
+    pub fn chain_domain(&self) -> Result<Vec<u8>, PartialMultisigError> {
+        hex::decode(&self.chain_domain_hex).map_err(|_| {
+            PartialMultisigError::BadEnvelope("chain_domain_hex is not valid hex".to_owned())
+        })
+    }
+
+    /// Descriptor blob of a multisig input, checked against the input's
+    /// `pubkey_compressed` (an envelope edited after creation must not make
+    /// signers sign a digest the final transaction will not have).
+    fn checked_descriptor_blob(&self, input_index: u32) -> Result<Vec<u8>, PartialMultisigError> {
+        let entry = self
+            .inputs
+            .get(&input_index)
+            .ok_or(PartialMultisigError::UnknownInput { input_index })?;
+        let blob = hex::decode(&entry.descriptor_hex)
+            .map_err(|_| PartialMultisigError::BadEnvelope("descriptor_hex bad".to_owned()))?;
+        let input = self
+            .tx
+            .inputs
+            .get(input_index as usize)
+            .ok_or(PartialMultisigError::UnknownInput { input_index })?;
+        if input.pubkey_compressed != blob {
+            return Err(PartialMultisigError::BadEnvelope(format!(
+                "input #{input_index} pubkey field does not match its multisig descriptor"
+            )));
+        }
+        Ok(blob)
+    }
+
     /// Compute the signing digest for one input, exactly as the
     /// consensus validator does. Signers call this locally to know
     /// what to feed into their secret key.
     pub fn signing_digest(&self, input_index: u32) -> Result<Hash256, PartialMultisigError> {
+        self.checked_descriptor_blob(input_index)?;
         let domain = hex::decode(&self.chain_domain_hex).map_err(|_| {
             PartialMultisigError::BadEnvelope("chain_domain_hex is not valid hex".to_owned())
         })?;
@@ -146,12 +191,7 @@ impl PartialMultisigTx {
         input_index: u32,
         wallet_key: &WalletKey,
     ) -> Result<(), PartialMultisigError> {
-        let entry = self
-            .inputs
-            .get_mut(&input_index)
-            .ok_or(PartialMultisigError::UnknownInput { input_index })?;
-        let blob = hex::decode(&entry.descriptor_hex)
-            .map_err(|_| PartialMultisigError::BadEnvelope("descriptor_hex bad".to_owned()))?;
+        let blob = self.checked_descriptor_blob(input_index)?;
         let descriptor = MultisigDescriptor::parse(&blob).map_err(|source| {
             PartialMultisigError::Descriptor {
                 input_index,
@@ -178,6 +218,10 @@ impl PartialMultisigTx {
             .map_err(|e| PartialMultisigError::BadEnvelope(format!("digest: {e}")))?;
         let signature = crate::signer::sign_digest(wallet_key, digest.0)
             .map_err(|e| PartialMultisigError::SigningFailed(format!("{e}")))?;
+        let entry = self
+            .inputs
+            .get_mut(&input_index)
+            .ok_or(PartialMultisigError::UnknownInput { input_index })?;
         entry
             .partial_signatures
             .insert(hex::encode(our_pubkey), hex::encode(signature));
@@ -190,8 +234,7 @@ impl PartialMultisigTx {
     pub fn inspect(&self) -> Result<Vec<InspectStatus>, PartialMultisigError> {
         let mut out = Vec::with_capacity(self.inputs.len());
         for (idx, entry) in &self.inputs {
-            let blob = hex::decode(&entry.descriptor_hex)
-                .map_err(|_| PartialMultisigError::BadEnvelope("descriptor_hex bad".to_owned()))?;
+            let blob = self.checked_descriptor_blob(*idx)?;
             let descriptor = MultisigDescriptor::parse(&blob).map_err(|source| {
                 PartialMultisigError::Descriptor {
                     input_index: *idx,
@@ -524,6 +567,30 @@ mod tests {
         let status = pmt.inspect().expect("inspect");
         assert_eq!(status[0].valid_sigs, 2);
         assert!(status[0].threshold_reached);
+    }
+
+    /// R8: the initiator does not have to pre-fill the descriptor; the
+    /// finalized tx must still verify under consensus.
+    #[test]
+    fn finalize_verifies_when_initiator_left_pubkey_field_empty() {
+        let (blob, keys) = three_party_descriptor();
+        let mut tx = unsigned_tx_with_one_multisig_input(&blob);
+        tx.inputs[0].pubkey_compressed = Vec::new();
+        let mut pmt = PartialMultisigTx::new(b"devnet", tx, &[(0, blob.clone())]).expect("new");
+        pmt.sign_input(0, &keys[0]).expect("sign 0");
+        pmt.sign_input(0, &keys[1]).expect("sign 1");
+        let finalized = pmt.finalize().expect("finalize");
+        let digest = finalized
+            .signing_digest_with_chain_domain(0, b"devnet")
+            .expect("digest");
+        let descriptor = MultisigDescriptor::parse(&blob).expect("parse");
+        scam_consensus::verify_multisig_spend(&descriptor, digest, &finalized.inputs[0].signature)
+            .expect("consensus verifies finalized multisig spend");
+
+        // Tampering with the pubkey field after creation is detected.
+        let mut tampered = pmt.clone();
+        tampered.tx.inputs[0].pubkey_compressed = vec![0x02; 33];
+        assert!(tampered.sign_input(0, &keys[2]).is_err());
     }
 
     #[test]

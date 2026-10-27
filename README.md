@@ -416,6 +416,20 @@ Then open:
 http://127.0.0.1:18080/
 ```
 
+RPC security model:
+- Every state-changing request must be `POST` with `Content-Type: application/json`
+  (blocks cross-site form posts); a browser `Origin` must be loopback.
+- The `Host` header must be loopback (DNS-rebinding protection), so expose the
+  RPC beyond the host only through a reverse proxy that you control.
+- Binding to a non-loopback address requires a bearer token:
+  `--auth-token-file <file>` (or `SCAM_RPC_AUTH_TOKEN`); clients then send
+  `Authorization: Bearer <token>` on every `POST`.
+- `--disable-wallet-rpc` turns off the routes that accept a mnemonic
+  (`/wallet/new|address|balance|send-preview|send`). Use it for any shared,
+  proxied or public deployment.
+- `SCAM_RPC_HTTP_BACKEND=legacy` selects the old HTTP server (loopback only, no
+  request policy); any other value uses the default axum server.
+
 RPC endpoints used by the console:
 - GET: `/health`, `/status`, `/block/<height>`, `/tx/<height>/<index>`, `/mempool`, `/events` (SSE snapshots)
 - POST: `/wallet/new`, `/wallet/address`, `/wallet/decode`, `/wallet/balance`, `/wallet/balance-by-address`, `/wallet/balance-history-by-address`, `/wallet/send-preview`, `/wallet/send`, `/tx/submit`, `/wallet/qr`
@@ -502,7 +516,9 @@ cargo run -p scam-node -- wallet send \
 
 ### 7.2 Encrypted wallet vault (recommended)
 
-Create secure vault:
+Create secure vault (refuses to overwrite an existing file; pass `--force` to
+replace it — the old wallet is then gone unless its mnemonic is backed up).
+The vault is written with owner-only permissions on Unix:
 
 ```bash
 cargo run -p scam-node -- wallet secure-new \

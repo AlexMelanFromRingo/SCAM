@@ -144,6 +144,75 @@ pub async fn send_message_async<S: AsyncWrite + Unpin>(
     Ok(())
 }
 
+/// Stateful frame reader that keeps partially received bytes between calls.
+///
+/// `read_message_async` built on `read_exact` is not cancel-safe: wrapping it
+/// in `tokio::time::timeout` drops whatever part of a frame had arrived, and
+/// the next read starts mid-frame (`InvalidMagic`), so a block that takes
+/// longer than the poll interval to arrive could never be received. Here
+/// bytes are only ever appended to an internal buffer (`read_buf` is
+/// cancel-safe), and a frame is decoded once complete. The blocking variant
+/// likewise keeps a partial frame across socket read timeouts.
+pub struct FrameReader {
+    codec: ScamWireCodec,
+    buf: BytesMut,
+}
+
+const FRAME_READER_CHUNK: usize = 64 * 1024;
+
+impl FrameReader {
+    pub fn new(cfg: FramingConfig) -> Self {
+        Self {
+            codec: ScamWireCodec::new(cfg),
+            buf: BytesMut::new(),
+        }
+    }
+
+    /// Bytes received but not yet decoded into a message.
+    pub fn buffered_len(&self) -> usize {
+        self.buf.len()
+    }
+
+    pub async fn read_message_async<S: AsyncRead + Unpin>(
+        &mut self,
+        stream: &mut S,
+    ) -> Result<WireMessage, TransportError> {
+        loop {
+            if let Some(message) = self.codec.decode(&mut self.buf)? {
+                return Ok(message);
+            }
+            self.buf.reserve(FRAME_READER_CHUNK);
+            let read = stream
+                .read_buf(&mut self.buf)
+                .await
+                .map_err(TransportError::Io)?;
+            if read == 0 {
+                return Err(TransportError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "peer closed the connection",
+                )));
+            }
+        }
+    }
+
+    pub fn read_message<R: Read>(&mut self, stream: &mut R) -> Result<WireMessage, TransportError> {
+        let mut chunk = vec![0u8; FRAME_READER_CHUNK];
+        loop {
+            if let Some(message) = self.codec.decode(&mut self.buf)? {
+                return Ok(message);
+            }
+            let read = stream.read(&mut chunk).map_err(TransportError::Io)?;
+            if read == 0 {
+                return Err(TransportError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "peer closed the connection",
+                )));
+            }
+            self.buf.extend_from_slice(&chunk[..read]);
+        }
+    }
+}
+
 pub fn read_message<R: Read>(
     stream: &mut R,
     cfg: &FramingConfig,
@@ -920,6 +989,86 @@ mod tests {
                 crate::transport::TransportError::MessageTooLarge { .. }
             ));
         });
+    }
+
+    /// P5: a frame arriving in pieces slower than the caller's poll timeout
+    /// must still be delivered intact. Plain `read_message_async` under
+    /// `timeout` drops the partial frame and desyncs the stream.
+    #[test]
+    fn frame_reader_survives_timeouts_mid_frame() {
+        let runtime = Runtime::new().expect("tokio runtime");
+        runtime.block_on(async {
+            let cfg = FramingConfig::default();
+            let first = WireMessage::Ping { nonce: 7 };
+            let second = WireMessage::Ping { nonce: 8 };
+            let mut framed = encode_framed_message_bytes(&cfg, &first);
+            framed.extend(encode_framed_message_bytes(&cfg, &second));
+            let (mut tx, mut rx) = tokio::io::duplex(framed.len() + 8);
+            let writer = tokio::spawn(async move {
+                for chunk in framed.chunks(3) {
+                    tx.write_all(chunk).await.expect("write");
+                    tokio::time::sleep(Duration::from_millis(15)).await;
+                }
+            });
+            let mut reader = crate::transport::FrameReader::new(cfg);
+            let mut received = Vec::new();
+            let mut timeouts = 0u32;
+            while received.len() < 2 {
+                match tokio::time::timeout(
+                    Duration::from_millis(5),
+                    reader.read_message_async(&mut rx),
+                )
+                .await
+                {
+                    Ok(Ok(message)) => received.push(message),
+                    Ok(Err(err)) => panic!("stream desynced: {err}"),
+                    Err(_) => timeouts += 1,
+                }
+            }
+            writer.await.expect("writer");
+            assert!(timeouts > 0, "test must actually time out mid-frame");
+            assert_eq!(received, vec![first, second]);
+        });
+    }
+
+    #[test]
+    fn frame_reader_blocking_keeps_partial_frame_across_read_timeouts() {
+        struct Trickle {
+            data: Vec<u8>,
+            pos: usize,
+            calls: usize,
+        }
+        impl Read for Trickle {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.calls += 1;
+                if self.calls.is_multiple_of(2) {
+                    return Err(std::io::ErrorKind::WouldBlock.into());
+                }
+                let end = (self.pos + 2).min(self.data.len());
+                let n = end - self.pos;
+                buf[..n].copy_from_slice(&self.data[self.pos..end]);
+                self.pos = end;
+                Ok(n)
+            }
+        }
+        let cfg = FramingConfig::default();
+        let message = WireMessage::Ping { nonce: 99 };
+        let mut stream = Trickle {
+            data: encode_framed_message_bytes(&cfg, &message),
+            pos: 0,
+            calls: 0,
+        };
+        let mut reader = crate::transport::FrameReader::new(cfg);
+        let decoded = loop {
+            match reader.read_message(&mut stream) {
+                Ok(message) => break message,
+                Err(crate::transport::TransportError::Io(err))
+                    if err.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(err) => panic!("unexpected: {err}"),
+            }
+        };
+        assert_eq!(decoded, message);
+        assert_eq!(reader.buffered_len(), 0);
     }
 
     #[test]

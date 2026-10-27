@@ -123,6 +123,68 @@ pub fn validate_and_apply_block_with_context(
     ctx: BlockApplyContext<'_>,
     utxos: &mut UtxoSet,
 ) -> Result<BlockApplySummary, TxValidationError> {
+    validate_and_apply_block_with_undo(block, ctx, utxos).map(|(summary, _)| summary)
+}
+
+/// Net effect of one connected block on the UTXO set, sufficient to
+/// disconnect it again with [`revert_block_undo`].
+///
+/// `spent_entries` only lists outputs that existed *before* the block;
+/// `created_outpoints` only lists outputs that still exist *after* it.
+/// Outputs created and spent inside the same block appear in neither.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BlockUndoData {
+    pub spent_entries: Vec<(OutPoint, UtxoEntry)>,
+    pub created_outpoints: Vec<OutPoint>,
+}
+
+#[derive(Debug, Error, Eq, PartialEq)]
+pub enum UndoError {
+    #[error("cannot disconnect block: created output {outpoint:?} is missing from the UTXO set")]
+    MissingCreatedOutput { outpoint: OutPoint },
+    #[error("cannot disconnect block: spent output {outpoint:?} is already present")]
+    SpentOutputAlreadyPresent { outpoint: OutPoint },
+}
+
+/// Disconnect a block previously connected with
+/// [`validate_and_apply_block_with_undo`]. All-or-nothing: on error the
+/// set is left untouched.
+pub fn revert_block_undo(undo: &BlockUndoData, utxos: &mut UtxoSet) -> Result<(), UndoError> {
+    for outpoint in &undo.created_outpoints {
+        if !utxos.contains_key(outpoint) {
+            return Err(UndoError::MissingCreatedOutput {
+                outpoint: outpoint.clone(),
+            });
+        }
+    }
+    let created: HashSet<&OutPoint> = undo.created_outpoints.iter().collect();
+    for (outpoint, _) in &undo.spent_entries {
+        if utxos.contains_key(outpoint) && !created.contains(outpoint) {
+            return Err(UndoError::SpentOutputAlreadyPresent {
+                outpoint: outpoint.clone(),
+            });
+        }
+    }
+    for outpoint in &undo.created_outpoints {
+        utxos.remove(outpoint);
+    }
+    for (outpoint, entry) in &undo.spent_entries {
+        utxos.insert(outpoint.clone(), entry.clone());
+    }
+    Ok(())
+}
+
+/// Validate `block` against `utxos` and, only if every rule passes,
+/// apply it. Returns the undo record for a later disconnect.
+///
+/// The set is never cloned: outputs created inside the block live in a
+/// per-block overlay and the base set is mutated once, at the end, after
+/// all checks succeeded. A failed block leaves `utxos` untouched.
+pub fn validate_and_apply_block_with_undo(
+    block: &Block,
+    ctx: BlockApplyContext<'_>,
+    utxos: &mut UtxoSet,
+) -> Result<(BlockApplySummary, BlockUndoData), TxValidationError> {
     validate_block_basic(block, ctx.limits).map_err(TxValidationError::InvalidBlockStructure)?;
     if !block_meets_pow(block) {
         return Err(TxValidationError::PowMismatch);
@@ -131,8 +193,13 @@ pub fn validate_and_apply_block_with_context(
     let coinbase = &block.transactions[0];
     let coinbase_value = tx_output_total(coinbase);
 
-    let mut staged = utxos.clone();
-    let mut spent_in_block = HashSet::<OutPoint>::new();
+    let mut overlay = BlockOverlay {
+        base: utxos,
+        spent: HashSet::new(),
+        created: HashMap::new(),
+        created_height: ctx.current_height,
+        created_time: block.header.timestamp,
+    };
     let mut total_fees: u128 = 0;
     let mut spent_count = 0usize;
     let mut created_count = 0usize;
@@ -146,8 +213,14 @@ pub fn validate_and_apply_block_with_context(
             (ctx.current_height, block.header.timestamp, csv_time),
             ctx.coinbase_maturity,
             ctx.chain_domain,
-            &mut spent_in_block,
-            &staged,
+            &mut overlay.spent,
+            |outpoint| {
+                overlay
+                    .created
+                    .get(outpoint)
+                    .or_else(|| overlay.base.get(outpoint))
+                    .cloned()
+            },
         )?;
 
         let fee = input_total
@@ -156,35 +229,10 @@ pub fn validate_and_apply_block_with_context(
         total_fees = total_fees
             .checked_add(fee)
             .ok_or(TxValidationError::FeeOverflow { tx_index })?;
+        spent_count += tx.inputs.len();
 
-        for input in &tx.inputs {
-            let removed = staged.remove(&input.prev_out);
-            if removed.is_none() {
-                return Err(TxValidationError::MissingUtxo {
-                    tx_index,
-                    outpoint: input.prev_out.clone(),
-                });
-            }
-            spent_count += 1;
-        }
-
-        let txid = tx.txid();
-        for (vout, output) in tx.outputs.iter().enumerate() {
-            staged.insert(
-                OutPoint {
-                    txid,
-                    vout: vout as u32,
-                },
-                UtxoEntry {
-                    value: output.value,
-                    key_hash20: output.key_hash20,
-                    created_height: ctx.current_height,
-                    created_time: block.header.timestamp,
-                    is_coinbase: false,
-                },
-            );
-            created_count += 1;
-        }
+        overlay.stage_outputs(tx, tx_index, false)?;
+        created_count += tx.outputs.len();
     }
 
     let max_coinbase_value = (ctx.block_subsidy as u128)
@@ -197,34 +245,296 @@ pub fn validate_and_apply_block_with_context(
         });
     }
 
-    let coinbase_txid = coinbase.txid();
-    for (vout, output) in coinbase.outputs.iter().enumerate() {
-        staged.insert(
-            OutPoint {
-                txid: coinbase_txid,
-                vout: vout as u32,
-            },
-            UtxoEntry {
-                value: output.value,
-                key_hash20: output.key_hash20,
-                created_height: ctx.current_height,
-                created_time: block.header.timestamp,
-                is_coinbase: true,
-            },
-        );
-        created_count += 1;
+    overlay.stage_outputs(coinbase, 0, true)?;
+    created_count += coinbase.outputs.len();
+
+    // Commit. Every check passed, so from here on nothing can fail.
+    let BlockOverlay {
+        spent, mut created, ..
+    } = overlay;
+    let mut undo = BlockUndoData::default();
+    for outpoint in spent {
+        if created.remove(&outpoint).is_none()
+            && let Some(entry) = utxos.remove(&outpoint)
+        {
+            undo.spent_entries.push((outpoint, entry));
+        }
+    }
+    undo.created_outpoints.reserve(created.len());
+    for (outpoint, entry) in created {
+        undo.created_outpoints.push(outpoint.clone());
+        utxos.insert(outpoint, entry);
     }
 
-    *utxos = staged;
+    Ok((
+        BlockApplySummary {
+            block_hash: block.header.block_hash(),
+            tx_count: block.transactions.len(),
+            spent_utxos: spent_count,
+            created_utxos: created_count,
+            total_fees,
+            coinbase_value,
+        },
+        undo,
+    ))
+}
 
-    Ok(BlockApplySummary {
-        block_hash: block.header.block_hash(),
-        tx_count: block.transactions.len(),
-        spent_utxos: spent_count,
-        created_utxos: created_count,
-        total_fees,
-        coinbase_value,
+/// Per-block view over the base UTXO set: outputs created inside the
+/// block live in `created`, outpoints spent inside the block in `spent`.
+/// The base set is only read until the block has fully validated.
+struct BlockOverlay<'a> {
+    base: &'a UtxoSet,
+    spent: HashSet<OutPoint>,
+    created: HashMap<OutPoint, UtxoEntry>,
+    created_height: u64,
+    created_time: u64,
+}
+
+impl BlockOverlay<'_> {
+    /// Stage `tx`'s outputs, enforcing the BIP30 rule: a block may not
+    /// create an outpoint that is currently unspent.
+    fn stage_outputs(
+        &mut self,
+        tx: &Transaction,
+        tx_index: usize,
+        is_coinbase: bool,
+    ) -> Result<(), TxValidationError> {
+        let txid = tx.txid();
+        for (vout, output) in tx.outputs.iter().enumerate() {
+            let outpoint = OutPoint {
+                txid,
+                vout: vout as u32,
+            };
+            let live_in_base = self.base.contains_key(&outpoint) && !self.spent.contains(&outpoint);
+            if live_in_base || self.created.contains_key(&outpoint) {
+                return Err(TxValidationError::OutputAlreadyExists { tx_index, outpoint });
+            }
+            self.created.insert(
+                outpoint,
+                UtxoEntry {
+                    value: output.value,
+                    key_hash20: output.key_hash20,
+                    created_height: self.created_height,
+                    created_time: self.created_time,
+                    is_coinbase,
+                },
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Chain context for validating a transaction that is not in a block yet
+/// (mempool admission, block-template assembly): "would this tx be valid in
+/// the next block on top of the current tip?".
+#[derive(Clone, Copy, Debug)]
+pub struct NextBlockTxContext<'a> {
+    /// Height of the block the tx would be mined in (`tip_height + 1`).
+    pub next_height: u64,
+    /// Median-time-past of the current tip. The next header must carry a
+    /// timestamp strictly greater than this, so `median_time_past + 1` is the
+    /// most conservative clock for absolute lock_time, and it is the BIP68
+    /// clock for relative time locks.
+    pub median_time_past: u64,
+    pub coinbase_maturity: u64,
+    pub chain_domain: &'a [u8],
+    pub max_tx_bytes: Option<usize>,
+}
+
+/// Amounts of a transaction that passed [`validate_tx_for_next_block`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ValidatedTx {
+    pub input_total: u128,
+    pub output_total: u128,
+    pub fee: u64,
+}
+
+/// Full contextual validation of a standalone transaction against the
+/// UTXO view returned by `lookup` — the same per-input rules a block applies
+/// (ownership, signatures incl. multisig, coinbase maturity, absolute and
+/// BIP68 relative locks, value overflow). Outputs of unconfirmed parents
+/// should be returned with `created_height = next_height` and
+/// `created_time = median_time_past`, which makes any non-zero relative lock
+/// on them unsatisfiable, as in BIP68.
+pub fn validate_tx_for_next_block(
+    tx: &Transaction,
+    ctx: &NextBlockTxContext<'_>,
+    lookup: impl Fn(&OutPoint) -> Option<UtxoEntry>,
+) -> Result<ValidatedTx, TxValidationError> {
+    const TX_INDEX: usize = 0;
+    if tx.inputs.is_empty() {
+        return Err(TxValidationError::InvalidBlockStructure(
+            BlockValidationError::TxHasNoInputs { tx_index: TX_INDEX },
+        ));
+    }
+    if tx.outputs.is_empty() {
+        return Err(TxValidationError::InvalidBlockStructure(
+            BlockValidationError::TxHasNoOutputs { tx_index: TX_INDEX },
+        ));
+    }
+    if tx.outputs.iter().any(|out| out.value == 0) {
+        return Err(TxValidationError::InvalidBlockStructure(
+            BlockValidationError::ZeroValueOutput { tx_index: TX_INDEX },
+        ));
+    }
+    if let Some(max_tx) = ctx.max_tx_bytes {
+        let bytes = tx.encode_for_hash().len();
+        if bytes > max_tx {
+            return Err(TxValidationError::InvalidBlockStructure(
+                BlockValidationError::TxTooLarge {
+                    tx_index: TX_INDEX,
+                    bytes,
+                    max_bytes: max_tx,
+                },
+            ));
+        }
+    }
+    let mut seen_inputs = HashSet::<OutPoint>::with_capacity(tx.inputs.len());
+    for input in &tx.inputs {
+        if !seen_inputs.insert(input.prev_out.clone()) {
+            return Err(TxValidationError::InvalidBlockStructure(
+                BlockValidationError::DuplicateInputInTx { tx_index: TX_INDEX },
+            ));
+        }
+    }
+
+    let mut spent = HashSet::new();
+    let earliest_header_time = ctx.median_time_past.saturating_add(1);
+    let (input_total, output_total) = validate_non_coinbase_tx(
+        tx,
+        TX_INDEX,
+        (ctx.next_height, earliest_header_time, ctx.median_time_past),
+        ctx.coinbase_maturity,
+        ctx.chain_domain,
+        &mut spent,
+        lookup,
+    )?;
+    let fee = u64::try_from(input_total - output_total)
+        .map_err(|_| TxValidationError::FeeOverflow { tx_index: TX_INDEX })?;
+    Ok(ValidatedTx {
+        input_total,
+        output_total,
+        fee,
     })
+}
+
+/// Outcome of [`select_valid_block_transactions`].
+#[derive(Debug, Default)]
+pub struct BlockTxSelection {
+    /// Transactions that are valid in this order, with their exact fees.
+    pub accepted: Vec<(Transaction, u64)>,
+    pub total_fees: u64,
+    pub total_tx_bytes: usize,
+    /// Candidates dropped (invalid, conflicting, or over the byte budget).
+    pub rejected: Vec<(scam_core::Hash256, String)>,
+}
+
+/// Filter an ordered candidate list (parents before children) down to a
+/// set that is valid as the non-coinbase part of the next block and fits in
+/// `max_total_tx_bytes` (bincode bytes, as counted by the block-size rule). Children of a dropped
+/// parent are dropped too, because their inputs are then missing.
+pub fn select_valid_block_transactions(
+    candidates: &[Transaction],
+    ctx: &NextBlockTxContext<'_>,
+    base: &UtxoSet,
+    max_total_tx_bytes: usize,
+) -> BlockTxSelection {
+    let mut selection = BlockTxSelection::default();
+    let mut created = HashMap::<OutPoint, UtxoEntry>::new();
+    let mut spent = HashSet::<OutPoint>::new();
+    let mut total_fees: u128 = 0;
+
+    for tx in candidates {
+        let txid = tx.txid();
+        if tx.is_coinbase() {
+            selection.rejected.push((txid, "coinbase".to_owned()));
+            continue;
+        }
+        // Budget in block-serialization bytes: the consensus block-size rule
+        // measures `bincode::serialized_size(block)`.
+        let bytes = bincode::serialized_size(tx)
+            .map(|n| n as usize)
+            .unwrap_or(usize::MAX);
+        if selection.total_tx_bytes.saturating_add(bytes) > max_total_tx_bytes {
+            selection
+                .rejected
+                .push((txid, "block byte budget exhausted".to_owned()));
+            continue;
+        }
+        if tx
+            .inputs
+            .iter()
+            .any(|input| spent.contains(&input.prev_out))
+        {
+            selection
+                .rejected
+                .push((txid, "conflicts with an earlier template tx".to_owned()));
+            continue;
+        }
+        let validated = validate_tx_for_next_block(tx, ctx, |outpoint| {
+            created
+                .get(outpoint)
+                .or_else(|| base.get(outpoint))
+                .cloned()
+        });
+        let validated = match validated {
+            Ok(v) => v,
+            Err(err) => {
+                selection.rejected.push((txid, err.to_string()));
+                continue;
+            }
+        };
+        let creates_live_outpoint = (0..tx.outputs.len()).any(|vout| {
+            let outpoint = OutPoint {
+                txid,
+                vout: vout as u32,
+            };
+            created.contains_key(&outpoint) || base.contains_key(&outpoint)
+        });
+        if creates_live_outpoint {
+            selection
+                .rejected
+                .push((txid, "creates an already-unspent outpoint".to_owned()));
+            continue;
+        }
+        let Some(next_fees) = total_fees.checked_add(u128::from(validated.fee)) else {
+            selection
+                .rejected
+                .push((txid, "fee total overflow".to_owned()));
+            continue;
+        };
+        if u64::try_from(next_fees).is_err() {
+            selection
+                .rejected
+                .push((txid, "fee total overflow".to_owned()));
+            continue;
+        }
+
+        for input in &tx.inputs {
+            created.remove(&input.prev_out);
+            spent.insert(input.prev_out.clone());
+        }
+        for (vout, output) in tx.outputs.iter().enumerate() {
+            created.insert(
+                OutPoint {
+                    txid,
+                    vout: vout as u32,
+                },
+                UtxoEntry {
+                    value: output.value,
+                    key_hash20: output.key_hash20,
+                    created_height: ctx.next_height,
+                    created_time: ctx.median_time_past,
+                    is_coinbase: false,
+                },
+            );
+        }
+        total_fees = next_fees;
+        selection.total_tx_bytes += bytes;
+        selection.accepted.push((tx.clone(), validated.fee));
+    }
+    selection.total_fees = u64::try_from(total_fees).unwrap_or(u64::MAX);
+    selection
 }
 
 // `block_context = (current_height, raw_block_time, csv_time_clock)`.
@@ -239,7 +549,7 @@ fn validate_non_coinbase_tx(
     coinbase_maturity: u64,
     chain_domain: &[u8],
     spent_in_block: &mut HashSet<OutPoint>,
-    utxos: &UtxoSet,
+    lookup: impl Fn(&OutPoint) -> Option<UtxoEntry>,
 ) -> Result<(u128, u128), TxValidationError> {
     let (current_height, block_timestamp, csv_time_clock) = block_context;
     if tx.is_coinbase() {
@@ -271,12 +581,10 @@ fn validate_non_coinbase_tx(
             });
         }
 
-        let utxo = utxos
-            .get(&input.prev_out)
-            .ok_or_else(|| TxValidationError::MissingUtxo {
-                tx_index,
-                outpoint: input.prev_out.clone(),
-            })?;
+        let utxo = lookup(&input.prev_out).ok_or_else(|| TxValidationError::MissingUtxo {
+            tx_index,
+            outpoint: input.prev_out.clone(),
+        })?;
 
         if utxo.is_coinbase
             && current_height < utxo.created_height.saturating_add(coinbase_maturity)
@@ -519,6 +827,8 @@ pub enum TxValidationError {
     },
     #[error("negative fee in tx #{tx_index}")]
     NegativeFee { tx_index: usize },
+    #[error("tx #{tx_index} creates output {outpoint:?} which is already unspent (BIP30)")]
+    OutputAlreadyExists { tx_index: usize, outpoint: OutPoint },
     #[error(
         "tx #{tx_index} is non-final at height={block_height} time={block_time} lock_time={lock_time}"
     )]
@@ -1110,6 +1420,345 @@ mod tests {
             .expect("block1 must apply");
         assert_eq!(applied.total_fees, 10);
         assert_eq!(utxos.len(), 2);
+    }
+
+    /// BIP30 class: a coinbase byte-identical to an earlier *unspent*
+    /// coinbase has the same txid. Before the fix `staged.insert` silently
+    /// overwrote the victim's UTXO (resetting its maturity) and a later
+    /// disconnect of the copy deleted the outpoint entirely, so nodes that
+    /// reorged diverged from nodes that did not.
+    #[test]
+    fn block_recreating_unspent_outpoint_is_rejected_and_set_is_untouched() {
+        let chain_domain = b"devnet";
+        let (_, victim_key_hash, _) = key_material([9u8; 32]);
+        let victim_coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: OutPoint::coinbase(),
+                signature: b"same-tag".to_vec(),
+                pubkey_compressed: vec![],
+                sequence: u32::MAX,
+            }],
+            outputs: vec![TxOut {
+                value: 50,
+                key_hash20: victim_key_hash,
+            }],
+            lock_time: 0,
+        };
+        let genesis = make_block(
+            Hash256::ZERO,
+            100,
+            Target::MAX,
+            vec![victim_coinbase.clone()],
+        );
+        let mut utxos = UtxoSet::new();
+        validate_and_apply_block(&genesis, 0, 50, 1, chain_domain, &mut utxos)
+            .expect("genesis applies");
+        let before = utxos.clone();
+
+        let copy = make_block(
+            genesis.header.block_hash(),
+            200,
+            Target::MAX,
+            vec![victim_coinbase.clone()],
+        );
+        let err = validate_and_apply_block(&copy, 1, 50, 1, chain_domain, &mut utxos)
+            .expect_err("duplicate unspent outpoint must be rejected");
+        match err {
+            TxValidationError::OutputAlreadyExists { tx_index, outpoint } => {
+                assert_eq!(tx_index, 0);
+                assert_eq!(outpoint.txid, victim_coinbase.txid());
+            }
+            other => panic!("expected OutputAlreadyExists, got {other:?}"),
+        }
+        assert_eq!(utxos, before, "failed block must not mutate the UTXO set");
+    }
+
+    /// A transaction may spend an output created by an earlier transaction
+    /// of the same block; the undo record must describe the net effect
+    /// (base entries spent + outpoints that survive the block).
+    #[test]
+    fn in_block_parent_child_spend_applies_and_undo_reverts_exactly() {
+        let chain_domain = b"devnet";
+        let (miner_pubkey, miner_key_hash, miner_secret) = key_material([12u8; 32]);
+        let (_, receiver_key_hash, _) = key_material([13u8; 32]);
+
+        let genesis_coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: OutPoint::coinbase(),
+                signature: b"genesis-chain".to_vec(),
+                pubkey_compressed: vec![],
+                sequence: u32::MAX,
+            }],
+            outputs: vec![TxOut {
+                value: 50,
+                key_hash20: miner_key_hash,
+            }],
+            lock_time: 0,
+        };
+        let genesis = make_block(
+            Hash256::ZERO,
+            100,
+            Target::MAX,
+            vec![genesis_coinbase.clone()],
+        );
+        let mut utxos = UtxoSet::new();
+        validate_and_apply_block(&genesis, 0, 50, 1, chain_domain, &mut utxos)
+            .expect("genesis applies");
+        let before = utxos.clone();
+
+        let mut parent = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: OutPoint {
+                    txid: genesis_coinbase.txid(),
+                    vout: 0,
+                },
+                signature: vec![],
+                pubkey_compressed: miner_pubkey.to_vec(),
+                sequence: 0,
+            }],
+            outputs: vec![TxOut {
+                value: 45,
+                key_hash20: miner_key_hash,
+            }],
+            lock_time: 0,
+        };
+        sign_input(&mut parent, 0, chain_domain, &miner_secret);
+        let mut child = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: OutPoint {
+                    txid: parent.txid(),
+                    vout: 0,
+                },
+                signature: vec![],
+                pubkey_compressed: miner_pubkey.to_vec(),
+                sequence: 0,
+            }],
+            outputs: vec![TxOut {
+                value: 40,
+                key_hash20: receiver_key_hash,
+            }],
+            lock_time: 0,
+        };
+        sign_input(&mut child, 0, chain_domain, &miner_secret);
+        let coinbase1 = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: OutPoint::coinbase(),
+                signature: b"b1-chain".to_vec(),
+                pubkey_compressed: vec![],
+                sequence: u32::MAX,
+            }],
+            outputs: vec![TxOut {
+                value: 60,
+                key_hash20: receiver_key_hash,
+            }],
+            lock_time: 0,
+        };
+        let block1 = make_block(
+            genesis.header.block_hash(),
+            220,
+            Target::MAX,
+            vec![coinbase1, parent.clone(), child.clone()],
+        );
+        let ctx = super::BlockApplyContext {
+            current_height: 1,
+            block_subsidy: 50,
+            coinbase_maturity: 1,
+            chain_domain,
+            limits: crate::BlockSizeLimits::UNBOUNDED,
+            median_time_past: None,
+        };
+        let (summary, undo) = super::validate_and_apply_block_with_undo(&block1, ctx, &mut utxos)
+            .expect("in-block chain must apply");
+        assert_eq!(summary.total_fees, 10);
+        // genesis coinbase spent; parent output created and spent in-block;
+        // child output + coinbase output survive.
+        assert_eq!(utxos.len(), 2);
+        assert!(!utxos.contains_key(&OutPoint {
+            txid: parent.txid(),
+            vout: 0
+        }));
+        assert_eq!(undo.spent_entries.len(), 1);
+        assert_eq!(undo.created_outpoints.len(), 2);
+
+        super::revert_block_undo(&undo, &mut utxos).expect("undo applies");
+        assert_eq!(utxos, before, "undo must restore the pre-block set exactly");
+    }
+
+    fn funded_set(key_hash: [u8; 20], value: u64) -> (UtxoSet, OutPoint) {
+        let outpoint = OutPoint {
+            txid: Hash256([0xab; 32]),
+            vout: 0,
+        };
+        let mut utxos = UtxoSet::new();
+        utxos.insert(
+            outpoint.clone(),
+            super::UtxoEntry {
+                value,
+                key_hash20: key_hash,
+                created_height: 1,
+                created_time: 1_000,
+                is_coinbase: false,
+            },
+        );
+        (utxos, outpoint)
+    }
+
+    fn next_ctx(chain_domain: &[u8]) -> super::NextBlockTxContext<'_> {
+        super::NextBlockTxContext {
+            next_height: 10,
+            median_time_past: 5_000,
+            coinbase_maturity: 1,
+            chain_domain,
+            max_tx_bytes: Some(100_000),
+        }
+    }
+
+    fn spend(
+        prev: OutPoint,
+        pubkey: &[u8],
+        value: u64,
+        to: [u8; 20],
+        sequence: u32,
+    ) -> Transaction {
+        Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: prev,
+                signature: vec![],
+                pubkey_compressed: pubkey.to_vec(),
+                sequence,
+            }],
+            outputs: vec![TxOut {
+                value,
+                key_hash20: to,
+            }],
+            lock_time: 0,
+        }
+    }
+
+    /// M1: a spend with a forged signature (or someone else's key) must be
+    /// rejected at admission, not only at block validation.
+    #[test]
+    fn next_block_validation_rejects_forged_and_foreign_spends() {
+        let domain = b"devnet";
+        let (owner_pk, owner_hash, owner_sk) = key_material([21u8; 32]);
+        let (thief_pk, _, thief_sk) = key_material([22u8; 32]);
+        let (utxos, outpoint) = funded_set(owner_hash, 1_000);
+        let ctx = next_ctx(domain);
+        let lookup = |op: &OutPoint| utxos.get(op).cloned();
+
+        let mut garbage = spend(outpoint.clone(), &owner_pk, 10, owner_hash, u32::MAX);
+        garbage.inputs[0].signature = vec![7u8; 64];
+        assert!(matches!(
+            super::validate_tx_for_next_block(&garbage, &ctx, lookup),
+            Err(TxValidationError::InvalidSignature { .. })
+        ));
+
+        let mut foreign = spend(outpoint.clone(), &thief_pk, 10, owner_hash, u32::MAX);
+        sign_input(&mut foreign, 0, domain, &thief_sk);
+        assert!(matches!(
+            super::validate_tx_for_next_block(&foreign, &ctx, lookup),
+            Err(TxValidationError::PubkeyHashMismatch { .. })
+        ));
+
+        let mut honest = spend(outpoint, &owner_pk, 900, owner_hash, u32::MAX);
+        sign_input(&mut honest, 0, domain, &owner_sk);
+        let ok = super::validate_tx_for_next_block(&honest, &ctx, lookup).expect("valid");
+        assert_eq!(ok.fee, 100);
+    }
+
+    /// M2: a BIP68 relative lock that is not met at the next block must be
+    /// rejected at admission; otherwise it poisons every block template.
+    #[test]
+    fn next_block_validation_enforces_relative_locks() {
+        let domain = b"devnet";
+        let (pk, hash, sk) = key_material([23u8; 32]);
+        let (utxos, outpoint) = funded_set(hash, 1_000);
+        let ctx = next_ctx(domain);
+        // Created at height 1, next height 10 ⇒ 9 confirmations available.
+        let mut locked = spend(outpoint.clone(), &pk, 900, hash, 50);
+        sign_input(&mut locked, 0, domain, &sk);
+        assert!(matches!(
+            super::validate_tx_for_next_block(&locked, &ctx, |op| utxos.get(op).cloned()),
+            Err(TxValidationError::SequenceLockNotMet { .. })
+        ));
+        // SCAM's CSV rule is `next_height > created_height + value` (one
+        // block stricter than BIP68's `>=`), so 8 is the largest lock that
+        // is met at height 10 for an output created at height 1.
+        let mut mature = spend(outpoint, &pk, 900, hash, 8);
+        sign_input(&mut mature, 0, domain, &sk);
+        super::validate_tx_for_next_block(&mature, &ctx, |op| utxos.get(op).cloned())
+            .expect("an 8-block lock is met at height 10");
+    }
+
+    /// M4/M5: template selection keeps parents before children, drops an
+    /// invalid tx together with its descendants, and respects the byte budget.
+    #[test]
+    fn template_selection_drops_invalid_chains_and_respects_byte_budget() {
+        let domain = b"devnet";
+        let (pk, hash, sk) = key_material([24u8; 32]);
+        let (mut utxos, outpoint_a) = funded_set(hash, 1_000);
+        let outpoint_b = OutPoint {
+            txid: Hash256([0xcd; 32]),
+            vout: 0,
+        };
+        utxos.insert(
+            outpoint_b.clone(),
+            super::UtxoEntry {
+                value: 1_000,
+                key_hash20: hash,
+                created_height: 1,
+                created_time: 1_000,
+                is_coinbase: false,
+            },
+        );
+        let ctx = next_ctx(domain);
+
+        let mut parent = spend(outpoint_a, &pk, 990, hash, u32::MAX);
+        sign_input(&mut parent, 0, domain, &sk);
+        let mut child = spend(
+            OutPoint {
+                txid: parent.txid(),
+                vout: 0,
+            },
+            &pk,
+            980,
+            hash,
+            u32::MAX,
+        );
+        sign_input(&mut child, 0, domain, &sk);
+        let mut bad = spend(outpoint_b.clone(), &pk, 990, hash, u32::MAX);
+        bad.inputs[0].signature = vec![1u8; 64];
+        let mut bad_child = spend(
+            OutPoint {
+                txid: bad.txid(),
+                vout: 0,
+            },
+            &pk,
+            900,
+            hash,
+            u32::MAX,
+        );
+        sign_input(&mut bad_child, 0, domain, &sk);
+
+        let candidates = vec![parent.clone(), child.clone(), bad, bad_child];
+        let all = super::select_valid_block_transactions(&candidates, &ctx, &utxos, usize::MAX);
+        assert_eq!(all.accepted.len(), 2);
+        assert_eq!(all.accepted[0].0, parent);
+        assert_eq!(all.accepted[1].0, child);
+        assert_eq!(all.total_fees, 20);
+        assert_eq!(all.rejected.len(), 2);
+
+        let one_tx_budget = bincode::serialized_size(&parent).expect("size") as usize;
+        let tight =
+            super::select_valid_block_transactions(&candidates, &ctx, &utxos, one_tx_budget);
+        assert_eq!(tight.accepted.len(), 1);
+        assert!(tight.total_tx_bytes <= one_tx_budget);
     }
 
     #[test]

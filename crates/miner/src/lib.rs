@@ -1,5 +1,6 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
-use std::collections::{HashMap, HashSet};
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use scam_core::{
     Block, BlockHeader, Hash256, OutPoint, Target, Transaction, TxIn, TxOut, header_meets_pow,
@@ -26,6 +27,10 @@ pub struct MempoolTemplateParams {
     pub miner_key_hash20: [u8; 20],
     pub coinbase_tag: String,
     pub max_txs: usize,
+    /// Budget for the serialized size of the non-coinbase transactions
+    /// (as measured by `Transaction::encode_for_hash`). Callers derive it
+    /// from the consensus `max_block_size` minus header/coinbase overhead.
+    pub max_total_tx_bytes: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -81,101 +86,7 @@ pub fn build_template_from_mempool(
     params: &MempoolTemplateParams,
     mempool: &Mempool,
 ) -> Result<(BlockTemplate, TemplateBuildSummary), MinerError> {
-    let ranked = mempool.txids_by_feerate_desc();
-    let mut entries = HashMap::<Hash256, CandidateEntry>::new();
-    for txid in &ranked {
-        let Some((tx, fee)) = mempool.get_with_fee(txid) else {
-            continue;
-        };
-        let parents = tx
-            .inputs
-            .iter()
-            .filter_map(|input| {
-                if input.prev_out.is_coinbase() {
-                    return None;
-                }
-                let parent = input.prev_out.txid;
-                mempool.contains(&parent).then_some(parent)
-            })
-            .collect::<Vec<_>>();
-        entries.insert(
-            *txid,
-            CandidateEntry {
-                fee,
-                size: tx.encode_for_hash().len(),
-                parents,
-            },
-        );
-    }
-
-    let mut children = HashMap::<Hash256, Vec<Hash256>>::new();
-    for (txid, entry) in &entries {
-        for parent in &entry.parents {
-            children.entry(*parent).or_default().push(*txid);
-        }
-    }
-
-    let mut included = Vec::<Hash256>::new();
-    let mut included_set = HashSet::<Hash256>::new();
-
-    loop {
-        if included.len() >= params.max_txs {
-            break;
-        }
-        let ready_roots = ranked
-            .iter()
-            .copied()
-            .filter(|txid| {
-                if included_set.contains(txid) {
-                    return false;
-                }
-                entries
-                    .get(txid)
-                    .map(|entry| {
-                        entry
-                            .parents
-                            .iter()
-                            .all(|parent| included_set.contains(parent))
-                    })
-                    .unwrap_or(false)
-            })
-            .collect::<Vec<_>>();
-        if ready_roots.is_empty() {
-            break;
-        }
-
-        let mut best: Option<PackageCandidate> = None;
-        for root in ready_roots {
-            let package = build_cpfp_package(
-                root,
-                &ranked,
-                &entries,
-                &children,
-                &included_set,
-                params.max_txs.saturating_sub(included.len()),
-            );
-            if package.ordered_txids.is_empty() {
-                continue;
-            }
-            match &best {
-                Some(current) => {
-                    if package_beats_current(&package, current) {
-                        best = Some(package);
-                    }
-                }
-                None => best = Some(package),
-            }
-        }
-
-        let Some(best_package) = best else {
-            break;
-        };
-        for txid in best_package.ordered_txids {
-            if included_set.insert(txid) {
-                included.push(txid);
-            }
-        }
-    }
+    let included = select_by_ancestor_feerate(mempool, params.max_txs, params.max_total_tx_bytes);
 
     let mut total_fees = 0u64;
     let mut txs = Vec::<Transaction>::with_capacity(1 + included.len());
@@ -221,144 +132,230 @@ pub fn build_template_from_mempool(
     Ok((template, summary))
 }
 
-#[derive(Clone)]
-struct CandidateEntry {
+struct Candidate {
     fee: u64,
     size: usize,
+    /// In-mempool parents only.
     parents: Vec<Hash256>,
+    children: Vec<Hash256>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct PackageCandidate {
-    root: Hash256,
-    ordered_txids: Vec<Hash256>,
-    total_fee: u64,
-    total_size: usize,
-    score_key: u128,
+/// Fee and size of a tx together with all its not-yet-selected in-mempool
+/// ancestors ("ancestor package").
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PackageScore {
+    fee: u128,
+    size: u128,
 }
 
-fn build_cpfp_package(
-    root: Hash256,
-    ranked: &[Hash256],
-    entries: &HashMap<Hash256, CandidateEntry>,
-    children: &HashMap<Hash256, Vec<Hash256>>,
-    included_set: &HashSet<Hash256>,
-    max_package_txs: usize,
-) -> PackageCandidate {
-    if max_package_txs == 0 {
-        return PackageCandidate {
-            root,
-            ordered_txids: Vec::new(),
-            total_fee: 0,
-            total_size: 0,
-            score_key: 0,
+impl PackageScore {
+    /// Compare by feerate (cross-multiplied, exact), then by absolute fee.
+    fn cmp_rate(&self, other: &Self) -> Ordering {
+        (self.fee * other.size.max(1))
+            .cmp(&(other.fee * self.size.max(1)))
+            .then(self.fee.cmp(&other.fee))
+    }
+}
+
+#[derive(Eq, PartialEq)]
+struct HeapEntry {
+    score: PackageScore,
+    txid: Hash256,
+    version: u64,
+}
+
+impl Ord for HeapEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.score
+            .cmp_rate(&other.score)
+            // Deterministic tie-break: lower txid first.
+            .then_with(|| other.txid.cmp(&self.txid))
+    }
+}
+
+impl PartialOrd for HeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Greedy selection by ancestor-package feerate (the Bitcoin Core
+/// `BlockAssembler` approach): repeatedly take the transaction whose
+/// package — itself plus its unselected in-mempool ancestors — pays the
+/// best feerate, add the package parents-first, and rescore descendants.
+/// This gives CPFP for free and runs in O(N·A·log N) instead of rescanning
+/// the whole mempool for every selected package.
+fn select_by_ancestor_feerate(
+    mempool: &Mempool,
+    max_txs: usize,
+    max_total_tx_bytes: usize,
+) -> Vec<Hash256> {
+    let mut selected = Vec::<Hash256>::new();
+    if max_txs == 0 {
+        return selected;
+    }
+
+    let ranked = mempool.txids_by_feerate_desc();
+    let mut candidates = HashMap::<Hash256, Candidate>::with_capacity(ranked.len());
+    for txid in &ranked {
+        let Some((tx, fee)) = mempool.get_with_fee(txid) else {
+            continue;
         };
-    }
-
-    let mut package = HashSet::<Hash256>::new();
-    package.insert(root);
-
-    // Safety bound: package membership is monotonic and cannot grow beyond candidate count.
-    for _ in 0..=entries.len() {
-        let mut changed = false;
-        let current = package.iter().copied().collect::<Vec<_>>();
-        for txid in current {
-            let Some(descendants) = children.get(&txid) else {
-                continue;
-            };
-            for child in descendants {
-                if included_set.contains(child) {
-                    continue;
-                }
-                let Some(entry) = entries.get(child) else {
-                    continue;
-                };
-                let all_parents_ready = entry
-                    .parents
-                    .iter()
-                    .all(|parent| included_set.contains(parent) || package.contains(parent));
-                if all_parents_ready {
-                    changed |= package.insert(*child);
-                }
+        let mut parents = Vec::new();
+        for input in &tx.inputs {
+            let parent = input.prev_out.txid;
+            if !input.prev_out.is_coinbase()
+                && parent != *txid
+                && mempool.contains(&parent)
+                && !parents.contains(&parent)
+            {
+                parents.push(parent);
             }
         }
-        if !changed {
-            break;
+        candidates.insert(
+            *txid,
+            Candidate {
+                fee,
+                size: tx.encode_for_hash().len(),
+                parents,
+                children: Vec::new(),
+            },
+        );
+    }
+    let edges = candidates
+        .iter()
+        .flat_map(|(txid, c)| c.parents.iter().map(move |parent| (*parent, *txid)))
+        .collect::<Vec<_>>();
+    for (parent, child) in edges {
+        if let Some(entry) = candidates.get_mut(&parent) {
+            entry.children.push(child);
         }
     }
 
-    let mut remaining = package.clone();
-    let mut ordered = Vec::<Hash256>::new();
-    let mut total_fee = 0u64;
-    let mut total_size = 0usize;
-    let package_limit = package.len().min(max_package_txs);
+    let mut selected_set = HashSet::<Hash256>::new();
+    // Txs that can never be selected (package too large for the remaining
+    // budget, or part of a dependency cycle).
+    let mut skipped = HashSet::<Hash256>::new();
+    let mut versions = HashMap::<Hash256, u64>::new();
+    let mut heap = BinaryHeap::<HeapEntry>::new();
+    for txid in candidates.keys() {
+        if let Some((score, _)) = ancestor_package(*txid, &candidates, &selected_set) {
+            heap.push(HeapEntry {
+                score,
+                txid: *txid,
+                version: 0,
+            });
+        }
+    }
 
-    // Safety bound: each pass must either order at least one txid or terminate.
-    for _ in 0..=entries.len() {
-        if remaining.is_empty() {
+    let mut used_bytes = 0usize;
+    while let Some(entry) = heap.pop() {
+        if selected.len() >= max_txs {
             break;
         }
-        if ordered.len() == package_limit {
-            break;
+        if selected_set.contains(&entry.txid)
+            || skipped.contains(&entry.txid)
+            || versions.get(&entry.txid).copied().unwrap_or(0) != entry.version
+        {
+            continue;
         }
-        debug_assert!(ordered.len() < package_limit);
-        let mut progressed = false;
-        let ready_ranked = ranked
-            .iter()
-            .copied()
-            .filter(|txid| remaining.contains(txid))
-            .collect::<Vec<_>>();
-        for txid in ready_ranked {
-            if ordered.len() == package_limit {
-                break;
+        let Some((score, package)) = ancestor_package(entry.txid, &candidates, &selected_set)
+        else {
+            skipped.insert(entry.txid);
+            continue;
+        };
+        let package_bytes = usize::try_from(score.size).unwrap_or(usize::MAX);
+        if package.len() > max_txs - selected.len()
+            || used_bytes.saturating_add(package_bytes) > max_total_tx_bytes
+        {
+            skipped.insert(entry.txid);
+            continue;
+        }
+
+        used_bytes += package_bytes;
+        let mut touched = Vec::new();
+        for txid in &package {
+            selected_set.insert(*txid);
+            selected.push(*txid);
+            if let Some(candidate) = candidates.get(txid) {
+                touched.extend(candidate.children.iter().copied());
             }
-            let Some(entry) = entries.get(&txid) else {
-                continue;
-            };
-            let parents_ready = entry
-                .parents
-                .iter()
-                .all(|parent| included_set.contains(parent) || !remaining.contains(parent));
-            if !parents_ready {
+        }
+
+        // Every unselected descendant of the new package now has a smaller
+        // ancestor set: rescore it.
+        let mut stack = touched;
+        let mut seen = HashSet::<Hash256>::new();
+        while let Some(txid) = stack.pop() {
+            if selected_set.contains(&txid) || !seen.insert(txid) {
                 continue;
             }
-            remaining.remove(&txid);
-            ordered.push(txid);
-            total_fee = total_fee.saturating_add(entry.fee);
-            total_size = total_size.saturating_add(entry.size);
-            progressed = true;
-        }
-        if !progressed {
-            break;
+            if let Some(candidate) = candidates.get(&txid) {
+                stack.extend(candidate.children.iter().copied());
+            }
+            if skipped.contains(&txid) {
+                // A smaller package might fit now.
+                skipped.remove(&txid);
+            }
+            if let Some((score, _)) = ancestor_package(txid, &candidates, &selected_set) {
+                let version = versions.entry(txid).or_insert(0);
+                *version += 1;
+                heap.push(HeapEntry {
+                    score,
+                    txid,
+                    version: *version,
+                });
+            }
         }
     }
-
-    let score_key = if total_size == 0 {
-        0
-    } else {
-        ((total_fee as u128) * 1000) / (total_size as u128)
-    };
-    PackageCandidate {
-        root,
-        ordered_txids: ordered,
-        total_fee,
-        total_size,
-        score_key,
-    }
+    selected
 }
 
-fn package_beats_current(candidate: &PackageCandidate, current: &PackageCandidate) -> bool {
-    let candidate_rank = (
-        candidate.score_key,
-        candidate.total_fee,
-        std::cmp::Reverse(candidate.root),
-    );
-    let current_rank = (
-        current.score_key,
-        current.total_fee,
-        std::cmp::Reverse(current.root),
-    );
-    candidate_rank.cmp(&current_rank).is_gt()
+/// Unselected ancestors of `txid` plus `txid`, parents first, with the
+/// package's total fee and size. `None` if a dependency cycle is found.
+fn ancestor_package(
+    txid: Hash256,
+    candidates: &HashMap<Hash256, Candidate>,
+    selected: &HashSet<Hash256>,
+) -> Option<(PackageScore, Vec<Hash256>)> {
+    // Iterative post-order DFS so parents are emitted before children.
+    let mut ordered = Vec::<Hash256>::new();
+    let mut done = HashSet::<Hash256>::new();
+    let mut on_path = HashSet::<Hash256>::new();
+    let mut stack = vec![(txid, false)];
+    while let Some((current, expanded)) = stack.pop() {
+        if expanded {
+            on_path.remove(&current);
+            if done.insert(current) {
+                ordered.push(current);
+            }
+            continue;
+        }
+        if done.contains(&current) || selected.contains(&current) {
+            continue;
+        }
+        if !on_path.insert(current) {
+            return None;
+        }
+        stack.push((current, true));
+        let candidate = candidates.get(&current)?;
+        for parent in &candidate.parents {
+            if !selected.contains(parent) && !done.contains(parent) {
+                if on_path.contains(parent) {
+                    return None;
+                }
+                stack.push((*parent, false));
+            }
+        }
+    }
+
+    let mut score = PackageScore { fee: 0, size: 0 };
+    for member in &ordered {
+        let candidate = candidates.get(member)?;
+        score.fee += u128::from(candidate.fee);
+        score.size += candidate.size as u128;
+    }
+    Some((score, ordered))
 }
 
 impl TemplateManager {
@@ -459,12 +456,9 @@ pub enum MinerError {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{HashMap, HashSet};
-
     use scam_core::{OutPoint, Target, Transaction, TxIn, TxOut};
     use scam_mempool::Mempool;
 
-    use super::{CandidateEntry, PackageCandidate, build_cpfp_package, package_beats_current};
     use crate::{
         BlockTemplate, MempoolTemplateParams, TemplateManager, TemplateRefresh,
         build_template_from_mempool, mine_block, mine_block_with_extra_nonce,
@@ -558,6 +552,7 @@ mod tests {
             miner_key_hash20: [9u8; 20],
             coinbase_tag: "miner-template".to_owned(),
             max_txs: 100,
+            max_total_tx_bytes: usize::MAX,
         };
         let (template, summary) = build_template_from_mempool(&params, &mempool).expect("template");
         assert_eq!(summary.included_txids, vec![high_id, low_id]);
@@ -583,6 +578,7 @@ mod tests {
             miner_key_hash20: [9u8; 20],
             coinbase_tag: "zero-max-txs".to_owned(),
             max_txs: 0,
+            max_total_tx_bytes: usize::MAX,
         };
         let (template, summary) = build_template_from_mempool(&params, &mempool).expect("template");
         assert!(summary.included_txids.is_empty());
@@ -610,6 +606,7 @@ mod tests {
             miner_key_hash20: [1u8; 20],
             coinbase_tag: "dep-order".to_owned(),
             max_txs: 100,
+            max_total_tx_bytes: usize::MAX,
         };
         let (template, summary) = build_template_from_mempool(&params, &mempool).expect("template");
         assert_eq!(summary.included_txids, vec![parent_id, child_id]);
@@ -643,6 +640,7 @@ mod tests {
             miner_key_hash20: [3u8; 20],
             coinbase_tag: "cpfp".to_owned(),
             max_txs: 2,
+            max_total_tx_bytes: usize::MAX,
         };
         let (_template, summary) =
             build_template_from_mempool(&params, &mempool).expect("template");
@@ -677,6 +675,7 @@ mod tests {
             miner_key_hash20: [8u8; 20],
             coinbase_tag: "cpfp-pressure".to_owned(),
             max_txs: 3,
+            max_total_tx_bytes: usize::MAX,
         };
         let (_template, summary) =
             build_template_from_mempool(&params, &mempool).expect("template");
@@ -687,282 +686,86 @@ mod tests {
         assert!(summary.included_txids.contains(&mid_a_id));
     }
 
-    #[test]
-    fn cpfp_package_builder_terminates_on_cyclic_dependencies() {
-        let a = scam_core::Hash256([1u8; 32]);
-        let b = scam_core::Hash256([2u8; 32]);
-
-        let ranked = vec![a, b];
-        let mut entries = HashMap::<scam_core::Hash256, CandidateEntry>::new();
-        entries.insert(
-            a,
-            CandidateEntry {
-                fee: 10,
-                size: 100,
-                parents: vec![b],
-            },
-        );
-        entries.insert(
-            b,
-            CandidateEntry {
-                fee: 10,
-                size: 100,
-                parents: vec![a],
-            },
-        );
-
-        let mut children = HashMap::<scam_core::Hash256, Vec<scam_core::Hash256>>::new();
-        children.insert(a, vec![b]);
-        children.insert(b, vec![a]);
-        let included = HashSet::new();
-
-        let package = build_cpfp_package(a, &ranked, &entries, &children, &included, 8);
-        assert!(package.ordered_txids.is_empty());
-        assert_eq!(package.total_fee, 0);
-        assert_eq!(package.total_size, 0);
-        assert_eq!(package.score_key, 0);
+    fn params(max_txs: usize, max_total_tx_bytes: usize) -> MempoolTemplateParams {
+        MempoolTemplateParams {
+            version: 1,
+            prev_block: scam_core::Hash256::ZERO,
+            timestamp: 1_770_763_200,
+            target: Target::MAX,
+            block_subsidy: 50,
+            miner_key_hash20: [4u8; 20],
+            coinbase_tag: "budget".to_owned(),
+            max_txs,
+            max_total_tx_bytes,
+        }
     }
 
+    /// M4: the template must respect a byte budget, not only a tx count.
     #[test]
-    fn cpfp_package_builder_orders_dependencies_before_descendants() {
-        let root = scam_core::Hash256([11u8; 32]);
-        let c1 = scam_core::Hash256([12u8; 32]);
-        let c2 = scam_core::Hash256([13u8; 32]);
-        let c3 = scam_core::Hash256([14u8; 32]);
-
-        let ranked = vec![c3, c2, c1, root];
-        let mut entries = HashMap::<scam_core::Hash256, CandidateEntry>::new();
-        entries.insert(
-            root,
-            CandidateEntry {
-                fee: 1,
-                size: 100,
-                parents: vec![],
-            },
-        );
-        entries.insert(
-            c1,
-            CandidateEntry {
-                fee: 2,
-                size: 100,
-                parents: vec![root],
-            },
-        );
-        entries.insert(
-            c2,
-            CandidateEntry {
-                fee: 3,
-                size: 100,
-                parents: vec![c1],
-            },
-        );
-        entries.insert(
-            c3,
-            CandidateEntry {
-                fee: 4,
-                size: 100,
-                parents: vec![c2],
-            },
-        );
-
-        let mut children = HashMap::<scam_core::Hash256, Vec<scam_core::Hash256>>::new();
-        children.insert(root, vec![c1]);
-        children.insert(c1, vec![c2]);
-        children.insert(c2, vec![c3]);
-        let included = HashSet::new();
-
-        let package = build_cpfp_package(root, &ranked, &entries, &children, &included, 8);
-        assert_eq!(package.ordered_txids, vec![root, c1, c2, c3]);
-        assert_eq!(package.total_fee, 10);
-        assert_eq!(package.total_size, 400);
-        assert_eq!(package.score_key, 25);
+    fn template_builder_respects_byte_budget() {
+        let mut mempool = Mempool::with_policy(100, 0).expect("mempool");
+        let mut ids = Vec::new();
+        for i in 0..10u8 {
+            let tx = spend_tx([100 + i; 32], 0, b"budget-tx", 100 + i);
+            ids.push(tx.txid());
+            mempool
+                .insert_with_fee(tx, 10 + u64::from(i))
+                .expect("insert");
+        }
+        let one = spend_tx([100u8; 32], 0, b"budget-tx", 100)
+            .encode_for_hash()
+            .len();
+        let (template, summary) =
+            build_template_from_mempool(&params(100, one * 3 + one / 2), &mempool)
+                .expect("template");
+        assert_eq!(summary.included_txids.len(), 3);
+        let bytes: usize = template.transactions[1..]
+            .iter()
+            .map(|tx| tx.encode_for_hash().len())
+            .sum();
+        assert!(bytes <= one * 3 + one / 2);
+        // Highest fee first.
+        assert_eq!(summary.included_txids[0], ids[9]);
     }
 
+    /// A long chain is selected parents-first and a package that no longer
+    /// fits is skipped while smaller ones still fill the block.
     #[test]
-    fn cpfp_package_builder_respects_zero_tx_limit() {
-        let root = scam_core::Hash256([31u8; 32]);
-        let ranked = vec![root];
-        let mut entries = HashMap::<scam_core::Hash256, CandidateEntry>::new();
-        entries.insert(
-            root,
-            CandidateEntry {
-                fee: 100,
-                size: 200,
-                parents: vec![],
-            },
-        );
-        let children = HashMap::<scam_core::Hash256, Vec<scam_core::Hash256>>::new();
-        let included = HashSet::new();
+    fn template_builder_selects_chain_in_dependency_order() {
+        let mut mempool = Mempool::with_policy(100, 0).expect("mempool");
+        let mut prev = [77u8; 32];
+        let mut chain = Vec::new();
+        for i in 0..6u8 {
+            let tx = spend_tx(prev, 0, b"chain-link", 30 + i);
+            prev = tx.txid().0;
+            chain.push(tx.txid());
+            mempool.insert_with_fee(tx, 5).expect("insert link");
+        }
+        let (_t, summary) =
+            build_template_from_mempool(&params(100, usize::MAX), &mempool).expect("template");
+        assert_eq!(summary.included_txids, chain);
 
-        let package = build_cpfp_package(root, &ranked, &entries, &children, &included, 0);
-        assert_eq!(package.ordered_txids, Vec::<scam_core::Hash256>::new());
-        assert_eq!(package.total_fee, 0);
-        assert_eq!(package.total_size, 0);
-        assert_eq!(package.score_key, 0);
+        let (_t, limited) =
+            build_template_from_mempool(&params(4, usize::MAX), &mempool).expect("template");
+        assert_eq!(limited.included_txids, chain[..4].to_vec());
     }
 
+    /// Thousands of independent txs must not take quadratic-or-worse time
+    /// (the old package scan was O(N^3)). Run as a smoke test.
     #[test]
-    fn cpfp_package_builder_ignores_ranked_entries_outside_package() {
-        let root = scam_core::Hash256([41u8; 32]);
-        let child = scam_core::Hash256([42u8; 32]);
-        let outsider_a = scam_core::Hash256([90u8; 32]);
-        let outsider_b = scam_core::Hash256([91u8; 32]);
-
-        let ranked = vec![outsider_a, outsider_b, child, root];
-        let mut entries = HashMap::<scam_core::Hash256, CandidateEntry>::new();
-        entries.insert(
-            root,
-            CandidateEntry {
-                fee: 1,
-                size: 100,
-                parents: vec![],
-            },
-        );
-        entries.insert(
-            child,
-            CandidateEntry {
-                fee: 2,
-                size: 100,
-                parents: vec![root],
-            },
-        );
-        entries.insert(
-            outsider_a,
-            CandidateEntry {
-                fee: 999,
-                size: 100,
-                parents: vec![],
-            },
-        );
-        entries.insert(
-            outsider_b,
-            CandidateEntry {
-                fee: 888,
-                size: 100,
-                parents: vec![],
-            },
-        );
-
-        let mut children = HashMap::<scam_core::Hash256, Vec<scam_core::Hash256>>::new();
-        children.insert(root, vec![child]);
-        let included = HashSet::new();
-
-        let package = build_cpfp_package(root, &ranked, &entries, &children, &included, 2);
-        assert_eq!(package.ordered_txids, vec![root, child]);
-    }
-
-    #[test]
-    fn cpfp_package_builder_enforces_strict_package_limit() {
-        let root = scam_core::Hash256([51u8; 32]);
-        let child_a = scam_core::Hash256([52u8; 32]);
-        let child_b = scam_core::Hash256([53u8; 32]);
-        let child_c = scam_core::Hash256([54u8; 32]);
-
-        let ranked = vec![child_c, child_b, child_a, root];
-        let mut entries = HashMap::<scam_core::Hash256, CandidateEntry>::new();
-        entries.insert(
-            root,
-            CandidateEntry {
-                fee: 1,
-                size: 100,
-                parents: vec![],
-            },
-        );
-        entries.insert(
-            child_a,
-            CandidateEntry {
-                fee: 2,
-                size: 100,
-                parents: vec![root],
-            },
-        );
-        entries.insert(
-            child_b,
-            CandidateEntry {
-                fee: 3,
-                size: 100,
-                parents: vec![child_a],
-            },
-        );
-        entries.insert(
-            child_c,
-            CandidateEntry {
-                fee: 4,
-                size: 100,
-                parents: vec![child_b],
-            },
-        );
-
-        let mut children = HashMap::<scam_core::Hash256, Vec<scam_core::Hash256>>::new();
-        children.insert(root, vec![child_a]);
-        children.insert(child_a, vec![child_b]);
-        children.insert(child_b, vec![child_c]);
-        let included = HashSet::new();
-
-        let package = build_cpfp_package(root, &ranked, &entries, &children, &included, 2);
-        assert_eq!(package.ordered_txids, vec![root, child_a]);
-        assert_eq!(package.total_fee, 3);
-        assert_eq!(package.total_size, 200);
-        assert_eq!(package.score_key, 15);
-    }
-
-    #[test]
-    fn package_comparator_uses_score_fee_and_root_tiebreak() {
-        let base = PackageCandidate {
-            root: scam_core::Hash256([10u8; 32]),
-            ordered_txids: vec![],
-            total_fee: 100,
-            total_size: 200,
-            score_key: 500,
-        };
-
-        let higher_score = PackageCandidate {
-            root: scam_core::Hash256([11u8; 32]),
-            ordered_txids: vec![],
-            total_fee: 1,
-            total_size: 1,
-            score_key: 501,
-        };
-        assert!(package_beats_current(&higher_score, &base));
-
-        let same_score_higher_fee = PackageCandidate {
-            root: scam_core::Hash256([12u8; 32]),
-            ordered_txids: vec![],
-            total_fee: 101,
-            total_size: 200,
-            score_key: 500,
-        };
-        assert!(package_beats_current(&same_score_higher_fee, &base));
-
-        let same_score_fee_lower_root = PackageCandidate {
-            root: scam_core::Hash256([9u8; 32]),
-            ordered_txids: vec![],
-            total_fee: 100,
-            total_size: 200,
-            score_key: 500,
-        };
-        assert!(package_beats_current(&same_score_fee_lower_root, &base));
-
-        let same_score_fee_higher_root = PackageCandidate {
-            root: scam_core::Hash256([20u8; 32]),
-            ordered_txids: vec![],
-            total_fee: 100,
-            total_size: 200,
-            score_key: 500,
-        };
-        assert!(!package_beats_current(&same_score_fee_higher_root, &base));
-    }
-
-    #[test]
-    fn package_comparator_rejects_exact_ties() {
-        let base = PackageCandidate {
-            root: scam_core::Hash256([77u8; 32]),
-            ordered_txids: vec![],
-            total_fee: 100,
-            total_size: 200,
-            score_key: 500,
-        };
-        assert!(!package_beats_current(&base, &base));
+    fn template_builder_handles_large_mempool() {
+        let mut mempool = Mempool::with_policy(20_000, 0).expect("mempool");
+        for i in 0..5_000u32 {
+            let mut prev = [0u8; 32];
+            prev[..4].copy_from_slice(&i.to_le_bytes());
+            let tx = spend_tx(prev, 0, b"bulk", (i % 251) as u8);
+            mempool
+                .insert_with_fee(tx, 1 + u64::from(i % 97))
+                .expect("insert bulk");
+        }
+        let (_t, summary) =
+            build_template_from_mempool(&params(4_000, usize::MAX), &mempool).expect("template");
+        assert_eq!(summary.included_txids.len(), 4_000);
     }
 
     #[test]
@@ -1013,6 +816,7 @@ mod tests {
             miner_key_hash20: [5u8; 20],
             coinbase_tag: "mgr".to_owned(),
             max_txs: 100,
+            max_total_tx_bytes: usize::MAX,
         };
 
         let (refresh_a, _template_a, summary_a) = manager
@@ -1058,6 +862,7 @@ mod tests {
             miner_key_hash20: [7u8; 20],
             coinbase_tag: "invalidate".to_owned(),
             max_txs: 100,
+            max_total_tx_bytes: usize::MAX,
         };
 
         let (refresh_a, _, _) = manager.build_or_reuse(&params, &mempool).expect("build");

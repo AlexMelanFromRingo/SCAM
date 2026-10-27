@@ -154,10 +154,37 @@ pub fn decrypt_wallet_vault(
     })
 }
 
+/// Write a new vault file. Refuses to overwrite an existing file (a second
+/// `secure-new` used to silently destroy the first wallet). The file is
+/// created with owner-only permissions on Unix and fsynced.
 pub fn save_wallet_vault(
     path: &Path,
     vault: &EncryptedWalletVault,
 ) -> Result<(), WalletVaultError> {
+    if path.exists() {
+        return Err(WalletVaultError::VaultExists {
+            path: path.display().to_string(),
+        });
+    }
+    write_vault_file(path, vault, false)
+}
+
+/// Atomically replace (or create) a vault file: written to a temp file in
+/// the same directory, fsynced, then renamed over the target.
+pub fn replace_wallet_vault(
+    path: &Path,
+    vault: &EncryptedWalletVault,
+) -> Result<(), WalletVaultError> {
+    write_vault_file(path, vault, true)
+}
+
+fn write_vault_file(
+    path: &Path,
+    vault: &EncryptedWalletVault,
+    replace: bool,
+) -> Result<(), WalletVaultError> {
+    use std::io::Write;
+
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| WalletVaultError::CreateDir {
             path: parent.display().to_string(),
@@ -165,10 +192,42 @@ pub fn save_wallet_vault(
         })?;
     }
     let bytes = serde_json::to_vec_pretty(vault).map_err(WalletVaultError::EncodeVault)?;
-    fs::write(path, bytes).map_err(|source| WalletVaultError::WriteVault {
+    let write_err = |source| WalletVaultError::WriteVault {
         path: path.display().to_string(),
         source,
+    };
+    let target = if replace {
+        let mut name = path.file_name().unwrap_or_default().to_os_string();
+        name.push(format!(".tmp.{}", std::process::id()));
+        path.with_file_name(name)
+    } else {
+        path.to_path_buf()
+    };
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&target).map_err(|source| {
+        if source.kind() == std::io::ErrorKind::AlreadyExists && !replace {
+            WalletVaultError::VaultExists {
+                path: path.display().to_string(),
+            }
+        } else {
+            write_err(source)
+        }
     })?;
+    file.write_all(&bytes).map_err(write_err)?;
+    file.sync_all().map_err(write_err)?;
+    drop(file);
+    if replace {
+        fs::rename(&target, path).map_err(|source| {
+            let _ = fs::remove_file(&target);
+            write_err(source)
+        })?;
+    }
     Ok(())
 }
 
@@ -199,6 +258,10 @@ fn derive_encryption_key(
 
 #[derive(Debug, Error)]
 pub enum WalletVaultError {
+    #[error(
+        "wallet vault already exists at {path}; refusing to overwrite (use --force to replace it)"
+    )]
+    VaultExists { path: String },
     #[error("encryption password must not be empty")]
     EmptyEncryptionPassword,
     #[error("unsupported wallet vault version: expected {expected}, got {got}")]
@@ -254,8 +317,37 @@ mod tests {
     use crate::mnemonic::WalletSeedMode;
     use crate::vault::{
         decrypt_wallet_vault, load_wallet_vault, new_encrypted_wallet_vault,
-        new_encrypted_wallet_vault_with_mode, save_wallet_vault,
+        new_encrypted_wallet_vault_with_mode, replace_wallet_vault, save_wallet_vault,
     };
+
+    /// R3: saving must never silently overwrite an existing vault; replace is
+    /// explicit and atomic; files are owner-only on Unix.
+    #[test]
+    fn save_refuses_overwrite_and_replace_is_explicit() {
+        let path = temp_test_file("vault-overwrite");
+        let first = new_encrypted_wallet_vault(MNEMONIC, "", "pw-1").expect("vault 1");
+        save_wallet_vault(&path, &first).expect("first save");
+        let second = new_encrypted_wallet_vault(MNEMONIC, "", "pw-2").expect("vault 2");
+        let err = save_wallet_vault(&path, &second).expect_err("overwrite must be refused");
+        assert!(matches!(
+            err,
+            crate::vault::WalletVaultError::VaultExists { .. }
+        ));
+        // The original is intact and still opens with its password.
+        let loaded = load_wallet_vault(&path).expect("load");
+        decrypt_wallet_vault(&loaded, "pw-1").expect("original password still works");
+
+        replace_wallet_vault(&path, &second).expect("explicit replace");
+        let loaded = load_wallet_vault(&path).expect("load replaced");
+        decrypt_wallet_vault(&loaded, "pw-2").expect("new password works");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).expect("meta").permissions().mode();
+            assert_eq!(mode & 0o077, 0, "vault must not be group/world accessible");
+        }
+        let _ = std::fs::remove_file(path);
+    }
 
     const MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
 

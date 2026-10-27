@@ -27,8 +27,9 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use num_traits::ToPrimitive;
 use scam_chain::{BlockSubmissionOutcome, ChainError, ChainRuntime};
 use scam_consensus::{
-    TxValidationError, UtxoSet, chainwork_for_target, tx_is_final_for_block,
-    validate_and_apply_block,
+    NextBlockTxContext, TxValidationError, UtxoEntry, UtxoSet, chainwork_for_target,
+    looks_like_multisig_blob, select_valid_block_transactions, validate_and_apply_block,
+    validate_tx_for_next_block,
 };
 use scam_core::{
     ChainConfig, ChainConfigError, DifficultyAlgorithm, Hash256, OutPoint, Target, Transaction,
@@ -40,10 +41,10 @@ use scam_miner::{
     mine_block_with_extra_nonce,
 };
 use scam_p2p::{
-    CompactBlock, FramingConfig, GossipEngine, GossipError, InventoryItem, LocalHandshake,
-    PeerAddress, PeerCandidate, PrefilledTxn, RemoteHandshake, ReplacementRateLimit,
-    TransportError, WireMessage, build_block_locator, client_handshake, client_handshake_async,
-    read_message, read_message_async, request_blocks, request_headers,
+    CompactBlock, FrameReader, FramingConfig, GossipEngine, GossipError, InventoryItem,
+    LocalHandshake, PeerAddress, PeerCandidate, PrefilledTxn, RemoteHandshake,
+    ReplacementRateLimit, TransportError, WireMessage, build_block_locator, client_handshake,
+    client_handshake_async, read_message, request_blocks, request_headers,
     select_block_hashes_for_peer, select_headers_for_peer, select_outbound_peers, send_message,
     send_message_async, server_handshake, server_handshake_async,
 };
@@ -52,12 +53,12 @@ use scam_rpc::{
     header_to_block_response, to_pretty_json,
 };
 use scam_storage::{
-    ChainArchive, ChainStateSnapshot, MempoolSnapshot, MempoolTxRecord, PeerAddressBook,
-    PeerAddressRecord, PoolLedgerSnapshot, PoolPayoutRecord, PoolRoundRecord, PoolShareRecord,
+    ChainStateSnapshot, MempoolSnapshot, MempoolTxRecord, PeerAddressBook, PeerAddressRecord,
+    PoolLedgerSnapshot, PoolPayoutRecord, PoolRoundRecord, PoolShareRecord,
     PoolWorkerAccrualRecord, StorageError, load_block_by_hash_db, load_chain_archive_db,
-    load_mempool_db, load_peer_book_db, load_pool_ledger_db, load_snapshot, load_snapshot_db,
-    save_chain_archive_db, save_mempool_db, save_peer_book_db, save_pool_ledger_db, save_snapshot,
-    save_snapshot_db,
+    load_chain_archive_range_db, load_chain_archive_tip_db, load_mempool_db, load_peer_book_db,
+    load_pool_ledger_db, load_snapshot, load_snapshot_db, persist_chain_archive_incremental_db,
+    save_mempool_db, save_peer_book_db, save_pool_ledger_db, save_snapshot, save_snapshot_db,
 };
 use scam_stratum::{
     IdentityTranslator, JobDeclarator, MiningJob, MiningTemplate, NoiseSv2Transport,
@@ -72,7 +73,7 @@ use scam_wallet::{
     WalletMnemonic, WalletSeedMode, WalletVaultError, account_index_from_derivation_path,
     decrypt_wallet_vault, derive_wallet_key, derive_watched_keys, load_wallet_vault,
     new_encrypted_wallet_vault_with_mode, new_mnemonic, parse_address, qr_for_payment_uri,
-    rescan_blocks, save_wallet_vault, sign_digest, to_address, verify_digest,
+    replace_wallet_vault, rescan_blocks, save_wallet_vault, sign_digest, to_address, verify_digest,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -892,6 +893,16 @@ struct RpcServeArgs {
     max_nonce: u64,
     #[arg(long, default_value_t = 0)]
     max_requests: u32,
+    /// File holding a bearer token required on every state-changing (POST)
+    /// request (`Authorization: Bearer <token>`). Also read from the
+    /// `SCAM_RPC_AUTH_TOKEN` environment variable. Mandatory for
+    /// non-loopback binds.
+    #[arg(long)]
+    auth_token_file: Option<PathBuf>,
+    /// Disable the `/wallet/*` routes that take a mnemonic or passphrase in
+    /// the request body (recommended for any shared / proxied deployment).
+    #[arg(long, default_value_t = false)]
+    disable_wallet_rpc: bool,
 }
 
 #[derive(Debug, Args)]
@@ -979,6 +990,10 @@ enum WalletCommand {
         password: String,
         #[arg(long, default_value = "data/wallets/default.vault.json")]
         out: PathBuf,
+        /// Replace an existing vault at `--out` (the old wallet is lost
+        /// unless its mnemonic is backed up).
+        #[arg(long, default_value_t = false)]
+        force: bool,
         #[arg(long, default_value_t = 0)]
         account: u32,
         #[arg(long, default_value_t = 0)]
@@ -995,6 +1010,10 @@ enum WalletCommand {
         password: String,
         #[arg(long, default_value = "data/wallets/default.vault.json")]
         out: PathBuf,
+        /// Replace an existing vault at `--out` (the old wallet is lost
+        /// unless its mnemonic is backed up).
+        #[arg(long, default_value_t = false)]
+        force: bool,
         #[arg(long, default_value_t = 0)]
         account: u32,
         #[arg(long, default_value_t = 0)]
@@ -1665,9 +1684,10 @@ fn run_mode_relay_telemetry_enabled(run_relay: bool, relay_telemetry_path: &Path
     run_relay || relay_telemetry_path.exists()
 }
 
-fn runtime_to_archive(runtime: &ChainRuntime) -> Result<ChainArchive, NodeError> {
+#[cfg(test)]
+fn runtime_to_archive(runtime: &ChainRuntime) -> Result<scam_storage::ChainArchive, NodeError> {
     let blocks_by_height = runtime.main_chain_blocks()?;
-    Ok(ChainArchive {
+    Ok(scam_storage::ChainArchive {
         network_id: runtime.config().network_id.clone(),
         blocks_by_height,
     })
@@ -1702,10 +1722,35 @@ fn load_runtime_from_db_or_genesis(
     }
 }
 
+/// Persist the runtime's main chain. Incremental (only new blocks are
+/// written, in one redb transaction) and guarded: a process whose chain is
+/// behind the archive gets `StaleArchiveWriter` instead of rolling the
+/// shared archive back.
 fn persist_runtime_db(runtime: &ChainRuntime, runtime_db_path: &Path) -> Result<(), NodeError> {
-    let archive = runtime_to_archive(runtime)?;
-    save_chain_archive_db(runtime_db_path, &archive)?;
-    Ok(())
+    let persisted = persist_chain_archive_incremental_db(
+        runtime_db_path,
+        &runtime.config().network_id,
+        runtime.block_hashes(),
+        &runtime.cumulative_work().to_bytes_be(),
+        &|hash| runtime.block_by_hash(hash).cloned(),
+    );
+    match persisted {
+        Ok(_) => Ok(()),
+        // Another process already stored a chain with at least as much work.
+        // Nothing is lost: this process merges it on its next refresh and its
+        // own blocks are written once its branch is the heaviest. Failing the
+        // caller here would drop an innocent peer session.
+        Err(StorageError::StaleArchiveWriter {
+            disk_tip,
+            disk_height,
+        }) => {
+            eprintln!(
+                "warning: runtime db holds a chain with at least as much work (tip {disk_tip} at height {disk_height}); not overwriting"
+            );
+            Ok(())
+        }
+        Err(err) => Err(err.into()),
+    }
 }
 
 fn mempool_snapshot_from_pool(cfg: &ChainConfig, mempool: &Mempool) -> MempoolSnapshot {
@@ -2337,6 +2382,8 @@ fn run_mode(args: RunModeArgs) -> Result<(), NodeError> {
             interval_sec: cfg.target_block_time_sec,
             max_nonce: 500_000,
             max_requests: 0,
+            auth_token_file: None,
+            disable_wallet_rpc: false,
         };
         let tx = done_tx.clone();
         spawn_mode_service("rpc-serve", tx, move || run_rpc_serve(rpc_args));
@@ -2457,7 +2504,6 @@ fn build_runtime_for_query(
             count: mine_blocks,
             interval_sec,
             max_nonce,
-            subsidy: cfg.block_subsidy,
             miner_key_hash: cfg.genesis_reward_key_hash20()?,
             label_prefix,
             print_each: false,
@@ -3713,6 +3759,7 @@ fn run_wallet_with_seed_mode(
             passphrase,
             password,
             out,
+            force,
             account,
             index,
             hrp,
@@ -3724,7 +3771,11 @@ fn run_wallet_with_seed_mode(
                 seed_mode,
                 &password,
             )?;
-            save_wallet_vault(&out, &vault)?;
+            if force {
+                replace_wallet_vault(&out, &vault)?;
+            } else {
+                save_wallet_vault(&out, &vault)?;
+            }
 
             let seed = mnemonic.to_seed_with_mode(&passphrase, seed_mode);
             let key = derive_wallet_key(&seed, account, index)?;
@@ -3743,6 +3794,7 @@ fn run_wallet_with_seed_mode(
             passphrase,
             password,
             out,
+            force,
             account,
             index,
             hrp,
@@ -3754,7 +3806,11 @@ fn run_wallet_with_seed_mode(
                 seed_mode,
                 &password,
             )?;
-            save_wallet_vault(&out, &vault)?;
+            if force {
+                replace_wallet_vault(&out, &vault)?;
+            } else {
+                save_wallet_vault(&out, &vault)?;
+            }
 
             let seed = parsed.to_seed_with_mode(&passphrase, seed_mode);
             let key = derive_wallet_key(&seed, account, index)?;
@@ -4149,6 +4205,14 @@ fn run_wallet_with_seed_mode(
                 .map_err(|e| NodeError::Runtime(format!("read {envelope_in}: {e}")))?;
             let mut pmt = scam_wallet::PartialMultisigTx::from_json(&raw)
                 .map_err(|e| NodeError::Runtime(format!("envelope parse: {e}")))?;
+            let domain = pmt
+                .chain_domain()
+                .map_err(|e| NodeError::Runtime(format!("envelope chain domain: {e}")))?;
+            // Signatures are only valid on this network; make it visible.
+            println!(
+                "signing for chain domain: {}",
+                String::from_utf8_lossy(&domain)
+            );
             let seed_mode: WalletSeedMode = seed_mode.into();
             let seed = wallet_seed_from_mnemonic(&mnemonic, &passphrase, seed_mode)?;
             let key = derive_wallet_key(&seed, account, index)?;
@@ -4621,6 +4685,28 @@ fn build_signed_transfer_tx_with_exclusions(
     })
 }
 
+/// Bytes left for non-coinbase transactions once the header, the coinbase
+/// and a small margin (extra-nonce growth) are accounted for, in the same
+/// bincode measure the consensus block-size rule uses.
+fn template_tx_byte_budget(cfg: &ChainConfig, coinbase: &Transaction) -> usize {
+    const EXTRA_NONCE_MARGIN_BYTES: u64 = 64;
+    let skeleton = scam_core::Block {
+        header: scam_core::BlockHeader {
+            version: 1,
+            prev_block: Hash256::ZERO,
+            merkle_root: Hash256::ZERO,
+            timestamp: 0,
+            target: scam_core::Target::MAX,
+            nonce: 0,
+        },
+        transactions: vec![coinbase.clone()],
+    };
+    let overhead = bincode::serialized_size(&skeleton)
+        .unwrap_or(u64::MAX)
+        .saturating_add(EXTRA_NONCE_MARGIN_BYTES);
+    usize::try_from(u64::from(cfg.max_block_size).saturating_sub(overhead)).unwrap_or(0)
+}
+
 fn build_coinbase_tx(tag: String, subsidy: u64, key_hash20: [u8; 20]) -> Transaction {
     Transaction {
         version: 1,
@@ -4643,7 +4729,6 @@ struct MiningLoopParams {
     count: u32,
     interval_sec: u64,
     max_nonce: u64,
-    subsidy: u64,
     miner_key_hash: [u8; 20],
     label_prefix: &'static str,
     print_each: bool,
@@ -4655,11 +4740,16 @@ fn mine_block_with_transactions(
     runtime: &mut ChainRuntime,
     interval_sec: u64,
     max_nonce: u64,
-    subsidy: u64,
     miner_key_hash: [u8; 20],
     coinbase_tag: String,
     mut transactions: Vec<Transaction>,
 ) -> Result<(Hash256, scam_core::Target, u128), NodeError> {
+    let next_height = runtime.tip_height().saturating_add(1);
+    // Subsidy follows the halving schedule, and the height in the tag makes
+    // every coinbase unique: a repeated tag+payee+value would recreate an
+    // unspent outpoint, which consensus rejects (BIP30 rule).
+    let subsidy = runtime.config().subsidy_at_height(next_height);
+    let coinbase_tag = format!("{coinbase_tag}@h{next_height}");
     let expected_target = runtime.expected_target_for_next_block()?;
     let timestamp = runtime.tip_header().timestamp.saturating_add(interval_sec);
     let mut block_txs = Vec::with_capacity(transactions.len() + 1);
@@ -4702,7 +4792,6 @@ fn mine_blocks_on_runtime(
             runtime,
             params.interval_sec,
             params.max_nonce,
-            params.subsidy,
             params.miner_key_hash,
             format!("{}-{step}", params.label_prefix),
             Vec::new(),
@@ -4802,7 +4891,6 @@ fn run_chain_demo(args: ChainDemoArgs) -> Result<(), NodeError> {
         count: args.blocks,
         interval_sec: args.interval_sec,
         max_nonce: args.max_nonce,
-        subsidy: cfg.block_subsidy,
         miner_key_hash,
         label_prefix: "chain-demo",
         print_each: true,
@@ -4830,7 +4918,6 @@ fn run_sync_demo(args: SyncDemoArgs) -> Result<(), NodeError> {
         count: args.local_blocks,
         interval_sec: args.interval_sec,
         max_nonce: args.max_nonce,
-        subsidy: cfg.block_subsidy,
         miner_key_hash,
         label_prefix: "local",
         print_each: false,
@@ -4839,7 +4926,6 @@ fn run_sync_demo(args: SyncDemoArgs) -> Result<(), NodeError> {
         count: args.remote_blocks,
         interval_sec: args.interval_sec,
         max_nonce: args.max_nonce,
-        subsidy: cfg.block_subsidy,
         miner_key_hash,
         label_prefix: "remote",
         print_each: false,
@@ -4915,7 +5001,10 @@ fn ensure_network_id_match(expected: &str, got: &str, context: &str) -> Result<(
 
 fn consensus_fingerprint(cfg: &ChainConfig) -> String {
     let mut payload = Vec::with_capacity(256);
-    payload.extend_from_slice(b"scam-consensus-fingerprint-v1");
+    // v2: monetary policy (halving/tail emission) and versionbits
+    // parameters are consensus rules too; peers that disagree on them would
+    // handshake fine and fork at the first halving or activation.
+    payload.extend_from_slice(b"scam-consensus-fingerprint-v2");
     payload.extend_from_slice(cfg.network_id.as_bytes());
     payload.push(0);
     payload.extend_from_slice(&cfg.target_block_time_sec.to_le_bytes());
@@ -4932,6 +5021,18 @@ fn consensus_fingerprint(cfg: &ChainConfig) -> String {
     payload.extend_from_slice(&cfg.max_tx_size.to_le_bytes());
     payload.extend_from_slice(&cfg.coinbase_maturity.to_le_bytes());
     payload.extend_from_slice(&cfg.block_subsidy.to_le_bytes());
+    payload.extend_from_slice(&cfg.halving_interval_blocks.to_le_bytes());
+    payload.extend_from_slice(&cfg.tail_emission.to_le_bytes());
+    payload.extend_from_slice(&cfg.versionbits_window_blocks.to_le_bytes());
+    payload.extend_from_slice(&cfg.versionbits_threshold.to_le_bytes());
+    payload.extend_from_slice(&(cfg.deployments.len() as u64).to_le_bytes());
+    for deployment in &cfg.deployments {
+        payload.extend_from_slice(&(deployment.name.len() as u64).to_le_bytes());
+        payload.extend_from_slice(deployment.name.as_bytes());
+        payload.push(deployment.bit);
+        payload.extend_from_slice(&deployment.start_unix.to_le_bytes());
+        payload.extend_from_slice(&deployment.timeout_unix.to_le_bytes());
+    }
     payload.extend_from_slice(cfg.genesis_message.as_bytes());
     payload.push(0);
     payload.extend_from_slice(&cfg.genesis_timestamp.to_le_bytes());
@@ -5013,7 +5114,6 @@ fn run_net_demo(args: NetDemoArgs) -> Result<(), NodeError> {
         count: args.local_blocks,
         interval_sec: args.interval_sec,
         max_nonce: args.max_nonce,
-        subsidy: cfg.block_subsidy,
         miner_key_hash,
         label_prefix: "net-local",
         print_each: false,
@@ -5022,7 +5122,6 @@ fn run_net_demo(args: NetDemoArgs) -> Result<(), NodeError> {
         count: args.remote_blocks,
         interval_sec: args.interval_sec,
         max_nonce: args.max_nonce,
-        subsidy: cfg.block_subsidy,
         miner_key_hash,
         label_prefix: "net-remote",
         print_each: false,
@@ -5632,6 +5731,10 @@ struct RelayServerState {
     last_parent_sync_request_sec: HashMap<Hash256, u64>,
     peer_compact_pref: HashMap<u64, bool>,
     peer_runtime_reputation: HashMap<u64, RuntimePeerReputation>,
+    /// IPs refused at accept/dial time until the stored unix second.
+    banned_ips: HashMap<IpAddr, u64>,
+    /// Randomly keyed per process; orders address-list eviction.
+    addr_eviction_hasher: std::collections::hash_map::RandomState,
     pending_parent_tx_requests: HashMap<Hash256, u64>,
     pending_compact_blocks: HashMap<Hash256, PendingCompactBlock>,
     peer_reported_tip_heights: HashMap<u64, u64>,
@@ -5661,6 +5764,8 @@ impl RelayServerState {
             last_parent_sync_request_sec: HashMap::new(),
             peer_compact_pref: HashMap::new(),
             peer_runtime_reputation: HashMap::new(),
+            banned_ips: HashMap::new(),
+            addr_eviction_hasher: std::collections::hash_map::RandomState::new(),
             pending_parent_tx_requests: HashMap::new(),
             pending_compact_blocks: HashMap::new(),
             peer_reported_tip_heights: HashMap::new(),
@@ -5721,6 +5826,14 @@ const RELAY_MAX_PENDING_PEER_BOOK_UPDATES: usize = 4_000;
 const RELAY_MAX_LOCATOR_ITEMS: usize = 101;
 const RELAY_MAX_HEADERS_PER_ANNOUNCEMENT: usize = 2_000;
 const RELAY_MAX_GETBLOCKTXN_INDEXES: usize = 1_024;
+const RELAY_MAX_PENDING_COMPACT_BLOCKS: usize = 64;
+const RELAY_ACCEPT_HISTORY_PRUNE_THRESHOLD: usize = 4_096;
+/// Longest error detail logged for a finished peer session.
+const RELAY_SESSION_ERROR_LOG_MAX_CHARS: usize = 512;
+const RELAY_MAX_ARCHIVE_GETDATA_BLOCKS: usize = 16;
+/// Upper bound on block bytes served for a single GetData request; the
+/// requester re-requests the rest after its inflight timeout.
+const RELAY_MAX_GETDATA_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const RELAY_MAX_ORPHAN_PARENT_REQUESTS: usize = 64;
 const RELAY_PARENT_REQUEST_TTL_SEC: u64 = 90;
 const RELAY_OUTBOUND_ANCHOR_TARGETS: usize = 2;
@@ -5792,7 +5905,13 @@ struct PoolPayoutConfig {
     mode: PoolPayoutModeArg,
     pool_fee_bps: u16,
     pplns_window_shares: usize,
+    /// PPS credit for a share whose difficulty equals the reference below.
     pps_share_atomic: u64,
+    /// Expected hashes of the reference share (the pool's hardest share
+    /// target). Credits scale linearly with each share's expected hashes,
+    /// so a miner kept at "any hash" difficulty is not paid like one doing
+    /// real work.
+    pps_reference_expected_hashes: f64,
     pps_max_liability_atomic: u128,
     pps_reserve_floor_atomic: u128,
     payout_threshold_atomic: u128,
@@ -5807,6 +5926,7 @@ impl Default for PoolPayoutConfig {
             pool_fee_bps: 100,
             pplns_window_shares: 300,
             pps_share_atomic: 0,
+            pps_reference_expected_hashes: 1.0,
             pps_max_liability_atomic: 0,
             pps_reserve_floor_atomic: 0,
             payout_threshold_atomic: 100_000_000,
@@ -6017,17 +6137,27 @@ impl StratumPoolLedgerState {
             > self.payout_cfg.pps_max_liability_atomic
     }
 
-    fn apply_pps_share_credit(&mut self, worker: &str, reserve_spendable_atomic: Option<u128>) {
+    fn apply_pps_share_credit(
+        &mut self,
+        worker: &str,
+        share_expected_hashes: f64,
+        reserve_spendable_atomic: Option<u128>,
+    ) {
         if !matches!(
             self.payout_cfg.mode,
             PoolPayoutModeArg::Pps | PoolPayoutModeArg::Hybrid
         ) {
             return;
         }
-        let credit = self.payout_cfg.pps_share_atomic as u128;
-        if credit == 0 {
+        // Pay for work, not for share count: scale by the share's difficulty
+        // relative to the reference share.
+        let reference = self.payout_cfg.pps_reference_expected_hashes.max(1.0);
+        let scaled =
+            self.payout_cfg.pps_share_atomic as f64 * (share_expected_hashes.max(0.0) / reference);
+        if !scaled.is_finite() || scaled < 1.0 {
             return;
         }
+        let credit = scaled.floor() as u128;
         if self.payout_cfg.pps_reserve_floor_atomic > 0 {
             match reserve_spendable_atomic {
                 Some(reserve) if reserve >= self.payout_cfg.pps_reserve_floor_atomic => {}
@@ -6284,7 +6414,7 @@ impl StratumPoolLedgerState {
         }
         counters.last_share_unix_sec = now_unix_sec;
         if accepted {
-            self.apply_pps_share_credit(worker, reserve_spendable_atomic);
+            self.apply_pps_share_credit(worker, expected_hashes, reserve_spendable_atomic);
         }
         true
     }
@@ -7451,31 +7581,72 @@ fn relay_compact_block_from_block(block: &scam_core::Block) -> CompactBlock {
     }
 }
 
-fn relay_lookup_mempool_tx_by_short_txid(
-    mempool: &Mempool,
-    short_txid: u64,
-) -> Option<Transaction> {
-    mempool
-        .txids_by_feerate_desc()
-        .into_iter()
-        .find_map(|txid| {
-            if compact_short_txid(txid) == short_txid {
-                mempool.get(&txid).cloned()
-            } else {
-                None
-            }
-        })
+/// Short-id → txid index of the mempool, built once per compact block
+/// (the old per-slot lookup re-sorted the whole mempool for every slot).
+fn relay_mempool_short_txid_index(mempool: &Mempool) -> HashMap<u64, Hash256> {
+    let mut index = HashMap::new();
+    for txid in mempool.txids_by_feerate_desc() {
+        index.entry(compact_short_txid(txid)).or_insert(txid);
+    }
+    index
 }
+
+/// Cheap header gate for block announcements from peers: PoW must hold, and
+/// if the parent is known the target must be the one its branch requires.
+fn relay_check_announced_header(
+    runtime: &ChainRuntime,
+    header: &scam_core::BlockHeader,
+) -> Result<(), NodeError> {
+    if !scam_core::header_meets_pow(header) {
+        return Err(NodeError::Runtime(
+            "announced block header does not meet its target".to_owned(),
+        ));
+    }
+    if runtime.height_of(&header.prev_block).is_some() {
+        let expected = runtime.expected_target_for_child_of(header.prev_block)?;
+        if header.target != expected {
+            return Err(NodeError::Runtime(format!(
+                "announced block header target {} differs from required {expected}",
+                header.target
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Upper bound on the number of transactions a consensus-valid block can
+/// hold: every serialized transaction is at least this many bytes.
+const MIN_SERIALIZED_TX_BYTES: u32 = 64;
 
 fn relay_reconstruct_compact_transactions(
     mempool: &Mempool,
     compact: &CompactBlock,
+    max_block_size: u32,
 ) -> Result<(Vec<Option<Transaction>>, Vec<u32>), NodeError> {
     let tx_count = compact.tx_count as usize;
     if tx_count == 0 {
         return Err(NodeError::Runtime(
             "compact block has zero transaction count".to_owned(),
         ));
+    }
+    // Validate the peer-supplied count before allocating anything sized by it.
+    let max_txs = (max_block_size / MIN_SERIALIZED_TX_BYTES).max(1) as usize;
+    if tx_count > max_txs {
+        return Err(NodeError::Runtime(format!(
+            "compact block claims {tx_count} transactions, above the {max_txs} a block can hold"
+        )));
+    }
+    if compact
+        .short_txids
+        .len()
+        .saturating_add(compact.prefilled.len())
+        != tx_count
+    {
+        return Err(NodeError::Runtime(format!(
+            "compact block lists {} short ids + {} prefilled txs for tx_count {tx_count}",
+            compact.short_txids.len(),
+            compact.prefilled.len()
+        )));
     }
 
     let mut transactions = vec![None; tx_count];
@@ -7490,6 +7661,7 @@ fn relay_reconstruct_compact_transactions(
         transactions[index] = Some(entry.tx.clone());
     }
 
+    let short_index = relay_mempool_short_txid_index(mempool);
     let mut short_iter = compact.short_txids.iter().copied();
     let mut missing = Vec::<u32>::new();
     for (index, slot) in transactions.iter_mut().enumerate() {
@@ -7501,8 +7673,11 @@ fn relay_reconstruct_compact_transactions(
                 "compact block short txid list is shorter than required".to_owned(),
             ));
         };
-        match relay_lookup_mempool_tx_by_short_txid(mempool, short_txid) {
-            Some(tx) => *slot = Some(tx),
+        match short_index
+            .get(&short_txid)
+            .and_then(|txid| mempool.get(txid))
+        {
+            Some(tx) => *slot = Some(tx.clone()),
             None => missing.push(index as u32),
         }
     }
@@ -7872,21 +8047,49 @@ fn relay_queue_peer_book_update(state: &mut RelayServerState, entry: PeerAddress
     state.pending_peer_book_updates.drain(0..overflow);
 }
 
+/// Longest `host:port` string accepted from peers.
+const RELAY_MAX_PEER_ADDRESS_LEN: usize = 255;
+/// Most entries kept in the in-memory address list.
+const RELAY_MAX_KNOWN_PEER_ADDRESSES: usize = 2_000;
+/// Peers may not claim an address was seen further in the future than this.
+const RELAY_ADDR_MAX_FUTURE_SEC: u64 = 10 * 60;
+
+/// Whether a peer-advertised address is worth keeping: bounded length, a
+/// real port, and not an unspecified/multicast/broadcast IP.
+fn relay_peer_address_is_acceptable(address: &str) -> bool {
+    if address.trim().is_empty() || address.len() > RELAY_MAX_PEER_ADDRESS_LEN {
+        return false;
+    }
+    let Some(endpoint) = parse_relay_target_endpoint(address) else {
+        return false;
+    };
+    if endpoint.port == 0 {
+        return false;
+    }
+    match endpoint.host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(ip)) => !(ip.is_unspecified() || ip.is_multicast() || ip.is_broadcast()),
+        Ok(IpAddr::V6(ip)) => !(ip.is_unspecified() || ip.is_multicast()),
+        Err(_) => true,
+    }
+}
+
 fn relay_merge_known_peer_addresses(state: &mut RelayServerState, incoming: &[PeerAddress]) {
     if incoming.is_empty() {
         return;
     }
+    let max_seen = current_unix_sec()
+        .unwrap_or(0)
+        .saturating_add(RELAY_ADDR_MAX_FUTURE_SEC);
     let mut by_addr = HashMap::<String, PeerAddress>::new();
     for entry in &state.known_peer_addresses {
         by_addr.insert(entry.address.clone(), entry.clone());
     }
     for entry in incoming {
-        if entry.address.trim().is_empty() {
+        if !relay_peer_address_is_acceptable(&entry.address) {
             continue;
         }
-        if parse_relay_target_endpoint(&entry.address).is_none() {
-            continue;
-        }
+        let mut entry = entry.clone();
+        entry.last_seen_unix_sec = entry.last_seen_unix_sec.min(max_seen);
         by_addr
             .entry(entry.address.clone())
             .and_modify(|existing| {
@@ -7903,12 +8106,19 @@ fn relay_merge_known_peer_addresses(state: &mut RelayServerState, incoming: &[Pe
             })
             .or_insert_with(|| {
                 relay_queue_peer_book_update(state, entry.clone());
-                entry.clone()
+                entry
             });
     }
     let mut merged = by_addr.into_values().collect::<Vec<_>>();
+    if merged.len() > RELAY_MAX_KNOWN_PEER_ADDRESSES {
+        // Evict by a per-process secret ordering: a peer flooding addresses
+        // cannot choose which entries survive (sorting by the address string
+        // let "0…"/"1…" entries push everything else out).
+        let hasher = &state.addr_eviction_hasher;
+        merged.sort_by_cached_key(|entry| std::hash::BuildHasher::hash_one(hasher, &entry.address));
+        merged.truncate(RELAY_MAX_KNOWN_PEER_ADDRESSES);
+    }
     merged.sort_unstable_by(|a, b| a.address.cmp(&b.address));
-    merged.truncate(2_000);
     state.known_peer_addresses = merged;
 }
 
@@ -8051,7 +8261,19 @@ fn relay_collect_getdata_from_memory(
     let mut missing_block_hashes = Vec::<Hash256>::new();
     let mut not_found = Vec::<InventoryItem>::new();
 
+    // Bound the work and memory one request can cause: at most
+    // `p2p_max_inv_items` distinct items and a fixed byte budget of blocks.
+    // Duplicates used to clone the same block once per copy.
+    let max_items = state.runtime.config().p2p_max_inv_items.max(1);
+    let mut seen = HashSet::<InventoryItem>::new();
+    let mut served_block_bytes = 0usize;
     for item in items {
+        if seen.len() >= max_items {
+            break;
+        }
+        if !seen.insert(item.clone()) {
+            continue;
+        }
         match item {
             InventoryItem::Tx(txid) => {
                 if let Some(tx) = state.relay.mempool.get(&txid).cloned() {
@@ -8061,14 +8283,26 @@ fn relay_collect_getdata_from_memory(
                 }
             }
             InventoryItem::Block(hash) => {
-                if let Some(block) = state.runtime.block_by_hash(&hash).cloned() {
-                    out.push(WireMessage::Block { block });
+                if served_block_bytes >= RELAY_MAX_GETDATA_RESPONSE_BYTES {
+                    continue;
+                }
+                if let Some(block) = state.runtime.block_by_hash(&hash) {
+                    served_block_bytes = served_block_bytes.saturating_add(
+                        bincode::serialized_size(block)
+                            .map(|n| n as usize)
+                            .unwrap_or(usize::MAX),
+                    );
+                    out.push(WireMessage::Block {
+                        block: block.clone(),
+                    });
                 } else {
                     missing_block_hashes.push(hash);
                 }
             }
         }
     }
+    // Archive lookups for blocks not held in memory are bounded the same way.
+    missing_block_hashes.truncate(RELAY_MAX_ARCHIVE_GETDATA_BLOCKS);
 
     (out, missing_block_hashes, not_found)
 }
@@ -8603,8 +8837,14 @@ fn process_relay_wire_message_inner(
         WireMessage::CmpctBlock { block } => {
             let block_hash = block.header.block_hash();
             relay_clear_inflight_block_request(state, block_hash);
-            let (transactions, missing_indexes) =
-                relay_reconstruct_compact_transactions(&state.relay.mempool, &block)?;
+            // Proof of work at the branch's required target is checked before
+            // any per-block state is allocated or retained.
+            relay_check_announced_header(&state.runtime, &block.header)?;
+            let (transactions, missing_indexes) = relay_reconstruct_compact_transactions(
+                &state.relay.mempool,
+                &block,
+                state.runtime.config().max_block_size,
+            )?;
             if missing_indexes.is_empty() {
                 let block = relay_try_build_block_from_compact(&block.header, &transactions)
                     .ok_or_else(|| {
@@ -8613,6 +8853,14 @@ fn process_relay_wire_message_inner(
                         )
                     })?;
                 return relay_submit_incoming_block(state, block, now_unix_sec);
+            }
+            if state.pending_compact_blocks.len() >= RELAY_MAX_PENDING_COMPACT_BLOCKS
+                && !state.pending_compact_blocks.contains_key(&block_hash)
+            {
+                // Fall back to a full-block request instead of growing state.
+                return Ok(vec![WireMessage::GetData {
+                    items: vec![InventoryItem::Block(block_hash)],
+                }]);
             }
             state.pending_compact_blocks.insert(
                 block_hash,
@@ -10602,6 +10850,8 @@ fn run_relay_peer_session<IO: Read + Write>(
         };
         ensure_relay_peer_network(&cfg.network_id, &remote.network_id)?;
         ensure_relay_peer_consensus(&consensus_id, &remote.consensus_fingerprint)?;
+        // Survives read timeouts with a partial frame buffered (see FrameReader).
+        let mut frame_reader = FrameReader::new(framing.clone());
         let peer_is_ahead = relay_peer_is_ahead(remote.start_height, local_start_height);
         if matches!(mode, RelayPeerSessionMode::Outbound)
             && let (Some(store), Some(address)) = (anchor_store.as_ref(), peer_address)
@@ -10726,7 +10976,7 @@ fn run_relay_peer_session<IO: Read + Write>(
                 break;
             }
 
-            let inbound = match map_relay_read_result(read_message(stream, &framing))? {
+            let inbound = match map_relay_read_result(frame_reader.read_message(stream))? {
                 RelayReadOutcome::Timeout => {
                     timeout_streak = timeout_streak.saturating_add(1);
                     if relay_timeout_streak_reached_limit(timeout_streak) {
@@ -10807,6 +11057,14 @@ fn run_relay_peer_session<IO: Read + Write>(
 
     let mut peer_reputation_delta = RuntimePeerReputation::default();
     if let Ok(mut guard) = state.lock() {
+        let misbehaved = guard.relay.gossip.is_banned(peer_id)
+            || result
+                .as_ref()
+                .err()
+                .is_some_and(relay_error_is_misbehaviour);
+        if misbehaved && let Some(address) = peer_address {
+            relay_ban_peer_ip(&mut guard, address, current_unix_sec().unwrap_or(0));
+        }
         peer_reputation_delta = relay_take_peer_runtime_reputation(&mut guard, peer_id);
         guard.relay.gossip.disconnect_peer(peer_id);
         guard.peer_compact_pref.remove(&peer_id);
@@ -10887,6 +11145,8 @@ async fn run_relay_peer_session_async<S: AsyncRead + AsyncWrite + Unpin>(
         .await?;
         ensure_relay_peer_network(&cfg.network_id, &remote.network_id)?;
         ensure_relay_peer_consensus(&consensus_id, &remote.consensus_fingerprint)?;
+        // Survives read timeouts with a partial frame buffered (see FrameReader).
+        let mut frame_reader = FrameReader::new(framing.clone());
         let peer_is_ahead = relay_peer_is_ahead(remote.start_height, local_start_height);
         if matches!(mode, RelayPeerSessionMode::Outbound)
             && let (Some(store), Some(address)) = (anchor_store.as_ref(), peer_address)
@@ -11027,7 +11287,7 @@ async fn run_relay_peer_session_async<S: AsyncRead + AsyncWrite + Unpin>(
 
             let inbound = match relay_read_with_timeout_async(
                 stream,
-                &framing,
+                &mut frame_reader,
                 read_timeout_sec,
                 read_poll_interval_ms,
             )
@@ -11136,6 +11396,14 @@ async fn run_relay_peer_session_async<S: AsyncRead + AsyncWrite + Unpin>(
 
     let mut peer_reputation_delta = RuntimePeerReputation::default();
     if let Ok(mut guard) = state.lock() {
+        let misbehaved = guard.relay.gossip.is_banned(peer_id)
+            || session_result
+                .as_ref()
+                .err()
+                .is_some_and(relay_error_is_misbehaviour);
+        if misbehaved && let Some(address) = peer_address {
+            relay_ban_peer_ip(&mut guard, address, current_unix_sec().unwrap_or(0));
+        }
         peer_reputation_delta = relay_take_peer_runtime_reputation(&mut guard, peer_id);
         guard.relay.gossip.disconnect_peer(peer_id);
         guard.peer_compact_pref.remove(&peer_id);
@@ -11514,7 +11782,28 @@ fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
                     break;
                 }
             };
+            // Finished sessions used to stay in the JoinSet (with their error
+            // strings, which can embed attacker payloads) until shutdown.
+            while let Some(join_result) = workers.try_join_next() {
+                relay_log_finished_session(join_result, &mut first_error);
+            }
             let now_unix_sec = current_unix_sec().unwrap_or(0);
+            if inbound_accept_history.len() > RELAY_ACCEPT_HISTORY_PRUNE_THRESHOLD {
+                let window = inbound_accept_window_sec.max(1);
+                inbound_accept_history.retain(|_, events| {
+                    events
+                        .back()
+                        .is_some_and(|ts| now_unix_sec.saturating_sub(*ts) < window)
+                });
+            }
+            let banned = state
+                .lock()
+                .map(|guard| relay_ip_is_banned(&guard, peer_addr.ip(), now_unix_sec))
+                .unwrap_or(false);
+            if banned {
+                drop(stream);
+                continue;
+            }
             let per_ip_limit = relay_inbound_accept_limit_for_ip(
                 peer_addr.ip(),
                 inbound_accept_base_max_per_ip,
@@ -11596,28 +11885,7 @@ fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
         }
 
         while let Some(join_result) = workers.join_next().await {
-            match join_result {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => {
-                    if relay_session_error_is_fatal(&err) {
-                        if first_error.is_none() {
-                            first_error = Some(err);
-                        }
-                    } else {
-                        eprintln!(
-                            "warning: relay worker session ended: reason={} detail={err}",
-                            relay_disconnect_reason(&err)
-                        );
-                    }
-                }
-                Err(err) => {
-                    if first_error.is_none() {
-                        first_error = Some(NodeError::Runtime(format!(
-                            "relay worker task failed: {err}"
-                        )));
-                    }
-                }
-            }
+            relay_log_finished_session(join_result, &mut first_error);
         }
         // Normal max-clients exit should let workers finish organically first,
         // then stop background telemetry/outbound tasks.
@@ -11809,16 +12077,43 @@ fn admit_peer_tx_into_relay(
     let mut pending = VecDeque::<(Transaction, u64)>::new();
     pending.push_back((tx, fee));
 
+    let cfg = runtime.config();
+    let max_tx_bytes = cfg.max_tx_size as usize;
+    let mut is_original = true;
     while let Some((candidate_tx, candidate_fee)) = pending.pop_front() {
+        let from_peer = std::mem::replace(&mut is_original, false);
+        // Size is checked before anything is retained (orphans included).
+        let tx_bytes = candidate_tx.encode_for_hash().len();
+        if tx_bytes > max_tx_bytes {
+            if from_peer {
+                return Err(NodeError::Runtime(format!(
+                    "{RELAY_MISBEHAVIOUR_PREFIX}tx is {tx_bytes} bytes, above max_tx_size {max_tx_bytes}"
+                )));
+            }
+            continue;
+        }
         let missing = detect_missing_outpoints(runtime, &relay.mempool, &candidate_tx);
-        let effective_fee = tx_fee_from_known_prevouts(runtime, &relay.mempool, &candidate_tx)
-            .unwrap_or(candidate_fee);
         if !missing.is_empty() {
             let _ = relay
                 .orphan_pool
-                .insert(candidate_tx, effective_fee, missing, now_unix_sec)?;
+                .insert(candidate_tx, candidate_fee, missing, now_unix_sec)?;
             continue;
         }
+
+        // Full consensus validation (signatures, ownership, maturity,
+        // absolute and relative locks) before the tx can be stored or
+        // relayed; the fee used for policy is the actual one.
+        let effective_fee =
+            match validate_tx_for_next_block_typed(cfg, runtime, &relay.mempool, &candidate_tx)? {
+                Ok(fee) => fee,
+                Err(err) if from_peer && tx_validation_error_is_misbehaviour(&err) => {
+                    return Err(NodeError::Runtime(format!(
+                        "{RELAY_MISBEHAVIOUR_PREFIX}invalid transaction: {err}"
+                    )));
+                }
+                // Context-dependent (or a promoted orphan): drop, don't relay.
+                Err(_) => continue,
+            };
 
         let outcome = relay.mempool.insert_with_fee(candidate_tx, effective_fee)?;
         let inserted_txid = match outcome {
@@ -11866,7 +12161,6 @@ fn admit_peer_tx_into_relay(
 
 fn execute_soak_rounds<F>(
     runtime: &mut ChainRuntime,
-    cfg: &ChainConfig,
     params: SoakExecutionParams,
     mut on_round_end: F,
 ) -> Result<SoakSummary, NodeError>
@@ -11881,7 +12175,6 @@ where
             count: params.blocks_per_round,
             interval_sec: params.interval_sec,
             max_nonce: params.max_nonce,
-            subsidy: cfg.block_subsidy,
             miner_key_hash: params.miner_key_hash,
             label_prefix: "soak",
             print_each: false,
@@ -12004,7 +12297,7 @@ fn run_soak(args: SoakArgs) -> Result<(), NodeError> {
         miner_key_hash,
         sleep_per_round_sec: args.sleep_per_round_sec,
     };
-    let summary = execute_soak_rounds(&mut runtime, &cfg, execution, |round, runtime| {
+    let summary = execute_soak_rounds(&mut runtime, execution, |round, runtime| {
         let now_unix_sec = current_unix_sec()?;
         if tx_flow_enabled {
             let sender_key = soak_sender_key
@@ -12072,7 +12365,6 @@ fn run_soak(args: SoakArgs) -> Result<(), NodeError> {
                     runtime,
                     args.interval_sec,
                     args.max_nonce,
-                    cfg.block_subsidy,
                     miner_key_hash,
                     format!("soak-tx-{round}"),
                     round_txs,
@@ -12202,7 +12494,6 @@ fn run_reorg_demo(args: ReorgDemoArgs) -> Result<(), NodeError> {
         count: args.main_blocks,
         interval_sec: args.main_interval_sec,
         max_nonce: args.max_nonce,
-        subsidy: cfg.block_subsidy,
         miner_key_hash,
         label_prefix: "main",
         print_each: false,
@@ -12491,11 +12782,15 @@ fn sanitize_template_mempool_fees(
         let mut progressed = false;
         let mut deferred = Vec::<Hash256>::new();
         for txid in pending {
-            let Some((tx, stored_fee)) = mempool.get_with_fee(&txid) else {
+            let Some((tx, _stored_fee)) = mempool.get_with_fee(&txid) else {
                 continue;
             };
-            let resolved_fee = tx_fee_from_known_prevouts(runtime, &sanitized, tx);
-            let fee = resolved_fee.unwrap_or(stored_fee);
+            // Only fees computed from known prevouts are trusted; a child whose
+            // parent has not been re-admitted yet waits for the next pass.
+            let Some(fee) = tx_fee_from_known_prevouts(runtime, &sanitized, tx) else {
+                deferred.push(txid);
+                continue;
+            };
             let min_required = match sanitized.min_required_fee(tx) {
                 Ok(min) => min,
                 Err(_) => {
@@ -12531,21 +12826,59 @@ impl StratumTemplateProvider for RuntimeTemplateProvider {
         coinbase_label: &str,
     ) -> Result<StratumTemplateWork, NodeError> {
         let prev_block = runtime.tip_hash();
+        let next_height = runtime.tip_height().saturating_add(1);
         let target = runtime.expected_target_for_next_block()?;
         let mempool = load_mempool_from_db_or_empty_with_retry(cfg, mempool_db_path, 10, 25)?;
         let mempool = sanitize_template_mempool_fees(runtime, cfg, &mempool)?;
+        let block_subsidy = cfg.subsidy_at_height(next_height);
+        let coinbase_tag = stratum_coinbase_tag(coinbase_label, prev_block);
+        let tx_byte_budget = template_tx_byte_budget(
+            cfg,
+            &build_coinbase_tx(coinbase_tag.clone(), u64::MAX, reward_key_hash20),
+        );
         let params = MempoolTemplateParams {
             version: 1,
             prev_block,
             timestamp: next_stratum_job_timestamp(runtime, cfg),
             target,
-            block_subsidy: cfg.block_subsidy,
+            block_subsidy,
             miner_key_hash20: reward_key_hash20,
-            coinbase_tag: stratum_coinbase_tag(coinbase_label, prev_block),
+            coinbase_tag: coinbase_tag.clone(),
             max_txs: max_template_txs.max(1),
+            max_total_tx_bytes: tx_byte_budget,
         };
-        let (template_block, _summary) = build_template_from_mempool(&params, &mempool)
+        let (mut template_block, _summary) = build_template_from_mempool(&params, &mempool)
             .map_err(|e| NodeError::Runtime(format!("stratum template build failed: {e}")))?;
+
+        // Never hand miners work that consensus would reject: re-check the
+        // selected txs against the chain (signatures, locks, maturity,
+        // conflicts, exact block-size budget) and rebuild the coinbase from
+        // the exact fees of what survived.
+        let ctx = next_block_tx_context(cfg, runtime)?;
+        let selection = select_valid_block_transactions(
+            &template_block.transactions[1..],
+            &ctx,
+            runtime.utxo_set(),
+            tx_byte_budget,
+        );
+        if let Some((txid, reason)) = selection.rejected.first() {
+            eprintln!(
+                "warning: stratum template dropped {} tx(s); first {txid}: {reason}",
+                selection.rejected.len()
+            );
+        }
+        let coinbase_value = block_subsidy
+            .checked_add(selection.total_fees)
+            .ok_or_else(|| NodeError::Runtime("template coinbase value overflow".to_owned()))?;
+        let mut block_txs = Vec::with_capacity(selection.accepted.len() + 1);
+        block_txs.push(build_coinbase_tx(
+            coinbase_tag,
+            coinbase_value,
+            reward_key_hash20,
+        ));
+        block_txs.extend(selection.accepted.into_iter().map(|(tx, _fee)| tx));
+        template_block.transactions = block_txs;
+
         let txids = template_block
             .transactions
             .iter()
@@ -12640,6 +12973,9 @@ struct StratumServerContext {
     cfg: ChainConfig,
     runtime: Arc<Mutex<ChainRuntime>>,
     runtime_db_path: PathBuf,
+    /// Last runtime-DB mtime merged into `runtime`; other processes (the
+    /// relay) extend the chain on disk and the pool must follow.
+    runtime_db_seen_mtime: Arc<Mutex<Option<SystemTime>>>,
     mempool_db_path: PathBuf,
     max_template_txs: usize,
     share_target: Target,
@@ -12811,7 +13147,9 @@ async fn issue_new_stratum_job_async<S: AsyncRead + AsyncWrite + Unpin>(
                 prev_hash_hex: runtime.tip_hash().to_hex(),
                 ntime: next_stratum_job_timestamp(&runtime, &ctx.cfg),
                 network_target_hex: target.to_hex(),
-                block_subsidy: ctx.cfg.block_subsidy,
+                block_subsidy: ctx
+                    .cfg
+                    .subsidy_at_height(runtime.tip_height().saturating_add(1)),
                 reward_key_hash20_hex: hex::encode(reward_key_hash20),
                 coinbase_label: coinbase_label.to_owned(),
             };
@@ -12904,8 +13242,23 @@ async fn issue_new_stratum_job_async<S: AsyncRead + AsyncWrite + Unpin>(
 }
 
 fn load_runtime_tip_hash(ctx: &StratumServerContext) -> Result<Hash256, NodeError> {
-    let runtime = lock_runtime(&ctx.runtime)?;
+    let mut runtime = lock_runtime(&ctx.runtime)?;
+    stratum_refresh_runtime_locked(ctx, &mut runtime);
     Ok(runtime.tip_hash())
+}
+
+/// Merge blocks other processes wrote to the runtime DB (cheap `stat` when
+/// nothing changed). Failures are logged and retried on the next poll: the
+/// pool keeps serving its current view rather than dropping miners.
+fn stratum_refresh_runtime_locked(ctx: &StratumServerContext, runtime: &mut ChainRuntime) {
+    let Ok(mut seen) = ctx.runtime_db_seen_mtime.lock() else {
+        return;
+    };
+    if let Err(err) =
+        refresh_runtime_from_db_if_changed(&ctx.cfg, runtime, &ctx.runtime_db_path, &mut seen)
+    {
+        eprintln!("warning: stratum runtime refresh failed: {err}");
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -13262,6 +13615,17 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
                             } else {
                                 None
                             };
+                            // Work on a job whose parent is no longer the tip
+                            // is worthless to the pool; don't credit it.
+                            let current_tip = load_runtime_tip_hash(&ctx)?;
+                            if jobs
+                                .get(&job_id)
+                                .is_none_or(|work| work.job.prev_hash != current_tip)
+                            {
+                                record_pool_share_rejected(&ctx, &worker_label);
+                                record_stratum_share_rejected(&ctx, &worker_label);
+                                continue;
+                            }
                             let mut accepted_as_block = false;
                             if should_process_share_as_block(is_block) {
                                 let Some(work) = jobs.get(&job_id).cloned() else {
@@ -13295,6 +13659,9 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
 
                                 {
                                     let mut runtime = lock_runtime(&ctx.runtime)?;
+                                    // Validate against the latest shared chain, not a
+                                    // stale in-memory view.
+                                    stratum_refresh_runtime_locked(&ctx, &mut runtime);
                                     if !stratum_share_prev_hash_matches_tip(
                                         work.job.prev_hash,
                                         runtime.tip_hash(),
@@ -13362,7 +13729,10 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
                                                                     },
                                                                 )
                                                             })
-                                                            .unwrap_or(ctx.cfg.block_subsidy as u128);
+                                                            .unwrap_or(
+                                                                ctx.cfg.subsidy_at_height(new_height)
+                                                                    as u128,
+                                                            );
                                                         record_pool_round_closed(
                                                             &ctx,
                                                             &worker_label,
@@ -13516,6 +13886,66 @@ fn max_requests_limit_hit(max_requests: u32, served: u32) -> bool {
 
 fn max_requests_limit_configured(max_requests: u32) -> bool {
     max_requests != 0
+}
+
+/// Refuse `address`'s IP for `RELAY_IP_BAN_SEC`. Bans are keyed by IP, not
+/// by per-connection peer id or `ip:port`, so reconnecting does not reset
+/// them.
+fn relay_ban_peer_ip(state: &mut RelayServerState, address: &str, now_unix_sec: u64) {
+    let Ok(addr) = address.parse::<SocketAddr>() else {
+        return;
+    };
+    state.banned_ips.retain(|_, until| *until > now_unix_sec);
+    state
+        .banned_ips
+        .insert(addr.ip(), now_unix_sec.saturating_add(RELAY_IP_BAN_SEC));
+    eprintln!(
+        "warning: banning peer {} for {}s after invalid data",
+        addr.ip(),
+        RELAY_IP_BAN_SEC
+    );
+}
+
+fn relay_ip_is_banned(state: &RelayServerState, ip: IpAddr, now_unix_sec: u64) -> bool {
+    state
+        .banned_ips
+        .get(&ip)
+        .is_some_and(|until| *until > now_unix_sec)
+}
+
+/// Record the outcome of a finished inbound session: fatal errors stop the
+/// relay, anything else is logged (truncated: errors may quote peer data).
+fn relay_log_finished_session(
+    join_result: Result<Result<(), NodeError>, tokio::task::JoinError>,
+    first_error: &mut Option<NodeError>,
+) {
+    match join_result {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            if relay_session_error_is_fatal(&err) {
+                if first_error.is_none() {
+                    *first_error = Some(err);
+                }
+            } else {
+                let detail = err.to_string();
+                let detail = match detail.char_indices().nth(RELAY_SESSION_ERROR_LOG_MAX_CHARS) {
+                    Some((cut, _)) => format!("{}…", &detail[..cut]),
+                    None => detail,
+                };
+                eprintln!(
+                    "warning: relay worker session ended: reason={} detail={detail}",
+                    relay_disconnect_reason(&err)
+                );
+            }
+        }
+        Err(err) => {
+            if first_error.is_none() {
+                *first_error = Some(NodeError::Runtime(format!(
+                    "relay worker task failed: {err}"
+                )));
+            }
+        }
+    }
 }
 
 fn relay_inbound_accept_rate_limited(
@@ -13750,15 +14180,16 @@ fn relay_send_messages_until_closed<IO: Write>(
 
 async fn relay_read_with_timeout_async<S: AsyncRead + Unpin>(
     stream: &mut S,
-    framing: &FramingConfig,
+    frame_reader: &mut FrameReader,
     read_timeout_sec: u64,
     poll_interval_ms: u64,
 ) -> Result<RelayReadOutcome, NodeError> {
     let read_timeout_ms = read_timeout_sec.max(1).saturating_mul(1_000);
     let wait_ms = poll_interval_ms.max(1).min(read_timeout_ms);
+    // Cancel-safe: a timeout keeps any partial frame inside `frame_reader`.
     match timeout(
         Duration::from_millis(wait_ms),
-        read_message_async(stream, framing),
+        frame_reader.read_message_async(stream),
     )
     .await
     {
@@ -14068,6 +14499,19 @@ fn maybe_process_pool_payouts(ctx: &StratumServerContext) -> Result<(), NodeErro
             .collect::<Vec<_>>()
     };
 
+    // Outpoints already spent by unconfirmed txs (earlier payouts included):
+    // building two payouts from the same pool coin made the second one a
+    // conflict that could never confirm.
+    let mut reserved = if to_submit.is_empty() {
+        HashSet::new()
+    } else {
+        mempool_spent_outpoints(&load_mempool_from_db_or_empty_with_retry(
+            &ctx.cfg,
+            &ctx.mempool_db_path,
+            10,
+            25,
+        )?)
+    };
     for payout in to_submit {
         let decoded = match parse_address(&payout.worker) {
             Ok(decoded) => decoded,
@@ -14078,13 +14522,14 @@ fn maybe_process_pool_payouts(ctx: &StratumServerContext) -> Result<(), NodeErro
         };
         let signed = {
             let runtime = lock_runtime(&ctx.runtime)?;
-            build_signed_transfer_tx(
+            build_signed_transfer_tx_with_exclusions(
                 &runtime,
                 &ctx.cfg.network_id,
                 pool_key,
                 decoded.key_hash20,
                 amount,
                 ctx.pool_payout_cfg.payout_tx_fee_atomic,
+                &reserved,
             )
         };
         let signed = match signed {
@@ -14097,16 +14542,22 @@ fn maybe_process_pool_payouts(ctx: &StratumServerContext) -> Result<(), NodeErro
                 continue;
             }
         };
+        let spent_inputs = signed
+            .tx
+            .inputs
+            .iter()
+            .map(|input| input.prev_out.clone())
+            .collect::<Vec<_>>();
         let submit = submit_tx_via_mempool_db_with_retry(
             &ctx.cfg,
             &ctx.runtime_db_path,
             &ctx.mempool_db_path,
             signed.tx,
-            ctx.pool_payout_cfg.payout_tx_fee_atomic,
+            0,
             80,
             25,
         );
-        let (txid, _outcome, _fee) = match submit {
+        let (txid, outcome, _fee) = match submit {
             Ok(ok) => ok,
             Err(err) => {
                 eprintln!(
@@ -14116,6 +14567,16 @@ fn maybe_process_pool_payouts(ctx: &StratumServerContext) -> Result<(), NodeErro
                 continue;
             }
         };
+        // A rejected conflict is not a payout: it would never confirm and the
+        // worker would be skipped forever.
+        if !pool_payout_submit_outcome_is_live(&outcome) {
+            eprintln!(
+                "warning: payout tx for worker={} amount={} not admitted (outcome={outcome})",
+                payout.worker, payout.amount_atomic
+            );
+            continue;
+        }
+        reserved.extend(spent_inputs);
         let mut ledger = ctx
             .pool_ledger_state
             .lock()
@@ -14140,6 +14601,13 @@ fn maybe_process_pool_payouts(ctx: &StratumServerContext) -> Result<(), NodeErro
         persist_pool_ledger_with_warning(ctx);
     }
     Ok(())
+}
+
+fn pool_payout_submit_outcome_is_live(outcome: &str) -> bool {
+    matches!(
+        outcome,
+        "accepted" | "replaced" | "accepted_with_eviction" | "already_present"
+    )
 }
 
 fn run_pool_payout_tick_with_warning(ctx: &StratumServerContext) {
@@ -14183,36 +14651,126 @@ fn wallet_send_preview_has_invalid_amount(amount: u64) -> bool {
     amount == 0
 }
 
-#[derive(Clone, Copy)]
-struct ResolvedPrevout {
-    value: u64,
-    key_hash20: [u8; 20],
-    is_coinbase: bool,
-    created_height: u64,
+fn prevout_is_resolvable(runtime: &ChainRuntime, mempool: &Mempool, outpoint: &OutPoint) -> bool {
+    runtime.utxo_set().contains_key(outpoint)
+        || mempool
+            .get_with_fee(&outpoint.txid)
+            .is_some_and(|(parent, _)| parent.outputs.len() > outpoint.vout as usize)
 }
 
-fn resolve_prevout_for_admission(
+/// Chain context for "is this tx valid in the next block on our tip?".
+fn next_block_tx_context<'a>(
+    cfg: &'a ChainConfig,
+    runtime: &ChainRuntime,
+) -> Result<NextBlockTxContext<'a>, NodeError> {
+    Ok(NextBlockTxContext {
+        next_height: runtime.tip_height().saturating_add(1),
+        median_time_past: runtime.median_time_past_for_tip()?,
+        coinbase_maturity: cfg.coinbase_maturity as u64,
+        chain_domain: cfg.network_id.as_bytes(),
+        max_tx_bytes: Some(cfg.max_tx_size as usize),
+    })
+}
+
+/// UTXO view for admission: confirmed outputs, then outputs of unconfirmed
+/// mempool parents (treated as created in the next block).
+fn admission_utxo_entry(
     runtime: &ChainRuntime,
     mempool: &Mempool,
+    ctx: &NextBlockTxContext<'_>,
     outpoint: &OutPoint,
-) -> Option<ResolvedPrevout> {
+) -> Option<UtxoEntry> {
     if let Some(entry) = runtime.utxo_set().get(outpoint) {
-        return Some(ResolvedPrevout {
-            value: entry.value,
-            key_hash20: entry.key_hash20,
-            is_coinbase: entry.is_coinbase,
-            created_height: entry.created_height,
-        });
+        return Some(entry.clone());
     }
     let (parent_tx, _fee) = mempool.get_with_fee(&outpoint.txid)?;
     let output = parent_tx.outputs.get(outpoint.vout as usize)?;
-    Some(ResolvedPrevout {
+    Some(UtxoEntry {
         value: output.value,
         key_hash20: output.key_hash20,
+        created_height: ctx.next_height,
+        created_time: ctx.median_time_past,
         is_coinbase: false,
-        created_height: runtime.tip_height().saturating_add(1),
     })
 }
+
+/// Full consensus validation of a mempool candidate. Every admission path
+/// (RPC, wallet, P2P relay, orphan promotion) goes through here so a tx in
+/// the mempool is always valid for the next block. Returns the actual fee.
+fn validate_tx_for_next_block_admission(
+    cfg: &ChainConfig,
+    runtime: &ChainRuntime,
+    mempool: &Mempool,
+    tx: &Transaction,
+) -> Result<u64, NodeError> {
+    validate_tx_for_next_block_typed(cfg, runtime, mempool, tx)?
+        .map_err(|err| NodeError::Runtime(format!("transaction rejected: {err}")))
+}
+
+fn validate_tx_for_next_block_typed(
+    cfg: &ChainConfig,
+    runtime: &ChainRuntime,
+    mempool: &Mempool,
+    tx: &Transaction,
+) -> Result<Result<u64, TxValidationError>, NodeError> {
+    let ctx = next_block_tx_context(cfg, runtime)?;
+    Ok(validate_tx_for_next_block(tx, &ctx, |outpoint| {
+        admission_utxo_entry(runtime, mempool, &ctx, outpoint)
+    })
+    .map(|validated| validated.fee))
+}
+
+/// True when a tx is invalid regardless of chain state (bad signature or
+/// encoding, wrong key, overspend, malformed). Such a tx can only come from
+/// a broken or hostile peer. Context-dependent failures (missing or
+/// immature input, unmet lock time) are normal when peers are a block
+/// apart and must not be punished.
+fn tx_validation_error_is_misbehaviour(err: &TxValidationError) -> bool {
+    matches!(
+        err,
+        TxValidationError::InvalidBlockStructure(_)
+            | TxValidationError::InvalidPubkey { .. }
+            | TxValidationError::PubkeyHashMismatch { .. }
+            | TxValidationError::InvalidSignatureEncoding { .. }
+            | TxValidationError::InvalidSignature { .. }
+            | TxValidationError::InvalidMultisigBlob { .. }
+            | TxValidationError::InvalidMultisigSpend { .. }
+            | TxValidationError::Overspend { .. }
+            | TxValidationError::InputValueOverflow { .. }
+            | TxValidationError::CoinbasePrevoutInRegularTx { .. }
+            | TxValidationError::UnexpectedCoinbase { .. }
+    )
+}
+
+/// True when a peer-supplied block (or announcement) is invalid in a way
+/// that is independent of our clock and of which branch we follow.
+fn relay_error_is_misbehaviour(err: &NodeError) -> bool {
+    match err {
+        NodeError::Chain(
+            ChainError::Validation(_)
+            | ChainError::InvalidBlockStructure(_)
+            | ChainError::UnexpectedTarget { .. }
+            | ChainError::KnownInvalid { .. }
+            | ChainError::InvalidAncestor { .. },
+        ) => true,
+        NodeError::Transport(
+            TransportError::InvalidMagic { .. }
+            | TransportError::MessageTooLarge { .. }
+            | TransportError::Wire(_),
+        ) => true,
+        NodeError::Runtime(msg) => {
+            msg.starts_with(RELAY_MISBEHAVIOUR_PREFIX)
+                || msg.starts_with("announced block header")
+                || msg.starts_with("compact block")
+        }
+        _ => false,
+    }
+}
+
+/// Prefix of errors raised for peer data that is invalid in any context.
+const RELAY_MISBEHAVIOUR_PREFIX: &str = "peer misbehaviour: ";
+/// How long an IP that sent invalid data is refused.
+const RELAY_IP_BAN_SEC: u64 = 24 * 60 * 60;
 
 fn validate_tx_for_local_admission(
     cfg: &ChainConfig,
@@ -14235,33 +14793,18 @@ fn validate_tx_for_local_admission(
             "transaction must include at least one output".to_owned(),
         ));
     }
-    let candidate_height = runtime.tip_height().saturating_add(1);
-    let candidate_time = runtime.tip_header().timestamp.saturating_add(1);
-    if !tx_is_final_for_block(tx, candidate_height, candidate_time) {
-        return Err(NodeError::Runtime(format!(
-            "transaction is non-final for next block (height={candidate_height}, time={candidate_time}, lock_time={})",
-            tx.lock_time
-        )));
-    }
-
-    let mut seen = HashSet::<OutPoint>::new();
-    let mut input_sum = 0u128;
-    let mut output_sum = 0u128;
-    let mut missing = Vec::<String>::new();
-    let tip_height = runtime.tip_height();
-    let maturity = cfg.coinbase_maturity as u64;
-
     for (output_index, output) in tx.outputs.iter().enumerate() {
         if output.value == 0 {
             return Err(NodeError::Runtime(format!(
                 "output #{output_index} has zero value"
             )));
         }
-        output_sum = output_sum
-            .checked_add(output.value as u128)
-            .ok_or_else(|| NodeError::Runtime("output value overflow".to_owned()))?;
     }
 
+    // Cheap shape checks first so obviously malformed input fails with an
+    // actionable message before any signature work.
+    let mut seen = HashSet::<OutPoint>::new();
+    let mut missing = Vec::<String>::new();
     for (input_index, input) in tx.inputs.iter().enumerate() {
         if input.prev_out.is_coinbase() {
             return Err(NodeError::Runtime(format!(
@@ -14273,80 +14816,38 @@ fn validate_tx_for_local_admission(
                 "input #{input_index} double-spends prevout within tx"
             )));
         }
-        if input.pubkey_compressed.len() != 33 {
-            return Err(NodeError::Runtime(format!(
-                "input #{input_index} has invalid pubkey length {}",
-                input.pubkey_compressed.len()
-            )));
+        if !looks_like_multisig_blob(&input.pubkey_compressed) {
+            if input.pubkey_compressed.len() != 33 {
+                return Err(NodeError::Runtime(format!(
+                    "input #{input_index} has invalid pubkey length {}",
+                    input.pubkey_compressed.len()
+                )));
+            }
+            if !matches!(input.pubkey_compressed[0], 0x02 | 0x03) {
+                return Err(NodeError::Runtime(format!(
+                    "input #{input_index} has invalid pubkey prefix {:02x}",
+                    input.pubkey_compressed[0]
+                )));
+            }
+            if input.signature.len() != 64 {
+                return Err(NodeError::Runtime(format!(
+                    "input #{input_index} has invalid signature length {}",
+                    input.signature.len()
+                )));
+            }
         }
-        if !matches!(input.pubkey_compressed[0], 0x02 | 0x03) {
-            return Err(NodeError::Runtime(format!(
-                "input #{input_index} has invalid pubkey prefix {:02x}",
-                input.pubkey_compressed[0]
-            )));
-        }
-        if input.signature.len() != 64 {
-            return Err(NodeError::Runtime(format!(
-                "input #{input_index} has invalid signature length {}",
-                input.signature.len()
-            )));
-        }
-
-        let Some(prevout) = resolve_prevout_for_admission(runtime, mempool, &input.prev_out) else {
+        if !prevout_is_resolvable(runtime, mempool, &input.prev_out) {
             missing.push(format!("{}:{}", input.prev_out.txid, input.prev_out.vout));
-            continue;
-        };
-
-        if prevout.is_coinbase
-            && coinbase_prevout_is_immature(tip_height, prevout.created_height, maturity)
-        {
-            return Err(NodeError::Runtime(format!(
-                "input #{input_index} spends immature coinbase (created_height={}, maturity={})",
-                prevout.created_height, maturity
-            )));
         }
-        let derived_key_hash20 = scam_core::hash160_blake3(&input.pubkey_compressed);
-        if derived_key_hash20 != prevout.key_hash20 {
-            return Err(NodeError::Runtime(format!(
-                "input #{input_index} pubkey hash mismatch with referenced output"
-            )));
-        }
-
-        let mut signature = [0u8; 64];
-        signature.copy_from_slice(&input.signature);
-        let mut pubkey = [0u8; 33];
-        pubkey.copy_from_slice(&input.pubkey_compressed);
-        let digest = tx
-            .signing_digest_with_chain_domain(input_index, cfg.network_id.as_bytes())
-            .map_err(|e| {
-                NodeError::Runtime(format!("input #{input_index} signing digest failed: {e}"))
-            })?;
-        let sig_ok = verify_digest(digest.0, signature, pubkey)?;
-        if !sig_ok {
-            return Err(NodeError::Runtime(format!(
-                "input #{input_index} signature verification failed"
-            )));
-        }
-
-        input_sum = input_sum
-            .checked_add(prevout.value as u128)
-            .ok_or_else(|| NodeError::Runtime("input value overflow".to_owned()))?;
     }
-
     if !missing.is_empty() {
         return Err(NodeError::Runtime(format!(
             "transaction has unresolved inputs: {}",
             missing.join(", ")
         )));
     }
-    if input_sum < output_sum {
-        return Err(NodeError::Runtime(format!(
-            "transaction overspends: inputs={} outputs={}",
-            input_sum, output_sum
-        )));
-    }
-    let fee = input_sum.saturating_sub(output_sum);
-    u64::try_from(fee).map_err(|_| NodeError::Runtime("transaction fee overflow".to_owned()))
+
+    validate_tx_for_next_block_admission(cfg, runtime, mempool, tx)
 }
 
 fn coinbase_prevout_is_immature(tip_height: u64, created_height: u64, maturity: u64) -> bool {
@@ -14423,16 +14924,13 @@ fn submit_tx_via_mempool_db_for_runtime(
         retry_attempts,
         retry_backoff_ms,
     )?;
-    let implied_fee = validate_tx_for_local_admission(cfg, runtime, &mempool, &tx)?;
-    let fee = if requested_fee == 0 {
-        implied_fee
-    } else {
-        requested_fee
-    };
-    if fee < implied_fee {
+    // The fee is a property of the transaction (inputs - outputs), never of
+    // the request: a caller-claimed fee used to drive mempool priority and
+    // eviction and could make pool templates overpay the coinbase.
+    let fee = validate_tx_for_local_admission(cfg, runtime, &mempool, &tx)?;
+    if requested_fee != 0 && requested_fee != fee {
         return Err(NodeError::Runtime(format!(
-            "provided fee {} is lower than implied fee {}",
-            fee, implied_fee
+            "provided fee {requested_fee} does not match the transaction's actual fee {fee}"
         )));
     }
     let txid = tx.txid();
@@ -14868,6 +15366,15 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
         pool_fee_bps: args.pool_fee_bps,
         pplns_window_shares: args.pplns_window_shares.max(1),
         pps_share_atomic: args.pps_share_atomic,
+        pps_reference_expected_hashes: expected_hashes_for_target(
+            Target::from_hex(
+                args.min_share_target_hex
+                    .as_deref()
+                    .unwrap_or(&cfg.stratum_min_share_target),
+            )
+            .map_err(|e| NodeError::Runtime(format!("invalid min_share_target_hex: {e}")))?,
+        )
+        .max(1.0),
         pps_max_liability_atomic: args.pps_max_liability_atomic,
         pps_reserve_floor_atomic: args.pps_reserve_floor_atomic,
         payout_threshold_atomic: args.pool_payout_threshold_atomic.max(1),
@@ -15126,6 +15633,7 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
         cfg,
         runtime: Arc::new(Mutex::new(runtime)),
         runtime_db_path,
+        runtime_db_seen_mtime: Arc::new(Mutex::new(None)),
         mempool_db_path,
         max_template_txs,
         share_target,
@@ -16558,11 +17066,9 @@ fn run_sv2_conformance(args: Sv2ConformanceArgs) -> Result<(), NodeError> {
 }
 
 fn json_error_body(message: &str) -> String {
-    let escaped = message
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n");
-    format!("{{\"error\":\"{escaped}\"}}")
+    // serde_json escapes quotes, backslashes and every control character;
+    // the hand-rolled escaper let e.g. a tab from a Host header through.
+    serde_json::json!({ "error": message }).to_string()
 }
 
 #[derive(Debug)]
@@ -17515,17 +18021,36 @@ fn load_latest_jsonl_record<T: DeserializeOwned>(path: &Path) -> Result<Option<T
     Ok(Some(parsed))
 }
 
+/// Map a request path to a file under the UI directory. Only plain path
+/// segments are accepted: `..`, drive prefixes (`C:`), roots, backslashes
+/// and `:` are rejected on every platform. On Windows `ui_dir.join("C:/x")`
+/// discards `ui_dir`, which turned the UI server into an arbitrary file read.
 fn sanitize_ui_path(path: &str) -> Option<PathBuf> {
     let normalized = path.trim_start_matches('/');
     if normalized.is_empty() {
         return Some(PathBuf::from("index.html"));
     }
-    let candidate = PathBuf::from(normalized);
+    if normalized.contains(['\\', ':', '\0']) {
+        return None;
+    }
+    let mut candidate = PathBuf::new();
+    for segment in normalized.split('/') {
+        if segment.is_empty() || segment == "." {
+            continue;
+        }
+        if segment == ".." {
+            return None;
+        }
+        candidate.push(segment);
+    }
     if candidate
         .components()
-        .any(|component| matches!(component, std::path::Component::ParentDir))
+        .any(|component| !matches!(component, std::path::Component::Normal(_)))
     {
         return None;
+    }
+    if candidate.as_os_str().is_empty() {
+        return Some(PathBuf::from("index.html"));
     }
     Some(candidate)
 }
@@ -17570,13 +18095,56 @@ fn refresh_runtime_from_db_if_changed(
     if current_mtime == *last_seen_mtime {
         return Ok(());
     }
-    let fresh = load_with_retry(10, 25, is_runtime_db_lock_conflict, || {
-        load_runtime_from_db_or_genesis(cfg, runtime_db_path).map(|(loaded, _)| loaded)
-    })?;
-    if let Some(fresh) = fresh {
-        *runtime = fresh;
+    if !runtime_db_path.exists() {
         *last_seen_mtime = current_mtime;
+        return Ok(());
     }
+    let disk_tip = load_with_retry(10, 25, is_runtime_db_lock_conflict, || {
+        load_chain_archive_tip_db(runtime_db_path).map_err(NodeError::from)
+    })?;
+    // Lock-contended: keep the old mtime so the next poll retries.
+    let Some(disk_tip) = disk_tip else {
+        return Ok(());
+    };
+    let Some(disk_tip) = disk_tip else {
+        *last_seen_mtime = current_mtime;
+        return Ok(());
+    };
+    ensure_network_id_match(
+        &cfg.network_id,
+        &disk_tip.network_id,
+        "runtime db network mismatch",
+    )?;
+    let known_on_main_chain = runtime
+        .height_of(&disk_tip.hash)
+        .is_some_and(|height| runtime.block_hash_at_height(height) == Some(disk_tip.hash));
+    if !known_on_main_chain {
+        // Merge instead of replace: feed the archive's recent blocks through
+        // normal fork choice. Blocks we already have are no-ops, and blocks
+        // this process holds that are not on disk yet are kept (the old
+        // wholesale replacement dropped them and replayed the whole chain).
+        let from_height = runtime
+            .tip_height()
+            .min(disk_tip.height)
+            .saturating_sub(scam_chain::MAX_REORG_DEPTH);
+        let loaded = load_with_retry(10, 25, is_runtime_db_lock_conflict, || {
+            load_chain_archive_range_db(runtime_db_path, from_height).map_err(NodeError::from)
+        })?;
+        let Some((network_id, blocks)) = loaded else {
+            return Ok(());
+        };
+        ensure_network_id_match(&cfg.network_id, &network_id, "runtime db network mismatch")?;
+        for (height, block) in blocks {
+            match runtime.submit_block(block) {
+                Ok(_) => {}
+                Err(err) => {
+                    eprintln!("warning: runtime db refresh stopped at height {height}: {err}");
+                    break;
+                }
+            }
+        }
+    }
+    *last_seen_mtime = current_mtime;
     Ok(())
 }
 
@@ -17854,8 +18422,10 @@ fn rpc_http_backend_from_env() -> RpcHttpBackend {
         .to_ascii_lowercase()
         .as_str()
     {
-        "axum" => RpcHttpBackend::Axum,
-        _ => RpcHttpBackend::Legacy,
+        // Legacy is opt-in by name only; a typo must not silently select
+        // the server without request protections.
+        "legacy" => RpcHttpBackend::Legacy,
+        _ => RpcHttpBackend::Axum,
     }
 }
 
@@ -18339,12 +18909,31 @@ fn axum_try_serve_ui_asset(
             asset_path.display()
         ))
     })?;
-    Ok(Some(axum_binary_response(
-        StatusCode::OK,
-        guess_content_type(&asset_path),
-        body,
-    )))
+    let mut response = axum_binary_response(StatusCode::OK, guess_content_type(&asset_path), body);
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(UI_CONTENT_SECURITY_POLICY),
+    );
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    Ok(Some(response))
 }
+
+/// The console only talks to a local node; scripts, frames and form posts
+/// from elsewhere are refused (defense in depth against XSS/clickjacking).
+const UI_CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self'; \
+style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; \
+font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; \
+connect-src 'self' http://127.0.0.1:* http://localhost:* http://[::1]:*; \
+frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
 
 async fn axum_mempool_handler(AxumState(state): AxumState<AxumRpcState>) -> AxumResponse {
     let mut txids = Vec::<String>::new();
@@ -18944,19 +19533,155 @@ fn rpc_host_header_allowed(host: &str) -> bool {
     matches!(hostname, "127.0.0.1" | "::1" | "localhost")
 }
 
-async fn enforce_loopback_host_header(req: AxumRequest, next: AxumNext) -> AxumResponse {
-    let host = req
-        .headers()
-        .get(header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
+/// Request policy for the RPC server. The Host allow-list alone is not
+/// authentication: behind a reverse proxy every request carries a loopback
+/// Host, and simple cross-site `text/plain` POSTs skip CORS preflight.
+#[derive(Clone)]
+struct RpcRequestPolicy {
+    auth_token: Option<Arc<str>>,
+    wallet_rpc_enabled: bool,
+}
+
+/// Routes that receive a mnemonic/passphrase or return a fresh one.
+const RPC_WALLET_SECRET_ROUTES: &[&str] = &[
+    "/wallet/new",
+    "/wallet/address",
+    "/wallet/balance",
+    "/wallet/send-preview",
+    "/wallet/send",
+];
+
+fn load_rpc_auth_token(token_file: Option<&Path>) -> Result<Option<String>, NodeError> {
+    if let Some(path) = token_file {
+        let raw = fs::read_to_string(path).map_err(|e| {
+            NodeError::Runtime(format!(
+                "cannot read RPC auth token file {}: {e}",
+                path.display()
+            ))
+        })?;
+        let token = raw.trim();
+        if token.len() < 16 {
+            return Err(NodeError::Runtime(format!(
+                "RPC auth token in {} must be at least 16 characters",
+                path.display()
+            )));
+        }
+        return Ok(Some(token.to_owned()));
+    }
+    Ok(env_opt("SCAM_RPC_AUTH_TOKEN")
+        .map(|token| token.trim().to_owned())
+        .filter(|token| !token.is_empty()))
+}
+
+fn rpc_bind_is_loopback(bind: &str) -> bool {
+    match bind.parse::<SocketAddr>() {
+        Ok(addr) => addr.ip().is_loopback(),
+        Err(_) => bind
+            .rsplit_once(':')
+            .is_some_and(|(host, _)| host == "localhost"),
+    }
+}
+
+/// Refuse to expose the RPC beyond loopback without a credential. A value
+/// that is not `host:port` at all is left to the bind call to reject.
+fn ensure_rpc_bind_is_protected(bind: &str, policy: &RpcRequestPolicy) -> Result<(), NodeError> {
+    if !bind.contains(':') || rpc_bind_is_loopback(bind) || policy.auth_token.is_some() {
+        return Ok(());
+    }
+    Err(NodeError::Runtime(format!(
+        "refusing to bind RPC on non-loopback address {bind} without an auth token (--auth-token-file or SCAM_RPC_AUTH_TOKEN)"
+    )))
+}
+
+fn rpc_origin_allowed(origin: &str) -> bool {
+    origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+        .is_some_and(rpc_host_header_allowed)
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// `Some((status, message))` when the request must be rejected.
+fn rpc_request_policy_violation(
+    policy: &RpcRequestPolicy,
+    method: &Method,
+    path: &str,
+    headers: &axum::http::HeaderMap,
+) -> Option<(StatusCode, String)> {
+    let header_str = |name| {
+        headers
+            .get(name)
+            .and_then(|v: &HeaderValue| v.to_str().ok())
+    };
+    let host = header_str(header::HOST).unwrap_or("");
     if !rpc_host_header_allowed(host) {
-        return axum_json_response(
+        return Some((
             StatusCode::FORBIDDEN,
-            json_error_body(&format!(
-                "request rejected: Host header '{host}' is not in the loopback allow-list (DNS-rebinding protection)"
-            )),
-        );
+            format!(
+                "request rejected: Host header '{}' is not in the loopback allow-list (DNS-rebinding protection)",
+                host.escape_default()
+            ),
+        ));
+    }
+    if matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS) {
+        return None;
+    }
+    if !policy.wallet_rpc_enabled && RPC_WALLET_SECRET_ROUTES.contains(&path) {
+        return Some((
+            StatusCode::FORBIDDEN,
+            "wallet RPC routes that handle mnemonics are disabled on this node".to_owned(),
+        ));
+    }
+    let content_type = header_str(header::CONTENT_TYPE).unwrap_or("");
+    if !content_type
+        .to_ascii_lowercase()
+        .starts_with("application/json")
+    {
+        return Some((
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "state-changing requests must use Content-Type: application/json".to_owned(),
+        ));
+    }
+    if let Some(origin) = header_str(header::ORIGIN)
+        && !rpc_origin_allowed(origin)
+    {
+        return Some((
+            StatusCode::FORBIDDEN,
+            format!(
+                "cross-origin request from '{}' rejected",
+                origin.escape_default()
+            ),
+        ));
+    }
+    if let Some(token) = policy.auth_token.as_deref() {
+        let presented = header_str(header::AUTHORIZATION)
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .unwrap_or("");
+        if !constant_time_eq(presented.as_bytes(), token.as_bytes()) {
+            return Some((
+                StatusCode::UNAUTHORIZED,
+                "missing or invalid bearer token".to_owned(),
+            ));
+        }
+    }
+    None
+}
+
+async fn enforce_rpc_request_policy(
+    AxumState(policy): AxumState<RpcRequestPolicy>,
+    req: AxumRequest,
+    next: AxumNext,
+) -> AxumResponse {
+    if let Some((status, message)) =
+        rpc_request_policy_violation(&policy, req.method(), req.uri().path(), req.headers())
+    {
+        return axum_json_response(status, json_error_body(&message));
     }
     next.run(req).await
 }
@@ -19013,7 +19738,14 @@ fn run_rpc_serve_inner_axum(
         interval_sec,
         max_nonce,
         max_requests,
+        auth_token_file,
+        disable_wallet_rpc,
     } = args;
+    let request_policy = RpcRequestPolicy {
+        auth_token: load_rpc_auth_token(auth_token_file.as_deref())?.map(Arc::from),
+        wallet_rpc_enabled: !disable_wallet_rpc,
+    };
+    ensure_rpc_bind_is_protected(&bind, &request_policy)?;
     let runtime_db_path = runtime_db
         .clone()
         .unwrap_or_else(|| default_runtime_db_path(network));
@@ -19119,7 +19851,10 @@ fn run_rpc_serve_inner_axum(
                 .route("/wallet/qr", post(axum_wallet_qr_handler))
                 .route("/tx/submit", post(axum_tx_submit_handler))
                 .fallback(axum_fallback_handler)
-                .layer(axum_middleware::from_fn(enforce_loopback_host_header))
+                .layer(axum_middleware::from_fn_with_state(
+                    request_policy,
+                    enforce_rpc_request_policy,
+                ))
                 .with_state(shared);
 
             let graceful_shutdown_flag = shutdown_flag.clone();
@@ -19156,7 +19891,19 @@ fn run_rpc_serve_inner_legacy(
         interval_sec,
         max_nonce,
         max_requests,
+        auth_token_file,
+        disable_wallet_rpc,
     } = args;
+    // The legacy server has no Host/Origin/Content-Type/token checks; only
+    // allow it for loopback binds without any requested protection.
+    if auth_token_file.is_some() || disable_wallet_rpc || !rpc_bind_is_loopback(&bind) {
+        return Err(NodeError::Runtime(
+            "the legacy RPC backend cannot enforce auth/wallet/bind policy; use the default axum backend".to_owned(),
+        ));
+    }
+    eprintln!(
+        "warning: legacy RPC backend selected (SCAM_RPC_HTTP_BACKEND=legacy): no DNS-rebinding or CSRF protection"
+    );
     let runtime_db_path = runtime_db
         .clone()
         .unwrap_or_else(|| default_runtime_db_path(network));
@@ -20609,7 +21356,6 @@ mod tests {
             count: 2,
             interval_sec: cfg.target_block_time_sec,
             max_nonce: 500_000,
-            subsidy: cfg.block_subsidy,
             miner_key_hash: funded_hash20,
             label_prefix: "discover-funded",
             print_each: false,
@@ -20636,7 +21382,6 @@ mod tests {
             count: 2,
             interval_sec: late_runtime.config().target_block_time_sec,
             max_nonce: 500_000,
-            subsidy: late_runtime.config().block_subsidy,
             miner_key_hash: late_hash20,
             label_prefix: "discover-late",
             print_each: false,
@@ -20735,6 +21480,235 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// ST3: PPS credit scales with share difficulty; an "any hash" share
+    /// earns (almost) nothing compared to a reference-difficulty share.
+    /// ST4: only admitted payout txs count as submitted.
+    #[test]
+    fn pps_credit_scales_with_share_difficulty_and_payout_outcomes_are_checked() {
+        let mut ledger = super::StratumPoolLedgerState::new(
+            "devnet".to_owned(),
+            0,
+            Hash256::ZERO,
+            1_770_000_000,
+            8,
+            8,
+        );
+        ledger.workers.insert(
+            "w".to_owned(),
+            super::PoolWorkerAccrualRecord {
+                worker: "w".to_owned(),
+                accepted_total: 0,
+                rejected_total: 0,
+                blocks_found_total: 0,
+                expected_hashes_accumulated: 0.0,
+                pplns_accrual_atomic: 0,
+                pps_accrual_atomic: 0,
+                paid_total_atomic: 0,
+                last_share_unix_sec: 0,
+            },
+        );
+        ledger.set_payout_config(super::PoolPayoutConfig {
+            mode: super::PoolPayoutModeArg::Pps,
+            pps_share_atomic: 1_000,
+            pps_reference_expected_hashes: 256.0,
+            ..super::PoolPayoutConfig::default()
+        });
+        ledger.apply_pps_share_credit("w", 256.0, None);
+        assert_eq!(ledger.workers["w"].pps_accrual_atomic, 1_000);
+        ledger.apply_pps_share_credit("w", 1.0, None);
+        assert_eq!(
+            ledger.workers["w"].pps_accrual_atomic, 1_003,
+            "a 1-hash share earns 1/256 of the reference credit"
+        );
+        ledger.apply_pps_share_credit("w", 512.0, None);
+        assert_eq!(ledger.workers["w"].pps_accrual_atomic, 3_003);
+
+        assert!(super::pool_payout_submit_outcome_is_live("accepted"));
+        assert!(!super::pool_payout_submit_outcome_is_live(
+            "rejected_conflict_insufficient_fee"
+        ));
+        assert!(!super::pool_payout_submit_outcome_is_live(
+            "rejected_conflict_insufficient_feerate"
+        ));
+    }
+
+    /// S1: a process whose chain is behind the shared archive must neither
+    /// roll it back nor fail its caller.
+    #[test]
+    fn persist_runtime_db_never_rolls_back_a_heavier_archive() {
+        let mut cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("devnet config");
+        cfg.coinbase_maturity = 1;
+        cfg.validate().expect("config validate");
+        let work_dir = temp_dir("test-persist-stale-writer");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let runtime_db = work_dir.join("runtime.redb");
+
+        let mut relay_view = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let stale_view = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        mine_blocks_on_runtime(
+            &mut relay_view,
+            &super::MiningLoopParams {
+                count: 3,
+                interval_sec: cfg.target_block_time_sec,
+                max_nonce: 500_000,
+                miner_key_hash: [7u8; 20],
+                label_prefix: "stale-writer",
+                print_each: false,
+            },
+        )
+        .expect("mine");
+        persist_runtime_db(&relay_view, &runtime_db).expect("relay persists");
+        persist_runtime_db(&stale_view, &runtime_db).expect("stale writer is not an error");
+
+        let (reloaded, _) =
+            super::load_runtime_from_db_or_genesis(&cfg, &runtime_db).expect("reload");
+        assert_eq!(reloaded.tip_height(), 3, "archive was not rolled back");
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    /// R4/R7: state-changing RPC requests need JSON (no simple cross-site
+    /// form posts), a loopback Origin when one is sent, the bearer token when
+    /// configured; wallet-secret routes can be disabled; non-loopback binds
+    /// need a token.
+    #[test]
+    fn rpc_request_policy_blocks_csrf_and_enforces_token() {
+        use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
+        let open = super::RpcRequestPolicy {
+            auth_token: None,
+            wallet_rpc_enabled: true,
+        };
+        let headers = |pairs: &[(header::HeaderName, &str)]| {
+            let mut map = HeaderMap::new();
+            map.insert(header::HOST, HeaderValue::from_static("127.0.0.1:18080"));
+            for (name, value) in pairs {
+                map.insert(name.clone(), HeaderValue::from_str(value).expect("value"));
+            }
+            map
+        };
+        let check =
+            |policy: &super::RpcRequestPolicy, method: Method, path: &str, h: &HeaderMap| {
+                super::rpc_request_policy_violation(policy, &method, path, h)
+                    .map(|(status, _)| status)
+            };
+
+        let json = headers(&[(header::CONTENT_TYPE, "application/json")]);
+        assert_eq!(check(&open, Method::POST, "/tx/submit", &json), None);
+        assert_eq!(check(&open, Method::GET, "/status", &headers(&[])), None);
+        assert_eq!(
+            check(
+                &open,
+                Method::POST,
+                "/tx/submit",
+                &headers(&[(header::CONTENT_TYPE, "text/plain")])
+            ),
+            Some(StatusCode::UNSUPPORTED_MEDIA_TYPE)
+        );
+        let foreign = headers(&[
+            (header::CONTENT_TYPE, "application/json"),
+            (header::ORIGIN, "http://evil.example"),
+        ]);
+        assert_eq!(
+            check(&open, Method::POST, "/wallet/send", &foreign),
+            Some(StatusCode::FORBIDDEN)
+        );
+        let local_origin = headers(&[
+            (header::CONTENT_TYPE, "application/json"),
+            (header::ORIGIN, "http://127.0.0.1:18080"),
+        ]);
+        assert_eq!(
+            check(&open, Method::POST, "/wallet/send", &local_origin),
+            None
+        );
+
+        let no_wallet = super::RpcRequestPolicy {
+            auth_token: None,
+            wallet_rpc_enabled: false,
+        };
+        assert_eq!(
+            check(&no_wallet, Method::POST, "/wallet/send", &json),
+            Some(StatusCode::FORBIDDEN)
+        );
+        assert_eq!(check(&no_wallet, Method::POST, "/tx/submit", &json), None);
+
+        let token = super::RpcRequestPolicy {
+            auth_token: Some(Arc::from("s3cret-token-0123456789")),
+            wallet_rpc_enabled: true,
+        };
+        assert_eq!(
+            check(&token, Method::POST, "/tx/submit", &json),
+            Some(StatusCode::UNAUTHORIZED)
+        );
+        let wrong = headers(&[
+            (header::CONTENT_TYPE, "application/json"),
+            (header::AUTHORIZATION, "Bearer nope"),
+        ]);
+        assert_eq!(
+            check(&token, Method::POST, "/tx/submit", &wrong),
+            Some(StatusCode::UNAUTHORIZED)
+        );
+        let right = headers(&[
+            (header::CONTENT_TYPE, "application/json"),
+            (header::AUTHORIZATION, "Bearer s3cret-token-0123456789"),
+        ]);
+        assert_eq!(check(&token, Method::POST, "/tx/submit", &right), None);
+
+        assert!(super::ensure_rpc_bind_is_protected("0.0.0.0:18080", &open).is_err());
+        assert!(super::ensure_rpc_bind_is_protected("0.0.0.0:18080", &token).is_ok());
+        assert!(super::ensure_rpc_bind_is_protected("127.0.0.1:18080", &open).is_ok());
+        assert!(super::ensure_rpc_bind_is_protected("[::1]:18080", &open).is_ok());
+    }
+
+    /// R2: only plain segments under the UI dir are servable; drive
+    /// prefixes / backslashes / `..` are rejected on every platform.
+    #[test]
+    fn sanitize_ui_path_rejects_escapes_on_all_platforms() {
+        assert_eq!(
+            super::sanitize_ui_path("/"),
+            Some(PathBuf::from("index.html"))
+        );
+        assert_eq!(
+            super::sanitize_ui_path("/css/app.css"),
+            Some(PathBuf::from("css").join("app.css"))
+        );
+        for bad in [
+            "/../secret",
+            "/a/../../b",
+            "/C:/Users/u/data/wallets/default.vault.json",
+            "/c:secret",
+            "/..\\..\\x",
+            "/a\\b",
+            "/file.txt:stream",
+        ] {
+            assert_eq!(super::sanitize_ui_path(bad), None, "{bad}");
+        }
+    }
+
+    /// C16: monetary policy must be part of the handshake fingerprint.
+    #[test]
+    fn consensus_fingerprint_covers_monetary_policy_and_versionbits() {
+        let base: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let fp = super::consensus_fingerprint(&base);
+        let mut halving = base.clone();
+        halving.halving_interval_blocks = 210_000;
+        assert_ne!(super::consensus_fingerprint(&halving), fp);
+        let mut tail = base.clone();
+        tail.tail_emission = 1;
+        assert_ne!(super::consensus_fingerprint(&tail), fp);
+        let mut vb = base.clone();
+        vb.versionbits_window_blocks = 2_016;
+        assert_ne!(super::consensus_fingerprint(&vb), fp);
+        let mut deployment = base.clone();
+        deployment.deployments.push(scam_core::Deployment {
+            name: "x".to_owned(),
+            bit: 1,
+            start_unix: 0,
+            timeout_unix: 1,
+        });
+        assert_ne!(super::consensus_fingerprint(&deployment), fp);
+    }
+
     fn devnet_consensus_fingerprint() -> String {
         let cfg: ChainConfig =
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
@@ -20809,6 +21783,7 @@ mod tests {
             cfg: cfg.clone(),
             runtime: std::sync::Arc::new(std::sync::Mutex::new(runtime)),
             runtime_db_path,
+            runtime_db_seen_mtime: Arc::new(std::sync::Mutex::new(None)),
             mempool_db_path,
             max_template_txs: cfg.max_mempool_txs as usize,
             share_target: Target::MAX,
@@ -21229,7 +22204,6 @@ mod tests {
             count: remote_blocks,
             interval_sec: cfg.target_block_time_sec,
             max_nonce: 500_000,
-            subsidy: cfg.block_subsidy,
             miner_key_hash: cfg.genesis_reward_key_hash20().expect("key hash"),
             label_prefix: "sync-peer-test",
             print_each: false,
@@ -22652,7 +23626,6 @@ mod tests {
                 count: 2,
                 interval_sec: cfg.target_block_time_sec,
                 max_nonce: 500_000,
-                subsidy: cfg.block_subsidy,
                 miner_key_hash: sender_key_hash20,
                 label_prefix: "remove-confirmed-helper",
                 print_each: false,
@@ -22690,6 +23663,7 @@ mod tests {
             miner_key_hash20: sender_key_hash20,
             coinbase_tag: "remove-confirmed-helper-template".to_owned(),
             max_txs: cfg.max_mempool_txs as usize,
+            max_total_tx_bytes: usize::MAX,
         };
         let (template, summary) =
             super::build_template_from_mempool(&template_params, &mempool).expect("template");
@@ -22727,7 +23701,6 @@ mod tests {
                 count: 2,
                 interval_sec: cfg.target_block_time_sec,
                 max_nonce: 500_000,
-                subsidy: cfg.block_subsidy,
                 miner_key_hash: sender_key_hash20,
                 label_prefix: "remove-missing-helper",
                 print_each: false,
@@ -22812,7 +23785,6 @@ mod tests {
                 count: 2,
                 interval_sec: cfg.target_block_time_sec,
                 max_nonce: 500_000,
-                subsidy: cfg.block_subsidy,
                 miner_key_hash: sender_key_hash20,
                 label_prefix: "cleanup-missing-helper",
                 print_each: false,
@@ -23672,6 +24644,7 @@ mod tests {
             pool_fee_bps: 0,
             pplns_window_shares: 10,
             pps_share_atomic: 0,
+            pps_reference_expected_hashes: 1.0,
             pps_max_liability_atomic: 0,
             pps_reserve_floor_atomic: 0,
             payout_threshold_atomic: 1,
@@ -23725,6 +24698,7 @@ mod tests {
             pool_fee_bps: 0,
             pplns_window_shares: 10,
             pps_share_atomic: 100,
+            pps_reference_expected_hashes: 1.0,
             pps_max_liability_atomic: 150,
             pps_reserve_floor_atomic: 50,
             payout_threshold_atomic: 1,
@@ -23782,6 +24756,7 @@ mod tests {
             pool_fee_bps: 0,
             pplns_window_shares: 10,
             pps_share_atomic: 250,
+            pps_reference_expected_hashes: 1.0,
             pps_max_liability_atomic: 0,
             pps_reserve_floor_atomic: 0,
             payout_threshold_atomic: 200,
@@ -24379,7 +25354,7 @@ mod tests {
         });
         assert!(!ledger.pps_liability_exceeds_cap(10));
         assert!(ledger.pps_liability_exceeds_cap(11));
-        ledger.apply_pps_share_credit("worker-x", Some(1_000));
+        ledger.apply_pps_share_credit("worker-x", 1.0, Some(1_000));
         assert_eq!(
             ledger
                 .workers
@@ -24389,7 +25364,7 @@ mod tests {
             20,
             "equal-to-cap credit should be allowed"
         );
-        ledger.apply_pps_share_credit("worker-x", Some(1_000));
+        ledger.apply_pps_share_credit("worker-x", 1.0, Some(1_000));
         assert_eq!(
             ledger
                 .workers
@@ -24623,7 +25598,7 @@ mod tests {
             payout_tx_fee_atomic: 1,
             ..super::PoolPayoutConfig::default()
         });
-        ledger.apply_pps_share_credit("worker-z", None);
+        ledger.apply_pps_share_credit("worker-z", 1.0, None);
         let worker = ledger.workers.get("worker-z").expect("worker-z");
         assert_eq!(worker.pps_accrual_atomic, 9);
         assert_eq!(ledger.pps_guardrail_alerts_total, 0);
@@ -24844,7 +25819,6 @@ mod tests {
                 count: 3,
                 interval_sec: cfg.target_block_time_sec,
                 max_nonce: 500_000,
-                subsidy: cfg.block_subsidy,
                 miner_key_hash: key_hash20,
                 label_prefix: "spendable-balance",
                 print_each: false,
@@ -24882,7 +25856,6 @@ mod tests {
                 count: 2,
                 interval_sec: cfg.target_block_time_sec,
                 max_nonce: 500_000,
-                subsidy: cfg.block_subsidy,
                 miner_key_hash: sender_key_hash20,
                 label_prefix: "spendable-min-conf",
                 print_each: false,
@@ -24917,6 +25890,7 @@ mod tests {
             miner_key_hash20: sender_key_hash20,
             coinbase_tag: "spendable-min-conf-template".to_owned(),
             max_txs: cfg.max_mempool_txs as usize,
+            max_total_tx_bytes: usize::MAX,
         };
         let (template, _summary) =
             super::build_template_from_mempool(&template_params, &mempool).expect("template");
@@ -24934,7 +25908,6 @@ mod tests {
                 count: 1,
                 interval_sec: cfg.target_block_time_sec,
                 max_nonce: 500_000,
-                subsidy: cfg.block_subsidy,
                 miner_key_hash: sender_key_hash20,
                 label_prefix: "spendable-min-conf-mature",
                 print_each: false,
@@ -25149,7 +26122,6 @@ mod tests {
                 count: 2,
                 interval_sec: cfg.target_block_time_sec,
                 max_nonce: 500_000,
-                subsidy: cfg.block_subsidy,
                 miner_key_hash: pool_key_hash20,
                 label_prefix: "pool-payout-filter",
                 print_each: false,
@@ -25510,6 +26482,7 @@ mod tests {
             cfg: cfg.clone(),
             runtime: std::sync::Arc::new(std::sync::Mutex::new(runtime)),
             runtime_db_path,
+            runtime_db_seen_mtime: Arc::new(std::sync::Mutex::new(None)),
             mempool_db_path,
             max_template_txs: cfg.max_mempool_txs as usize,
             share_target: Target::MAX,
@@ -27114,7 +28087,6 @@ mod tests {
                 count: 2,
                 interval_sec: cfg.target_block_time_sec,
                 max_nonce: 500_000,
-                subsidy: cfg.block_subsidy,
                 miner_key_hash: sender_key_hash20,
                 label_prefix: "relay-restart",
                 print_each: false,
@@ -27240,7 +28212,6 @@ mod tests {
                 count: 1,
                 interval_sec: cfg.target_block_time_sec,
                 max_nonce: 500_000,
-                subsidy: cfg.block_subsidy,
                 miner_key_hash: sender_key_hash20,
                 label_prefix: "relay-restart-after",
                 print_each: false,
@@ -27600,6 +28571,13 @@ mod tests {
         );
         unsafe {
             std::env::set_var(KEY, "unknown");
+        }
+        assert_eq!(
+            super::rpc_http_backend_from_env(),
+            super::RpcHttpBackend::Axum
+        );
+        unsafe {
+            std::env::set_var(KEY, "legacy");
         }
         assert_eq!(
             super::rpc_http_backend_from_env(),
@@ -29220,7 +30198,6 @@ mod tests {
             count: cfg.coinbase_maturity,
             interval_sec: cfg.target_block_time_sec,
             max_nonce: 500_000,
-            subsidy: cfg.block_subsidy,
             miner_key_hash,
             label_prefix: "maturity-boundary",
             print_each: false,
@@ -29267,7 +30244,6 @@ mod tests {
                 count: 2,
                 interval_sec: cfg.target_block_time_sec,
                 max_nonce: 500_000,
-                subsidy: cfg.block_subsidy,
                 miner_key_hash: sender_key_hash20,
                 label_prefix: "wallet-min-conf-balance",
                 print_each: false,
@@ -29302,6 +30278,7 @@ mod tests {
             miner_key_hash20: sender_key_hash20,
             coinbase_tag: "wallet-min-conf-template".to_owned(),
             max_txs: cfg.max_mempool_txs as usize,
+            max_total_tx_bytes: usize::MAX,
         };
         let (template, _summary) =
             super::build_template_from_mempool(&template_params, &mempool).expect("template");
@@ -29328,7 +30305,6 @@ mod tests {
                 count: 2,
                 interval_sec: cfg.target_block_time_sec,
                 max_nonce: 500_000,
-                subsidy: cfg.block_subsidy,
                 miner_key_hash: sender_key_hash20,
                 label_prefix: "wallet-min-conf-mature",
                 print_each: false,
@@ -29986,6 +30962,8 @@ mod tests {
                 interval_sec: 120,
                 max_nonce: 500_000,
                 max_requests: 0,
+                auth_token_file: None,
+                disable_wallet_rpc: false,
             });
             let assertions = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let post_events = send_http_request(
@@ -30054,6 +31032,8 @@ mod tests {
             interval_sec: 120,
             max_nonce: 500_000,
             max_requests: 0,
+            auth_token_file: None,
+            disable_wallet_rpc: false,
         });
 
         with_rpc_server_shutdown(server_shutdown, server, "rpc health routes server", || {
@@ -30105,6 +31085,8 @@ mod tests {
             interval_sec: 120,
             max_nonce: 500_000,
             max_requests: 0,
+            auth_token_file: None,
+            disable_wallet_rpc: false,
         });
 
         with_rpc_server_shutdown(server_shutdown, server, "rpc legacy routes server", || {
@@ -30159,6 +31141,8 @@ mod tests {
                     interval_sec: 120,
                     max_nonce: 500_000,
                     max_requests: 1,
+                    auth_token_file: None,
+                    disable_wallet_rpc: false,
                 },
                 Some(shutdown_clone),
             )
@@ -30212,6 +31196,8 @@ mod tests {
             interval_sec: 120,
             max_nonce: 500_000,
             max_requests: 0,
+            auth_token_file: None,
+            disable_wallet_rpc: false,
         });
 
         with_rpc_server_shutdown(server_shutdown, server, "rpc core routes server", || {
@@ -30333,6 +31319,8 @@ mod tests {
             interval_sec: 120,
             max_nonce: 500_000,
             max_requests: 0,
+            auth_token_file: None,
+            disable_wallet_rpc: false,
         });
 
         with_rpc_server_shutdown(server_shutdown, server, "rpc pool routes server", || {
@@ -30405,6 +31393,8 @@ mod tests {
             interval_sec: 120,
             max_nonce: 500_000,
             max_requests: 0,
+            auth_token_file: None,
+            disable_wallet_rpc: false,
         });
 
         with_rpc_server_shutdown(server_shutdown, server, "rpc events server", || {
@@ -30497,7 +31487,6 @@ mod tests {
             count: 2,
             interval_sec: cfg.target_block_time_sec,
             max_nonce: 500_000,
-            subsidy: cfg.block_subsidy,
             miner_key_hash: sender_key_hash20,
             label_prefix: "rpc-send-reject",
             print_each: false,
@@ -30518,6 +31507,8 @@ mod tests {
             interval_sec: 120,
             max_nonce: 500_000,
             max_requests: 0,
+            auth_token_file: None,
+            disable_wallet_rpc: false,
         });
 
         with_rpc_server_shutdown(
@@ -30637,6 +31628,8 @@ mod tests {
             interval_sec: 120,
             max_nonce: 500_000,
             max_requests: 1,
+            auth_token_file: None,
+            disable_wallet_rpc: false,
         })
         .expect_err("invalid bind should fail");
         assert!(err.to_string().contains("rpc bind failed"));
@@ -30688,6 +31681,8 @@ mod tests {
             interval_sec: 120,
             max_nonce: 500_000,
             max_requests: 0,
+            auth_token_file: None,
+            disable_wallet_rpc: false,
         });
 
         with_rpc_server_shutdown(server_shutdown, server, "rpc strict routes server", || {
@@ -30701,7 +31696,7 @@ mod tests {
             assert!(unknown.contains("\"unknown endpoint\""));
             let post_pool_worker = send_http_request(
                 &addr,
-                "POST /pool/worker/miner.alpha HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+                "POST /pool/worker/miner.alpha HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 0\r\n\r\n",
             );
             assert!(post_pool_worker.starts_with("HTTP/1.1 404 Not Found"));
             assert!(
@@ -31417,7 +32412,6 @@ mod tests {
                 count: 1,
                 interval_sec: cfg.target_block_time_sec,
                 max_nonce: 500_000,
-                subsidy: cfg.block_subsidy,
                 miner_key_hash: reward_key_hash,
                 label_prefix: "refresh-runtime",
                 print_each: false,
@@ -31461,7 +32455,6 @@ mod tests {
                 count: 1,
                 interval_sec: cfg.target_block_time_sec,
                 max_nonce: 500_000,
-                subsidy: cfg.block_subsidy,
                 miner_key_hash: cfg.genesis_reward_key_hash20().expect("reward key"),
                 label_prefix: "refresh-relay-runtime",
                 print_each: false,
@@ -31564,7 +32557,6 @@ mod tests {
                 count: 1,
                 interval_sec: cfg.target_block_time_sec,
                 max_nonce: 500_000,
-                subsidy: cfg.block_subsidy,
                 miner_key_hash: cfg.genesis_reward_key_hash20().expect("reward key"),
                 label_prefix: "axum-runtime-lock",
                 print_each: false,
@@ -31624,7 +32616,6 @@ mod tests {
                 count: 1,
                 interval_sec: cfg.target_block_time_sec,
                 max_nonce: 500_000,
-                subsidy: cfg.block_subsidy,
                 miner_key_hash: cfg.genesis_reward_key_hash20().expect("reward key"),
                 label_prefix: "axum-status-telemetry-lock",
                 print_each: false,
@@ -31704,7 +32695,6 @@ mod tests {
                 count: 1,
                 interval_sec: cfg.target_block_time_sec,
                 max_nonce: 500_000,
-                subsidy: cfg.block_subsidy,
                 miner_key_hash: cfg.genesis_reward_key_hash20().expect("reward key"),
                 label_prefix: "axum-status-zero-hashrate-lock",
                 print_each: false,
@@ -31783,7 +32773,6 @@ mod tests {
                 count: 1,
                 interval_sec: cfg.target_block_time_sec,
                 max_nonce: 500_000,
-                subsidy: cfg.block_subsidy,
                 miner_key_hash: cfg.genesis_reward_key_hash20().expect("reward key"),
                 label_prefix: "axum-status-runtime-preferred",
                 print_each: false,
@@ -31908,7 +32897,8 @@ mod tests {
         let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
         let mut archive = super::runtime_to_archive(&runtime).expect("archive");
         archive.network_id = "wrongnet".to_owned();
-        super::save_chain_archive_db(&runtime_db_path, &archive).expect("save mismatched archive");
+        scam_storage::save_chain_archive_db(&runtime_db_path, &archive)
+            .expect("save mismatched archive");
 
         let state = super::AxumRpcState {
             network: Network::Devnet,
@@ -33431,7 +34421,6 @@ mod tests {
                 count: 2,
                 interval_sec: cfg.target_block_time_sec,
                 max_nonce: 500_000,
-                subsidy: cfg.block_subsidy,
                 miner_key_hash: sender_key_hash20,
                 label_prefix: "relay-session-persist",
                 print_each: false,
@@ -34696,8 +35685,8 @@ mod tests {
             sleep_per_round_sec: 0,
         };
 
-        let summary = execute_soak_rounds(&mut runtime, &cfg, params, |_round, _rt| Ok(()))
-            .expect("soak rounds");
+        let summary =
+            execute_soak_rounds(&mut runtime, params, |_round, _rt| Ok(())).expect("soak rounds");
 
         assert_eq!(summary.rounds, 3);
         assert_eq!(summary.blocks_mined, 6);
@@ -34723,12 +35712,11 @@ mod tests {
             sleep_per_round_sec: 0,
         };
 
-        let summary = execute_soak_rounds(&mut runtime, &cfg, params, |_round, runtime| {
+        let summary = execute_soak_rounds(&mut runtime, params, |_round, runtime| {
             mine_block_with_transactions(
                 runtime,
                 30,
                 500_000,
-                cfg.block_subsidy,
                 miner_key_hash,
                 "extra".to_owned(),
                 Vec::new(),
@@ -34756,8 +35744,8 @@ mod tests {
             miner_key_hash: cfg.genesis_reward_key_hash20().expect("key hash"),
             sleep_per_round_sec: 1,
         };
-        let summary = execute_soak_rounds(&mut runtime, &cfg, params, |_round, _rt| Ok(()))
-            .expect("soak rounds");
+        let summary =
+            execute_soak_rounds(&mut runtime, params, |_round, _rt| Ok(())).expect("soak rounds");
         assert!(
             summary.elapsed_sec >= 1,
             "sleep-per-round must contribute to elapsed time"
@@ -34780,7 +35768,6 @@ mod tests {
             count: 3,
             interval_sec: 30,
             max_nonce: 500_000,
-            subsidy: cfg.block_subsidy,
             miner_key_hash: sender_key_hash20,
             label_prefix: "self-send",
             print_each: false,
@@ -34815,7 +35802,6 @@ mod tests {
             count: 2,
             interval_sec: 30,
             max_nonce: 500_000,
-            subsidy: cfg.block_subsidy,
             miner_key_hash: owner_key_hash20,
             label_prefix: "collect-spendable",
             print_each: false,
@@ -34854,7 +35840,6 @@ mod tests {
                 count: 2,
                 interval_sec: cfg.target_block_time_sec,
                 max_nonce: 500_000,
-                subsidy: cfg.block_subsidy,
                 miner_key_hash: sender_key_hash20,
                 label_prefix: "collect-min-confirmations",
                 print_each: false,
@@ -34889,6 +35874,7 @@ mod tests {
             miner_key_hash20: sender_key_hash20,
             coinbase_tag: "collect-min-confirm-template".to_owned(),
             max_txs: cfg.max_mempool_txs as usize,
+            max_total_tx_bytes: usize::MAX,
         };
         let (template, _summary) =
             super::build_template_from_mempool(&template_params, &mempool).expect("template");
@@ -34909,7 +35895,6 @@ mod tests {
                 count: 1,
                 interval_sec: cfg.target_block_time_sec,
                 max_nonce: 500_000,
-                subsidy: cfg.block_subsidy,
                 miner_key_hash: sender_key_hash20,
                 label_prefix: "collect-min-confirmations-mature",
                 print_each: false,
@@ -34941,7 +35926,6 @@ mod tests {
             count: 2,
             interval_sec: 30,
             max_nonce: 500_000,
-            subsidy: cfg.block_subsidy,
             miner_key_hash: sender_key_hash20,
             label_prefix: "change-output",
             print_each: false,
@@ -34991,7 +35975,6 @@ mod tests {
             count: 3,
             interval_sec: 30,
             max_nonce: 500_000,
-            subsidy: cfg.block_subsidy,
             miner_key_hash: sender_key_hash20,
             label_prefix: "excluded-inputs",
             print_each: false,
@@ -35048,7 +36031,6 @@ mod tests {
                 count: 2,
                 interval_sec: cfg.target_block_time_sec,
                 max_nonce: 500_000,
-                subsidy: cfg.block_subsidy,
                 miner_key_hash: sender_key_hash20,
                 label_prefix: "validate-local-admission",
                 print_each: false,
@@ -35176,7 +36158,6 @@ mod tests {
             count: 2,
             interval_sec: cfg.target_block_time_sec,
             max_nonce: 500_000,
-            subsidy: cfg.block_subsidy,
             miner_key_hash: sender_key_hash20,
             label_prefix: "submit-mempool",
             print_each: false,
@@ -35231,7 +36212,6 @@ mod tests {
                 count: 2,
                 interval_sec: cfg.target_block_time_sec,
                 max_nonce: 500_000,
-                subsidy: cfg.block_subsidy,
                 miner_key_hash: sender_key_hash20,
                 label_prefix: "submit-mempool-runtime-retry",
                 print_each: false,
@@ -35295,7 +36275,6 @@ mod tests {
                 count: 2,
                 interval_sec: cfg.target_block_time_sec,
                 max_nonce: 500_000,
-                subsidy: cfg.block_subsidy,
                 miner_key_hash: sender_key_hash20,
                 label_prefix: "submit-fee-floor",
                 print_each: false,
@@ -35323,7 +36302,19 @@ mod tests {
             implied_fee.saturating_sub(1),
         )
         .expect_err("requested fee below implied fee must fail");
-        assert!(err.to_string().contains("lower than implied fee"));
+        assert!(err.to_string().contains("does not match"));
+
+        // M6: a claimed fee above the real one used to be stored and used for
+        // mempool priority/eviction; it must be refused.
+        let err = super::submit_tx_via_mempool_db(
+            &cfg,
+            &runtime_db,
+            &mempool_db,
+            signed.tx.clone(),
+            1_000_000_000,
+        )
+        .expect_err("inflated claimed fee must fail");
+        assert!(err.to_string().contains("does not match"));
 
         let (_txid, outcome, effective_fee) =
             super::submit_tx_via_mempool_db(&cfg, &runtime_db, &mempool_db, signed.tx, 0)
@@ -35625,7 +36616,6 @@ mod tests {
             count: 2,
             interval_sec: cfg.target_block_time_sec,
             max_nonce: 500_000,
-            subsidy: cfg.block_subsidy,
             miner_key_hash: sender_key_hash20,
             label_prefix: "tx-e2e-seed",
             print_each: false,
@@ -35669,6 +36659,7 @@ mod tests {
             miner_key_hash20: sender_key_hash20,
             coinbase_tag: "tx-e2e-template".to_owned(),
             max_txs: cfg.max_mempool_txs as usize,
+            max_total_tx_bytes: usize::MAX,
         };
         let (template, summary) =
             super::build_template_from_mempool(&template_params, &mempool).expect("template");
@@ -35764,7 +36755,6 @@ mod tests {
             count: 2,
             interval_sec: cfg.target_block_time_sec,
             max_nonce: 500_000,
-            subsidy: cfg.block_subsidy,
             miner_key_hash: sender_key_hash20,
             label_prefix: "wallet-history",
             print_each: false,
@@ -35796,6 +36786,7 @@ mod tests {
             miner_key_hash20: sender_key_hash20,
             coinbase_tag: "wallet-history-template".to_owned(),
             max_txs: cfg.max_mempool_txs as usize,
+            max_total_tx_bytes: usize::MAX,
         };
         let (template, _summary) =
             super::build_template_from_mempool(&template_params, &mempool).expect("template");
@@ -35840,7 +36831,6 @@ mod tests {
                 count: 2,
                 interval_sec: cfg.target_block_time_sec,
                 max_nonce: 500_000,
-                subsidy: cfg.block_subsidy,
                 miner_key_hash: key_hash20,
                 label_prefix: "wallet-self-history",
                 print_each: false,
@@ -35875,6 +36865,7 @@ mod tests {
             miner_key_hash20: key_hash20,
             coinbase_tag: "wallet-self-template".to_owned(),
             max_txs: cfg.max_mempool_txs as usize,
+            max_total_tx_bytes: usize::MAX,
         };
         let (template, _summary) =
             super::build_template_from_mempool(&template_params, &mempool).expect("template");
@@ -35913,7 +36904,6 @@ mod tests {
                 count: 2,
                 interval_sec: cfg.target_block_time_sec,
                 max_nonce: 500_000,
-                subsidy: cfg.block_subsidy,
                 miner_key_hash: sender_key_hash20,
                 label_prefix: "wallet-outgoing-only",
                 print_each: false,
@@ -35949,6 +36939,7 @@ mod tests {
             miner_key_hash20: sender_key_hash20,
             coinbase_tag: "wallet-outgoing-only-template".to_owned(),
             max_txs: cfg.max_mempool_txs as usize,
+            max_total_tx_bytes: usize::MAX,
         };
         let (template, _summary) =
             super::build_template_from_mempool(&template_params, &mempool).expect("template");
@@ -35986,7 +36977,6 @@ mod tests {
                 count: 2,
                 interval_sec: cfg.target_block_time_sec,
                 max_nonce: 500_000,
-                subsidy: cfg.block_subsidy,
                 miner_key_hash: miner_key_hash20,
                 label_prefix: "wallet-history-unrelated",
                 print_each: false,
@@ -36087,7 +37077,6 @@ mod tests {
                 count: 2,
                 interval_sec: cfg.target_block_time_sec,
                 max_nonce: 500_000,
-                subsidy: cfg.block_subsidy,
                 miner_key_hash: reward_key,
                 label_prefix: "relay-proactive-headers",
                 print_each: false,
@@ -36850,7 +37839,6 @@ mod tests {
                 count: 2,
                 interval_sec: cfg.target_block_time_sec,
                 max_nonce: 500_000,
-                subsidy: cfg.block_subsidy,
                 miner_key_hash: sender_key_hash20,
                 label_prefix: "compact-seed",
                 print_each: false,
@@ -37004,10 +37992,10 @@ mod tests {
             .insert_with_fee(tx_b.clone(), 2_000)
             .expect("insert tx_b");
 
+        let index = super::relay_mempool_short_txid_index(&mempool);
         let short_b = super::compact_short_txid(txid_b);
-        let found = super::relay_lookup_mempool_tx_by_short_txid(&mempool, short_b)
-            .expect("lookup by short txid");
-        assert_eq!(found.txid(), txid_b);
+        let found = index.get(&short_b).expect("lookup by short txid");
+        assert_eq!(*found, txid_b);
 
         let short_a = super::compact_short_txid(txid_a);
         let mut missing = short_b.wrapping_add(1);
@@ -37015,7 +38003,7 @@ mod tests {
             missing = missing.wrapping_add(1);
         }
         assert!(
-            super::relay_lookup_mempool_tx_by_short_txid(&mempool, missing).is_none(),
+            !index.contains_key(&missing),
             "unknown short txid must not return an unrelated transaction"
         );
     }
@@ -37162,6 +38150,62 @@ mod tests {
                 .known_peer_addresses
                 .iter()
                 .all(|entry| !entry.address.trim().is_empty())
+        );
+    }
+
+    /// P7: peer-advertised addresses are validated, timestamps cannot be
+    /// pushed into the future, and a flood cannot pick which entries survive
+    /// the cap by choosing lexicographically small strings.
+    #[test]
+    fn relay_addr_merge_validates_and_resists_ordering_flood() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let relay = RelayAdmissionState {
+            mempool: build_mempool_from_cfg(&cfg).expect("mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip: GossipEngine::new(64).expect("gossip"),
+        };
+        let mut state = RelayServerState::new(runtime, relay);
+        let entry = |address: String, seen: u64| super::PeerAddress {
+            address,
+            services: 1,
+            last_seen_unix_sec: seen,
+        };
+        super::relay_merge_known_peer_addresses(
+            &mut state,
+            &[
+                entry("0.0.0.0:18444".to_owned(), 1),
+                entry("224.0.0.1:18444".to_owned(), 1),
+                entry("198.51.100.1:0".to_owned(), 1),
+                entry(format!("{}.example:18444", "a".repeat(300)), 1),
+                entry("198.51.100.2:18444".to_owned(), u64::MAX),
+            ],
+        );
+        assert_eq!(state.known_peer_addresses.len(), 1);
+        let now = super::current_unix_sec().expect("now");
+        assert!(state.known_peer_addresses[0].last_seen_unix_sec <= now + 3_600);
+
+        let honest = (0..1_000u32)
+            .map(|i| entry(format!("198.51.{}.{}:18444", i / 250, i % 250), 10))
+            .collect::<Vec<_>>();
+        super::relay_merge_known_peer_addresses(&mut state, &honest);
+        let flood = (0..5_000u32)
+            .map(|i| entry(format!("1.0.{}.{}:18444", i / 250, i % 250), 10))
+            .collect::<Vec<_>>();
+        for chunk in flood.chunks(1_000) {
+            super::relay_merge_known_peer_addresses(&mut state, chunk);
+        }
+        assert_eq!(state.known_peer_addresses.len(), 2_000);
+        let surviving_honest = state
+            .known_peer_addresses
+            .iter()
+            .filter(|e| e.address.starts_with("198.51."))
+            .count();
+        assert!(
+            surviving_honest > 0,
+            "lexicographically small flood must not evict every honest address"
         );
     }
 
@@ -37983,6 +39027,216 @@ mod tests {
         }
     }
 
+    /// Devnet config + runtime whose genesis output is spendable by the
+    /// returned key, so relay tests can build *validly signed* peer txs.
+    fn relay_funded_runtime() -> (ChainConfig, ChainRuntime, scam_wallet::WalletKey, OutPoint) {
+        let mut cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let mnemonic = WalletMnemonic::parse(SOAK_FLOW_MNEMONIC).expect("mnemonic");
+        let key = derive_wallet_key(&mnemonic.to_seed(""), 0, 0).expect("key");
+        cfg.genesis_reward_key_hash20 =
+            hex::encode(scam_core::hash160_blake3(&key.pubkey_compressed()));
+        cfg.coinbase_maturity = 1;
+        cfg.validate().expect("config validate");
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let outpoint = runtime
+            .utxo_set()
+            .keys()
+            .next()
+            .cloned()
+            .expect("genesis utxo must exist");
+        (cfg, runtime, key, outpoint)
+    }
+
+    fn signed_relay_tx(
+        cfg: &ChainConfig,
+        key: &scam_wallet::WalletKey,
+        spend: OutPoint,
+        value: u64,
+        out_seed: u8,
+    ) -> Transaction {
+        let mut tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: spend,
+                signature: vec![],
+                pubkey_compressed: key.pubkey_compressed().to_vec(),
+                sequence: u32::MAX,
+            }],
+            outputs: vec![TxOut {
+                value,
+                key_hash20: [out_seed; 20],
+            }],
+            lock_time: 0,
+        };
+        let digest = tx
+            .signing_digest_with_chain_domain(0, cfg.network_id.as_bytes())
+            .expect("digest");
+        tx.inputs[0].signature = scam_wallet::sign_digest(key, digest.0)
+            .expect("sign")
+            .to_vec();
+        tx
+    }
+
+    /// P3: the peer-supplied `tx_count` is bounded before anything is
+    /// allocated (u32::MAX used to abort the process) and must match the
+    /// number of short ids + prefilled txs.
+    #[test]
+    fn compact_block_reconstruction_rejects_absurd_or_inconsistent_counts() {
+        let (cfg, runtime, _key, _outpoint) = relay_funded_runtime();
+        let mempool = build_mempool_from_cfg(&cfg).expect("mempool");
+        let header = runtime.tip_header().clone();
+        let huge = scam_p2p::CompactBlock {
+            header: header.clone(),
+            tx_count: u32::MAX,
+            short_txids: vec![],
+            prefilled: vec![],
+        };
+        let err =
+            super::relay_reconstruct_compact_transactions(&mempool, &huge, cfg.max_block_size)
+                .expect_err("absurd tx_count must be rejected");
+        assert!(err.to_string().contains("above"), "{err}");
+
+        let mismatched = scam_p2p::CompactBlock {
+            header,
+            tx_count: 3,
+            short_txids: vec![1],
+            prefilled: vec![],
+        };
+        let err = super::relay_reconstruct_compact_transactions(
+            &mempool,
+            &mismatched,
+            cfg.max_block_size,
+        )
+        .expect_err("count mismatch must be rejected");
+        assert!(err.to_string().contains("short ids"), "{err}");
+    }
+
+    /// P2: duplicate GetData items are served once and the item count is
+    /// capped (each duplicate used to clone the block under the relay lock).
+    #[test]
+    fn relay_getdata_deduplicates_and_caps_items() {
+        let (cfg, runtime, _key, _outpoint) = relay_funded_runtime();
+        let genesis_hash = runtime.tip_hash();
+        let relay = RelayAdmissionState {
+            mempool: build_mempool_from_cfg(&cfg).expect("mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip: GossipEngine::new(256).expect("gossip"),
+        };
+        let state = RelayServerState::new(runtime, relay);
+        let items = vec![InventoryItem::Block(genesis_hash); 10_000];
+        let (out, missing, not_found) = super::relay_collect_getdata_from_memory(&state, items);
+        assert_eq!(out.len(), 1, "one block served for 10k duplicate requests");
+        assert!(missing.is_empty());
+        assert!(not_found.is_empty());
+
+        let distinct = (0..(cfg.p2p_max_inv_items as u32 + 500))
+            .map(|i| {
+                let mut h = [0u8; 32];
+                h[..4].copy_from_slice(&i.to_le_bytes());
+                InventoryItem::Tx(Hash256(h))
+            })
+            .collect::<Vec<_>>();
+        let (_out, _missing, not_found) =
+            super::relay_collect_getdata_from_memory(&state, distinct);
+        assert_eq!(not_found.len(), cfg.p2p_max_inv_items);
+    }
+
+    /// P6: context-dependent rejections (here: non-final lock time) are
+    /// dropped quietly — honest peers a block apart must not be punished —
+    /// while bans are per IP and expire.
+    #[test]
+    fn relay_admission_drops_context_failures_quietly_and_bans_by_ip() {
+        let (cfg, runtime, key, outpoint) = relay_funded_runtime();
+        let mut gossip = GossipEngine::new(256).expect("gossip");
+        gossip.connect_peer(1);
+        let mut relay = RelayAdmissionState {
+            mempool: build_mempool_from_cfg(&cfg).expect("mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip,
+        };
+        let mut locked = signed_relay_tx(&cfg, &key, outpoint, 10_000, 9);
+        locked.lock_time = 1_000_000;
+        locked.inputs[0].sequence = 0;
+        let digest = locked
+            .signing_digest_with_chain_domain(0, cfg.network_id.as_bytes())
+            .expect("digest");
+        locked.inputs[0].signature = scam_wallet::sign_digest(&key, digest.0)
+            .expect("sign")
+            .to_vec();
+        admit_peer_tx_into_relay(&mut relay, &runtime, 1, locked, 1_000, 1_000)
+            .expect("non-final tx is dropped without failing the session");
+        assert_eq!(relay.mempool.len(), 0);
+
+        let err = super::NodeError::Runtime(format!(
+            "{}invalid transaction: x",
+            super::RELAY_MISBEHAVIOUR_PREFIX
+        ));
+        assert!(super::relay_error_is_misbehaviour(&err));
+        assert!(!super::relay_error_is_misbehaviour(
+            &super::NodeError::Chain(super::ChainError::TimestampTooFarInFuture {
+                block_hash: Hash256::ZERO,
+                got: 0,
+                max_allowed: 0,
+            })
+        ));
+
+        let relay_state = RelayAdmissionState {
+            mempool: build_mempool_from_cfg(&cfg).expect("mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip: GossipEngine::new(256).expect("gossip"),
+        };
+        let mut state = RelayServerState::new(runtime, relay_state);
+        let ip: std::net::IpAddr = "203.0.113.7".parse().expect("ip");
+        super::relay_ban_peer_ip(&mut state, "203.0.113.7:40000", 1_000);
+        assert!(super::relay_ip_is_banned(&state, ip, 1_001));
+        assert!(
+            super::relay_ip_is_banned(&state, ip, 1_002),
+            "a new source port does not lift the ban"
+        );
+        assert!(!super::relay_ip_is_banned(
+            &state,
+            ip,
+            1_000 + super::RELAY_IP_BAN_SEC
+        ));
+    }
+
+    /// M1: a peer tx with a forged signature must not enter the mempool.
+    #[test]
+    fn relay_admission_rejects_forged_peer_tx() {
+        let (cfg, runtime, key, outpoint) = relay_funded_runtime();
+        let mut gossip = GossipEngine::new(256).expect("gossip");
+        gossip.connect_peer(1);
+        let mut relay = RelayAdmissionState {
+            mempool: build_mempool_from_cfg(&cfg).expect("mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip,
+        };
+        let mut forged = signed_relay_tx(&cfg, &key, outpoint.clone(), 10, 9);
+        forged.inputs[0].signature = vec![7u8; 64];
+        let err = admit_peer_tx_into_relay(&mut relay, &runtime, 1, forged, 1_000, 1_000)
+            .expect_err("forged signature must be rejected");
+        assert!(err.to_string().contains("signature"), "{err}");
+        assert_eq!(relay.mempool.len(), 0);
+
+        // Spending the same output with someone else's key fails too.
+        let thief = derive_wallet_key(
+            &WalletMnemonic::parse(SOAK_FLOW_MNEMONIC)
+                .expect("mnemonic")
+                .to_seed(""),
+            0,
+            5,
+        )
+        .expect("thief");
+        let stolen = signed_relay_tx(&cfg, &thief, outpoint, 10, 9);
+        assert!(admit_peer_tx_into_relay(&mut relay, &runtime, 1, stolen, 1_000, 1_000).is_err());
+        assert_eq!(relay.mempool.len(), 0);
+    }
+
     #[test]
     fn detect_missing_outpoints_reports_only_unavailable_inputs() {
         let cfg: ChainConfig =
@@ -38135,16 +39389,7 @@ mod tests {
 
     #[test]
     fn relay_admission_announces_new_inventory_to_gossip_engine() {
-        let cfg: ChainConfig =
-            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
-        cfg.validate().expect("config validate");
-        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
-        let base_outpoint = runtime
-            .utxo_set()
-            .keys()
-            .next()
-            .cloned()
-            .expect("genesis utxo must exist");
+        let (cfg, runtime, key, base_outpoint) = relay_funded_runtime();
 
         let mut gossip = GossipEngine::with_limits_and_replacement(
             256,
@@ -38168,7 +39413,7 @@ mod tests {
             &mut relay,
             &runtime,
             1,
-            relay_tx(base_outpoint, 7, 42),
+            signed_relay_tx(&cfg, &key, base_outpoint, 10, 42),
             1_000,
             1_000,
         )
@@ -38181,16 +39426,7 @@ mod tests {
 
     #[test]
     fn relay_admission_enforces_peer_replacement_rate_limit() {
-        let cfg: ChainConfig =
-            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
-        cfg.validate().expect("config validate");
-        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
-        let base_outpoint = runtime
-            .utxo_set()
-            .keys()
-            .next()
-            .cloned()
-            .expect("genesis utxo must exist");
+        let (cfg, runtime, key, base_outpoint) = relay_funded_runtime();
 
         let mut gossip = GossipEngine::with_limits_and_replacement(
             256,
@@ -38211,12 +39447,9 @@ mod tests {
             gossip,
         };
 
-        let mut tx1 = relay_tx(base_outpoint.clone(), 1, 11);
-        tx1.outputs[0].value = 3;
-        let mut tx2 = relay_tx(base_outpoint.clone(), 2, 12);
-        tx2.outputs[0].value = 2;
-        let mut tx3 = relay_tx(base_outpoint.clone(), 3, 13);
-        tx3.outputs[0].value = 1;
+        let tx1 = signed_relay_tx(&cfg, &key, base_outpoint.clone(), 30_000, 11);
+        let tx2 = signed_relay_tx(&cfg, &key, base_outpoint.clone(), 20_000, 12);
+        let tx3 = signed_relay_tx(&cfg, &key, base_outpoint.clone(), 10_000, 13);
 
         admit_peer_tx_into_relay(&mut relay, &runtime, 1, tx1, 1_000, 1_000).expect("first");
         admit_peer_tx_into_relay(&mut relay, &runtime, 1, tx2, 1_001, 1_001)
@@ -38234,16 +39467,7 @@ mod tests {
 
     #[test]
     fn relay_runtime_wire_path_enforces_peer_replacement_quota() {
-        let cfg: ChainConfig =
-            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
-        cfg.validate().expect("config validate");
-        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
-        let base_outpoint = runtime
-            .utxo_set()
-            .keys()
-            .next()
-            .cloned()
-            .expect("genesis utxo must exist");
+        let (cfg, runtime, key, base_outpoint) = relay_funded_runtime();
 
         let mut gossip = GossipEngine::with_limits_and_replacement(
             256,
@@ -38264,12 +39488,9 @@ mod tests {
         };
         let mut state = RelayServerState::new(runtime, relay);
 
-        let mut tx_low = relay_tx(base_outpoint.clone(), 1, 11);
-        tx_low.outputs[0].value = 3;
-        let mut tx_mid = relay_tx(base_outpoint.clone(), 2, 12);
-        tx_mid.outputs[0].value = 2;
-        let mut tx_high = relay_tx(base_outpoint, 3, 13);
-        tx_high.outputs[0].value = 1;
+        let tx_low = signed_relay_tx(&cfg, &key, base_outpoint.clone(), 30_000, 11);
+        let tx_mid = signed_relay_tx(&cfg, &key, base_outpoint.clone(), 20_000, 12);
+        let tx_high = signed_relay_tx(&cfg, &key, base_outpoint, 10_000, 13);
         let txs = [tx_low, tx_mid, tx_high];
 
         let _ = process_relay_wire_message(
@@ -38378,7 +39599,6 @@ mod tests {
                 count: 1,
                 interval_sec: cfg.target_block_time_sec,
                 max_nonce: 500_000,
-                subsidy: cfg.block_subsidy,
                 miner_key_hash,
                 label_prefix: "relay-getdata-archive-fallback",
                 print_each: false,
@@ -38439,7 +39659,6 @@ mod tests {
                 count: 1,
                 interval_sec: cfg.target_block_time_sec,
                 max_nonce: 500_000,
-                subsidy: cfg.block_subsidy,
                 miner_key_hash,
                 label_prefix: "relay-getdata-archive-async-fallback",
                 print_each: false,
@@ -38572,7 +39791,6 @@ mod tests {
             count: 2,
             interval_sec: cfg.target_block_time_sec,
             max_nonce: 500_000,
-            subsidy: cfg.block_subsidy,
             miner_key_hash,
             label_prefix: "relay-orphan-recovery",
             print_each: false,
@@ -38771,7 +39989,6 @@ mod tests {
                 count: 3,
                 interval_sec: cfg.target_block_time_sec,
                 max_nonce: 500_000,
-                subsidy: cfg.block_subsidy,
                 miner_key_hash,
                 label_prefix: "relay-orphan-multi-level",
                 print_each: false,
@@ -38843,7 +40060,6 @@ mod tests {
                 count: 2,
                 interval_sec: cfg.target_block_time_sec,
                 max_nonce: 500_000,
-                subsidy: cfg.block_subsidy,
                 miner_key_hash: sender_key_hash20,
                 label_prefix: "relay-reorg-main",
                 print_each: false,
@@ -38881,6 +40097,7 @@ mod tests {
             miner_key_hash20: sender_key_hash20,
             coinbase_tag: "relay-reorg-confirm".to_owned(),
             max_txs: cfg.max_mempool_txs as usize,
+            max_total_tx_bytes: usize::MAX,
         };
         let (template, summary) =
             super::build_template_from_mempool(&template_params, &tx_block_mempool)
@@ -39003,7 +40220,6 @@ mod tests {
                 count: 2,
                 interval_sec: cfg.target_block_time_sec,
                 max_nonce: 500_000,
-                subsidy: cfg.block_subsidy,
                 miner_key_hash: sender_key_hash20,
                 label_prefix: "relay-transition-unchanged",
                 print_each: false,
@@ -39040,6 +40256,7 @@ mod tests {
             miner_key_hash20: sender_key_hash20,
             coinbase_tag: "relay-transition-unchanged-template".to_owned(),
             max_txs: cfg.max_mempool_txs as usize,
+            max_total_tx_bytes: usize::MAX,
         };
         let (template, _summary) =
             super::build_template_from_mempool(&template_params, &mined_mempool).expect("template");
@@ -39104,7 +40321,6 @@ mod tests {
                 count: 2,
                 interval_sec: cfg.target_block_time_sec,
                 max_nonce: 500_000,
-                subsidy: cfg.block_subsidy,
                 miner_key_hash: sender_key_hash20,
                 label_prefix: "relay-latency-a",
                 print_each: false,
@@ -40790,7 +42006,6 @@ mod tests {
                 count: 1,
                 interval_sec: cfg.target_block_time_sec,
                 max_nonce: 500_000,
-                subsidy: cfg.block_subsidy,
                 miner_key_hash: cfg.genesis_reward_key_hash20().expect("key"),
                 label_prefix: "state-sync-bg",
                 print_each: false,
@@ -41120,6 +42335,8 @@ mod tests {
                 interval_sec: 120,
                 max_nonce: 1000,
                 max_requests: 1,
+                auth_token_file: None,
+                disable_wallet_rpc: false,
             },
             Some(Arc::new(AtomicBool::new(true))),
         )

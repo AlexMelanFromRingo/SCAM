@@ -29,5 +29,5 @@ pub use signer::{
 pub use vault::{
     DecryptedWalletSecret, EncryptedWalletVault, WalletVaultError, decrypt_wallet_vault,
     load_wallet_vault, new_encrypted_wallet_vault, new_encrypted_wallet_vault_with_mode,
-    save_wallet_vault,
+    replace_wallet_vault, save_wallet_vault,
 };

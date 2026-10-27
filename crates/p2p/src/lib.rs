@@ -11,7 +11,7 @@ pub use gossip::{
 };
 pub use sync::{build_block_locator, select_block_hashes_for_peer, select_headers_for_peer};
 pub use transport::{
-    FramingConfig, LocalHandshake, RemoteHandshake, TransportError, client_handshake,
+    FrameReader, FramingConfig, LocalHandshake, RemoteHandshake, TransportError, client_handshake,
     client_handshake_async, read_message, read_message_async, request_blocks, request_blocks_async,
     request_headers, request_headers_async, send_message, send_message_async, server_handshake,
     server_handshake_async,

@@ -42,7 +42,12 @@ struct OrphanEntry {
     fee: u64,
     missing_outpoints: HashSet<OutPoint>,
     added_at: u64,
+    bytes: usize,
 }
+
+/// Default byte budget for all orphans together. Orphans are unvalidated
+/// (their inputs are unknown), so they must be cheap to hold.
+pub const DEFAULT_ORPHAN_POOL_MAX_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReadyOrphanTx {
@@ -61,6 +66,8 @@ pub enum OrphanInsertOutcome {
 #[derive(Clone, Debug)]
 pub struct OrphanPool {
     max_txs: usize,
+    max_total_bytes: usize,
+    total_bytes: usize,
     ttl_secs: u64,
     entries: HashMap<Hash256, OrphanEntry>,
     by_missing_outpoint: HashMap<OutPoint, HashSet<Hash256>>,
@@ -309,9 +316,27 @@ impl Mempool {
                     limit: self.max_replacement_descendants,
                 });
             }
+            // A replacement may not spend outputs of the transactions it
+            // evicts: it would be left in the mempool without its parent.
+            if let Some(conflicting) = tx
+                .inputs
+                .iter()
+                .map(|input| input.prev_out.txid)
+                .find(|parent| replacement_set.contains(parent))
+            {
+                return Err(MempoolError::ReplacementSpendsConflictingTx {
+                    incoming: txid,
+                    conflicting,
+                });
+            }
+            // BIP125 rule 4: besides out-paying what it replaces, the
+            // replacement pays relay fee for its own bytes, so replacement
+            // chains cannot be relayed for (almost) free.
+            let incremental_fee = (self.min_replacement_fee_delta as u128)
+                .max(required_fee_for_size(serialized_size, self.min_relay_fee_per_kb)? as u128);
             let replaced_fee_total = self
                 .total_fee_for_set(&replacement_set)?
-                .checked_add(self.min_replacement_fee_delta as u128)
+                .checked_add(incremental_fee)
                 .ok_or_else(|| {
                     MempoolError::InvalidLimit(
                         "replacement required fee overflow in mempool policy".to_owned(),
@@ -365,6 +390,19 @@ impl Mempool {
                 });
             }
 
+            // Evicting the victim also evicts its descendants; never let that
+            // remove a parent of the incoming tx.
+            let doomed = self.collect_replacement_set(victim_txid, usize::MAX);
+            if tx
+                .inputs
+                .iter()
+                .any(|input| doomed.contains(&input.prev_out.txid))
+            {
+                return Err(MempoolError::Full {
+                    limit: self.max_txs,
+                    incoming: txid,
+                });
+            }
             let removed = self.remove_with_descendants(victim_txid);
             self.insert_entry(
                 txid,
@@ -509,12 +547,23 @@ impl OrphanPool {
         }
         Ok(Self {
             max_txs,
+            max_total_bytes: DEFAULT_ORPHAN_POOL_MAX_BYTES,
+            total_bytes: 0,
             ttl_secs,
             entries: HashMap::new(),
             by_missing_outpoint: HashMap::new(),
             insertion_order: VecDeque::new(),
             telemetry: OrphanPoolTelemetry::default(),
         })
+    }
+
+    /// Cap the serialized bytes held by all orphans together.
+    pub fn set_max_total_bytes(&mut self, max_total_bytes: usize) {
+        self.max_total_bytes = max_total_bytes.max(1);
+    }
+
+    pub fn total_bytes(&self) -> usize {
+        self.total_bytes
     }
 
     pub fn len(&self) -> usize {
@@ -551,14 +600,25 @@ impl OrphanPool {
             return Ok(OrphanInsertOutcome::AlreadyPresent { txid });
         }
 
+        let bytes = tx.encode_for_hash().len();
+        if bytes > self.max_total_bytes {
+            return Err(MempoolError::TxTooLarge {
+                incoming: txid,
+                bytes,
+                max_bytes: self.max_total_bytes,
+            });
+        }
         let missing_set = missing_outpoints.into_iter().collect::<HashSet<_>>();
         let mut evicted = None;
-        if self.entries.len() >= self.max_txs {
-            while let Some(oldest) = self.insertion_order.pop_front() {
-                if self.remove_entry(oldest).is_some() {
-                    evicted = Some(oldest);
-                    break;
-                }
+        while self.entries.len() >= self.max_txs
+            || self.total_bytes.saturating_add(bytes) > self.max_total_bytes
+        {
+            let Some(oldest) = self.insertion_order.pop_front() else {
+                break;
+            };
+            if self.remove_entry(oldest).is_some() {
+                evicted = Some(oldest);
+                self.telemetry.evicted_total = self.telemetry.evicted_total.saturating_add(1);
             }
         }
 
@@ -569,8 +629,11 @@ impl OrphanPool {
                 fee,
                 missing_outpoints: missing_set.clone(),
                 added_at: now_unix_sec,
+                bytes,
             },
         );
+        self.total_bytes = self.total_bytes.saturating_add(bytes);
+        self.compact_insertion_order();
         self.insertion_order.push_back(txid);
         for outpoint in missing_set {
             self.by_missing_outpoint
@@ -581,7 +644,6 @@ impl OrphanPool {
 
         if let Some(evicted) = evicted {
             self.telemetry.accepted_total = self.telemetry.accepted_total.saturating_add(1);
-            self.telemetry.evicted_total = self.telemetry.evicted_total.saturating_add(1);
             return Ok(OrphanInsertOutcome::AcceptedWithEviction {
                 inserted: txid,
                 evicted,
@@ -651,8 +713,19 @@ impl OrphanPool {
         ready
     }
 
+    /// Expired/promoted orphans leave stale ids in `insertion_order`; drop
+    /// them once they outnumber live entries so the queue stays bounded.
+    fn compact_insertion_order(&mut self) {
+        if self.insertion_order.len() > self.entries.len().saturating_mul(2).max(64) {
+            let entries = &self.entries;
+            self.insertion_order
+                .retain(|txid| entries.contains_key(txid));
+        }
+    }
+
     fn remove_entry(&mut self, txid: Hash256) -> Option<OrphanEntry> {
         let entry = self.entries.remove(&txid)?;
+        self.total_bytes = self.total_bytes.saturating_sub(entry.bytes);
         for outpoint in &entry.missing_outpoints {
             let mut should_remove_key = false;
             if let Some(waiters) = self.by_missing_outpoint.get_mut(outpoint) {
@@ -837,6 +910,11 @@ pub enum MempoolError {
         incoming: Hash256,
         bytes: usize,
         max_bytes: usize,
+    },
+    #[error("replacement {incoming} spends an output of {conflicting}, which it would evict")]
+    ReplacementSpendsConflictingTx {
+        incoming: Hash256,
+        conflicting: Hash256,
     },
     #[error("orphan transaction {txid} must include at least one missing outpoint")]
     OrphanMissingOutpoints { txid: Hash256 },
@@ -1117,6 +1195,76 @@ mod tests {
         assert_eq!(Mempool::replacement_scan_limit(1), 3);
         assert_eq!(Mempool::replacement_scan_limit(25), 27);
         assert_eq!(Mempool::replacement_scan_limit(usize::MAX), usize::MAX);
+    }
+
+    /// M8: a full mempool must not evict the parent of the incoming tx
+    /// (the child would remain without its input).
+    #[test]
+    fn eviction_never_removes_parent_of_incoming_tx() {
+        let mut mempool = Mempool::with_policy(1, 0).expect("mempool");
+        let parent = mk_tx([31u8; 32], 0, b"parent", 1);
+        let parent_id = parent.txid();
+        mempool.insert_with_fee(parent, 1).expect("parent");
+        let child = mk_tx(parent_id.0, 0, b"child", 2);
+        let err = mempool
+            .insert_with_fee(child, 1_000)
+            .expect_err("child must not evict its own parent");
+        assert!(matches!(err, MempoolError::Full { .. }));
+        assert!(mempool.contains(&parent_id));
+    }
+
+    /// M8: a replacement may not spend outputs of the tx it replaces.
+    #[test]
+    fn replacement_spending_replaced_tx_output_is_rejected() {
+        let mut mempool = Mempool::with_policy(10, 0).expect("mempool");
+        let original = mk_tx([32u8; 32], 0, b"original", 1);
+        let original_id = original.txid();
+        mempool.insert_with_fee(original, 1).expect("original");
+        let mut sneaky = mk_tx([32u8; 32], 0, b"sneaky", 2);
+        sneaky.inputs.push(TxIn {
+            prev_out: OutPoint {
+                txid: original_id,
+                vout: 0,
+            },
+            signature: b"x".to_vec(),
+            pubkey_compressed: vec![2u8; 33],
+            sequence: 0,
+        });
+        let err = mempool
+            .insert_with_fee(sneaky, 1_000)
+            .expect_err("must be rejected");
+        assert!(matches!(
+            err,
+            MempoolError::ReplacementSpendsConflictingTx { .. }
+        ));
+        assert!(mempool.contains(&original_id));
+    }
+
+    /// M9: a replacement pays relay fee for its own size on top of the
+    /// replaced fees (BIP125 rule 4), not just +1.
+    #[test]
+    fn replacement_must_pay_incremental_relay_fee_for_its_size() {
+        let mut mempool = Mempool::with_policy(10, 1_000).expect("mempool");
+        let original = mk_tx([33u8; 32], 0, b"original", 1);
+        let size = original.encode_for_hash().len() as u64;
+        let base_fee = 10 * size;
+        mempool
+            .insert_with_fee(original, base_fee)
+            .expect("original");
+        let bump = mk_tx([33u8; 32], 0, b"bumped!!", 2);
+        let outcome = mempool
+            .insert_with_fee(bump.clone(), base_fee + 1)
+            .expect("evaluated");
+        assert!(matches!(
+            outcome,
+            InsertOutcome::RejectedConflictInsufficientFee { .. }
+                | InsertOutcome::RejectedConflictInsufficientFeerate { .. }
+        ));
+        let incremental = (bump.encode_for_hash().len() as u64 * 1_000).div_ceil(1_000);
+        let outcome = mempool
+            .insert_with_fee(bump, base_fee + incremental)
+            .expect("replacement");
+        assert!(matches!(outcome, InsertOutcome::Replaced { .. }));
     }
 
     #[test]
@@ -1584,6 +1732,66 @@ mod tests {
         ));
         assert!(!pool.contains(&tx_a_id));
         assert!(pool.contains(&tx_b_id));
+    }
+
+    /// M7: orphans are unvalidated, so their total bytes are capped and the
+    /// oldest are evicted to make room; a single oversized tx is refused.
+    #[test]
+    fn orphan_pool_enforces_total_byte_budget() {
+        let mut pool = OrphanPool::new(1_000, 600).expect("pool");
+        let one = mk_tx([1u8; 32], 0, b"sz", 1).encode_for_hash().len();
+        pool.set_max_total_bytes(one * 2);
+        let mut ids = Vec::new();
+        for i in 0..3u8 {
+            let tx = mk_tx([10 + i; 32], 0, b"sz", i);
+            ids.push(tx.txid());
+            let dep = OutPoint {
+                txid: scam_core::Hash256([50 + i; 32]),
+                vout: 0,
+            };
+            pool.insert(tx, 1, vec![dep], 10).expect("insert");
+        }
+        assert_eq!(pool.len(), 2);
+        assert!(pool.total_bytes() <= one * 2);
+        assert!(!pool.contains(&ids[0]), "oldest evicted for space");
+
+        let mut big = mk_tx([90u8; 32], 0, b"sz", 9);
+        big.inputs[0].signature = vec![0u8; one * 3];
+        let dep = OutPoint {
+            txid: scam_core::Hash256([91u8; 32]),
+            vout: 0,
+        };
+        assert!(matches!(
+            pool.insert(big, 1, vec![dep], 10),
+            Err(MempoolError::TxTooLarge { .. })
+        ));
+    }
+
+    /// M7: expiry churn must not grow the eviction queue without bound.
+    #[test]
+    fn orphan_pool_insertion_queue_stays_bounded_under_expiry_churn() {
+        let mut pool = OrphanPool::new(10_000, 5).expect("pool");
+        for round in 0..2_000u32 {
+            let mut prev = [0u8; 32];
+            prev[..4].copy_from_slice(&round.to_le_bytes());
+            let tx = mk_tx(prev, 0, b"churn", 1);
+            let mut dep_hash = [0xEEu8; 32];
+            dep_hash[..4].copy_from_slice(&round.to_le_bytes());
+            let dep = OutPoint {
+                txid: scam_core::Hash256(dep_hash),
+                vout: 0,
+            };
+            pool.insert(tx, 1, vec![dep], u64::from(round) * 10)
+                .expect("insert");
+            pool.expire(u64::from(round) * 10 + 6);
+        }
+        assert!(pool.is_empty());
+        assert!(
+            pool.insertion_order.len() <= 128,
+            "{}",
+            pool.insertion_order.len()
+        );
+        assert_eq!(pool.total_bytes(), 0);
     }
 
     #[test]

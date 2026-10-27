@@ -25,11 +25,12 @@
 //!   free because the tag prefix is the first 16 bytes of every multisig
 //!   blob, and no 33-byte legacy pubkey ever starts with the tag (legal
 //!   compressed pubkeys begin `0x02` or `0x03`).
-//! - All `n` pubkeys MUST be distinct and decode under
-//!   `secp256k1::PublicKey::from_slice`.
-//! - Exactly `k` signatures provided; each Schnorr-verifies against
-//!   exactly one unique pubkey. Pubkeys may not be reused across
-//!   signatures.
+//! - All `n` pubkeys MUST decode under `secp256k1::PublicKey::from_slice`
+//!   and be distinct as x-only keys (`02||X` and `03||X` alias the same
+//!   BIP340 signer).
+//! - Exactly `k` signatures provided, ordered like the descriptor's
+//!   pubkeys; each Schnorr-verifies against a strictly later pubkey than
+//!   the previous one.
 //!
 //! ## Output side
 //!
@@ -86,11 +87,12 @@ impl MultisigDescriptor {
         if k == 0 || (k as usize) > n {
             return Err(MultisigError::InvalidK { k, n: n as u8 });
         }
-        // Distinct-pubkey rule prevents the trivial `k=n=1, same key
-        // repeated` aliasing attack.
+        // Distinct-key rule, compared on the x-only key (bytes 1..33):
+        // BIP340 verification ignores the parity byte, so `02||X` and
+        // `03||X` are the same signer.
         for i in 0..n {
             for j in (i + 1)..n {
-                if pubkeys[i] == pubkeys[j] {
+                if xonly_bytes(&pubkeys[i]) == xonly_bytes(&pubkeys[j]) {
                     return Err(MultisigError::DuplicatePubkey { index: j });
                 }
             }
@@ -148,16 +150,21 @@ impl MultisigDescriptor {
             if PublicKey::from_slice(&pk).is_err() {
                 return Err(MultisigError::InvalidPubkey { index: i });
             }
-            for existing in &pubkeys {
-                if *existing == pk {
-                    return Err(MultisigError::DuplicatePubkey { index: i });
-                }
+            if pubkeys
+                .iter()
+                .any(|existing: &[u8; PUBKEY_LEN]| xonly_bytes(existing) == xonly_bytes(&pk))
+            {
+                return Err(MultisigError::DuplicatePubkey { index: i });
             }
             pubkeys.push(pk);
             cursor += PUBKEY_LEN;
         }
         Ok(Self { k, n, pubkeys })
     }
+}
+
+fn xonly_bytes(pubkey: &[u8; PUBKEY_LEN]) -> &[u8] {
+    &pubkey[1..]
 }
 
 /// Heuristic dispatch: is `pubkey_compressed` shaped like a multisig
@@ -181,8 +188,9 @@ pub fn looks_like_multisig_blob(pubkey_compressed: &[u8]) -> bool {
 ///
 /// Returns `Ok(())` iff:
 /// - `signature_blob.len() == k * 64`.
-/// - Each of the `k` signatures Schnorr-verifies against *some* unique
-///   pubkey from the descriptor. Pubkeys may not be reused.
+/// - Each of the `k` signatures Schnorr-verifies against a pubkey from the
+///   descriptor, in strictly increasing descriptor order (so no pubkey is
+///   used twice and at most `n` verifications are performed).
 pub fn verify_multisig_spend(
     descriptor: &MultisigDescriptor,
     signing_digest: Hash256,
@@ -199,31 +207,40 @@ pub fn verify_multisig_spend(
     let message =
         Message::from_digest_slice(&signing_digest.0).map_err(|_| MultisigError::BadDigest)?;
 
-    let mut used = vec![false; descriptor.pubkeys.len()];
+    // Signatures must follow descriptor order: each signature is matched
+    // against the remaining pubkeys after the previous match. That makes
+    // the witness canonical and caps the work at `n` verifications.
+    let mut next_pubkey = 0usize;
+    let mut matched_keys = Vec::with_capacity(descriptor.k as usize);
     for sig_idx in 0..(descriptor.k as usize) {
         let raw = &signature_blob[sig_idx * SIG_LEN..(sig_idx + 1) * SIG_LEN];
         let signature = Signature::from_slice(raw)
             .map_err(|_| MultisigError::InvalidSignatureEncoding { sig_index: sig_idx })?;
+        // Leave room for the signatures still to come.
+        let remaining_sigs = descriptor.k as usize - sig_idx - 1;
+        let last_candidate = descriptor.pubkeys.len().saturating_sub(remaining_sigs);
         let mut matched = None;
-        for (pk_idx, pk_bytes) in descriptor.pubkeys.iter().enumerate() {
-            if used[pk_idx] {
-                continue;
-            }
-            let Ok(parsed) = PublicKey::from_slice(pk_bytes) else {
+        while next_pubkey < last_candidate {
+            let pk_idx = next_pubkey;
+            next_pubkey += 1;
+            let Ok(parsed) = PublicKey::from_slice(&descriptor.pubkeys[pk_idx]) else {
                 // Already-validated in parse(); double-check for safety.
                 continue;
             };
             let (xonly, _) = parsed.x_only_public_key();
+            // Defense in depth for descriptors not produced by `parse`:
+            // one x-only signer never fills two slots.
+            if matched_keys.contains(&xonly) {
+                continue;
+            }
             if secp.verify_schnorr(&signature, &message, &xonly).is_ok() {
-                matched = Some(pk_idx);
+                matched = Some(xonly);
                 break;
             }
         }
         match matched {
-            Some(pk_idx) => used[pk_idx] = true,
-            None => {
-                return Err(MultisigError::SignatureUnmatched { sig_index: sig_idx });
-            }
+            Some(xonly) => matched_keys.push(xonly),
+            None => return Err(MultisigError::SignatureUnmatched { sig_index: sig_idx }),
         }
     }
     Ok(())
@@ -409,6 +426,75 @@ mod tests {
         sigs.extend_from_slice(&sig_a); // duplicate
         assert!(matches!(
             verify_multisig_spend(&d, digest, &sigs),
+            Err(MultisigError::SignatureUnmatched { .. })
+        ));
+    }
+
+    /// `02||X` and `03||X` are distinct 33-byte encodings of keys that
+    /// share the x-only key `X`, and BIP340 verification only looks at `X`.
+    /// Before the fix the holder of `X` could fill two slots of a k-of-n
+    /// with one signature, e.g. satisfy a "2-of-3 escrow" alone.
+    #[test]
+    fn xonly_aliased_pubkeys_are_rejected_as_duplicates() {
+        let (kp_a, pk_a) = keypair_from_seed(40);
+        let (_, pk_b) = keypair_from_seed(41);
+        let mut alias = pk_a;
+        alias[0] = if pk_a[0] == 0x02 { 0x03 } else { 0x02 };
+        assert!(
+            PublicKey::from_slice(&alias).is_ok(),
+            "alias is a valid point"
+        );
+
+        assert!(matches!(
+            MultisigDescriptor::encode(2, &[pk_a, alias, pk_b]),
+            Err(MultisigError::DuplicatePubkey { index: 1 })
+        ));
+
+        let mut blob = Vec::new();
+        blob.extend_from_slice(MULTISIG_TAG);
+        blob.push(2);
+        blob.push(3);
+        blob.extend_from_slice(&pk_a);
+        blob.extend_from_slice(&alias);
+        blob.extend_from_slice(&pk_b);
+        assert!(matches!(
+            MultisigDescriptor::parse(&blob),
+            Err(MultisigError::DuplicatePubkey { index: 1 })
+        ));
+
+        // And the one-key-two-slots spend itself must not verify even if a
+        // descriptor were constructed by hand.
+        let d = MultisigDescriptor {
+            k: 2,
+            n: 3,
+            pubkeys: vec![pk_a, alias, pk_b],
+        };
+        let digest = Hash256([0x21; 32]);
+        let sig = sign(&kp_a, digest);
+        let mut sigs = Vec::new();
+        sigs.extend_from_slice(&sig);
+        sigs.extend_from_slice(&sig);
+        assert!(verify_multisig_spend(&d, digest, &sigs).is_err());
+    }
+
+    /// Signatures must appear in descriptor order. This bounds verification
+    /// to at most `n` Schnorr checks per input (instead of `k * n`) and makes
+    /// the witness canonical.
+    #[test]
+    fn verify_multisig_spend_rejects_out_of_order_signatures() {
+        let (kp_a, pk_a) = keypair_from_seed(42);
+        let (_, pk_b) = keypair_from_seed(43);
+        let (kp_c, pk_c) = keypair_from_seed(44);
+        let blob = MultisigDescriptor::encode(2, &[pk_a, pk_b, pk_c]).expect("encode");
+        let d = MultisigDescriptor::parse(&blob).expect("parse");
+        let digest = Hash256([0x22; 32]);
+        let sig_a = sign(&kp_a, digest);
+        let sig_c = sign(&kp_c, digest);
+        let mut reversed = Vec::new();
+        reversed.extend_from_slice(&sig_c);
+        reversed.extend_from_slice(&sig_a);
+        assert!(matches!(
+            verify_multisig_spend(&d, digest, &reversed),
             Err(MultisigError::SignatureUnmatched { .. })
         ));
     }
