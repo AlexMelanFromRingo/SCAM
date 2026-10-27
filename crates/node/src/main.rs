@@ -7566,6 +7566,7 @@ fn append_relay_telemetry_snapshot(
             ))
         })?;
     }
+    rotate_telemetry_if_large(path);
     let mut file = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -7607,6 +7608,7 @@ fn append_jsonl_record<T: Serialize>(
             ))
         })?;
     }
+    rotate_telemetry_if_large(path);
     let mut file = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -12126,6 +12128,7 @@ fn append_soak_telemetry_snapshot(
             ))
         })?;
     }
+    rotate_telemetry_if_large(path);
     let mut file = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -18116,29 +18119,65 @@ fn parse_json_body<T: DeserializeOwned>(request: &HttpRequest) -> Result<T, Node
         .map_err(|e| NodeError::Runtime(format!("invalid json body: {e}")))
 }
 
+/// Read only the tail of an append-only JSONL file and parse its last
+/// non-empty line. The whole file used to be read on every `/status` and
+/// every SSE tick, while telemetry files grow forever.
 fn load_latest_jsonl_record<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, NodeError> {
+    use std::io::{Seek, SeekFrom};
     if !path.exists() {
         return Ok(None);
     }
-    let file = fs::File::open(path).map_err(|e| {
+    let mut file = fs::File::open(path).map_err(|e| {
         NodeError::Runtime(format!("cannot open telemetry {}: {e}", path.display()))
     })?;
-    let reader = BufReader::new(file);
-    let mut last = None::<String>;
-    for line in reader.lines() {
-        let line =
-            line.map_err(|e| NodeError::Runtime(format!("cannot read telemetry line: {e}")))?;
-        if line.trim().is_empty() {
-            continue;
+    let len = file
+        .metadata()
+        .map_err(|e| NodeError::Runtime(format!("cannot stat telemetry {}: {e}", path.display())))?
+        .len();
+    let mut window = TELEMETRY_TAIL_WINDOW_BYTES;
+    loop {
+        let start = len.saturating_sub(window);
+        file.seek(SeekFrom::Start(start))
+            .map_err(|e| NodeError::Runtime(format!("cannot seek telemetry: {e}")))?;
+        let mut tail = Vec::new();
+        file.read_to_end(&mut tail)
+            .map_err(|e| NodeError::Runtime(format!("cannot read telemetry line: {e}")))?;
+        let text = String::from_utf8_lossy(&tail);
+        let mut lines = text.lines().collect::<Vec<_>>();
+        // A window that starts mid-file may begin with a partial line.
+        if start > 0 && !lines.is_empty() {
+            lines.remove(0);
         }
-        last = Some(line);
+        if let Some(line) = lines.iter().rev().find(|line| !line.trim().is_empty()) {
+            let parsed = serde_json::from_str::<T>(line.trim_end())
+                .map_err(|e| NodeError::Runtime(format!("invalid telemetry json record: {e}")))?;
+            return Ok(Some(parsed));
+        }
+        if start == 0 {
+            return Ok(None);
+        }
+        window = window.saturating_mul(2);
     }
-    let Some(line) = last else {
-        return Ok(None);
+}
+
+const TELEMETRY_TAIL_WINDOW_BYTES: u64 = 64 * 1024;
+/// Telemetry files are rotated to `<file>.1` past this size.
+const TELEMETRY_MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Keep append-only telemetry bounded: move a large file to `<file>.1`
+/// (replacing the previous rotation) before the next append.
+fn rotate_telemetry_if_large(path: &Path) {
+    let Ok(meta) = fs::metadata(path) else {
+        return;
     };
-    let parsed = serde_json::from_str::<T>(line.trim_end())
-        .map_err(|e| NodeError::Runtime(format!("invalid telemetry json record: {e}")))?;
-    Ok(Some(parsed))
+    if meta.len() < TELEMETRY_MAX_FILE_BYTES {
+        return;
+    }
+    let mut rotated = path.as_os_str().to_owned();
+    rotated.push(".1");
+    if let Err(err) = fs::rename(path, &rotated) {
+        eprintln!("warning: cannot rotate telemetry {}: {err}", path.display());
+    }
 }
 
 /// Map a request path to a file under the UI directory. Only plain path
@@ -18560,6 +18599,80 @@ struct AxumRpcState {
     stratum_telemetry: Option<PathBuf>,
     pool_ledger_db_path: PathBuf,
     ui_dir: PathBuf,
+    extras: Arc<AxumRpcExtras>,
+}
+
+/// Most concurrent `/events` subscribers.
+const RPC_MAX_EVENT_SUBSCRIBERS: usize = 64;
+/// Most RPC requests executing at once (each may block a thread).
+const RPC_MAX_INFLIGHT_REQUESTS: usize = 64;
+/// How long one `/events` snapshot is shared between subscribers.
+const RPC_EVENTS_SNAPSHOT_TTL: Duration = Duration::from_secs(1);
+
+/// Shared RPC resources that bound per-request cost.
+struct AxumRpcExtras {
+    events_permits: Arc<tokio::sync::Semaphore>,
+    /// One snapshot per second for all subscribers (each used to reload the
+    /// runtime, mempool DB and telemetry files every second on its own).
+    events_cache: Mutex<Option<(Instant, String)>>,
+    txid_index: Mutex<TxidIndex>,
+}
+
+impl Default for AxumRpcExtras {
+    fn default() -> Self {
+        Self {
+            events_permits: Arc::new(tokio::sync::Semaphore::new(RPC_MAX_EVENT_SUBSCRIBERS)),
+            events_cache: Mutex::new(None),
+            txid_index: Mutex::new(TxidIndex::default()),
+        }
+    }
+}
+
+/// txid → (height, index) for the main chain, extended incrementally as
+/// the tip advances and rebuilt after a reorg. `/txid` used to hash every
+/// transaction of the whole chain on every request.
+#[derive(Default)]
+struct TxidIndex {
+    tip: Option<(u64, Hash256)>,
+    entries: HashMap<Hash256, (u64, usize)>,
+}
+
+impl TxidIndex {
+    fn sync(&mut self, runtime: &ChainRuntime) {
+        let tip_height = runtime.tip_height();
+        let start = match self.tip {
+            Some((height, hash)) if runtime.block_hash_at_height(height) == Some(hash) => {
+                height + 1
+            }
+            _ => {
+                self.entries.clear();
+                0
+            }
+        };
+        for height in start..=tip_height {
+            let Some(block) = runtime
+                .block_hash_at_height(height)
+                .and_then(|hash| runtime.block_by_hash(&hash))
+            else {
+                continue;
+            };
+            for (index, tx) in block.transactions.iter().enumerate() {
+                self.entries.entry(tx.txid()).or_insert((height, index));
+            }
+        }
+        self.tip = Some((tip_height, runtime.tip_hash()));
+    }
+}
+
+/// Run blocking request work without stalling the async runtime: on a
+/// multi-thread runtime the current worker hands its other tasks off first.
+fn rpc_blocking_section<T>(work: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(work)
+        }
+        _ => work(),
+    }
 }
 
 struct AxumRuntimeCache {
@@ -18793,21 +18906,20 @@ fn axum_txid_response(state: &AxumRpcState, txid_raw: &str) -> AxumResponse {
         Err(_) => return axum_bad_request("invalid txid hex, expected 32-byte hash"),
     };
     match axum_runtime_for_query(state, |runtime| {
-        let mut located = None::<TxLookupRpcResponse>;
-        for height in 0..=runtime.tip_height() {
-            let Some(hash) = runtime.block_hash_at_height(height) else {
-                continue;
-            };
-            let Some(block) = runtime.block_by_hash(&hash) else {
-                return Ok(axum_internal_error(format!(
-                    "block for height {height} missing"
-                )));
-            };
-            if let Some((index, tx)) = find_tx_by_txid(block, needle_txid) {
-                located = Some(tx_lookup_response(height, index, tx));
-                break;
-            }
-        }
+        let position = {
+            let mut index = state
+                .extras
+                .txid_index
+                .lock()
+                .map_err(|_| NodeError::Runtime("txid index mutex poisoned".to_owned()))?;
+            index.sync(runtime);
+            index.entries.get(&needle_txid).copied()
+        };
+        let located = position.and_then(|(height, index)| {
+            let block = runtime.block_by_hash(&runtime.block_hash_at_height(height)?)?;
+            let tx = block.transactions.get(index)?;
+            Some(tx_lookup_response(height, index, tx))
+        });
         match located {
             Some(payload) => {
                 let body = to_pretty_json(&payload)
@@ -18983,6 +19095,22 @@ fn axum_wallet_send_preview_payload(
             })
             .collect(),
     })
+}
+
+fn axum_events_snapshot_cached(state: &AxumRpcState) -> Result<String, NodeError> {
+    let mut cache = state
+        .extras
+        .events_cache
+        .lock()
+        .map_err(|_| NodeError::Runtime("events cache mutex poisoned".to_owned()))?;
+    if let Some((at, payload)) = cache.as_ref()
+        && at.elapsed() < RPC_EVENTS_SNAPSHOT_TTL
+    {
+        return Ok(payload.clone());
+    }
+    let payload = axum_events_snapshot_payload(state)?;
+    *cache = Some((Instant::now(), payload.clone()));
+    Ok(payload)
 }
 
 fn axum_events_snapshot_payload(state: &AxumRpcState) -> Result<String, NodeError> {
@@ -19188,13 +19316,21 @@ async fn axum_txid_handler(
 }
 
 async fn axum_events_handler(AxumState(state): AxumState<AxumRpcState>) -> AxumResponse {
+    let Ok(permit) = state.extras.events_permits.clone().try_acquire_owned() else {
+        return axum_json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json_error_body("too many event subscribers"),
+        );
+    };
     let stream_state = state.clone();
     let initial = tokio_stream::once(Ok::<AxumSseEvent, Infallible>(
         AxumSseEvent::default().comment("heartbeat"),
     ));
     let snapshots =
         IntervalStream::new(tokio::time::interval(Duration::from_secs(1))).map(move |_| {
-            let data = match axum_events_snapshot_payload(&stream_state) {
+            // The subscriber slot is held for as long as the stream lives.
+            let _subscriber = &permit;
+            let data = match rpc_blocking_section(|| axum_events_snapshot_cached(&stream_state)) {
                 Ok(payload) => payload,
                 Err(err) => json_error_body(&err.to_string()),
             };
@@ -19660,6 +19796,7 @@ fn rpc_host_header_allowed(host: &str) -> bool {
 struct RpcRequestPolicy {
     auth_token: Option<Arc<str>>,
     wallet_rpc_enabled: bool,
+    inflight: Arc<tokio::sync::Semaphore>,
 }
 
 /// Routes that receive a mnemonic/passphrase or return a fresh one.
@@ -19803,7 +19940,19 @@ async fn enforce_rpc_request_policy(
     {
         return axum_json_response(status, json_error_body(&message));
     }
-    next.run(req).await
+    let Ok(_slot) = policy.inflight.clone().try_acquire_owned() else {
+        return axum_json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json_error_body("too many concurrent requests"),
+        );
+    };
+    // Handlers do synchronous DB/chain work; run them off the async workers.
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(|| handle.block_on(next.run(req)))
+        }
+        _ => next.run(req).await,
+    }
 }
 
 async fn axum_fallback_handler(
@@ -19864,6 +20013,7 @@ fn run_rpc_serve_inner_axum(
     let request_policy = RpcRequestPolicy {
         auth_token: load_rpc_auth_token(auth_token_file.as_deref())?.map(Arc::from),
         wallet_rpc_enabled: !disable_wallet_rpc,
+        inflight: Arc::new(tokio::sync::Semaphore::new(RPC_MAX_INFLIGHT_REQUESTS)),
     };
     ensure_rpc_bind_is_protected(&bind, &request_policy)?;
     let runtime_db_path = runtime_db
@@ -19919,10 +20069,14 @@ fn run_rpc_serve_inner_axum(
         stratum_telemetry,
         pool_ledger_db_path,
         ui_dir,
+        extras: Arc::default(),
     };
     let listener_bind = bind.clone();
 
-    TokioRuntimeBuilder::new_current_thread()
+    // Multi-thread so a slow handler (it runs in `rpc_blocking_section`)
+    // cannot stall the accept loop or other clients.
+    TokioRuntimeBuilder::new_multi_thread()
+        .worker_threads(4)
         .enable_all()
         .build()
         .map_err(|e| NodeError::Runtime(format!("rpc axum runtime build failed: {e}")))?
@@ -21600,6 +21754,82 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// R6: the txid index extends incrementally and rebuilds after a reorg.
+    #[test]
+    fn txid_index_tracks_tip_and_rebuilds_after_reorg() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let mut runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let mut index = super::TxidIndex::default();
+        index.sync(&runtime);
+        assert_eq!(index.entries.len(), 1, "genesis coinbase indexed");
+        mine_blocks_on_runtime(
+            &mut runtime,
+            &super::MiningLoopParams {
+                count: 2,
+                interval_sec: cfg.target_block_time_sec,
+                max_nonce: 500_000,
+                miner_key_hash: [3u8; 20],
+                label_prefix: "txid-index",
+                print_each: false,
+            },
+        )
+        .expect("mine");
+        index.sync(&runtime);
+        assert_eq!(index.entries.len(), 3);
+        let tip_coinbase = runtime
+            .block_by_hash(&runtime.tip_hash())
+            .expect("tip")
+            .transactions[0]
+            .txid();
+        assert_eq!(index.entries.get(&tip_coinbase), Some(&(2, 0)));
+
+        // Pretend the indexed tip was reorged away: full rebuild.
+        index.tip = Some((2, Hash256([0xAB; 32])));
+        index.entries.insert(Hash256([0xCD; 32]), (9, 9));
+        index.sync(&runtime);
+        assert_eq!(index.entries.len(), 3);
+        assert!(!index.entries.contains_key(&Hash256([0xCD; 32])));
+    }
+
+    /// R6: `/events` subscribers are capped; extra ones get 503.
+    #[test]
+    fn events_subscribers_are_capped() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let work_dir = temp_dir("test-events-cap");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let extras = super::AxumRpcExtras {
+            events_permits: Arc::new(tokio::sync::Semaphore::new(0)),
+            ..super::AxumRpcExtras::default()
+        };
+        let state = super::AxumRpcState {
+            network: Network::Devnet,
+            cfg: cfg.clone(),
+            runtime_db_path: work_dir.join("runtime.redb"),
+            runtime_cache: Arc::new(std::sync::Mutex::new(super::AxumRuntimeCache {
+                runtime: ChainRuntime::from_config(cfg.clone()).expect("runtime"),
+                last_seen_mtime: None,
+            })),
+            mempool_db_path: work_dir.join("mempool.redb"),
+            relay_telemetry: None,
+            stratum_telemetry: None,
+            pool_ledger_db_path: work_dir.join("pool-ledger.redb"),
+            ui_dir: work_dir.join("ui"),
+            extras: Arc::new(extras),
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+        let response = rt.block_on(super::axum_events_handler(super::AxumState(state)));
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
     /// ST5: PPLNS credits are frozen when a round closes, so trimming the
     /// share history or evicting old rounds never shrinks what a worker has
     /// earned (it used to drop below `paid_total` and stop payouts).
@@ -21753,6 +21983,7 @@ mod tests {
         let open = super::RpcRequestPolicy {
             auth_token: None,
             wallet_rpc_enabled: true,
+            inflight: Arc::new(tokio::sync::Semaphore::new(1)),
         };
         let headers = |pairs: &[(header::HeaderName, &str)]| {
             let mut map = HeaderMap::new();
@@ -21800,6 +22031,7 @@ mod tests {
         let no_wallet = super::RpcRequestPolicy {
             auth_token: None,
             wallet_rpc_enabled: false,
+            inflight: Arc::new(tokio::sync::Semaphore::new(1)),
         };
         assert_eq!(
             check(&no_wallet, Method::POST, "/wallet/send", &json),
@@ -21810,6 +22042,7 @@ mod tests {
         let token = super::RpcRequestPolicy {
             auth_token: Some(Arc::from("s3cret-token-0123456789")),
             wallet_rpc_enabled: true,
+            inflight: Arc::new(tokio::sync::Semaphore::new(1)),
         };
         assert_eq!(
             check(&token, Method::POST, "/tx/submit", &json),
@@ -27682,6 +27915,40 @@ mod tests {
         let _ = fs::remove_dir_all(work_dir);
     }
 
+    /// R6: the latest-record reader only reads the file tail (works across
+    /// window boundaries and long lines), and big files are rotated.
+    #[test]
+    fn telemetry_tail_reader_and_rotation() {
+        let work_dir = temp_dir("test-telemetry-tail");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let path = work_dir.join("telemetry.jsonl");
+        let mut body = String::new();
+        for i in 0..20_000 {
+            body.push_str(&format!(
+                "{{\"round\":{i},\"pad\":\"{}\"}}\n",
+                "x".repeat(16)
+            ));
+        }
+        let long = "y".repeat(200 * 1024);
+        body.push_str(&format!("{{\"round\":-1,\"pad\":\"{long}\"}}\n\n"));
+        fs::write(&path, body).expect("write");
+        let latest = super::load_latest_jsonl_record::<serde_json::Value>(&path)
+            .expect("load")
+            .expect("record");
+        assert_eq!(latest["round"], serde_json::json!(-1));
+
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open");
+        file.set_len(super::TELEMETRY_MAX_FILE_BYTES).expect("grow");
+        drop(file);
+        super::rotate_telemetry_if_large(&path);
+        assert!(!path.exists(), "large file moved aside");
+        assert!(work_dir.join("telemetry.jsonl.1").exists());
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
     #[test]
     fn default_runtime_db_path_uses_network_name() {
         let path = super::default_runtime_db_path(Network::Testnet);
@@ -30661,6 +30928,7 @@ mod tests {
             stratum_telemetry: None,
             pool_ledger_db_path: work_dir.join("pool-ledger.redb"),
             ui_dir: work_dir.join("ui"),
+            extras: Arc::default(),
         };
 
         let internal = super::axum_internal_error("boom");
@@ -30736,6 +31004,7 @@ mod tests {
             stratum_telemetry: None,
             pool_ledger_db_path: work_dir.join("pool-ledger.redb"),
             ui_dir: work_dir.join("ui"),
+            extras: Arc::default(),
         };
 
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -30781,6 +31050,7 @@ mod tests {
             stratum_telemetry: None,
             pool_ledger_db_path: work_dir.join("pool-ledger.redb"),
             ui_dir: work_dir.join("ui"),
+            extras: Arc::default(),
         };
 
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -30851,6 +31121,7 @@ mod tests {
             stratum_telemetry: None,
             pool_ledger_db_path: work_dir.join("pool-ledger.redb"),
             ui_dir: work_dir.join("ui"),
+            extras: Arc::default(),
         };
 
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -30960,6 +31231,7 @@ mod tests {
             stratum_telemetry: None,
             pool_ledger_db_path: work_dir.join("pool-ledger.redb"),
             ui_dir: work_dir.join("ui"),
+            extras: Arc::default(),
         };
         assert_eq!(
             super::axum_internal_error("guard").status(),
@@ -32777,6 +33049,7 @@ mod tests {
             stratum_telemetry: None,
             pool_ledger_db_path: work_dir.join("pool-ledger.redb"),
             ui_dir: work_dir.join("ui"),
+            extras: Arc::default(),
         };
         let payload = super::axum_status_payload(&state).expect("status payload");
         assert_eq!(
@@ -32853,6 +33126,7 @@ mod tests {
             stratum_telemetry: None,
             pool_ledger_db_path: work_dir.join("pool-ledger.redb"),
             ui_dir: work_dir.join("ui"),
+            extras: Arc::default(),
         };
 
         let payload = super::axum_status_payload(&state).expect("status payload");
@@ -32933,6 +33207,7 @@ mod tests {
             stratum_telemetry: None,
             pool_ledger_db_path: work_dir.join("pool-ledger.redb"),
             ui_dir: work_dir.join("ui"),
+            extras: Arc::default(),
         };
 
         let payload = super::axum_status_payload(&state).expect("status payload");
@@ -33014,6 +33289,7 @@ mod tests {
             stratum_telemetry: None,
             pool_ledger_db_path: work_dir.join("pool-ledger.redb"),
             ui_dir: work_dir.join("ui"),
+            extras: Arc::default(),
         };
 
         let payload = super::axum_status_payload(&state).expect("status payload");
@@ -33048,6 +33324,7 @@ mod tests {
             stratum_telemetry: None,
             pool_ledger_db_path: work_dir.join("pool-ledger.redb"),
             ui_dir: work_dir.join("ui"),
+            extras: Arc::default(),
         };
 
         let lock_value = super::axum_runtime_for_query_with_refresh(
@@ -33102,6 +33379,7 @@ mod tests {
             stratum_telemetry: None,
             pool_ledger_db_path: work_dir.join("pool-ledger.redb"),
             ui_dir: work_dir.join("ui"),
+            extras: Arc::default(),
         };
 
         let err = super::axum_runtime_for_query(&state, |_runtime| Ok::<u64, super::NodeError>(1))
@@ -42281,6 +42559,7 @@ mod tests {
             stratum_telemetry: None,
             pool_ledger_db_path: work_dir.join("pool-ledger.redb"),
             ui_dir: work_dir.join("ui"),
+            extras: Arc::default(),
         };
 
         let binary = super::axum_binary_response(
