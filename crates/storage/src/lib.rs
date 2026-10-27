@@ -20,6 +20,9 @@ pub const STORE_SCHEMA_VERSION: u32 = 1;
 /// records signed payout transactions before they are broadcast. Older
 /// ledgers cannot be decoded and are refused.
 pub const POOL_LEDGER_SCHEMA_VERSION: u32 = 3;
+/// Peer book format. v2 records the announcing peer's group, services, last
+/// successful connection and tried state (addrman layout); v1 is refused.
+pub const PEER_BOOK_SCHEMA_VERSION: u32 = 2;
 const UTXO_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("utxos");
 const BLOCK_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("blocks_by_hash");
 const HEADER_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("headers_by_hash");
@@ -62,11 +65,17 @@ pub struct PeerAddressBook {
     pub peers: Vec<PeerAddressRecord>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
 pub struct PeerAddressRecord {
     pub address: String,
     pub last_seen_unix_sec: u64,
+    /// Failed connection attempts since the last success.
     pub ban_score: u32,
+    /// Network group of the peer that announced it, or `manual`.
+    pub source_group: String,
+    pub services: u64,
+    pub last_success_unix_sec: u64,
+    pub tried: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -959,7 +968,7 @@ pub fn save_peer_book_db(path: &Path, peer_book: &PeerAddressBook) -> Result<(),
             .map_err(|e| StorageError::Db(e.to_string()))?;
         meta.insert("network_id", peer_book.network_id.as_bytes())
             .map_err(|e| StorageError::Db(e.to_string()))?;
-        write_schema_version(&mut meta, STORE_SCHEMA_VERSION)?;
+        write_schema_version(&mut meta, PEER_BOOK_SCHEMA_VERSION)?;
     }
     {
         let mut peer_table = write_txn
@@ -968,6 +977,79 @@ pub fn save_peer_book_db(path: &Path, peer_book: &PeerAddressBook) -> Result<(),
         for record in peers {
             let value = bincode::serialize(&record).map_err(StorageError::Encode)?;
             peer_table
+                .insert(record.address.as_str(), value.as_slice())
+                .map_err(|e| StorageError::Db(e.to_string()))?;
+        }
+    }
+    write_txn
+        .commit()
+        .map_err(|e| StorageError::Db(e.to_string()))?;
+    Ok(())
+}
+
+/// Apply peer-book changes (upserted records, removed addresses) in one
+/// write transaction; the store is created if missing. The relay keeps its
+/// address table in memory and persists only what changed.
+pub fn apply_peer_book_delta_db(
+    path: &Path,
+    network_id: &str,
+    upserted: &[PeerAddressRecord],
+    removed: &[String],
+) -> Result<(), StorageError> {
+    if upserted
+        .iter()
+        .any(|record| record.address.trim().is_empty())
+    {
+        return Err(StorageError::InvalidPeerBook(
+            "peer address cannot be empty".to_owned(),
+        ));
+    }
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent).map_err(|source| StorageError::CreateDir {
+            path: parent.display().to_string(),
+            source,
+        })?;
+    }
+    let db = Database::create(path).map_err(|e| StorageError::Db(e.to_string()))?;
+    let write_txn = db
+        .begin_write()
+        .map_err(|e| StorageError::Db(e.to_string()))?;
+    {
+        let mut meta = write_txn
+            .open_table(META_TABLE)
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+        let existing = meta
+            .get("network_id")
+            .map_err(|e| StorageError::Db(e.to_string()))?
+            .map(|raw| String::from_utf8_lossy(raw.value()).into_owned());
+        match existing {
+            Some(existing) => {
+                if existing != network_id {
+                    return Err(StorageError::InvalidPeerBook(format!(
+                        "peer book network mismatch: db='{existing}', write='{network_id}'"
+                    )));
+                }
+                check_schema_version(&meta, "peer book", PEER_BOOK_SCHEMA_VERSION, None)?;
+            }
+            None => {
+                meta.insert("network_id", network_id.as_bytes())
+                    .map_err(|e| StorageError::Db(e.to_string()))?;
+                write_schema_version(&mut meta, PEER_BOOK_SCHEMA_VERSION)?;
+            }
+        }
+    }
+    {
+        let mut table = write_txn
+            .open_table(PEER_TABLE)
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+        for address in removed {
+            table
+                .remove(address.as_str())
+                .map_err(|e| StorageError::Db(e.to_string()))?;
+        }
+        for record in upserted {
+            let value = bincode::serialize(record).map_err(StorageError::Encode)?;
+            table
                 .insert(record.address.as_str(), value.as_slice())
                 .map_err(|e| StorageError::Db(e.to_string()))?;
         }
@@ -987,7 +1069,7 @@ pub fn load_peer_book_db(path: &Path) -> Result<PeerAddressBook, StorageError> {
         let meta = read_txn
             .open_table(META_TABLE)
             .map_err(|e| StorageError::Db(e.to_string()))?;
-        check_schema_version(&meta, "peer book", STORE_SCHEMA_VERSION, Some(1))?;
+        check_schema_version(&meta, "peer book", PEER_BOOK_SCHEMA_VERSION, None)?;
         let network_id_raw = meta
             .get("network_id")
             .map_err(|e| StorageError::Db(e.to_string()))?
@@ -1691,10 +1773,10 @@ mod tests {
         ChainArchive, ChainStateSnapshot, MempoolSnapshot, MempoolTxRecord, PeerAddressBook,
         PeerAddressRecord, PoolChainPoint, PoolLedgerDelta, PoolLedgerSnapshot, PoolPayoutRecord,
         PoolRoundRecord, PoolShareRecord, PoolWorkerAccrualRecord, UtxoRecord,
-        apply_pool_ledger_delta_db, load_block_by_hash_db, load_chain_archive_db, load_mempool_db,
-        load_peer_book_db, load_pool_ledger_db, load_snapshot, load_snapshot_db,
-        save_chain_archive_db, save_mempool_db, save_peer_book_db, save_pool_ledger_db,
-        save_snapshot, save_snapshot_db,
+        apply_peer_book_delta_db, apply_pool_ledger_delta_db, load_block_by_hash_db,
+        load_chain_archive_db, load_mempool_db, load_peer_book_db, load_pool_ledger_db,
+        load_snapshot, load_snapshot_db, save_chain_archive_db, save_mempool_db, save_peer_book_db,
+        save_pool_ledger_db, save_snapshot, save_snapshot_db,
     };
 
     fn temp_test_file(stem: &str, ext: &str) -> PathBuf {
@@ -2097,17 +2179,20 @@ mod tests {
                     address: "127.0.0.1:8333".to_owned(),
                     last_seen_unix_sec: 1_770_763_200,
                     ban_score: 0,
+                    ..Default::default()
                 },
                 PeerAddressRecord {
                     address: "192.168.1.10:8333".to_owned(),
                     last_seen_unix_sec: 1_770_763_210,
                     ban_score: 2,
+                    ..Default::default()
                 },
                 // Duplicate address should be deduplicated by save path.
                 PeerAddressRecord {
                     address: "127.0.0.1:8333".to_owned(),
                     last_seen_unix_sec: 1_770_763_300,
                     ban_score: 5,
+                    ..Default::default()
                 },
             ],
         };
@@ -2124,6 +2209,68 @@ mod tests {
     }
 
     #[test]
+    fn peer_book_delta_writes_only_changes_and_guards_network_and_version() {
+        let path = temp_test_file("peer-book-delta", "redb");
+        let record = |address: &str, tried: bool| PeerAddressRecord {
+            address: address.to_owned(),
+            last_seen_unix_sec: 10,
+            source_group: "v4:1.2".to_owned(),
+            tried,
+            ..Default::default()
+        };
+        apply_peer_book_delta_db(
+            &path,
+            "devnet",
+            &[record("1.2.3.4:1", false), record("5.6.7.8:1", true)],
+            &[],
+        )
+        .expect("create");
+        apply_peer_book_delta_db(
+            &path,
+            "devnet",
+            &[record("9.9.9.9:1", false)],
+            &["1.2.3.4:1".to_owned()],
+        )
+        .expect("delta");
+        let book = load_peer_book_db(&path).expect("load");
+        assert_eq!(
+            book.peers
+                .iter()
+                .map(|p| p.address.as_str())
+                .collect::<Vec<_>>(),
+            vec!["5.6.7.8:1", "9.9.9.9:1"]
+        );
+        assert!(book.peers[0].tried);
+        assert!(matches!(
+            apply_peer_book_delta_db(&path, "testnet", &[], &[]),
+            Err(crate::StorageError::InvalidPeerBook(_))
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        // A v1 peer book (no version key) is refused.
+        let old = temp_test_file("peer-book-v1", "redb");
+        {
+            let db = redb::Database::create(&old).expect("create");
+            let txn = db.begin_write().expect("txn");
+            {
+                let mut meta = txn.open_table(crate::META_TABLE).expect("meta");
+                meta.insert("network_id", b"devnet".as_slice())
+                    .expect("net");
+            }
+            txn.commit().expect("commit");
+        }
+        assert!(matches!(
+            load_peer_book_db(&old),
+            Err(crate::StorageError::UnsupportedSchema { found: None, .. })
+        ));
+        assert!(matches!(
+            apply_peer_book_delta_db(&old, "devnet", &[], &[]),
+            Err(crate::StorageError::UnsupportedSchema { found: None, .. })
+        ));
+        let _ = std::fs::remove_file(old);
+    }
+
+    #[test]
     fn peer_book_rejects_empty_address() {
         let peer_book = PeerAddressBook {
             network_id: "devnet".to_owned(),
@@ -2131,6 +2278,7 @@ mod tests {
                 address: "   ".to_owned(),
                 last_seen_unix_sec: 0,
                 ban_score: 0,
+                ..Default::default()
             }],
         };
         let path = temp_test_file("peer-book-invalid", "redb");

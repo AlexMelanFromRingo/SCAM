@@ -62,7 +62,7 @@ Baseline at start: `fmt`/`clippy -D warnings`/`cargo test --workspace
 | P4 | high | Finished inbound sessions never reaped from `JoinSet`; errors embed attacker payload (`{other:?}` of 8 MiB msg). | `main.rs` relay accept loop, `p2p/src/transport.rs` | fixed (relay and stratum reap finished sessions with `try_join_next`; logged detail truncated) |
 | P5 | high | `timeout(read_message_async)` is not cancel-safe ⇒ partial frame lost, stream desync; >250 ms block transfer never succeeds. | `main.rs` relay session read loop | fixed (`FrameReader`, async + blocking) |
 | P6 | high | Bans keyed by per-connection id / `ip:port`; no ban check on accept; invalid blocks/txs not penalized; Addr re-announce lowers ban score. | `gossip.rs`, `main.rs` | fixed (24 h IP bans checked at accept; only context-free invalid data punished; context-dependent tx failures dropped quietly) |
-| P7 | high | Addr: unbounded peer book, no address validation/length cap, stamps `max(seen, now)`, string-sorted truncation ⇒ eclipse aid; O(n²) rewrite per message. | `main.rs` addr handling | partially fixed (validation, timestamp clamp, keyed-random eviction); source-group bucketing and peer-book rewrite cost open |
+| P7 | high | Addr: unbounded peer book, no address validation/length cap, stamps `max(seen, now)`, string-sorted truncation ⇒ eclipse aid; O(n²) rewrite per message. | `main.rs` addr handling | fixed (addrman table `scam_p2p::AddrTable`: new/tried bucket grids keyed by a persisted secret; a gossiped address is bucketed by its own group and the announcing peer's group, each source reaching only 8 of 64 new buckets; new addresses never displace live ones; tried on successful handshake, failures counted; table and peer book bounded (2 560 + 1 024 operator-pinned); announced timestamps kept (clamped), never stamped "now"; the relay writes only changed rows via `apply_peer_book_delta_db`; peer book schema v2; bucket secret from the OS RNG on every platform) |
 | P8 | medium | Per-peer `known_inventory` unbounded. | `gossip.rs` | fixed (50k per peer, oldest evicted) |
 | P9 | medium | O(chain)/O(mempool) work under the global mutex per message (GetHeaders clones all headers, mempool sorted per 250 ms poll). | `main.rs` | fixed (header/hash selection via runtime indexes; per-session mempool rescan only when its revision changes) |
 | P10 | medium | Peer tip height trusted from Version/Inv/unchecked headers ⇒ forced outbound churn ("lag mode"). | `main.rs` | fixed (claimed tips capped at base lead 6 + 2 blocks per elapsed target interval since our tip; base lead below the lag threshold) |
@@ -74,12 +74,12 @@ Baseline at start: `fmt`/`clippy -D warnings`/`cargo test --workspace
 
 | ID | Sev | Finding | Where | Status |
 |---|---|---|---|---|
-| S1 | critical | `stratum-serve` loads the chain once, never reloads, and persists its stale chain over the shared archive (temp+rename, no ancestry check); relay refresh adopts disk state without fork choice ⇒ chain rollback. | `main.rs` stratum persist / relay refresh | fixed (guarded write refuses stale writers via recorded tip work; refresh merges disk blocks through `submit_block`) — single-writer redesign still recommended |
-| S2 | high | Relay drops the mutex between `submit_block` and persist; background refresh can reload in between and the session then persists the older chain. | `main.rs` relay session | mitigated (refresh now merges instead of replacing, so the new block survives) |
+| S1 | critical | `stratum-serve` loads the chain once, never reloads, and persists its stale chain over the shared archive (temp+rename, no ancestry check); relay refresh adopts disk state without fork choice ⇒ chain rollback. | `main.rs` stratum persist / relay refresh | fixed (guarded write refuses stale writers via recorded tip work; refresh merges disk blocks through `submit_block`) — single-writer redesign still recommended; owner decision (2026-10-28): single node process owning every store — in progress |
+| S2 | high | Relay drops the mutex between `submit_block` and persist; background refresh can reload in between and the session then persists the older chain. | `main.rs` relay session | mitigated (refresh now merges instead of replacing, so the new block survives); owner decision (2026-10-28): single node process owning every store — in progress |
 | S3 | high | Every tip change rewrites the entire archive (O(H²) bytes during sync). | `storage::save_chain_archive_db` callers | fixed (`persist_chain_archive_incremental_db`: one redb txn, only new blocks) |
 | S4 | high | Every start/refresh replays all blocks with full signature checks (relay ~1 s after any write, RPC cache, each SSE conn, each payout). | `main.rs::load_runtime_from_db_or_genesis` | partially fixed (refresh reads tip meta, then only the tail, validating only unknown blocks); cold start still replays — persisted UTXO set needed |
 | S5 | medium | Mempool DB: load-modify-rewrite from RPC, relay and stratum ⇒ lost updates; `GET /mempool` writes. | `main.rs` | fixed (mempool tracks its own delta; `apply_mempool_delta_db` writes only inserts/removals in one txn; relay refresh merges instead of replacing) |
-| S6 | medium | redb exclusive open per access; nested retry sleeps while holding locks / in async tasks. | `main.rs` | open |
+| S6 | medium | redb exclusive open per access; nested retry sleeps while holding locks / in async tasks. | `main.rs` | open; owner decision (2026-10-28): single node process owning every store — in progress |
 | S7 | low | No on-disk schema version; `#[serde(default)]` useless under bincode. | `storage` | fixed (`schema_version` in every store; unknown versions refused; pool ledger requires v2) |
 | S8 | low | Temp files leaked on error; rename while temp DB still open. | `storage` | fixed (every whole-store rewrite happens in place inside one redb transaction — no temp DB, no rename; the bincode snapshot file is written temp+fsync+rename with the temp removed on error) |
 
@@ -157,6 +157,9 @@ but **existing devnet/testnet chains and nodes must be upgraded together**:
 - Every store carries `schema_version`. Pool ledgers written before the
   current format (v3) are refused — move the file aside to start a fresh
   ledger.
+- Peer books are format v2 (addrman fields). A v1 `peers/<network>.redb` is
+  refused — move it aside (re-add pinned peers with `add-peer`). Addresses
+  added with `add-peer(s)` are operator-pinned and never evicted.
 - Consensus: from height 1 a coinbase's script must start with the block
   height (8 bytes little-endian). Miners and pool software building their own
   coinbase must prepend it (`scam_core::coinbase_script`); genesis is

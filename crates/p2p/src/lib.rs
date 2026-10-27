@@ -1,10 +1,12 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
+pub mod addrman;
 pub mod discovery;
 pub mod gossip;
 pub mod sync;
 pub mod transport;
 pub mod wire;
 
+pub use addrman::{AddrEntry, AddrTable, AddrTableChanges, MANUAL_SOURCE_GROUP, address_group};
 pub use discovery::{PeerCandidate, select_outbound_peers};
 pub use gossip::{
     GossipEngine, GossipError, GossipTelemetry, OutboundMessage, PeerId, ReplacementRateLimit,

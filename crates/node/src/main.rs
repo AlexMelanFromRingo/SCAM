@@ -41,13 +41,13 @@ use scam_miner::{
     mine_block_with_extra_nonce,
 };
 use scam_p2p::{
-    CompactBlock, FrameReader, FramingConfig, GossipEngine, GossipError, InventoryItem,
-    LocalHandshake, PeerAddress, PeerCandidate, PrefilledTxn, RemoteHandshake,
-    ReplacementRateLimit, TransportError, WireMessage, build_block_locator, client_handshake,
-    client_handshake_async, read_message, request_blocks, request_headers,
-    select_block_hashes_for_peer, select_block_hashes_with_lookup, select_headers_for_peer,
-    select_headers_with_lookup, select_outbound_peers, send_message, send_message_async,
-    server_handshake, server_handshake_async,
+    AddrEntry, AddrTable, CompactBlock, FrameReader, FramingConfig, GossipEngine, GossipError,
+    InventoryItem, LocalHandshake, MANUAL_SOURCE_GROUP, PeerAddress, PeerCandidate, PrefilledTxn,
+    RemoteHandshake, ReplacementRateLimit, TransportError, WireMessage, address_group,
+    build_block_locator, client_handshake, client_handshake_async, read_message, request_blocks,
+    request_headers, select_block_hashes_for_peer, select_block_hashes_with_lookup,
+    select_headers_for_peer, select_headers_with_lookup, select_outbound_peers, send_message,
+    send_message_async, server_handshake, server_handshake_async,
 };
 use scam_rpc::{
     StatusResponse, TxResponse, TxSubmitRpcRequest, decode_tx_submit_request,
@@ -57,10 +57,10 @@ use scam_storage::{
     ChainStateSnapshot, MempoolTxRecord, PeerAddressBook, PeerAddressRecord, PoolChainPoint,
     PoolLedgerDelta, PoolLedgerSnapshot, PoolPayoutRecord, PoolRoundCredit, PoolRoundRecord,
     PoolShareRecord, PoolWorkerAccrualRecord, StorageError, apply_mempool_delta_db,
-    apply_pool_ledger_delta_db, load_block_by_hash_db, load_chain_archive_db,
-    load_chain_archive_range_db, load_chain_archive_tip_db, load_mempool_db, load_peer_book_db,
-    load_pool_ledger_db, load_snapshot, load_snapshot_db, persist_chain_archive_incremental_db,
-    save_peer_book_db, save_snapshot, save_snapshot_db,
+    apply_peer_book_delta_db, apply_pool_ledger_delta_db, load_block_by_hash_db,
+    load_chain_archive_db, load_chain_archive_range_db, load_chain_archive_tip_db, load_mempool_db,
+    load_peer_book_db, load_pool_ledger_db, load_snapshot, load_snapshot_db,
+    persist_chain_archive_incremental_db, save_peer_book_db, save_snapshot, save_snapshot_db,
 };
 #[cfg(test)]
 use scam_storage::{MempoolSnapshot, save_pool_ledger_db};
@@ -2969,12 +2969,9 @@ fn load_or_init_peer_bucket_secret(
             ))
         })?;
     }
+    // OS randomness on every platform (`/dev/urandom` broke Windows).
     let mut secret = [0u8; 32];
-    let mut urandom = fs::File::open("/dev/urandom")
-        .map_err(|e| NodeError::Runtime(format!("failed to open /dev/urandom: {e}")))?;
-    urandom
-        .read_exact(&mut secret)
-        .map_err(|e| NodeError::Runtime(format!("failed to read random bytes: {e}")))?;
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut secret);
 
     let tmp_path = path.with_extension("tmp");
     fs::write(&tmp_path, format!("{}\n", hex::encode(secret))).map_err(|e| {
@@ -3083,16 +3080,14 @@ impl PeerAnchorStore {
 #[derive(Clone, Debug)]
 struct PeerBookStore {
     peers_db_path: PathBuf,
-    legacy_txt_path: PathBuf,
     network_id: String,
 }
 
 impl PeerBookStore {
     fn from_peers_dir(peers_dir: &Path, network_id: &str) -> Self {
-        let (peers_db_path, legacy_txt_path) = peer_book_paths(peers_dir, network_id);
+        let (peers_db_path, _legacy_txt_path) = peer_book_paths(peers_dir, network_id);
         Self {
             peers_db_path,
-            legacy_txt_path,
             network_id: network_id.to_owned(),
         }
     }
@@ -3402,8 +3397,8 @@ fn load_or_init_peer_book(
             .filter(|line| !line.is_empty())
             .map(|address| PeerAddressRecord {
                 address: address.to_owned(),
-                last_seen_unix_sec: 0,
-                ban_score: 0,
+                source_group: MANUAL_SOURCE_GROUP.to_owned(),
+                ..Default::default()
             })
             .collect::<Vec<_>>();
         peers.sort_by(|a, b| a.address.cmp(&b.address));
@@ -3672,8 +3667,8 @@ fn run_add_peer(args: AddPeerArgs) -> Result<(), NodeError> {
     {
         peer_book.peers.push(PeerAddressRecord {
             address: args.peer.clone(),
-            last_seen_unix_sec: 0,
-            ban_score: 0,
+            source_group: MANUAL_SOURCE_GROUP.to_owned(),
+            ..Default::default()
         });
         peer_book.peers.sort_by(|a, b| a.address.cmp(&b.address));
         peer_book.peers.dedup_by(|a, b| a.address == b.address);
@@ -3706,8 +3701,8 @@ fn run_add_peers(args: AddPeersArgs) -> Result<(), NodeError> {
         }
         peer_book.peers.push(PeerAddressRecord {
             address: peer.to_owned(),
-            last_seen_unix_sec: 0,
-            ban_score: 0,
+            source_group: MANUAL_SOURCE_GROUP.to_owned(),
+            ..Default::default()
         });
         added = added.saturating_add(1);
     }
@@ -5957,8 +5952,9 @@ fn run_sync_book(args: SyncBookArgs) -> Result<(), NodeError> {
             }
             peer_book.peers.push(PeerAddressRecord {
                 address: addr_string,
-                last_seen_unix_sec: 0,
-                ban_score: 0,
+                // DNS seed answers are bucketed per seed, like any source.
+                source_group: format!("seed:{seed}"),
+                ..Default::default()
             });
             seed_imported = seed_imported.saturating_add(1);
         }
@@ -6028,7 +6024,9 @@ fn run_sync_book(args: SyncBookArgs) -> Result<(), NodeError> {
                 total_applied = total_applied.saturating_add(stats.blocks_applied);
                 if let Some(peer) = find_peer_record_mut(&mut peer_book, &addr_string) {
                     peer.last_seen_unix_sec = attempt_now;
-                    peer.ban_score = peer.ban_score.saturating_sub(1);
+                    peer.last_success_unix_sec = attempt_now;
+                    peer.tried = true;
+                    peer.ban_score = 0;
                 }
             }
             Err(err) => {
@@ -6083,8 +6081,6 @@ struct RelayServerState {
     peer_runtime_reputation: HashMap<u64, RuntimePeerReputation>,
     /// IPs refused at accept/dial time until the stored unix second.
     banned_ips: HashMap<IpAddr, u64>,
-    /// Randomly keyed per process; orders address-list eviction.
-    addr_eviction_hasher: std::collections::hash_map::RandomState,
     pending_parent_tx_requests: HashMap<Hash256, u64>,
     pending_compact_blocks: HashMap<Hash256, PendingCompactBlock>,
     peer_reported_tip_heights: HashMap<u64, u64>,
@@ -6097,8 +6093,10 @@ struct RelayServerState {
     peer_last_non_fatal_recon_log_sec: HashMap<u64, u64>,
     inflight_block_requests: HashMap<Hash256, InflightBlockRequest>,
     peer_inflight_block_requests: HashMap<u64, usize>,
-    known_peer_addresses: Vec<PeerAddress>,
-    pending_peer_book_updates: Vec<PeerAddress>,
+    /// Known peer addresses (addrman layout); changes reach the peer book
+    /// on `relay_flush_pending_peer_book_updates`.
+    addr_table: AddrTable,
+    addr_sample_nonce: u64,
     outbound_worker_starts_total: u64,
     outbound_supervisor_starts_total: u64,
 }
@@ -6115,7 +6113,6 @@ impl RelayServerState {
             peer_compact_pref: HashMap::new(),
             peer_runtime_reputation: HashMap::new(),
             banned_ips: HashMap::new(),
-            addr_eviction_hasher: std::collections::hash_map::RandomState::new(),
             pending_parent_tx_requests: HashMap::new(),
             pending_compact_blocks: HashMap::new(),
             peer_reported_tip_heights: HashMap::new(),
@@ -6128,8 +6125,9 @@ impl RelayServerState {
             peer_last_non_fatal_recon_log_sec: HashMap::new(),
             inflight_block_requests: HashMap::new(),
             peer_inflight_block_requests: HashMap::new(),
-            known_peer_addresses: Vec::new(),
-            pending_peer_book_updates: Vec::new(),
+            // Replaced by the persisted table (and its secret) on startup.
+            addr_table: AddrTable::new(rand::random()),
+            addr_sample_nonce: 0,
             outbound_worker_starts_total: 0,
             outbound_supervisor_starts_total: 0,
         }
@@ -6174,7 +6172,6 @@ const RELAY_INBOUND_ACCEPT_LOOPBACK_MULTIPLIER: usize = 16;
 const RELAY_MAX_CONSECUTIVE_READ_TIMEOUTS: u32 = 16;
 const RELAY_PROTOCOL_PENALTY: u32 = 25;
 const RELAY_MAX_ADDR_ITEMS: usize = 1_000;
-const RELAY_MAX_PENDING_PEER_BOOK_UPDATES: usize = 4_000;
 const RELAY_MAX_LOCATOR_ITEMS: usize = 101;
 const RELAY_MAX_HEADERS_PER_ANNOUNCEMENT: usize = 2_000;
 const RELAY_MAX_GETBLOCKTXN_INDEXES: usize = 1_024;
@@ -8739,9 +8736,11 @@ fn load_relay_outbound_feeler_target(
     };
     sort_and_dedup_peer_book(&mut peer_book);
     let network_policy = RelayNetworkPolicy::from_env();
+    // Feelers probe addresses never connected to (the "new" table).
     let mut candidates = peer_book
         .peers
         .into_iter()
+        .filter(|peer| !peer.tried)
         .filter(|peer| !excluded_targets.contains(&peer.address))
         .filter(|peer| !relay_target_matches_bind(bind_addr, &peer.address))
         .filter(|peer| relay_target_allowed_by_policy(&peer.address, &network_policy))
@@ -8755,55 +8754,24 @@ fn load_relay_outbound_feeler_target(
     Ok(candidates.into_iter().next().map(|peer| peer.address))
 }
 
-fn relay_known_peer_addresses(state: &RelayServerState, max_items: usize) -> Vec<PeerAddress> {
+/// A sample of usable known addresses in an order peers cannot predict.
+fn relay_known_peer_addresses(state: &mut RelayServerState, max_items: usize) -> Vec<PeerAddress> {
+    state.addr_sample_nonce = state.addr_sample_nonce.wrapping_add(1);
+    let now_unix_sec = current_unix_sec().unwrap_or(0);
     state
-        .known_peer_addresses
-        .iter()
-        .take(max_items)
-        .cloned()
-        .collect::<Vec<_>>()
-}
-
-fn relay_queue_peer_book_update(state: &mut RelayServerState, entry: PeerAddress) {
-    if entry.address.trim().is_empty() {
-        return;
-    }
-    if parse_relay_target_endpoint(&entry.address).is_none() {
-        return;
-    }
-    if let Some(existing) = state
-        .pending_peer_book_updates
-        .iter_mut()
-        .find(|known| known.address == entry.address)
-    {
-        existing.last_seen_unix_sec = existing.last_seen_unix_sec.max(entry.last_seen_unix_sec);
-        existing.services |= entry.services;
-        return;
-    }
-    state.pending_peer_book_updates.push(entry);
-    if state.pending_peer_book_updates.len() <= RELAY_MAX_PENDING_PEER_BOOK_UPDATES {
-        return;
-    }
-    state
-        .pending_peer_book_updates
-        .sort_unstable_by(|a, b| a.address.cmp(&b.address));
-    state
-        .pending_peer_book_updates
-        .dedup_by(|a, b| a.address == b.address);
-    let overflow = state
-        .pending_peer_book_updates
-        .len()
-        .saturating_sub(RELAY_MAX_PENDING_PEER_BOOK_UPDATES);
-    if overflow == 0 {
-        return;
-    }
-    state.pending_peer_book_updates.drain(0..overflow);
+        .addr_table
+        .sample(max_items, state.addr_sample_nonce, now_unix_sec)
+        .into_iter()
+        .map(|entry| PeerAddress {
+            address: entry.address,
+            services: entry.services,
+            last_seen_unix_sec: entry.last_seen_unix_sec,
+        })
+        .collect()
 }
 
 /// Longest `host:port` string accepted from peers.
 const RELAY_MAX_PEER_ADDRESS_LEN: usize = 255;
-/// Most entries kept in the in-memory address list.
-const RELAY_MAX_KNOWN_PEER_ADDRESSES: usize = 2_000;
 /// Peers may not claim an address was seen further in the future than this.
 const RELAY_ADDR_MAX_FUTURE_SEC: u64 = 10 * 60;
 
@@ -8826,156 +8794,155 @@ fn relay_peer_address_is_acceptable(address: &str) -> bool {
     }
 }
 
-fn relay_merge_known_peer_addresses(state: &mut RelayServerState, incoming: &[PeerAddress]) {
-    if incoming.is_empty() {
-        return;
-    }
-    let max_seen = current_unix_sec()
-        .unwrap_or(0)
-        .saturating_add(RELAY_ADDR_MAX_FUTURE_SEC);
-    let mut by_addr = HashMap::<String, PeerAddress>::new();
-    for entry in &state.known_peer_addresses {
-        by_addr.insert(entry.address.clone(), entry.clone());
-    }
+/// Group the addresses a peer announces are bucketed under: the peer's own
+/// network group, so one source can fill only its share of the table.
+fn relay_peer_source_group(state: &RelayServerState, peer_id: u64) -> String {
+    state
+        .peer_session_addresses
+        .get(&peer_id)
+        .map_or_else(|| "unknown".to_owned(), |address| address_group(address))
+}
+
+fn relay_merge_known_peer_addresses(
+    state: &mut RelayServerState,
+    source_group: &str,
+    incoming: &[PeerAddress],
+) {
+    let now_unix_sec = current_unix_sec().unwrap_or(0);
+    let max_seen = now_unix_sec.saturating_add(RELAY_ADDR_MAX_FUTURE_SEC);
     for entry in incoming {
         if !relay_peer_address_is_acceptable(&entry.address) {
             continue;
         }
-        let mut entry = entry.clone();
-        entry.last_seen_unix_sec = entry.last_seen_unix_sec.min(max_seen);
-        by_addr
-            .entry(entry.address.clone())
-            .and_modify(|existing| {
-                let before_seen = existing.last_seen_unix_sec;
-                let before_services = existing.services;
-                existing.last_seen_unix_sec =
-                    existing.last_seen_unix_sec.max(entry.last_seen_unix_sec);
-                existing.services |= entry.services;
-                if existing.last_seen_unix_sec != before_seen
-                    || existing.services != before_services
-                {
-                    relay_queue_peer_book_update(state, existing.clone());
-                }
-            })
-            .or_insert_with(|| {
-                relay_queue_peer_book_update(state, entry.clone());
-                entry
-            });
+        // The announced time is kept (clamped), never stamped as "now".
+        state.addr_table.add(
+            &entry.address,
+            source_group,
+            entry.services,
+            entry.last_seen_unix_sec.min(max_seen),
+            now_unix_sec,
+        );
     }
-    let mut merged = by_addr.into_values().collect::<Vec<_>>();
-    if merged.len() > RELAY_MAX_KNOWN_PEER_ADDRESSES {
-        // Evict by a per-process secret ordering: a peer flooding addresses
-        // cannot choose which entries survive (sorting by the address string
-        // let "0…"/"1…" entries push everything else out).
-        let hasher = &state.addr_eviction_hasher;
-        merged.sort_by_cached_key(|entry| std::hash::BuildHasher::hash_one(hasher, &entry.address));
-        merged.truncate(RELAY_MAX_KNOWN_PEER_ADDRESSES);
-    }
-    merged.sort_unstable_by(|a, b| a.address.cmp(&b.address));
-    state.known_peer_addresses = merged;
 }
 
-fn relay_persist_peer_book_updates(
-    store: &PeerBookStore,
-    updates: &[PeerAddress],
+fn peer_record_from_addr_entry(entry: AddrEntry) -> PeerAddressRecord {
+    PeerAddressRecord {
+        address: entry.address,
+        last_seen_unix_sec: entry.last_seen_unix_sec,
+        ban_score: entry.failures,
+        source_group: entry.source_group,
+        services: entry.services,
+        last_success_unix_sec: entry.last_success_unix_sec,
+        tried: entry.tried,
+    }
+}
+
+fn addr_entry_from_peer_record(record: PeerAddressRecord) -> AddrEntry {
+    AddrEntry {
+        // Records without a source were added by an operator.
+        source_group: if record.source_group.is_empty() {
+            MANUAL_SOURCE_GROUP.to_owned()
+        } else {
+            record.source_group
+        },
+        address: record.address,
+        services: record.services,
+        last_seen_unix_sec: record.last_seen_unix_sec,
+        last_success_unix_sec: record.last_success_unix_sec,
+        failures: record.ban_score,
+        tried: record.tried,
+    }
+}
+
+/// The relay's address table, rebuilt from the peer book with the persisted
+/// bucket secret (so placements survive restarts).
+fn load_relay_addr_table(
+    peers_dir: &Path,
+    network_name: &str,
+    now_unix_sec: u64,
+) -> Result<AddrTable, NodeError> {
+    let secret = load_or_init_peer_bucket_secret(peers_dir, network_name)?;
+    let (peers_db_path, legacy_txt_path) = peer_book_paths(peers_dir, network_name);
+    let peers = load_with_retry(10, 15, is_peer_book_db_lock_conflict, || {
+        load_or_init_peer_book(network_name, &peers_db_path, &legacy_txt_path)
+    })?
+    .map(|book| book.peers)
+    .unwrap_or_default();
+    Ok(AddrTable::from_entries(
+        secret,
+        peers
+            .into_iter()
+            .filter(|record| !record.address.trim().is_empty())
+            .map(addr_entry_from_peer_record)
+            .collect(),
+        now_unix_sec,
+    ))
+}
+
+/// Write the address-table changes since the last flush (only those rows)
+/// to the peer book, outside the relay lock.
+fn relay_flush_pending_peer_book_updates(
+    state: &Arc<Mutex<RelayServerState>>,
 ) -> Result<(), NodeError> {
-    if updates.is_empty() {
-        return Ok(());
-    }
-    let now_unix_sec = current_unix_sec().unwrap_or(0);
-    let mut unique_updates = updates
-        .iter()
-        .filter(|entry| !entry.address.trim().is_empty())
-        .filter(|entry| parse_relay_target_endpoint(&entry.address).is_some())
-        .cloned()
-        .collect::<Vec<_>>();
-    if unique_updates.is_empty() {
-        return Ok(());
-    }
-    unique_updates.sort_unstable_by(|a, b| a.address.cmp(&b.address));
-    unique_updates.dedup_by(|a, b| a.address == b.address);
-
-    let mut peer_book = match load_with_retry(8, 10, is_peer_book_db_lock_conflict, || {
-        load_or_init_peer_book(
-            &store.network_id,
-            &store.peers_db_path,
-            &store.legacy_txt_path,
-        )
-    })? {
-        Some(book) => book,
-        None => return Ok(()),
+    let poisoned = || NodeError::Runtime("relay state mutex poisoned".to_owned());
+    let (store, changes) = {
+        let mut guard = state.lock().map_err(|_| poisoned())?;
+        let Some(store) = guard.peer_book_store.clone() else {
+            return Ok(());
+        };
+        (store, guard.addr_table.take_changes())
     };
-
-    let mut changed = false;
-    for entry in unique_updates {
-        if let Some(existing) = find_peer_record_mut(&mut peer_book, &entry.address) {
-            let next_last_seen = existing
-                .last_seen_unix_sec
-                .max(entry.last_seen_unix_sec)
-                .max(now_unix_sec);
-            if next_last_seen != existing.last_seen_unix_sec {
-                existing.last_seen_unix_sec = next_last_seen;
-                changed = true;
-            }
-            let next_ban = existing.ban_score.saturating_sub(1);
-            if next_ban != existing.ban_score {
-                existing.ban_score = next_ban;
-                changed = true;
-            }
-            continue;
-        }
-        peer_book.peers.push(PeerAddressRecord {
-            address: entry.address,
-            last_seen_unix_sec: entry.last_seen_unix_sec.max(now_unix_sec),
-            ban_score: 0,
-        });
-        changed = true;
-    }
-
-    if !changed {
+    if changes.upserted.is_empty() && changes.removed.is_empty() {
         return Ok(());
     }
-    sort_and_dedup_peer_book(&mut peer_book);
-    persist_with_retry(
+    let records = changes
+        .upserted
+        .iter()
+        .cloned()
+        .map(peer_record_from_addr_entry)
+        .collect::<Vec<_>>();
+    let written = persist_with_retry(
         8,
         10,
         is_peer_book_db_lock_conflict,
         "peer book persist failed for unknown reason",
-        || save_peer_book_db(&store.peers_db_path, &peer_book).map_err(NodeError::from),
-    )
-}
-
-fn relay_flush_pending_peer_book_updates(
-    state: &Arc<Mutex<RelayServerState>>,
-) -> Result<(), NodeError> {
-    let (store, updates) = {
-        let mut guard = state
+        || {
+            apply_peer_book_delta_db(
+                &store.peers_db_path,
+                &store.network_id,
+                &records,
+                &changes.removed,
+            )
+            .map_err(NodeError::from)
+        },
+    );
+    if written.is_err() {
+        state
             .lock()
-            .map_err(|_| NodeError::Runtime("relay state mutex poisoned".to_owned()))?;
-        if guard.pending_peer_book_updates.is_empty() {
-            return Ok(());
-        }
-        let updates = std::mem::take(&mut guard.pending_peer_book_updates);
-        (guard.peer_book_store.clone(), updates)
-    };
-    let Some(store) = store else {
-        return Ok(());
-    };
-    relay_persist_peer_book_updates(&store, &updates)
+            .map_err(|_| poisoned())?
+            .addr_table
+            .requeue(changes);
+    }
+    written
 }
 
+/// An outbound connection to `address` completed its handshake.
 fn relay_register_connected_peer_address(state: &mut RelayServerState, address: &str, now: u64) {
-    if address.trim().is_empty() {
+    if !relay_peer_address_is_acceptable(address) {
         return;
     }
-    relay_merge_known_peer_addresses(
-        state,
-        &[PeerAddress {
-            address: address.to_owned(),
-            services: 1,
-            last_seen_unix_sec: now,
-        }],
-    );
+    if state.addr_table.get(address).is_none() {
+        state
+            .addr_table
+            .add(address, &address_group(address), 1, now, now);
+    }
+    state.addr_table.mark_good(address, now);
+}
+
+fn relay_register_failed_peer_address(state: &Arc<Mutex<RelayServerState>>, address: &str) {
+    if let Ok(mut guard) = state.lock() {
+        guard.addr_table.mark_failed(address);
+    }
 }
 
 fn relay_submit_incoming_block(
@@ -9342,7 +9309,8 @@ fn process_relay_wire_message_inner(
                     ),
                 ));
             }
-            relay_merge_known_peer_addresses(state, &peers);
+            let source_group = relay_peer_source_group(state, peer_id);
+            relay_merge_known_peer_addresses(state, &source_group, &peers);
             Ok(Vec::new())
         }
         WireMessage::SendCmpct {
@@ -9895,33 +9863,6 @@ fn load_relay_outbound_targets(
         .collect::<Vec<_>>())
 }
 
-fn load_relay_known_peer_addresses(
-    peers_dir: &Path,
-    network_name: &str,
-) -> Result<Vec<PeerAddress>, NodeError> {
-    let (peers_db_path, legacy_txt_path) = peer_book_paths(peers_dir, network_name);
-    let mut peer_book = match load_with_retry(10, 15, is_peer_book_db_lock_conflict, || {
-        load_or_init_peer_book(network_name, &peers_db_path, &legacy_txt_path)
-    })? {
-        Some(book) => book,
-        None => return Ok(Vec::new()),
-    };
-    sort_and_dedup_peer_book(&mut peer_book);
-    let mut peers = peer_book
-        .peers
-        .into_iter()
-        .filter(|record| !record.address.trim().is_empty())
-        .map(|record| PeerAddress {
-            address: record.address,
-            services: 1,
-            last_seen_unix_sec: record.last_seen_unix_sec,
-        })
-        .collect::<Vec<_>>();
-    peers.sort_unstable_by(|a, b| a.address.cmp(&b.address));
-    peers.truncate(2_000);
-    Ok(peers)
-}
-
 fn load_relay_outbound_targets_selected(
     peers_dir: &Path,
     cfg: &ChainConfig,
@@ -9963,14 +9904,16 @@ fn load_relay_outbound_targets_selected(
                 selector_identity,
                 &peer.address,
             ));
+        // "Tried" means a connection succeeded, not that someone gossiped a
+        // recent timestamp for it.
         if let Ok(addr) = peer.address.parse::<SocketAddr>() {
             candidates.push(PeerCandidate {
                 addr,
-                last_connected_unix_sec: peer.last_seen_unix_sec,
+                last_connected_unix_sec: peer.last_success_unix_sec,
                 failure_count,
             });
         } else {
-            domain_candidates.push((peer.address, peer.last_seen_unix_sec, failure_count));
+            domain_candidates.push((peer.address, peer.last_success_unix_sec, failure_count));
         }
     }
     if candidates.is_empty() && domain_candidates.is_empty() {
@@ -10133,6 +10076,7 @@ fn run_relay_outbound_worker(
             Ok(stream) => stream,
             Err(err) => {
                 eprintln!("warning: outbound relay connect to {target} failed: {err}");
+                relay_register_failed_peer_address(&state, &target);
                 if let Some(store) = anchor_store.as_ref() {
                     let now_unix_sec = current_unix_sec().unwrap_or(0);
                     let _ = update_peer_anchor_store_attempt(store, &target, now_unix_sec, false);
@@ -10503,6 +10447,7 @@ async fn run_relay_outbound_worker_async(
             Ok(stream) => stream,
             Err(err) => {
                 eprintln!("warning: outbound relay connect to {target} failed: {err}");
+                relay_register_failed_peer_address(&state, &target);
                 if let Some(store) = anchor_store.as_ref() {
                     let now_unix_sec = current_unix_sec().unwrap_or(0);
                     let _ = update_peer_anchor_store_attempt(store, &target, now_unix_sec, false);
@@ -12374,10 +12319,10 @@ fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
     ));
     let active_peers = Arc::new(Mutex::new(0usize));
     let next_peer_id = Arc::new(AtomicU64::new(0));
-    match load_relay_known_peer_addresses(&args.peers_dir, &cfg.network_id) {
-        Ok(known) => {
+    match load_relay_addr_table(&args.peers_dir, &cfg.network_id, current_unix_sec()?) {
+        Ok(table) => {
             if let Ok(mut guard) = state.lock() {
-                guard.known_peer_addresses = known;
+                guard.addr_table = table;
             }
         }
         Err(err) => {
@@ -28589,16 +28534,19 @@ mod tests {
                     address: "127.0.0.1:18444".to_owned(),
                     last_seen_unix_sec: 1,
                     ban_score: 2,
+                    ..Default::default()
                 },
                 PeerAddressRecord {
                     address: "127.0.0.1:18443".to_owned(),
                     last_seen_unix_sec: 0,
                     ban_score: 0,
+                    ..Default::default()
                 },
                 PeerAddressRecord {
                     address: "127.0.0.1:18444".to_owned(),
                     last_seen_unix_sec: 9,
                     ban_score: 9,
+                    ..Default::default()
                 },
             ],
         };
@@ -28774,16 +28722,19 @@ mod tests {
                         address: "127.0.0.1:18444".to_owned(),
                         last_seen_unix_sec: 0,
                         ban_score: 0,
+                        ..Default::default()
                     },
                     PeerAddressRecord {
                         address: "127.0.0.1:18445".to_owned(),
                         last_seen_unix_sec: 0,
                         ban_score: 0,
+                        ..Default::default()
                     },
                     PeerAddressRecord {
                         address: "127.0.0.1:18446".to_owned(),
                         last_seen_unix_sec: 0,
                         ban_score: 0,
+                        ..Default::default()
                     },
                 ],
             },
@@ -28813,11 +28764,13 @@ mod tests {
                         address: "10.1.1.1:19444".to_owned(),
                         last_seen_unix_sec: 0,
                         ban_score: 0,
+                        ..Default::default()
                     },
                     PeerAddressRecord {
                         address: "11.1.1.1:19444".to_owned(),
                         last_seen_unix_sec: 0,
                         ban_score: 0,
+                        ..Default::default()
                     },
                 ],
             },
@@ -35089,16 +35042,19 @@ mod tests {
                         address: "127.0.0.1:18446".to_owned(),
                         last_seen_unix_sec: 0,
                         ban_score: 0,
+                        ..Default::default()
                     },
                     PeerAddressRecord {
                         address: "127.0.0.1:18445".to_owned(),
                         last_seen_unix_sec: 0,
                         ban_score: 0,
+                        ..Default::default()
                     },
                     PeerAddressRecord {
                         address: "127.0.0.1:18446".to_owned(),
                         last_seen_unix_sec: 1,
                         ban_score: 0,
+                        ..Default::default()
                     },
                 ],
             },
@@ -35116,66 +35072,52 @@ mod tests {
     }
 
     #[test]
-    fn load_relay_known_peer_addresses_filters_invalid_entries_and_caps_output() {
-        let peers_dir = temp_dir("test-relay-known-peer-addresses");
+    fn load_relay_addr_table_rebuilds_from_peer_book_within_bounds() {
+        let peers_dir = temp_dir("test-relay-addr-table-load");
         fs::create_dir_all(&peers_dir).expect("mkdir");
         let peers_db_path = peers_dir.join("devnet.redb");
-
+        // One source announcing thousands of addresses (spread over many
+        // groups) plus an operator-pinned address.
+        let mut records = (0..3_000u32)
+            .map(|idx| PeerAddressRecord {
+                address: format!("{}.{}.0.1:18444", 1 + idx / 200, idx % 200),
+                last_seen_unix_sec: 1_800_000_000,
+                source_group: "v4:66.6".to_owned(),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        records.push(PeerAddressRecord {
+            address: "seed.example.org:18444".to_owned(),
+            ..Default::default()
+        });
         super::save_peer_book_db(
             &peers_db_path,
             &PeerAddressBook {
                 network_id: "devnet".to_owned(),
-                peers: vec![
-                    PeerAddressRecord {
-                        address: "127.0.0.1:19000".to_owned(),
-                        last_seen_unix_sec: 1,
-                        ban_score: 0,
-                    },
-                    PeerAddressRecord {
-                        address: "127.0.0.1:19000".to_owned(),
-                        last_seen_unix_sec: 5,
-                        ban_score: 0,
-                    },
-                    PeerAddressRecord {
-                        address: "127.0.0.1:19001".to_owned(),
-                        last_seen_unix_sec: 2,
-                        ban_score: 0,
-                    },
-                ],
+                peers: records,
             },
         )
         .expect("save peer book");
 
-        let peers = super::load_relay_known_peer_addresses(&peers_dir, "devnet")
-            .expect("load known peer addresses");
-        assert_eq!(
-            peers
-                .iter()
-                .map(|entry| entry.address.clone())
-                .collect::<Vec<_>>(),
-            vec!["127.0.0.1:19000".to_owned(), "127.0.0.1:19001".to_owned()]
+        let mut table =
+            super::load_relay_addr_table(&peers_dir, "devnet", 1_800_000_000).expect("load table");
+        let share = (scam_p2p::addrman::NEW_BUCKETS_PER_SOURCE_GROUP as usize)
+            * scam_p2p::addrman::BUCKET_SIZE;
+        assert!(table.len() <= share + 1, "one source fills only its share");
+        assert!(
+            table
+                .get("seed.example.org:18444")
+                .is_some_and(|entry| entry.is_manual()),
+            "records without a source are operator-pinned"
         );
-        assert!(peers.iter().all(|entry| !entry.address.trim().is_empty()));
-
-        let many_records = (0..2_101u32)
-            .map(|idx| PeerAddressRecord {
-                address: format!("127.0.0.1:{}", 20_000 + idx),
-                last_seen_unix_sec: idx as u64,
-                ban_score: 0,
-            })
-            .collect::<Vec<_>>();
-        super::save_peer_book_db(
-            &peers_db_path,
-            &PeerAddressBook {
-                network_id: "devnet".to_owned(),
-                peers: many_records,
-            },
-        )
-        .expect("save large peer book");
-
-        let capped = super::load_relay_known_peer_addresses(&peers_dir, "devnet")
-            .expect("load capped known peers");
-        assert_eq!(capped.len(), 2_000);
+        // Rows that did not fit are deleted from the store on the next flush.
+        let changes = table.take_changes();
+        assert!(changes.upserted.is_empty(), "loading changes nothing else");
+        assert_eq!(changes.removed.len(), 3_001 - table.len());
+        // Same secret, same layout.
+        let again =
+            super::load_relay_addr_table(&peers_dir, "devnet", 1_800_000_000).expect("reload");
+        assert_eq!(again.len(), table.len());
 
         let _ = fs::remove_dir_all(peers_dir);
     }
@@ -35204,33 +35146,44 @@ mod tests {
             super::relay_register_connected_peer_address(&mut guard, "127.0.0.1:18444", 42);
             super::relay_merge_known_peer_addresses(
                 &mut guard,
+                "v4:10.0",
                 &[super::PeerAddress {
                     address: "127.0.0.1:18445".to_owned(),
                     services: 1,
                     last_seen_unix_sec: 99,
                 }],
             );
-            assert!(
-                !guard.pending_peer_book_updates.is_empty(),
-                "updates should be queued before flush"
-            );
         }
 
         super::relay_flush_pending_peer_book_updates(&state).expect("flush peer-book updates");
 
         let book = load_peer_book_db(&store.peers_db_path).expect("load persisted peer book");
-        let addresses = book
-            .peers
-            .iter()
-            .map(|entry| entry.address.as_str())
-            .collect::<std::collections::HashSet<_>>();
-        assert!(addresses.contains("127.0.0.1:18444"));
-        assert!(addresses.contains("127.0.0.1:18445"));
+        let find = |address: &str| {
+            book.peers
+                .iter()
+                .find(|entry| entry.address == address)
+                .cloned()
+                .expect("persisted")
+        };
+        let connected = find("127.0.0.1:18444");
+        assert!(connected.tried && connected.last_success_unix_sec == 42);
+        let gossiped = find("127.0.0.1:18445");
+        assert_eq!(gossiped.last_seen_unix_sec, 99, "announced time kept");
+        assert_eq!(gossiped.source_group, "v4:10.0");
+        assert!(!gossiped.tried);
 
-        let guard = state.lock().expect("state lock");
-        assert!(
-            guard.pending_peer_book_updates.is_empty(),
-            "flush should clear pending updates"
+        // Nothing changed: nothing to write; a failure is counted and flushed.
+        super::relay_flush_pending_peer_book_updates(&state).expect("no-op flush");
+        super::relay_register_failed_peer_address(&state, "127.0.0.1:18445");
+        super::relay_flush_pending_peer_book_updates(&state).expect("flush failure");
+        let book = load_peer_book_db(&store.peers_db_path).expect("reload");
+        assert_eq!(
+            book.peers
+                .iter()
+                .find(|entry| entry.address == "127.0.0.1:18445")
+                .expect("row")
+                .ban_score,
+            1
         );
         let _ = fs::remove_dir_all(peers_dir);
     }
@@ -35250,11 +35203,13 @@ mod tests {
                         address: "not-a-socket".to_owned(),
                         last_seen_unix_sec: 0,
                         ban_score: 0,
+                        ..Default::default()
                     },
                     PeerAddressRecord {
                         address: "127.0.0.1:19444".to_owned(),
                         last_seen_unix_sec: 0,
                         ban_score: 0,
+                        ..Default::default()
                     },
                 ],
             },
@@ -35285,11 +35240,13 @@ mod tests {
                         address: "127.0.0.1:19444".to_owned(),
                         last_seen_unix_sec: 0,
                         ban_score: 0,
+                        ..Default::default()
                     },
                     PeerAddressRecord {
                         address: "127.0.0.1:19445".to_owned(),
                         last_seen_unix_sec: 0,
                         ban_score: 0,
+                        ..Default::default()
                     },
                 ],
             },
@@ -35320,11 +35277,13 @@ mod tests {
                         address: "127.0.0.1:19444".to_owned(),
                         last_seen_unix_sec: 0,
                         ban_score: 0,
+                        ..Default::default()
                     },
                     PeerAddressRecord {
                         address: "relay.example.test:19444".to_owned(),
                         last_seen_unix_sec: 1,
                         ban_score: 0,
+                        ..Default::default()
                     },
                 ],
             },
@@ -35522,6 +35481,7 @@ mod tests {
                     address: "127.0.0.1:18444".to_owned(),
                     last_seen_unix_sec: 0,
                     ban_score: 0,
+                    ..Default::default()
                 }],
             },
         )
@@ -35681,6 +35641,7 @@ mod tests {
                     address: target.clone(),
                     last_seen_unix_sec: 0,
                     ban_score: 0,
+                    ..Default::default()
                 }],
             },
         )
@@ -35872,6 +35833,7 @@ mod tests {
                     address: target.clone(),
                     last_seen_unix_sec: 0,
                     ban_score: 0,
+                    ..Default::default()
                 }],
             },
         )
@@ -39199,11 +39161,10 @@ mod tests {
             gossip: GossipEngine::new(64).expect("gossip"),
         };
         let mut state = RelayServerState::new(runtime, relay);
-        state.known_peer_addresses = vec![super::PeerAddress {
-            address: "127.0.0.1:18444".to_owned(),
-            services: 1,
-            last_seen_unix_sec: 10,
-        }];
+        let now = super::current_unix_sec().expect("now");
+        state
+            .addr_table
+            .add("127.0.0.1:18444", "v4:10.0", 1, now, now);
 
         let response =
             process_relay_wire_message(&mut state, 1, WireMessage::GetAddr, 100).expect("getaddr");
@@ -39222,18 +39183,13 @@ mod tests {
                 peers: vec![super::PeerAddress {
                     address: "127.0.0.1:19444".to_owned(),
                     services: 1,
-                    last_seen_unix_sec: 20,
+                    last_seen_unix_sec: now,
                 }],
             },
             101,
         )
         .expect("addr merge");
-        assert!(
-            state
-                .known_peer_addresses
-                .iter()
-                .any(|entry| entry.address == "127.0.0.1:19444")
-        );
+        assert!(state.addr_table.get("127.0.0.1:19444").is_some());
     }
 
     #[test]
@@ -40172,137 +40128,60 @@ mod tests {
         assert!(matches!(passthrough[1], WireMessage::CmpctBlock { .. }));
     }
 
+    /// P7: one announcing source can fill only its bucket share of the
+    /// address table, and its flood cannot displace addresses other sources
+    /// gave us (live entries are never evicted by new ones).
     #[test]
-    fn relay_merge_known_peer_addresses_merges_service_flags_and_enforces_cap() {
-        let cfg: ChainConfig =
-            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
-        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
-        let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(&cfg).expect("mempool"),
-            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
-                .expect("orphan"),
-            gossip: GossipEngine::new(64).expect("gossip"),
-        };
-        let mut state = RelayServerState::new(runtime, relay);
-        state.known_peer_addresses = vec![super::PeerAddress {
-            address: "127.0.0.1:2000".to_owned(),
-            services: 0b001,
-            last_seen_unix_sec: 10,
-        }];
-
-        super::relay_merge_known_peer_addresses(
-            &mut state,
-            &[
-                super::PeerAddress {
-                    address: "127.0.0.1:2000".to_owned(),
-                    services: 0b010,
-                    last_seen_unix_sec: 20,
-                },
-                super::PeerAddress {
-                    address: " ".to_owned(),
-                    services: 0b111,
-                    last_seen_unix_sec: 99,
-                },
-                super::PeerAddress {
-                    address: "not-a-socket-address".to_owned(),
-                    services: 0b111,
-                    last_seen_unix_sec: 100,
-                },
-                super::PeerAddress {
-                    address: "127.0.0.1:2001".to_owned(),
-                    services: 0b100,
-                    last_seen_unix_sec: 15,
-                },
-            ],
-        );
-
-        assert_eq!(state.known_peer_addresses.len(), 2);
-        assert_eq!(state.known_peer_addresses[0].address, "127.0.0.1:2000");
-        assert_eq!(state.known_peer_addresses[0].services, 0b011);
-        assert_eq!(state.known_peer_addresses[0].last_seen_unix_sec, 20);
-        assert_eq!(state.known_peer_addresses[1].address, "127.0.0.1:2001");
-        assert!(
-            state
-                .known_peer_addresses
-                .iter()
-                .all(|entry| entry.address != "not-a-socket-address")
-        );
-
-        let many = (0..2_100u32)
-            .map(|idx| super::PeerAddress {
-                address: format!("10.0.0.{}:{}", idx % 250, 30_000 + idx),
-                services: 1,
-                last_seen_unix_sec: idx as u64,
-            })
-            .collect::<Vec<_>>();
-        super::relay_merge_known_peer_addresses(&mut state, &many);
-        assert_eq!(
-            state.known_peer_addresses.len(),
-            2_000,
-            "known peer list must be capped at 2,000 records"
-        );
-        assert!(
-            state
-                .known_peer_addresses
-                .iter()
-                .all(|entry| !entry.address.trim().is_empty())
-        );
-    }
-
-    /// P7: peer-advertised addresses are validated, timestamps cannot be
-    /// pushed into the future, and a flood cannot pick which entries survive
-    /// the cap by choosing lexicographically small strings.
-    #[test]
-    fn relay_addr_merge_validates_and_resists_ordering_flood() {
-        let cfg: ChainConfig =
-            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
-        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
-        let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(&cfg).expect("mempool"),
-            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
-                .expect("orphan"),
-            gossip: GossipEngine::new(64).expect("gossip"),
-        };
-        let mut state = RelayServerState::new(runtime, relay);
-        let entry = |address: String, seen: u64| super::PeerAddress {
+    fn relay_addr_flood_from_one_source_is_bounded_and_displaces_nothing() {
+        let mut state = relay_state_for_tests();
+        let now = super::current_unix_sec().expect("now");
+        let entry = |address: String| super::PeerAddress {
             address,
             services: 1,
-            last_seen_unix_sec: seen,
+            last_seen_unix_sec: now,
         };
-        super::relay_merge_known_peer_addresses(
-            &mut state,
-            &[
-                entry("0.0.0.0:18444".to_owned(), 1),
-                entry("224.0.0.1:18444".to_owned(), 1),
-                entry("198.51.100.1:0".to_owned(), 1),
-                entry(format!("{}.example:18444", "a".repeat(300)), 1),
-                entry("198.51.100.2:18444".to_owned(), u64::MAX),
-            ],
-        );
-        assert_eq!(state.known_peer_addresses.len(), 1);
-        let now = super::current_unix_sec().expect("now");
-        assert!(state.known_peer_addresses[0].last_seen_unix_sec <= now + 3_600);
-
         let honest = (0..1_000u32)
-            .map(|i| entry(format!("198.51.{}.{}:18444", i / 250, i % 250), 10))
+            .map(|i| entry(format!("198.{}.{}.1:18444", 1 + i / 250, i % 250)))
             .collect::<Vec<_>>();
-        super::relay_merge_known_peer_addresses(&mut state, &honest);
-        let flood = (0..5_000u32)
-            .map(|i| entry(format!("1.0.{}.{}:18444", i / 250, i % 250), 10))
+        for (index, chunk) in honest.chunks(100).enumerate() {
+            // Ten honest sources in different groups.
+            super::relay_merge_known_peer_addresses(&mut state, &format!("v4:20.{index}"), chunk);
+        }
+        let honest_kept = state
+            .addr_table
+            .entries()
+            .map(|e| e.address.clone())
+            .collect::<HashSet<_>>();
+        assert!(!honest_kept.is_empty());
+
+        let flood = (0..20_000u32)
+            .map(|i| {
+                entry(format!(
+                    "{}.{}.{}.1:18444",
+                    1 + i / 5_000,
+                    (i / 250) % 20,
+                    i % 250
+                ))
+            })
             .collect::<Vec<_>>();
         for chunk in flood.chunks(1_000) {
-            super::relay_merge_known_peer_addresses(&mut state, chunk);
+            super::relay_merge_known_peer_addresses(&mut state, "v4:66.6", chunk);
         }
-        assert_eq!(state.known_peer_addresses.len(), 2_000);
-        let surviving_honest = state
-            .known_peer_addresses
-            .iter()
-            .filter(|e| e.address.starts_with("198.51."))
+        let flooded = state
+            .addr_table
+            .entries()
+            .filter(|e| e.source_group == "v4:66.6")
             .count();
+        let share = (scam_p2p::addrman::NEW_BUCKETS_PER_SOURCE_GROUP as usize)
+            * scam_p2p::addrman::BUCKET_SIZE;
+        assert!(flooded <= share, "flooder holds {flooded} > {share}");
         assert!(
-            surviving_honest > 0,
-            "lexicographically small flood must not evict every honest address"
+            honest_kept
+                .iter()
+                .all(|address| state.addr_table.get(address).is_some()),
+            "no honest address was displaced"
         );
+        assert!(state.addr_table.len() <= super::AddrTable::capacity());
     }
 
     #[test]
@@ -43170,210 +43049,73 @@ mod tests {
         );
     }
 
+    /// P7: a re-announced address is a change only when its newest
+    /// timestamp or its service bits change; addresses are bucketed by the
+    /// announcing peer's group and unacceptable ones are ignored.
     #[test]
-    fn relay_queue_peer_book_update_enforces_merge_and_capacity_boundaries() {
+    fn relay_merge_known_peer_addresses_tracks_changes_per_field() {
         let mut state = relay_state_for_tests();
-        let mk = |port: u16, services: u64, seen: u64| super::PeerAddress {
-            address: format!("127.0.0.1:{port}"),
-            services,
-            last_seen_unix_sec: seen,
+        let announce = |state: &mut RelayServerState, services: u64, seen: u64| {
+            super::relay_merge_known_peer_addresses(
+                state,
+                "v4:10.0",
+                &[super::PeerAddress {
+                    address: "127.0.0.1:2000".to_owned(),
+                    services,
+                    last_seen_unix_sec: seen,
+                }],
+            );
+            state.addr_table.take_changes().upserted
         };
-
-        super::relay_queue_peer_book_update(&mut state, mk(19_000, 0b001, 10));
-        super::relay_queue_peer_book_update(&mut state, mk(19_000, 0b010, 20));
-        assert_eq!(state.pending_peer_book_updates.len(), 1);
-        assert_eq!(state.pending_peer_book_updates[0].services, 0b011);
-        assert_eq!(state.pending_peer_book_updates[0].last_seen_unix_sec, 20);
-
-        state.pending_peer_book_updates.clear();
-        state.pending_peer_book_updates.push(mk(19_002, 1, 1));
-        super::relay_queue_peer_book_update(&mut state, mk(19_001, 1, 1));
-        assert_eq!(
-            state
-                .pending_peer_book_updates
-                .iter()
-                .map(|entry| entry.address.clone())
-                .collect::<Vec<_>>(),
-            vec!["127.0.0.1:19002".to_owned(), "127.0.0.1:19001".to_owned()],
-            "below limit queue updates must preserve insertion order"
+        assert_eq!(announce(&mut state, 0b001, 10).len(), 1, "new address");
+        assert!(
+            announce(&mut state, 0b001, 5).is_empty(),
+            "older: no change"
         );
+        let newer = announce(&mut state, 0b001, 20);
+        assert_eq!(newer[0].last_seen_unix_sec, 20);
+        let services = announce(&mut state, 0b100, 20);
+        assert_eq!(services[0].services, 0b101);
+        assert_eq!(services[0].source_group, "v4:10.0");
 
-        state.pending_peer_book_updates.clear();
-        for idx in (0..(super::RELAY_MAX_PENDING_PEER_BOOK_UPDATES - 1)).rev() {
-            state.pending_peer_book_updates.push(super::PeerAddress {
-                address: format!("127.0.0.1:{}", 20_000 + idx),
-                services: 1,
-                last_seen_unix_sec: idx as u64,
-            });
-        }
-        let first_before = state.pending_peer_book_updates[0].address.clone();
-        super::relay_queue_peer_book_update(
+        super::relay_merge_known_peer_addresses(
             &mut state,
-            super::PeerAddress {
-                address: "127.0.0.1:29999".to_owned(),
-                services: 1,
-                last_seen_unix_sec: 9_999,
-            },
-        );
-        assert_eq!(
-            state.pending_peer_book_updates.len(),
-            super::RELAY_MAX_PENDING_PEER_BOOK_UPDATES
-        );
-        assert_eq!(
-            state.pending_peer_book_updates[0].address, first_before,
-            "exact limit must not trigger sorting/rebalancing"
-        );
-
-        state.pending_peer_book_updates.clear();
-        for idx in 0..(super::RELAY_MAX_PENDING_PEER_BOOK_UPDATES - 1) {
-            state.pending_peer_book_updates.push(super::PeerAddress {
-                address: format!("127.0.0.1:{}", 30_000 + idx),
-                services: 1,
-                last_seen_unix_sec: idx as u64,
-            });
-        }
-        state.pending_peer_book_updates.push(super::PeerAddress {
-            address: "127.0.0.1:35555".to_owned(),
-            services: 1,
-            last_seen_unix_sec: 1,
-        });
-        state.pending_peer_book_updates.push(super::PeerAddress {
-            address: "127.0.0.1:35555".to_owned(),
-            services: 1,
-            last_seen_unix_sec: 2,
-        });
-        super::relay_queue_peer_book_update(
-            &mut state,
-            super::PeerAddress {
-                address: "127.0.0.1:39999".to_owned(),
-                services: 1,
-                last_seen_unix_sec: 12_345,
-            },
-        );
-        assert_eq!(
-            state.pending_peer_book_updates.len(),
-            super::RELAY_MAX_PENDING_PEER_BOOK_UPDATES
-        );
-        assert_eq!(
-            state
-                .pending_peer_book_updates
-                .iter()
-                .filter(|entry| entry.address == "127.0.0.1:35555")
-                .count(),
-            1,
-            "overflow cleanup must dedup duplicate addresses"
+            "v4:10.0",
+            &[
+                super::PeerAddress {
+                    address: "0.0.0.0:2000".to_owned(),
+                    services: 1,
+                    last_seen_unix_sec: 1,
+                },
+                super::PeerAddress {
+                    address: "127.0.0.1:0".to_owned(),
+                    services: 1,
+                    last_seen_unix_sec: 1,
+                },
+            ],
         );
         assert!(
-            state
-                .pending_peer_book_updates
-                .iter()
-                .any(|entry| entry.address == "127.0.0.1:39999"),
-            "new overflow entry should be retained after rebalance"
+            state.addr_table.take_changes().upserted.is_empty(),
+            "unacceptable addresses are ignored"
         );
-    }
-
-    #[test]
-    fn relay_merge_known_peer_addresses_queues_updates_when_each_field_changes() {
-        let mut state = relay_state_for_tests();
-        state.known_peer_addresses = vec![super::PeerAddress {
-            address: "127.0.0.1:2000".to_owned(),
-            services: 0b001,
-            last_seen_unix_sec: 10,
-        }];
-
+        // Far-future claims are clamped, not stored as given.
         super::relay_merge_known_peer_addresses(
             &mut state,
+            "v4:10.0",
             &[super::PeerAddress {
-                address: "127.0.0.1:2000".to_owned(),
-                services: 0b001,
-                last_seen_unix_sec: 20,
+                address: "127.0.0.1:2001".to_owned(),
+                services: 1,
+                last_seen_unix_sec: u64::MAX,
             }],
         );
-        assert_eq!(state.pending_peer_book_updates.len(), 1);
-        assert_eq!(state.pending_peer_book_updates[0].services, 0b001);
-        assert_eq!(state.pending_peer_book_updates[0].last_seen_unix_sec, 20);
-
-        state.pending_peer_book_updates.clear();
-        super::relay_merge_known_peer_addresses(
-            &mut state,
-            &[super::PeerAddress {
-                address: "127.0.0.1:2000".to_owned(),
-                services: 0b101,
-                last_seen_unix_sec: 20,
-            }],
+        let clamped = state
+            .addr_table
+            .get("127.0.0.1:2001")
+            .expect("stored")
+            .last_seen_unix_sec;
+        assert!(
+            clamped <= super::current_unix_sec().expect("now") + super::RELAY_ADDR_MAX_FUTURE_SEC
         );
-        assert_eq!(state.pending_peer_book_updates.len(), 1);
-        assert_eq!(state.pending_peer_book_updates[0].services, 0b101);
-        assert_eq!(state.pending_peer_book_updates[0].last_seen_unix_sec, 20);
-    }
-
-    #[test]
-    fn relay_persist_peer_book_updates_updates_last_seen_and_decay_paths() {
-        let peers_dir = temp_dir("test-relay-persist-peer-book-updates");
-        fs::create_dir_all(&peers_dir).expect("mkdir peers dir");
-        let store = super::PeerBookStore::from_peers_dir(&peers_dir, "devnet");
-
-        super::save_peer_book_db(
-            &store.peers_db_path,
-            &PeerAddressBook {
-                network_id: "devnet".to_owned(),
-                peers: vec![PeerAddressRecord {
-                    address: "127.0.0.1:21000".to_owned(),
-                    last_seen_unix_sec: 10,
-                    ban_score: 0,
-                }],
-            },
-        )
-        .expect("save seed peer book");
-        super::relay_persist_peer_book_updates(
-            &store,
-            &[super::PeerAddress {
-                address: "127.0.0.1:21000".to_owned(),
-                services: 1,
-                last_seen_unix_sec: 20,
-            }],
-        )
-        .expect("persist updates");
-        let book = load_peer_book_db(&store.peers_db_path).expect("load updated peer book");
-        let peer = book
-            .peers
-            .iter()
-            .find(|entry| entry.address == "127.0.0.1:21000")
-            .expect("updated peer");
-        assert!(peer.last_seen_unix_sec >= 20);
-        assert_eq!(peer.ban_score, 0);
-
-        super::save_peer_book_db(
-            &store.peers_db_path,
-            &PeerAddressBook {
-                network_id: "devnet".to_owned(),
-                peers: vec![PeerAddressRecord {
-                    address: "127.0.0.1:21001".to_owned(),
-                    last_seen_unix_sec: u64::MAX - 1,
-                    ban_score: 5,
-                }],
-            },
-        )
-        .expect("save high-seen peer book");
-        super::relay_persist_peer_book_updates(
-            &store,
-            &[super::PeerAddress {
-                address: "127.0.0.1:21001".to_owned(),
-                services: 1,
-                last_seen_unix_sec: 1,
-            }],
-        )
-        .expect("persist decay updates");
-        let decayed = load_peer_book_db(&store.peers_db_path)
-            .expect("load decayed peer book")
-            .peers
-            .into_iter()
-            .find(|entry| entry.address == "127.0.0.1:21001")
-            .expect("decayed peer");
-        assert_eq!(decayed.last_seen_unix_sec, u64::MAX - 1);
-        assert_eq!(decayed.ban_score, 4);
-
-        let _ = fs::remove_dir_all(peers_dir);
     }
 
     #[test]
