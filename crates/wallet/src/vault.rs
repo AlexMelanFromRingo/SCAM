@@ -40,12 +40,25 @@ pub struct DecryptedWalletSecret {
     pub seed_mode: WalletSeedMode,
 }
 
+impl Drop for DecryptedWalletSecret {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.bip39_passphrase);
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct WalletSecretPayload {
     mnemonic: String,
     bip39_passphrase: String,
     #[serde(default)]
     seed_mode: WalletSeedMode,
+}
+
+impl Drop for WalletSecretPayload {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.mnemonic);
+        zeroize::Zeroize::zeroize(&mut self.bip39_passphrase);
+    }
 }
 
 pub fn new_encrypted_wallet_vault(
@@ -77,21 +90,23 @@ pub fn new_encrypted_wallet_vault_with_mode(
         bip39_passphrase: bip39_passphrase.to_owned(),
         seed_mode,
     };
-    let plaintext = serde_json::to_vec(&payload).map_err(WalletVaultError::EncodePayload)?;
+    let plaintext = zeroize::Zeroizing::new(
+        serde_json::to_vec(&payload).map_err(WalletVaultError::EncodePayload)?,
+    );
 
     let mut salt = [0u8; 16];
     let mut nonce = [0u8; 24];
     rand::rngs::OsRng.fill_bytes(&mut salt);
     rand::rngs::OsRng.fill_bytes(&mut nonce);
 
-    let key = derive_encryption_key(
+    let key = zeroize::Zeroizing::new(derive_encryption_key(
         encryption_password,
         &salt,
         KDF_MEM_COST_KIB,
         KDF_TIME_COST,
         KDF_LANES,
-    )?;
-    let cipher = XChaCha20Poly1305::new((&key).into());
+    )?);
+    let cipher = XChaCha20Poly1305::new((&*key).into());
     let ciphertext = cipher
         .encrypt(XNonce::from_slice(&nonce), plaintext.as_ref())
         .map_err(|_| WalletVaultError::EncryptFailed)?;
@@ -133,23 +148,25 @@ pub fn decrypt_wallet_vault(
     let nonce = decode_hex_array::<24>(&vault.nonce_hex).map_err(WalletVaultError::InvalidHex)?;
     let ciphertext = hex::decode(&vault.ciphertext_hex).map_err(WalletVaultError::InvalidHexRaw)?;
 
-    let key = derive_encryption_key(
+    let key = zeroize::Zeroizing::new(derive_encryption_key(
         encryption_password,
         &salt,
         vault.kdf.memory_kib,
         vault.kdf.iterations,
         vault.kdf.lanes,
-    )?;
-    let cipher = XChaCha20Poly1305::new((&key).into());
-    let plaintext = cipher
-        .decrypt(XNonce::from_slice(&nonce), ciphertext.as_ref())
-        .map_err(|_| WalletVaultError::DecryptFailed)?;
+    )?);
+    let cipher = XChaCha20Poly1305::new((&*key).into());
+    let plaintext = zeroize::Zeroizing::new(
+        cipher
+            .decrypt(XNonce::from_slice(&nonce), ciphertext.as_ref())
+            .map_err(|_| WalletVaultError::DecryptFailed)?,
+    );
     let payload: WalletSecretPayload =
         serde_json::from_slice(&plaintext).map_err(WalletVaultError::DecodePayload)?;
     let mnemonic = WalletMnemonic::parse(&payload.mnemonic)?;
     Ok(DecryptedWalletSecret {
         mnemonic,
-        bip39_passphrase: payload.bip39_passphrase,
+        bip39_passphrase: payload.bip39_passphrase.clone(),
         seed_mode: payload.seed_mode,
     })
 }

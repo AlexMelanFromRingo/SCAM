@@ -16,6 +16,13 @@ pub struct WalletKey {
     pubkey_compressed: [u8; 33],
 }
 
+/// Best-effort wipe of the private key when the last copy is dropped.
+impl Drop for WalletKey {
+    fn drop(&mut self) {
+        self.secret_key.non_secure_erase();
+    }
+}
+
 impl WalletKey {
     pub fn pubkey_compressed(&self) -> [u8; 33] {
         self.pubkey_compressed

@@ -10,6 +10,14 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("chain_meta");
+/// Metadata key holding a store's on-disk format version (u32 LE).
+const SCHEMA_VERSION_KEY: &str = "schema_version";
+/// Format of the chain archive, chain snapshot, mempool and peer-book
+/// stores. An absent key means 1 (the layout is unchanged).
+pub const STORE_SCHEMA_VERSION: u32 = 1;
+/// Pool ledger format. v2 adds frozen per-round PPLNS credits and settled
+/// worker credits; v1 ledgers (no key) cannot be decoded and are refused.
+pub const POOL_LEDGER_SCHEMA_VERSION: u32 = 2;
 const UTXO_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("utxos");
 const BLOCK_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("blocks_by_hash");
 const HEADER_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("headers_by_hash");
@@ -103,10 +111,18 @@ pub struct PoolRoundRecord {
     pub end_unix_sec: Option<u64>,
     pub closed_by_worker: Option<String>,
     pub found_block_hash: Option<Hash256>,
-    #[serde(default)]
     pub found_block_reward_atomic: u128,
-    #[serde(default)]
     pub orphaned: bool,
+    /// PPLNS split frozen when the round closed. Recomputing it later from
+    /// the (capped) share history shrank old rounds' rewards and stopped
+    /// payouts to workers already paid.
+    pub pplns_credits: Vec<PoolRoundCredit>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct PoolRoundCredit {
+    pub worker: String,
+    pub amount_atomic: u128,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -117,6 +133,8 @@ pub struct PoolWorkerAccrualRecord {
     pub blocks_found_total: u64,
     pub expected_hashes_accumulated: f64,
     pub pplns_accrual_atomic: u128,
+    /// PPLNS credits of rounds that have left the round-retention window.
+    pub pplns_settled_atomic: u128,
     pub pps_accrual_atomic: u128,
     pub paid_total_atomic: u128,
     pub last_share_unix_sec: u64,
@@ -234,6 +252,7 @@ pub fn save_snapshot_db(path: &Path, snapshot: &ChainStateSnapshot) -> Result<()
             bincode::serialize(&snapshot.block_hashes_by_height).map_err(StorageError::Encode)?;
         meta.insert("network_id", snapshot.network_id.as_bytes())
             .map_err(|e| StorageError::Db(e.to_string()))?;
+        write_schema_version(&mut meta, STORE_SCHEMA_VERSION)?;
         meta.insert("tip_height", tip_height_bytes.as_slice())
             .map_err(|e| StorageError::Db(e.to_string()))?;
         meta.insert("tip_hash", snapshot.tip_hash.0.as_slice())
@@ -270,6 +289,7 @@ pub fn load_snapshot_db(path: &Path) -> Result<ChainStateSnapshot, StorageError>
         let meta = read_txn
             .open_table(META_TABLE)
             .map_err(|e| StorageError::Db(e.to_string()))?;
+        check_schema_version(&meta, "chain snapshot", STORE_SCHEMA_VERSION, Some(1))?;
 
         let network_id_raw = meta
             .get("network_id")
@@ -379,6 +399,7 @@ pub fn save_chain_archive_db(path: &Path, archive: &ChainArchive) -> Result<(), 
         let tip_height = (archive.blocks_by_height.len() as u64).saturating_sub(1);
         meta.insert("network_id", archive.network_id.as_bytes())
             .map_err(|e| StorageError::Db(e.to_string()))?;
+        write_schema_version(&mut meta, STORE_SCHEMA_VERSION)?;
         meta.insert("tip_height", tip_height.to_le_bytes().as_slice())
             .map_err(|e| StorageError::Db(e.to_string()))?;
         let tip_hash = archive
@@ -421,6 +442,49 @@ pub fn save_chain_archive_db(path: &Path, archive: &ChainArchive) -> Result<(), 
         .commit()
         .map_err(|e| StorageError::Db(e.to_string()))?;
     atomic_replace_file(&tmp_path, path)?;
+    Ok(())
+}
+
+fn write_schema_version(
+    meta: &mut redb::Table<&str, &[u8]>,
+    version: u32,
+) -> Result<(), StorageError> {
+    meta.insert(SCHEMA_VERSION_KEY, version.to_le_bytes().as_slice())
+        .map_err(|e| StorageError::Db(e.to_string()))?;
+    Ok(())
+}
+
+/// Check a store's format version. `legacy_version` is what an absent key
+/// means (`None`: the key is mandatory).
+fn check_schema_version<T: redb::ReadableTable<&'static str, &'static [u8]>>(
+    meta: &T,
+    store: &'static str,
+    expected: u32,
+    legacy_version: Option<u32>,
+) -> Result<(), StorageError> {
+    let found = match meta
+        .get(SCHEMA_VERSION_KEY)
+        .map_err(|e| StorageError::Db(e.to_string()))?
+    {
+        Some(raw) => {
+            let bytes: [u8; 4] =
+                raw.value()
+                    .try_into()
+                    .map_err(|_| StorageError::InvalidMetaFormat {
+                        key: SCHEMA_VERSION_KEY.to_owned(),
+                        details: "expected 4 bytes".to_owned(),
+                    })?;
+            Some(u32::from_le_bytes(bytes))
+        }
+        None => legacy_version,
+    };
+    if found != Some(expected) {
+        return Err(StorageError::UnsupportedSchema {
+            store,
+            found,
+            expected,
+        });
+    }
     Ok(())
 }
 
@@ -499,6 +563,7 @@ pub fn load_chain_archive_tip_db(path: &Path) -> Result<Option<ArchiveTip>, Stor
     let meta = read_txn
         .open_table(META_TABLE)
         .map_err(|e| StorageError::Db(e.to_string()))?;
+    check_schema_version(&meta, "chain archive", STORE_SCHEMA_VERSION, Some(1))?;
     read_archive_tip(&meta)
 }
 
@@ -515,6 +580,7 @@ pub fn load_chain_archive_range_db(
         let meta = read_txn
             .open_table(META_TABLE)
             .map_err(|e| StorageError::Db(e.to_string()))?;
+        check_schema_version(&meta, "chain archive", STORE_SCHEMA_VERSION, Some(1))?;
         let raw = meta
             .get("network_id")
             .map_err(|e| StorageError::Db(e.to_string()))?
@@ -688,6 +754,7 @@ pub fn persist_chain_archive_incremental_db(
 
         meta.insert("network_id", network_id.as_bytes())
             .map_err(|e| StorageError::Db(e.to_string()))?;
+        write_schema_version(&mut meta, STORE_SCHEMA_VERSION)?;
         meta.insert("tip_height", new_tip_height.to_le_bytes().as_slice())
             .map_err(|e| StorageError::Db(e.to_string()))?;
         meta.insert("tip_hash", new_tip_hash.0.as_slice())
@@ -715,6 +782,7 @@ pub fn load_chain_archive_db(path: &Path) -> Result<ChainArchive, StorageError> 
         let meta = read_txn
             .open_table(META_TABLE)
             .map_err(|e| StorageError::Db(e.to_string()))?;
+        check_schema_version(&meta, "chain archive", STORE_SCHEMA_VERSION, Some(1))?;
         let network_id_raw = meta
             .get("network_id")
             .map_err(|e| StorageError::Db(e.to_string()))?
@@ -849,6 +917,7 @@ pub fn save_peer_book_db(path: &Path, peer_book: &PeerAddressBook) -> Result<(),
             .map_err(|e| StorageError::Db(e.to_string()))?;
         meta.insert("network_id", peer_book.network_id.as_bytes())
             .map_err(|e| StorageError::Db(e.to_string()))?;
+        write_schema_version(&mut meta, STORE_SCHEMA_VERSION)?;
     }
     {
         let mut peer_table = write_txn
@@ -877,6 +946,7 @@ pub fn load_peer_book_db(path: &Path) -> Result<PeerAddressBook, StorageError> {
         let meta = read_txn
             .open_table(META_TABLE)
             .map_err(|e| StorageError::Db(e.to_string()))?;
+        check_schema_version(&meta, "peer book", STORE_SCHEMA_VERSION, Some(1))?;
         let network_id_raw = meta
             .get("network_id")
             .map_err(|e| StorageError::Db(e.to_string()))?
@@ -950,6 +1020,7 @@ pub fn save_mempool_db(path: &Path, snapshot: &MempoolSnapshot) -> Result<(), St
             .map_err(|e| StorageError::Db(e.to_string()))?;
         meta.insert("network_id", snapshot.network_id.as_bytes())
             .map_err(|e| StorageError::Db(e.to_string()))?;
+        write_schema_version(&mut meta, STORE_SCHEMA_VERSION)?;
         let count = entries.len() as u64;
         meta.insert("tx_count", count.to_le_bytes().as_slice())
             .map_err(|e| StorageError::Db(e.to_string()))?;
@@ -986,6 +1057,7 @@ pub fn load_mempool_db(path: &Path) -> Result<MempoolSnapshot, StorageError> {
         let meta = read_txn
             .open_table(META_TABLE)
             .map_err(|e| StorageError::Db(e.to_string()))?;
+        check_schema_version(&meta, "mempool", STORE_SCHEMA_VERSION, Some(1))?;
         let network_id_raw = meta
             .get("network_id")
             .map_err(|e| StorageError::Db(e.to_string()))?
@@ -1115,6 +1187,7 @@ pub fn save_pool_ledger_db(path: &Path, snapshot: &PoolLedgerSnapshot) -> Result
         let current_round_id_bytes = snapshot.current_round_id.to_le_bytes();
         meta.insert("network_id", snapshot.network_id.as_bytes())
             .map_err(|e| StorageError::Db(e.to_string()))?;
+        write_schema_version(&mut meta, POOL_LEDGER_SCHEMA_VERSION)?;
         meta.insert("current_round_id", current_round_id_bytes.as_slice())
             .map_err(|e| StorageError::Db(e.to_string()))?;
     }
@@ -1190,6 +1263,7 @@ pub fn load_pool_ledger_db(path: &Path) -> Result<PoolLedgerSnapshot, StorageErr
         let meta = read_txn
             .open_table(POOL_META_TABLE)
             .map_err(|e| StorageError::Db(e.to_string()))?;
+        check_schema_version(&meta, "pool ledger", POOL_LEDGER_SCHEMA_VERSION, None)?;
         let network_id_raw = meta
             .get("network_id")
             .map_err(|e| StorageError::Db(e.to_string()))?
@@ -1427,6 +1501,14 @@ pub enum StorageError {
     InvalidMempool(String),
     #[error("invalid pool ledger snapshot: {0}")]
     InvalidPoolLedger(String),
+    #[error(
+        "{store} has unsupported schema version {found:?} (this build expects {expected}); move the file aside to start fresh"
+    )]
+    UnsupportedSchema {
+        store: &'static str,
+        found: Option<u32>,
+        expected: u32,
+    },
     #[error(
         "refusing to overwrite archive: its tip {disk_tip} at height {disk_height} is not on this writer's chain and has at least as much work"
     )]
@@ -1742,6 +1824,54 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// S7: stores carry a schema version; a file with an unknown version
+    /// is refused instead of being misread.
+    #[test]
+    fn stores_record_and_enforce_schema_version() {
+        let path = temp_test_file("archive-schema", "redb");
+        let chain = chain_of(Hash256::ZERO, 2, 7);
+        persist(&path, &chain, 2).expect("persist");
+        load_chain_archive_db(&path).expect("current version loads");
+        {
+            let db = redb::Database::open(&path).expect("open");
+            let txn = db.begin_write().expect("txn");
+            {
+                let mut meta = txn.open_table(crate::META_TABLE).expect("meta");
+                meta.insert(crate::SCHEMA_VERSION_KEY, 99u32.to_le_bytes().as_slice())
+                    .expect("insert");
+            }
+            txn.commit().expect("commit");
+        }
+        assert!(matches!(
+            load_chain_archive_db(&path),
+            Err(crate::StorageError::UnsupportedSchema {
+                found: Some(99),
+                ..
+            })
+        ));
+        let _ = std::fs::remove_file(path);
+
+        // A pool ledger without a version is a v1 ledger: refused.
+        let ledger_path = temp_test_file("ledger-schema", "redb");
+        {
+            let db = redb::Database::create(&ledger_path).expect("create");
+            let txn = db.begin_write().expect("txn");
+            {
+                let mut meta = txn.open_table(crate::POOL_META_TABLE).expect("meta");
+                meta.insert("network_id", b"devnet".as_slice())
+                    .expect("net");
+                meta.insert("current_round_id", 0u64.to_le_bytes().as_slice())
+                    .expect("round");
+            }
+            txn.commit().expect("commit");
+        }
+        assert!(matches!(
+            load_pool_ledger_db(&ledger_path),
+            Err(crate::StorageError::UnsupportedSchema { found: None, .. })
+        ));
+        let _ = std::fs::remove_file(ledger_path);
+    }
+
     #[test]
     fn chain_archive_db_load_block_by_hash_roundtrip() {
         let genesis = Block {
@@ -1962,6 +2092,7 @@ mod tests {
                     found_block_hash: Some(Hash256([0x33; 32])),
                     found_block_reward_atomic: 5_000_000_000,
                     orphaned: false,
+                    pplns_credits: Vec::new(),
                 },
                 PoolRoundRecord {
                     round_id: 7,
@@ -1975,6 +2106,7 @@ mod tests {
                     found_block_hash: None,
                     found_block_reward_atomic: 0,
                     orphaned: false,
+                    pplns_credits: Vec::new(),
                 },
             ],
             workers: vec![
@@ -1985,6 +2117,7 @@ mod tests {
                     blocks_found_total: 1,
                     expected_hashes_accumulated: 34_000.0,
                     pplns_accrual_atomic: 10_000,
+                    pplns_settled_atomic: 0,
                     pps_accrual_atomic: 2_000,
                     paid_total_atomic: 500,
                     last_share_unix_sec: 1_770_763_201,
@@ -1996,6 +2129,7 @@ mod tests {
                     blocks_found_total: 2,
                     expected_hashes_accumulated: 44_000.0,
                     pplns_accrual_atomic: 20_000,
+                    pplns_settled_atomic: 0,
                     pps_accrual_atomic: 4_000,
                     paid_total_atomic: 1_000,
                     last_share_unix_sec: 1_770_763_202,

@@ -22,10 +22,9 @@ pub struct UtxoEntry {
     pub value: u64,
     pub key_hash20: [u8; 20],
     pub created_height: u64,
-    /// Block timestamp at the height when this UTXO was created.
-    /// Required for BIP68 (CSV) relative-time locktimes. Older redb
-    /// databases without this field will fail to deserialize and must
-    /// be rebuilt — devnet/testnet only, no live mainnet yet.
+    /// BIP68 "coin time": median-time-past of the chain *before* the block
+    /// that created this output (the MTP that block was validated against).
+    /// Relative time locks count from here.
     #[serde(default)]
     pub created_time: u64,
     pub is_coinbase: bool,
@@ -193,24 +192,23 @@ pub fn validate_and_apply_block_with_undo(
     let coinbase = &block.transactions[0];
     let coinbase_value = tx_output_total(coinbase);
 
+    let csv_time = ctx.median_time_past.unwrap_or(block.header.timestamp);
     let mut overlay = BlockOverlay {
         base: utxos,
         spent: HashSet::new(),
         created: HashMap::new(),
         created_height: ctx.current_height,
-        created_time: block.header.timestamp,
+        created_time: csv_time,
     };
     let mut total_fees: u128 = 0;
     let mut spent_count = 0usize;
     let mut created_count = 0usize;
 
-    let csv_time = ctx.median_time_past.unwrap_or(block.header.timestamp);
-
     for (tx_index, tx) in block.transactions.iter().enumerate().skip(1) {
         let (input_total, output_total) = validate_non_coinbase_tx(
             tx,
             tx_index,
-            (ctx.current_height, block.header.timestamp, csv_time),
+            (ctx.current_height, csv_time),
             ctx.coinbase_maturity,
             ctx.chain_domain,
             &mut overlay.spent,
@@ -331,10 +329,8 @@ impl BlockOverlay<'_> {
 pub struct NextBlockTxContext<'a> {
     /// Height of the block the tx would be mined in (`tip_height + 1`).
     pub next_height: u64,
-    /// Median-time-past of the current tip. The next header must carry a
-    /// timestamp strictly greater than this, so `median_time_past + 1` is the
-    /// most conservative clock for absolute lock_time, and it is the BIP68
-    /// clock for relative time locks.
+    /// Median-time-past of the current tip: the clock the next block uses
+    /// for absolute lock_time (BIP113) and relative time locks (BIP68).
     pub median_time_past: u64,
     pub coinbase_maturity: u64,
     pub chain_domain: &'a [u8],
@@ -399,11 +395,10 @@ pub fn validate_tx_for_next_block(
     }
 
     let mut spent = HashSet::new();
-    let earliest_header_time = ctx.median_time_past.saturating_add(1);
     let (input_total, output_total) = validate_non_coinbase_tx(
         tx,
         TX_INDEX,
-        (ctx.next_height, earliest_header_time, ctx.median_time_past),
+        (ctx.next_height, ctx.median_time_past),
         ctx.coinbase_maturity,
         ctx.chain_domain,
         &mut spent,
@@ -537,30 +532,30 @@ pub fn select_valid_block_transactions(
     selection
 }
 
-// `block_context = (current_height, raw_block_time, csv_time_clock)`.
-// `raw_block_time` is the header timestamp; used by the transaction-level
-// `tx_is_final_for_block` BIP65 check. `csv_time_clock` is the BIP68 clock
-// for time-based per-input sequence locks — chain runtime passes MTP here,
-// fallback wrappers pass `raw_block_time`.
+// `block_context = (current_height, median_time_past)`. The MTP is the clock
+// for both absolute lock_time (BIP113) and relative time locks (BIP68);
+// wrappers without chain context pass the header timestamp instead.
 fn validate_non_coinbase_tx(
     tx: &Transaction,
     tx_index: usize,
-    block_context: (u64, u64, u64),
+    block_context: (u64, u64),
     coinbase_maturity: u64,
     chain_domain: &[u8],
     spent_in_block: &mut HashSet<OutPoint>,
     lookup: impl Fn(&OutPoint) -> Option<UtxoEntry>,
 ) -> Result<(u128, u128), TxValidationError> {
-    let (current_height, block_timestamp, csv_time_clock) = block_context;
+    let (current_height, csv_time_clock) = block_context;
     if tx.is_coinbase() {
         return Err(TxValidationError::UnexpectedCoinbase { tx_index });
     }
-    if !tx_is_final_for_block(tx, current_height, block_timestamp) {
+    // BIP113: time-based lock_time is compared with median-time-past, not
+    // the header timestamp a miner chooses (up to 2 h in the future).
+    if !tx_is_final_for_block(tx, current_height, csv_time_clock) {
         return Err(TxValidationError::NonFinalTransaction {
             tx_index,
             lock_time: tx.lock_time,
             block_height: current_height,
-            block_time: block_timestamp,
+            block_time: csv_time_clock,
         });
     }
 
@@ -1687,13 +1682,41 @@ mod tests {
             super::validate_tx_for_next_block(&locked, &ctx, |op| utxos.get(op).cloned()),
             Err(TxValidationError::SequenceLockNotMet { .. })
         ));
-        // SCAM's CSV rule is `next_height > created_height + value` (one
-        // block stricter than BIP68's `>=`), so 8 is the largest lock that
-        // is met at height 10 for an output created at height 1.
-        let mut mature = spend(outpoint, &pk, 900, hash, 8);
+        // BIP68: an output created at height 1 with a 9-block lock is
+        // spendable from height 10; a 10-block lock is not.
+        let mut mature = spend(outpoint.clone(), &pk, 900, hash, 9);
         sign_input(&mut mature, 0, domain, &sk);
         super::validate_tx_for_next_block(&mature, &ctx, |op| utxos.get(op).cloned())
-            .expect("an 8-block lock is met at height 10");
+            .expect("a 9-block lock is met at height 10");
+        let mut early = spend(outpoint, &pk, 900, hash, 10);
+        sign_input(&mut early, 0, domain, &sk);
+        assert!(matches!(
+            super::validate_tx_for_next_block(&early, &ctx, |op| utxos.get(op).cloned()),
+            Err(TxValidationError::SequenceLockNotMet { .. })
+        ));
+    }
+
+    /// C17 / BIP113: a time-based lock_time is checked against MTP, so a
+    /// miner cannot unlock it early with a future-dated header.
+    #[test]
+    fn absolute_time_lock_uses_median_time_past() {
+        let domain = b"devnet";
+        let (pk, hash, sk) = key_material([25u8; 32]);
+        let (utxos, outpoint) = funded_set(hash, 1_000);
+        let ctx = next_ctx(domain); // MTP 5_000
+        let lock_time = super::LOCKTIME_THRESHOLD + 10;
+        let mut tx = spend(outpoint, &pk, 900, hash, 0);
+        tx.lock_time = lock_time;
+        sign_input(&mut tx, 0, domain, &sk);
+        let mut late = ctx;
+        late.median_time_past = u64::from(lock_time) - 1;
+        assert!(matches!(
+            super::validate_tx_for_next_block(&tx, &late, |op| utxos.get(op).cloned()),
+            Err(TxValidationError::NonFinalTransaction { .. })
+        ));
+        late.median_time_past = u64::from(lock_time);
+        super::validate_tx_for_next_block(&tx, &late, |op| utxos.get(op).cloned())
+            .expect("final once MTP reaches lock_time");
     }
 
     /// M4/M5: template selection keeps parents before children, drops an

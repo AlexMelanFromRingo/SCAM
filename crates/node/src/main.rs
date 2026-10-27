@@ -54,7 +54,7 @@ use scam_rpc::{
 };
 use scam_storage::{
     ChainStateSnapshot, MempoolSnapshot, MempoolTxRecord, PeerAddressBook, PeerAddressRecord,
-    PoolLedgerSnapshot, PoolPayoutRecord, PoolRoundRecord, PoolShareRecord,
+    PoolLedgerSnapshot, PoolPayoutRecord, PoolRoundCredit, PoolRoundRecord, PoolShareRecord,
     PoolWorkerAccrualRecord, StorageError, load_block_by_hash_db, load_chain_archive_db,
     load_chain_archive_range_db, load_chain_archive_tip_db, load_mempool_db, load_peer_book_db,
     load_pool_ledger_db, load_snapshot, load_snapshot_db, persist_chain_archive_incremental_db,
@@ -749,9 +749,14 @@ struct StratumServeArgs {
     pool_payout_interval_sec: u64,
     #[arg(long, default_value_t = 500)]
     pool_payout_tx_fee_atomic: u64,
-    #[arg(long)]
+    #[arg(long, env = "SCAM_POOL_PAYOUT_MNEMONIC", hide_env_values = true)]
     pool_payout_mnemonic: Option<String>,
-    #[arg(long, default_value = "")]
+    #[arg(
+        long,
+        default_value = "",
+        env = "SCAM_POOL_PAYOUT_PASSPHRASE",
+        hide_env_values = true
+    )]
     pool_payout_passphrase: String,
     #[arg(long, default_value_t = 0)]
     pool_payout_account: u32,
@@ -944,7 +949,12 @@ enum WalletCommand {
     New {
         #[arg(long, default_value_t = 12)]
         words: usize,
-        #[arg(long, default_value = "")]
+        #[arg(
+            long,
+            default_value = "",
+            env = "SCAM_WALLET_PASSPHRASE",
+            hide_env_values = true
+        )]
         passphrase: String,
         #[arg(long, default_value_t = 0)]
         account: u32,
@@ -954,9 +964,14 @@ enum WalletCommand {
         hrp: String,
     },
     Address {
-        #[arg(long)]
+        #[arg(long, env = "SCAM_WALLET_MNEMONIC", hide_env_values = true)]
         mnemonic: String,
-        #[arg(long, default_value = "")]
+        #[arg(
+            long,
+            default_value = "",
+            env = "SCAM_WALLET_PASSPHRASE",
+            hide_env_values = true
+        )]
         passphrase: String,
         #[arg(long)]
         path: Option<String>,
@@ -968,9 +983,14 @@ enum WalletCommand {
         hrp: String,
     },
     Restore {
-        #[arg(long)]
+        #[arg(long, env = "SCAM_WALLET_MNEMONIC", hide_env_values = true)]
         mnemonic: String,
-        #[arg(long, default_value = "")]
+        #[arg(
+            long,
+            default_value = "",
+            env = "SCAM_WALLET_PASSPHRASE",
+            hide_env_values = true
+        )]
         passphrase: String,
         #[arg(long)]
         path: Option<String>,
@@ -984,9 +1004,14 @@ enum WalletCommand {
     SecureNew {
         #[arg(long, default_value_t = 12)]
         words: usize,
-        #[arg(long, default_value = "")]
+        #[arg(
+            long,
+            default_value = "",
+            env = "SCAM_WALLET_PASSPHRASE",
+            hide_env_values = true
+        )]
         passphrase: String,
-        #[arg(long)]
+        #[arg(long, env = "SCAM_WALLET_PASSWORD", hide_env_values = true)]
         password: String,
         #[arg(long, default_value = "data/wallets/default.vault.json")]
         out: PathBuf,
@@ -1002,11 +1027,16 @@ enum WalletCommand {
         hrp: String,
     },
     SecureRestore {
-        #[arg(long)]
+        #[arg(long, env = "SCAM_WALLET_MNEMONIC", hide_env_values = true)]
         mnemonic: String,
-        #[arg(long, default_value = "")]
+        #[arg(
+            long,
+            default_value = "",
+            env = "SCAM_WALLET_PASSPHRASE",
+            hide_env_values = true
+        )]
         passphrase: String,
-        #[arg(long)]
+        #[arg(long, env = "SCAM_WALLET_PASSWORD", hide_env_values = true)]
         password: String,
         #[arg(long, default_value = "data/wallets/default.vault.json")]
         out: PathBuf,
@@ -1024,7 +1054,7 @@ enum WalletCommand {
     SecureAddress {
         #[arg(long)]
         wallet: PathBuf,
-        #[arg(long)]
+        #[arg(long, env = "SCAM_WALLET_PASSWORD", hide_env_values = true)]
         password: String,
         #[arg(long, default_value_t = 0)]
         account: u32,
@@ -1038,9 +1068,14 @@ enum WalletCommand {
         network: Network,
         #[arg(long)]
         config: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(long, env = "SCAM_WALLET_MNEMONIC", hide_env_values = true)]
         mnemonic: String,
-        #[arg(long, default_value = "")]
+        #[arg(
+            long,
+            default_value = "",
+            env = "SCAM_WALLET_PASSPHRASE",
+            hide_env_values = true
+        )]
         passphrase: String,
         #[arg(long, default_value_t = 0)]
         account: u32,
@@ -1062,7 +1097,7 @@ enum WalletCommand {
         config: Option<PathBuf>,
         #[arg(long)]
         wallet: PathBuf,
-        #[arg(long)]
+        #[arg(long, env = "SCAM_WALLET_PASSWORD", hide_env_values = true)]
         password: String,
         #[arg(long, default_value_t = 0)]
         account: u32,
@@ -1082,9 +1117,14 @@ enum WalletCommand {
         network: Network,
         #[arg(long)]
         config: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(long, env = "SCAM_WALLET_MNEMONIC", hide_env_values = true)]
         mnemonic: String,
-        #[arg(long, default_value = "")]
+        #[arg(
+            long,
+            default_value = "",
+            env = "SCAM_WALLET_PASSPHRASE",
+            hide_env_values = true
+        )]
         passphrase: String,
         #[arg(long)]
         path: Option<String>,
@@ -1118,9 +1158,14 @@ enum WalletCommand {
         network: Network,
         #[arg(long)]
         config: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(long, env = "SCAM_WALLET_MNEMONIC", hide_env_values = true)]
         mnemonic: String,
-        #[arg(long, default_value = "")]
+        #[arg(
+            long,
+            default_value = "",
+            env = "SCAM_WALLET_PASSPHRASE",
+            hide_env_values = true
+        )]
         passphrase: String,
         #[arg(long, default_value_t = 0)]
         start_account: u32,
@@ -1142,9 +1187,14 @@ enum WalletCommand {
         network: Network,
         #[arg(long)]
         config: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(long, env = "SCAM_WALLET_MNEMONIC", hide_env_values = true)]
         mnemonic: String,
-        #[arg(long, default_value = "")]
+        #[arg(
+            long,
+            default_value = "",
+            env = "SCAM_WALLET_PASSPHRASE",
+            hide_env_values = true
+        )]
         passphrase: String,
         #[arg(long)]
         path: Option<String>,
@@ -1170,9 +1220,14 @@ enum WalletCommand {
         address: String,
     },
     Sign {
-        #[arg(long)]
+        #[arg(long, env = "SCAM_WALLET_MNEMONIC", hide_env_values = true)]
         mnemonic: String,
-        #[arg(long, default_value = "")]
+        #[arg(
+            long,
+            default_value = "",
+            env = "SCAM_WALLET_PASSPHRASE",
+            hide_env_values = true
+        )]
         passphrase: String,
         #[arg(long)]
         digest_hex: String,
@@ -1259,9 +1314,14 @@ enum WalletCommand {
         #[arg(long, value_name = "FILE")]
         envelope_out: String,
         /// Wallet seed (mnemonic, BIP39) used to derive the signing key.
-        #[arg(long)]
+        #[arg(long, env = "SCAM_WALLET_MNEMONIC", hide_env_values = true)]
         mnemonic: String,
-        #[arg(long, default_value = "")]
+        #[arg(
+            long,
+            default_value = "",
+            env = "SCAM_WALLET_PASSPHRASE",
+            hide_env_values = true
+        )]
         passphrase: String,
         #[arg(long, value_enum, default_value_t = WalletSeedModeArg::Bip39)]
         seed_mode: WalletSeedModeArg,
@@ -6009,6 +6069,7 @@ impl StratumPoolLedgerState {
             found_block_hash: None,
             found_block_reward_atomic: 0,
             orphaned: false,
+            pplns_credits: Vec::new(),
         });
         Self {
             network_id,
@@ -6177,9 +6238,76 @@ impl StratumPoolLedgerState {
         }
     }
 
+    /// PPLNS split of `reward_atomic` over the last `pplns_window_shares`
+    /// accepted shares up to `end_unix_sec`, weighted by share difficulty.
+    fn pplns_window_credits(&self, end_unix_sec: u64, reward_atomic: u128) -> Vec<PoolRoundCredit> {
+        let mut window = self
+            .shares
+            .iter()
+            .filter(|share| share.accepted && share.timestamp_unix_sec <= end_unix_sec)
+            .collect::<Vec<_>>();
+        window.sort_by(|a, b| {
+            a.timestamp_unix_sec
+                .cmp(&b.timestamp_unix_sec)
+                .then(a.share_key.cmp(&b.share_key))
+        });
+        let window_limit = self.payout_cfg.pplns_window_shares.max(1);
+        let start = window.len().saturating_sub(window_limit);
+        let mut worker_weights = std::collections::BTreeMap::<String, f64>::new();
+        let mut total_weight = 0.0f64;
+        for share in &window[start..] {
+            let weight = share.expected_hashes.max(0.0);
+            if weight <= 0.0 {
+                continue;
+            }
+            total_weight += weight;
+            *worker_weights.entry(share.worker.clone()).or_insert(0.0) += weight;
+        }
+        if total_weight <= 0.0 {
+            return Vec::new();
+        }
+        worker_weights
+            .into_iter()
+            .filter_map(|(worker, weight)| {
+                let amount_atomic =
+                    ((reward_atomic as f64) * (weight / total_weight)).floor() as u128;
+                (amount_atomic > 0).then_some(PoolRoundCredit {
+                    worker,
+                    amount_atomic,
+                })
+            })
+            .collect()
+    }
+
+    /// Freeze the PPLNS split of every closed round that has none yet.
+    fn freeze_round_credits(&mut self) {
+        let mut frozen = Vec::new();
+        for (idx, round) in self.rounds.iter().enumerate() {
+            if !round.pplns_credits.is_empty() || round.found_block_reward_atomic == 0 {
+                continue;
+            }
+            let Some(end_unix_sec) = round.end_unix_sec else {
+                continue;
+            };
+            let reward = self.reward_after_pool_fee(round.found_block_reward_atomic);
+            if reward == 0 {
+                continue;
+            }
+            frozen.push((idx, self.pplns_window_credits(end_unix_sec, reward)));
+        }
+        for (idx, credits) in frozen {
+            if let Some(round) = self.rounds.get_mut(idx) {
+                round.pplns_credits = credits;
+            }
+        }
+    }
+
+    /// PPLNS accrual = credits of rounds no longer retained + frozen credits
+    /// of retained rounds still on the active chain. Never recomputed from
+    /// the capped share history, so it cannot shrink below what was paid.
     fn recompute_pplns_accruals(&mut self) {
         for worker in self.workers.values_mut() {
-            worker.pplns_accrual_atomic = 0;
+            worker.pplns_accrual_atomic = worker.pplns_settled_atomic;
         }
         if !matches!(
             self.payout_cfg.mode,
@@ -6187,67 +6315,38 @@ impl StratumPoolLedgerState {
         ) {
             return;
         }
-        let mut accepted = self
-            .shares
-            .iter()
-            .filter(|share| share.accepted)
-            .cloned()
-            .collect::<Vec<_>>();
-        accepted.sort_by(|a, b| {
-            a.timestamp_unix_sec
-                .cmp(&b.timestamp_unix_sec)
-                .then(a.share_key.cmp(&b.share_key))
-        });
-
+        self.freeze_round_credits();
+        let mut credited = Vec::new();
         for round in &self.rounds {
-            if round.orphaned {
+            if round.orphaned || round.end_unix_sec.is_none() {
                 continue;
             }
-            let Some(end_unix_sec) = round.end_unix_sec else {
-                continue;
-            };
-            let gross = round.found_block_reward_atomic;
-            if gross == 0 {
-                continue;
-            }
-            let reward = self.reward_after_pool_fee(gross);
-            if reward == 0 {
-                continue;
-            }
-            let mut window = accepted
-                .iter()
-                .filter(|share| share.timestamp_unix_sec <= end_unix_sec)
-                .collect::<Vec<_>>();
-            if window.is_empty() {
-                continue;
-            }
-            let window_limit = self.payout_cfg.pplns_window_shares.max(1);
-            let start = window.len().saturating_sub(window_limit);
-            if start != 0 {
-                window = window[start..].to_vec();
-            }
-            let mut worker_weights = HashMap::<String, f64>::new();
-            let mut total_weight = 0.0f64;
-            for share in window {
-                let weight = share.expected_hashes.max(0.0);
-                if weight <= 0.0 {
-                    continue;
-                }
-                total_weight += weight;
-                *worker_weights.entry(share.worker.clone()).or_insert(0.0) += weight;
-            }
-            if total_weight <= 0.0 {
-                continue;
-            }
-            for (worker, weight) in worker_weights {
-                let payout = ((reward as f64) * (weight / total_weight)).floor() as u128;
-                if payout == 0 {
-                    continue;
-                }
-                if let Some(entry) = self.workers.get_mut(&worker) {
-                    entry.pplns_accrual_atomic = entry.pplns_accrual_atomic.saturating_add(payout);
-                }
-            }
+            credited.extend(round.pplns_credits.iter().cloned());
+        }
+        for credit in credited {
+            let entry = self
+                .workers
+                .entry(credit.worker.clone())
+                .or_insert_with(|| new_pool_worker_record(&credit.worker));
+            entry.pplns_accrual_atomic = entry
+                .pplns_accrual_atomic
+                .saturating_add(credit.amount_atomic);
+        }
+    }
+
+    /// A round leaving the retention window keeps its (non-orphaned) credits.
+    fn settle_evicted_round(&mut self, round: PoolRoundRecord) {
+        if round.orphaned || round.end_unix_sec.is_none() {
+            return;
+        }
+        for credit in round.pplns_credits {
+            let entry = self
+                .workers
+                .entry(credit.worker.clone())
+                .or_insert_with(|| new_pool_worker_record(&credit.worker));
+            entry.pplns_settled_atomic = entry
+                .pplns_settled_atomic
+                .saturating_add(credit.amount_atomic);
         }
     }
 
@@ -6398,6 +6497,7 @@ impl StratumPoolLedgerState {
                     blocks_found_total: 0,
                     expected_hashes_accumulated: 0.0,
                     pplns_accrual_atomic: 0,
+                    pplns_settled_atomic: 0,
                     pps_accrual_atomic: 0,
                     paid_total_atomic: 0,
                     last_share_unix_sec: 0,
@@ -6430,6 +6530,7 @@ impl StratumPoolLedgerState {
                     blocks_found_total: 0,
                     expected_hashes_accumulated: 0.0,
                     pplns_accrual_atomic: 0,
+                    pplns_settled_atomic: 0,
                     pps_accrual_atomic: 0,
                     paid_total_atomic: 0,
                     last_share_unix_sec: 0,
@@ -6455,11 +6556,13 @@ impl StratumPoolLedgerState {
             current.found_block_hash = Some(found_block_hash);
             current.found_block_reward_atomic = found_block_reward_atomic;
             current.orphaned = false;
+            current.pplns_credits = Vec::new();
         }
         if matches!(
             self.payout_cfg.mode,
             PoolPayoutModeArg::Pplns | PoolPayoutModeArg::Hybrid
         ) {
+            // Freezes this round's split from the shares present right now.
             self.recompute_pplns_accruals();
         }
         self.open_next_round(end_height, end_tip_hash, now_unix_sec);
@@ -6482,11 +6585,13 @@ impl StratumPoolLedgerState {
             found_block_hash: None,
             found_block_reward_atomic: 0,
             orphaned: false,
+            pplns_credits: Vec::new(),
         });
         while self.rounds.len() > self.max_round_records {
-            if self.rounds.pop_front().is_none() {
+            let Some(evicted) = self.rounds.pop_front() else {
                 break;
-            }
+            };
+            self.settle_evicted_round(evicted);
         }
     }
 
@@ -14610,6 +14715,21 @@ fn pool_payout_submit_outcome_is_live(outcome: &str) -> bool {
     )
 }
 
+fn new_pool_worker_record(worker: &str) -> PoolWorkerAccrualRecord {
+    PoolWorkerAccrualRecord {
+        worker: worker.to_owned(),
+        accepted_total: 0,
+        rejected_total: 0,
+        blocks_found_total: 0,
+        expected_hashes_accumulated: 0.0,
+        pplns_accrual_atomic: 0,
+        pplns_settled_atomic: 0,
+        pps_accrual_atomic: 0,
+        paid_total_atomic: 0,
+        last_share_unix_sec: 0,
+    }
+}
+
 fn run_pool_payout_tick_with_warning(ctx: &StratumServerContext) {
     if let Err(err) = maybe_process_pool_payouts(ctx) {
         eprintln!("warning: pool payout tick failed: {err}");
@@ -21480,6 +21600,61 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// ST5: PPLNS credits are frozen when a round closes, so trimming the
+    /// share history or evicting old rounds never shrinks what a worker has
+    /// earned (it used to drop below `paid_total` and stop payouts).
+    #[test]
+    fn pplns_credits_survive_share_trimming_and_round_eviction() {
+        let mut ledger =
+            super::StratumPoolLedgerState::new("devnet".to_owned(), 0, Hash256::ZERO, 1_000, 8, 2);
+        ledger.set_payout_config(super::PoolPayoutConfig {
+            mode: super::PoolPayoutModeArg::Pplns,
+            pool_fee_bps: 0,
+            pplns_window_shares: 4,
+            ..super::PoolPayoutConfig::default()
+        });
+        let mut nonce = 0u64;
+        let mut share = |ledger: &mut super::StratumPoolLedgerState, worker: &str, at: u64| {
+            nonce += 1;
+            ledger.register_share(worker, 1, 1, nonce, at, 1.0, true, false, at, None);
+        };
+        for t in 0..4 {
+            share(&mut ledger, "alice", 1_001 + t);
+        }
+        ledger.close_round_with_block("alice", Hash256([1; 32]), 1_000, 1, Hash256([1; 32]), 1_010);
+        assert_eq!(ledger.workers["alice"].pplns_accrual_atomic, 1_000);
+        ledger
+            .workers
+            .get_mut("alice")
+            .expect("alice")
+            .paid_total_atomic = 1_000;
+
+        // Bob floods shares: alice's shares fall out of the 8-record history.
+        for t in 0..20 {
+            share(&mut ledger, "bob", 1_020 + t);
+        }
+        ledger.recompute_pplns_accruals();
+        assert_eq!(
+            ledger.workers["alice"].pplns_accrual_atomic, 1_000,
+            "trimmed history must not shrink alice's earned credit"
+        );
+
+        // More rounds evict alice's round from the 2-round retention.
+        for round in 0..3u8 {
+            ledger.close_round_with_block(
+                "bob",
+                Hash256([10 + round; 32]),
+                1_000,
+                2 + u64::from(round),
+                Hash256([10 + round; 32]),
+                1_050 + u64::from(round),
+            );
+        }
+        assert_eq!(ledger.workers["alice"].pplns_accrual_atomic, 1_000);
+        assert_eq!(ledger.workers["alice"].pplns_settled_atomic, 1_000);
+        assert_eq!(ledger.workers["bob"].pplns_accrual_atomic, 3_000);
+    }
+
     /// ST3: PPS credit scales with share difficulty; an "any hash" share
     /// earns (almost) nothing compared to a reference-difficulty share.
     /// ST4: only admitted payout txs count as submitted.
@@ -21502,6 +21677,7 @@ mod tests {
                 blocks_found_total: 0,
                 expected_hashes_accumulated: 0.0,
                 pplns_accrual_atomic: 0,
+                pplns_settled_atomic: 0,
                 pps_accrual_atomic: 0,
                 paid_total_atomic: 0,
                 last_share_unix_sec: 0,
@@ -24461,6 +24637,7 @@ mod tests {
                     found_block_hash: Some(Hash256([0x33; 32])),
                     found_block_reward_atomic: 50,
                     orphaned: true,
+                    pplns_credits: Vec::new(),
                 },
                 super::PoolRoundRecord {
                     round_id: 7,
@@ -24474,6 +24651,7 @@ mod tests {
                     found_block_hash: None,
                     found_block_reward_atomic: 0,
                     orphaned: false,
+                    pplns_credits: Vec::new(),
                 },
             ],
             workers: Vec::new(),
@@ -24510,6 +24688,7 @@ mod tests {
                     found_block_hash: None,
                     found_block_reward_atomic: 0,
                     orphaned: false,
+                    pplns_credits: Vec::new(),
                 },
                 super::PoolRoundRecord {
                     round_id: 7,
@@ -24523,6 +24702,7 @@ mod tests {
                     found_block_hash: Some(Hash256([0xAA; 32])),
                     found_block_reward_atomic: 50,
                     orphaned: false,
+                    pplns_credits: Vec::new(),
                 },
             ],
             workers: Vec::new(),
@@ -24552,6 +24732,7 @@ mod tests {
                 blocks_found_total: 2,
                 expected_hashes_accumulated: 42.0,
                 pplns_accrual_atomic: 100,
+                pplns_settled_atomic: 0,
                 pps_accrual_atomic: 200,
                 paid_total_atomic: 50,
                 last_share_unix_sec: 77,
@@ -25243,6 +25424,7 @@ mod tests {
                 found_block_hash: Some(Hash256([9; 32])),
                 found_block_reward_atomic: 1_000,
                 orphaned: false,
+                pplns_credits: Vec::new(),
             },
             super::PoolRoundRecord {
                 round_id: 2,
@@ -25256,6 +25438,7 @@ mod tests {
                 found_block_hash: Some(Hash256([10; 32])),
                 found_block_reward_atomic: 1_000,
                 orphaned: false,
+                pplns_credits: Vec::new(),
             },
         ];
         let state = super::StratumPoolLedgerState::from_snapshot(
@@ -25337,6 +25520,7 @@ mod tests {
                 blocks_found_total: 0,
                 expected_hashes_accumulated: 0.0,
                 pplns_accrual_atomic: 0,
+                pplns_settled_atomic: 0,
                 pps_accrual_atomic: 10,
                 paid_total_atomic: 0,
                 last_share_unix_sec: 0,
@@ -25583,6 +25767,7 @@ mod tests {
                 blocks_found_total: 0,
                 expected_hashes_accumulated: 0.0,
                 pplns_accrual_atomic: 0,
+                pplns_settled_atomic: 0,
                 pps_accrual_atomic: 0,
                 paid_total_atomic: 0,
                 last_share_unix_sec: 0,
@@ -25667,6 +25852,7 @@ mod tests {
                 blocks_found_total: 0,
                 expected_hashes_accumulated: 0.0,
                 pplns_accrual_atomic: 0,
+                pplns_settled_atomic: 0,
                 pps_accrual_atomic: 100,
                 paid_total_atomic: 0,
                 last_share_unix_sec: 0,
@@ -25707,6 +25893,7 @@ mod tests {
                 blocks_found_total: 0,
                 expected_hashes_accumulated: 0.0,
                 pplns_accrual_atomic: 77,
+                pplns_settled_atomic: 0,
                 pps_accrual_atomic: 0,
                 paid_total_atomic: 0,
                 last_share_unix_sec: 0,
@@ -25967,6 +26154,7 @@ mod tests {
                 blocks_found_total: 0,
                 expected_hashes_accumulated: 0.0,
                 pplns_accrual_atomic: 0,
+                pplns_settled_atomic: 0,
                 pps_accrual_atomic: 200,
                 paid_total_atomic: 0,
                 last_share_unix_sec: 0,
@@ -26340,6 +26528,7 @@ mod tests {
                 blocks_found_total: 0,
                 expected_hashes_accumulated: 0.0,
                 pplns_accrual_atomic: 0,
+                pplns_settled_atomic: 0,
                 pps_accrual_atomic: 0,
                 paid_total_atomic: 0,
                 last_share_unix_sec: 0,

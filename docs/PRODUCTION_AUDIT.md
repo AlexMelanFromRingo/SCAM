@@ -31,9 +31,9 @@ Baseline at start: `fmt`/`clippy -D warnings`/`cargo test --workspace
 | C14 | high | Local miner coinbase tag has no height (`mine-once`, mining loop) ⇒ identical coinbases (now invalid under C1). | `main.rs::build_coinbase_tx` callers | fixed (height in tag; reproduced by soak tests) |
 | C15 | high | Stratum template and other node paths use `cfg.block_subsidy` instead of `subsidy_at_height(h)` ⇒ after the first halving every pool block is invalid. | `main.rs` (~20 non-test sites) | fixed (local miner, stratum template, TP request, round reward) |
 | C16 | medium | P2P consensus fingerprint omits `halving_interval_blocks`, `tail_emission`, versionbits params ⇒ peers with different monetary policy handshake and fork later. | `main.rs::consensus_fingerprint` | fixed (fingerprint v2) |
-| C17 | low | BIP113 not applied: absolute `lock_time` compared to header time, not MTP. | `consensus/src/utxo.rs` | deferred |
-| C18 | low | BIP34 (height in coinbase) not a consensus rule; C1 covers safety. | consensus | deferred |
-| C20 | low | CSV deviates from BIP68 by one: height locks need `spend > created + value` (BIP68: `>=`), time locks compare with the creating block's own header time (BIP68: MTP of its parent). Deterministic, not exploitable; docs claim "verbatim BIP68". | `consensus/src/csv.rs` | deferred (document or align before mainnet) |
+| C17 | low | BIP113 not applied: absolute `lock_time` compared to header time, not MTP. | `consensus/src/utxo.rs` | fixed (lock_time vs MTP) |
+| C18 | low | BIP34 (height in coinbase) not a consensus rule; C1 covers safety. | consensus | deferred (C1 already prevents overwrites; BIP34 would only add txid uniqueness for spent coinbases at the cost of rewriting most block fixtures) |
+| C20 | low | CSV deviates from BIP68 by one: height locks need `spend > created + value` (BIP68: `>=`), time locks compare with the creating block's own header time (BIP68: MTP of its parent). Deterministic, not exploitable; docs claim "verbatim BIP68". | `consensus/src/csv.rs` | fixed (exact BIP68: `>=`, coin time = creation MTP) |
 | C19 | info | `config/mainnet.toml` has halvings disabled ⇒ constant 50/block forever. Policy decision for the owner. | config | deferred (owner decision) |
 
 ## Mempool / block templates
@@ -79,7 +79,7 @@ Baseline at start: `fmt`/`clippy -D warnings`/`cargo test --workspace
 | S4 | high | Every start/refresh replays all blocks with full signature checks (relay ~1 s after any write, RPC cache, each SSE conn, each payout). | `main.rs::load_runtime_from_db_or_genesis` | partially fixed (refresh reads tip meta, then only the tail, validating only unknown blocks); cold start still replays — persisted UTXO set needed |
 | S5 | medium | Mempool DB: load-modify-rewrite from RPC, relay and stratum ⇒ lost updates; `GET /mempool` writes. | `main.rs` | open |
 | S6 | medium | redb exclusive open per access; nested retry sleeps while holding locks / in async tasks. | `main.rs` | open |
-| S7 | low | No on-disk schema version; `#[serde(default)]` useless under bincode. | `storage` | open |
+| S7 | low | No on-disk schema version; `#[serde(default)]` useless under bincode. | `storage` | fixed (`schema_version` in every store; unknown versions refused; pool ledger requires v2) |
 | S8 | low | Temp files leaked on error; rename while temp DB still open. | `storage` | fixed for the runtime archive (no temp file anymore) |
 
 ## Stratum / pool
@@ -90,7 +90,7 @@ Baseline at start: `fmt`/`clippy -D warnings`/`cargo test --workspace
 | ST2 | critical | Sanitizer uses claimed fee when parent not yet resolved (children first by feerate) ⇒ `CoinbaseRewardTooHigh`; retry path rewrites coinbase ⇒ PoW lost. | `main.rs` | fixed (see M6/M5) |
 | ST3 | high | PPS credit fixed per share regardless of share difficulty; min share target = any hash; liability cap 0 = unlimited. | `main.rs` payout | fixed (credit scales with share expected hashes vs the hardest share target); liability cap default still 0 |
 | ST4 | high | Payout txs pick the same pool coins; conflict outcome reported as success; txid recorded after broadcast ⇒ stuck or double payouts. | `main.rs::build_signed_transfer_tx` & payout loop | partially fixed (mempool-spent coins excluded, conflict outcome is a failure); txid-before-broadcast + stuck-payout expiry open |
-| ST5 | high | PPLNS earnings recomputed from capped history but compared with lifetime paid ⇒ workers stop being paid. | `main.rs` payout | open — needs per-round credit snapshots persisted, i.e. a ledger schema version (S7) |
+| ST5 | high | PPLNS earnings recomputed from capped history but compared with lifetime paid ⇒ workers stop being paid. | `main.rs` payout | fixed (split frozen per round at close; evicted rounds folded into `pplns_settled_atomic`; ledger schema v2) |
 | ST6 | medium | Shares for old-tip jobs still credited; tip only rechecked on read timeout. | `stratum/src/lib.rs`, `main.rs` | fixed (share credited only if its job builds on the current — refreshed — tip) |
 | ST7 | medium | Whole pool ledger DB rewritten per share. | `storage`, `main.rs` | open |
 | ST8 | low | Stratum async read timeout not cancel-safe. | `main.rs` | open |
@@ -104,13 +104,13 @@ Baseline at start: `fmt`/`clippy -D warnings`/`cargo test --workspace
 | R2 | high | Windows: UI file server `ui_dir.join("C:/…")` escapes the UI dir ⇒ arbitrary file read (vaults). | `main.rs::sanitize_ui_path` | fixed |
 | R3 | high | `wallet secure-new/restore` silently overwrite an existing vault; write not atomic; default 0644. | `main.rs`, `wallet/src/vault.rs` | fixed (create_new + 0600 + fsync; `--force` = atomic replace) |
 | R4 | high | `/wallet/*` take mnemonic+passphrase in the body, always enabled, no auth; Host allow-list passes behind a reverse proxy. | `main.rs` router | fixed (JSON-only POST, loopback Origin, optional bearer token required for non-loopback binds, `--disable-wallet-rpc`) |
-| R5 | medium | Secrets only via CLI args (`ps`, shell history). | `main.rs::WalletCommand` | open |
+| R5 | medium | Secrets only via CLI args (`ps`, shell history). | `main.rs::WalletCommand` | fixed (`SCAM_WALLET_PASSWORD/MNEMONIC/PASSPHRASE`, `SCAM_POOL_PAYOUT_MNEMONIC/PASSPHRASE`; values hidden in `--help`) |
 | R6 | medium | RPC DoS: blocking work in async handlers under mutex; `/txid` full-chain scan; `/events` unlimited subscribers each reloading state; telemetry files never rotated. | `main.rs` | open |
 | R7 | medium | Legacy RPC backend: no Host allow-list; `?` in accept loop kills server; selected by any non-"axum" env value. | `main.rs` | fixed (explicit `legacy` only; refuses non-loopback/auth configs) |
 | R8 | medium | PSBT-lite signs a digest computed before `pubkey_compressed` is set to the descriptor ⇒ finalized tx invalid; chain domain not checked; no input values. | `wallet/src/psbt.rs` | fixed (descriptor filled at creation and checked on sign/finalize; CLI prints chain domain) — input values still absent |
 | R11 | low | Web console: mnemonic fields autocomplete/spellcheck on; no CSP / X-Frame-Options; `apiBase` override from localStorage. | `web/` | fixed (no autocomplete/spellcheck on secrets, passphrases masked, CSP + X-Frame-Options + nosniff; CSP limits `connect-src` to loopback) |
 | R12 | low | QR payment URI label not percent-encoded ⇒ parameter injection. | `wallet/src/qr.rs` | fixed |
-| R13 | low | No zeroization of secrets; `json_error_body` does not escape control chars. | wallet, `main.rs` | partially fixed (JSON via serde); zeroization open |
+| R13 | low | No zeroization of secrets; `json_error_body` does not escape control chars. | wallet, `main.rs` | fixed (JSON via serde; keys, mnemonics, passphrases, vault key and plaintext wiped on drop) |
 
 ## Behaviour changes operators must know
 
@@ -135,7 +135,13 @@ but **existing devnet/testnet chains and nodes must be upgraded together**:
 - RPC: see the security model in `README.md` (JSON-only POST, loopback
   Origin, bearer token for non-loopback binds, `--disable-wallet-rpc`).
 - `wallet secure-new|secure-restore` no longer overwrite an existing vault
-  without `--force`.
+  without `--force`. Wallet secrets can come from `SCAM_WALLET_PASSWORD`,
+  `SCAM_WALLET_MNEMONIC`, `SCAM_WALLET_PASSPHRASE` instead of argv.
+- Consensus now follows BIP68/BIP113 exactly: relative locks are met at
+  `created + value` (height) / `coin MTP + value*512` (time), and absolute
+  time locks compare with median-time-past.
+- Every store carries `schema_version`. Pool ledgers written before this
+  pass (v1) are refused — move the file aside to start a fresh ledger.
 - The runtime archive is written incrementally with recorded tip work; a
   process whose chain is behind the archive gets `StaleArchiveWriter` instead
   of overwriting it. Archives written by older versions are accepted.

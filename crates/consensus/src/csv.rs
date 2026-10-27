@@ -103,15 +103,14 @@ pub fn check_sequence_lock(
     }
     let value = u64::from(sequence & SEQUENCE_VALUE_MASK);
     if sequence & SEQUENCE_TYPE_FLAG != 0 {
-        // Time-based: value units of 512 seconds. Lock is satisfied
-        // when the spending block's median time has *exceeded* the
-        // required threshold. BIP68 uses MTP for spend_block_time; for
-        // SCAM the caller passes block header timestamp (good enough
-        // until we wire MTP through the validate_non_coinbase_tx call
-        // site — pre-launch chains only).
+        // Time-based, BIP68: `utxo_created_time` is the coin's MTP (the
+        // median-time-past before the block that created it) and
+        // `spend_block_time` the spending block's MTP. Satisfied once
+        // `value * 512` seconds have elapsed (`>=`, as Bitcoin Core's
+        // `nMinTime = coinTime + (value << 9) - 1; ok iff MTP > nMinTime`).
         let required_time =
             utxo_created_time.saturating_add(value << SEQUENCE_TIME_GRANULARITY_SHIFT);
-        if spend_block_time > required_time {
+        if spend_block_time >= required_time {
             Ok(SequenceLockOutcome::SatisfiedByTime { required_time })
         } else {
             Ok(SequenceLockOutcome::Locked {
@@ -121,8 +120,9 @@ pub fn check_sequence_lock(
             })
         }
     } else {
+        // Height-based, BIP68: spendable in block `created + value` or later.
         let required_height = utxo_created_height.saturating_add(value);
-        if spend_block_height > required_height {
+        if spend_block_height >= required_height {
             Ok(SequenceLockOutcome::SatisfiedByHeight { required_height })
         } else {
             Ok(SequenceLockOutcome::Locked {
@@ -178,40 +178,30 @@ mod tests {
     }
 
     #[test]
-    fn height_based_lock_satisfied_when_spend_strictly_above_required() {
-        // sequence = 5 → block-based, require 5 blocks elapsed.
-        // utxo at height 100, spend at height 106 (> 100+5=105) → ok.
+    fn height_based_lock_matches_bip68_boundary() {
+        // sequence = 5: a coin from block 100 is spendable from block 105
+        // (Bitcoin Core: nMinHeight = 100 + 5 - 1 = 104 < 105).
         assert_eq!(
-            check_sequence_lock(5, 100, 0, 106, 0).expect("ok"),
+            check_sequence_lock(5, 100, 0, 105, 0).expect("ok"),
             SequenceLockOutcome::SatisfiedByHeight {
                 required_height: 105
             }
         );
-        // Spend at exactly required_height = 105 → still locked (>, not >=).
         assert_eq!(
-            check_sequence_lock(5, 100, 0, 105, 0).expect("ok"),
+            check_sequence_lock(5, 100, 0, 104, 0).expect("ok"),
             SequenceLockOutcome::Locked {
                 kind: LockKind::Height,
                 required: 105,
-                actual: 105,
+                actual: 104,
             }
         );
     }
 
     #[test]
-    fn height_zero_means_spend_in_next_block_only() {
-        // sequence = 0 (block-based, value=0). Spending in the same
-        // block as creation must fail (>, not >=).
+    fn height_zero_lock_is_always_satisfied() {
+        // value 0 imposes no relative delay (BIP68).
         assert!(matches!(
             check_sequence_lock(0, 50, 0, 50, 0).expect("ok"),
-            SequenceLockOutcome::Locked {
-                kind: LockKind::Height,
-                ..
-            }
-        ));
-        // Next block is fine.
-        assert!(matches!(
-            check_sequence_lock(0, 50, 0, 51, 0).expect("ok"),
             SequenceLockOutcome::SatisfiedByHeight { .. }
         ));
     }
@@ -220,16 +210,16 @@ mod tests {
     fn time_based_lock_uses_512_second_granularity() {
         // sequence = TYPE | 1 → time-based, value = 1 → require 512s.
         let seq = SEQUENCE_TYPE_FLAG | 1;
-        // utxo at t=1_000_000, spend at t=1_000_513 (= 1_000_000 + 512 + 1) → ok.
+        // coin MTP 1_000_000, spending MTP 1_000_512 (= +512) → ok (BIP68 >=).
         assert_eq!(
-            check_sequence_lock(seq, 0, 1_000_000, 0, 1_000_513).expect("ok"),
+            check_sequence_lock(seq, 0, 1_000_000, 0, 1_000_512).expect("ok"),
             SequenceLockOutcome::SatisfiedByTime {
                 required_time: 1_000_512
             }
         );
-        // Spend at exactly required_time → locked.
+        // One second earlier → locked.
         assert!(matches!(
-            check_sequence_lock(seq, 0, 1_000_000, 0, 1_000_512).expect("ok"),
+            check_sequence_lock(seq, 0, 1_000_000, 0, 1_000_511).expect("ok"),
             SequenceLockOutcome::Locked {
                 kind: LockKind::Time,
                 ..
@@ -244,9 +234,10 @@ mod tests {
         // saturating_add so even u64::MAX utxo_time stays in-range.
         let seq = SEQUENCE_TYPE_FLAG | 0xFFFF;
         let out = check_sequence_lock(seq, 0, u64::MAX - 1, 0, u64::MAX).expect("ok");
-        // Result is "Locked" because spend_time is at most u64::MAX,
-        // and required_time saturated to u64::MAX. spend > required
-        // is false.
+        // required_time saturates to u64::MAX; no panic, and only a spend
+        // at the saturated time itself satisfies it.
+        assert!(matches!(out, SequenceLockOutcome::SatisfiedByTime { .. }));
+        let out = check_sequence_lock(seq, 0, u64::MAX - 1, 0, u64::MAX - 1).expect("ok");
         assert!(matches!(out, SequenceLockOutcome::Locked { .. }));
     }
 }

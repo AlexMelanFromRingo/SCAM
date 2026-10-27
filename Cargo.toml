@@ -32,7 +32,7 @@ bytes = "1.10"
 bitcoin = { version = "0.32", default-features = false, features = ["std"] }
 bip39 = { version = "2.2", default-features = true, features = ["rand"] }
 chacha20poly1305 = { version = "0.10", features = ["std"] }
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.5", features = ["derive", "env"] }
 hex = "0.4"
 num-bigint = "0.4"
 num-traits = "0.2"
@@ -53,3 +53,4 @@ tokio-socks = "0.5"
 tokio-util = { version = "0.7", features = ["codec"] }
 minisketch-rs = "0.1.9"
 siphasher = "1.0"
+zeroize = "1.8"
