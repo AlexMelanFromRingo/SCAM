@@ -1190,8 +1190,14 @@ impl SecureSv2Transport {
             .read_exact(&mut ciphertext)
             .await
             .map_err(StratumError::Io)?;
-        let plaintext = self.decrypt_payload(&ciphertext)?;
-        decode_single_frame_bytes(&plaintext).map(Some)
+        self.decrypt_frame(&ciphertext).map(Some)
+    }
+
+    /// Decrypt and decode one complete ciphertext frame (as returned by
+    /// [`Sv2StreamReader::read_secure_frame_async`]).
+    pub fn decrypt_frame(&mut self, ciphertext: &[u8]) -> Result<Sv2Message, StratumError> {
+        let plaintext = self.decrypt_payload(ciphertext)?;
+        decode_single_frame_bytes(&plaintext)
     }
 
     fn from_handshake(
@@ -1586,16 +1592,21 @@ impl NoiseSv2Transport {
             .read_exact(&mut ciphertext)
             .await
             .map_err(StratumError::Io)?;
+        self.decrypt_frame(&ciphertext).map(Some)
+    }
 
-        let mut plaintext = vec![0u8; len];
+    /// Decrypt and decode one complete ciphertext frame (as returned by
+    /// [`Sv2StreamReader::read_secure_frame_async`]).
+    pub fn decrypt_frame(&mut self, ciphertext: &[u8]) -> Result<Sv2Message, StratumError> {
+        let mut plaintext = vec![0u8; ciphertext.len()];
         let decrypted_len = self
             .transport
-            .read_message(&ciphertext, &mut plaintext)
+            .read_message(ciphertext, &mut plaintext)
             .map_err(|e| StratumError::SecureTransport(format!("noise decrypt failed: {e}")))?;
         plaintext.truncate(decrypted_len);
         self.received_messages = self.received_messages.saturating_add(1);
         self.maybe_rekey_incoming()?;
-        decode_single_frame_bytes(&plaintext).map(Some)
+        decode_single_frame_bytes(&plaintext)
     }
 
     fn maybe_rekey_outgoing(&mut self) -> Result<(), StratumError> {
@@ -1963,6 +1974,109 @@ pub async fn write_frame_async<W: AsyncWrite + Unpin>(
     writer.write_all(&len_buf).await.map_err(StratumError::Io)?;
     writer.write_all(&payload).await.map_err(StratumError::Io)?;
     writer.flush().await.map_err(StratumError::Io)
+}
+
+/// Cancel-safe buffered reader for one stratum connection.
+///
+/// The `read_*_async` helpers use `read_exact`, which loses whatever part of
+/// a frame it had read when the surrounding `timeout` fires; the next read
+/// then starts mid-frame and the session desyncs. This reader only appends
+/// to its own buffer (`read_buf` is cancel-safe) and hands out a frame once
+/// it is complete; headers are validated before payload bytes are buffered.
+#[derive(Default)]
+pub struct Sv2StreamReader {
+    buf: Vec<u8>,
+}
+
+impl Sv2StreamReader {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Next plain SV2 frame, `Ok(None)` on a clean EOF between frames.
+    pub async fn read_plain_frame_async<R: AsyncRead + Unpin>(
+        &mut self,
+        reader: &mut R,
+    ) -> Result<Option<Sv2Message>, StratumError> {
+        loop {
+            if self.buf.len() >= SV2_HEADER_LEN {
+                let extension = u16::from_le_bytes([self.buf[0], self.buf[1]]);
+                if extension != SV2_EXTENSION_MINING {
+                    return Err(StratumError::UnsupportedExtension(extension));
+                }
+                if !is_known_message_type(self.buf[2]) {
+                    return Err(StratumError::UnsupportedMessageType(self.buf[2]));
+                }
+                let len = decode_u24_le([self.buf[3], self.buf[4], self.buf[5]]);
+                if len == 0 {
+                    return Err(StratumError::InvalidFrameLength(0));
+                }
+                if len > MAX_FRAME_SIZE {
+                    return Err(StratumError::FrameTooLarge {
+                        got: len,
+                        max: MAX_FRAME_SIZE,
+                    });
+                }
+                let total = SV2_HEADER_LEN + len;
+                if self.buf.len() >= total {
+                    let frame = self.buf.drain(..total).collect::<Vec<_>>();
+                    return decode_single_frame_bytes(&frame).map(Some);
+                }
+            }
+            if !self.fill(reader).await? {
+                return Ok(None);
+            }
+        }
+    }
+
+    /// Next complete secure/noise ciphertext frame (4-byte LE length
+    /// prefix stripped), `Ok(None)` on a clean EOF between frames.
+    pub async fn read_secure_frame_async<R: AsyncRead + Unpin>(
+        &mut self,
+        reader: &mut R,
+    ) -> Result<Option<Vec<u8>>, StratumError> {
+        loop {
+            if self.buf.len() >= 4 {
+                let len = u32::from_le_bytes([self.buf[0], self.buf[1], self.buf[2], self.buf[3]])
+                    as usize;
+                if len == 0 {
+                    return Err(StratumError::InvalidFrameLength(0));
+                }
+                if len > SECURE_MAX_FRAME_SIZE {
+                    return Err(StratumError::FrameTooLarge {
+                        got: len,
+                        max: SECURE_MAX_FRAME_SIZE,
+                    });
+                }
+                if self.buf.len() >= 4 + len {
+                    let frame = self.buf.drain(..4 + len).skip(4).collect::<Vec<_>>();
+                    return Ok(Some(frame));
+                }
+            }
+            if !self.fill(reader).await? {
+                return Ok(None);
+            }
+        }
+    }
+
+    /// Append available bytes; `Ok(false)` on EOF at a frame boundary.
+    async fn fill<R: AsyncRead + Unpin>(&mut self, reader: &mut R) -> Result<bool, StratumError> {
+        self.buf.reserve(4_096);
+        let read = reader
+            .read_buf(&mut self.buf)
+            .await
+            .map_err(StratumError::Io)?;
+        if read > 0 {
+            return Ok(true);
+        }
+        if self.buf.is_empty() {
+            return Ok(false);
+        }
+        Err(StratumError::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "connection closed mid-frame",
+        )))
+    }
 }
 
 pub async fn read_frame_async<R: AsyncRead + Unpin>(
@@ -3675,6 +3789,64 @@ mod tests {
             .expect("read large frame")
             .expect("some large frame");
         assert_eq!(decoded_large, large_message);
+    }
+
+    /// ST8: frames arriving slower than the caller's read timeout are still
+    /// delivered intact (plain and noise-encrypted).
+    #[test]
+    fn stream_reader_survives_timeouts_mid_frame() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+        rt.block_on(async {
+            let messages = vec![Sv2Message::KeepAlive, Sv2Message::KeepAlive];
+            let mut wire = Vec::new();
+            for message in &messages {
+                write_frame(&mut wire, message).expect("encode");
+            }
+            let (mut client, mut server) = build_noise_transport_pair_for_tests();
+            let mut secure_wire = Vec::new();
+            client
+                .write_message(&mut secure_wire, &Sv2Message::KeepAlive)
+                .expect("encrypt");
+
+            for (bytes, secure) in [(wire, false), (secure_wire, true)] {
+                let (mut tx, mut rx) = tokio::io::duplex(bytes.len() + 8);
+                let writer = tokio::spawn(async move {
+                    for chunk in bytes.chunks(2) {
+                        tx.write_all(chunk).await.expect("write");
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                });
+                let mut reader = super::Sv2StreamReader::new();
+                let mut got = Vec::new();
+                let mut timeouts = 0u32;
+                let want = if secure { 1 } else { 2 };
+                while got.len() < want {
+                    let next = tokio::time::timeout(std::time::Duration::from_millis(3), async {
+                        if secure {
+                            match reader.read_secure_frame_async(&mut rx).await? {
+                                Some(ct) => server.decrypt_frame(&ct).map(Some),
+                                None => Ok(None),
+                            }
+                        } else {
+                            reader.read_plain_frame_async(&mut rx).await
+                        }
+                    })
+                    .await;
+                    match next {
+                        Ok(Ok(Some(message))) => got.push(message),
+                        Ok(Ok(None)) => panic!("unexpected eof"),
+                        Ok(Err(err)) => panic!("stream desynced: {err}"),
+                        Err(_) => timeouts += 1,
+                    }
+                }
+                writer.await.expect("writer");
+                assert!(timeouts > 0);
+                assert!(got.iter().all(|m| matches!(m, Sv2Message::KeepAlive)));
+            }
+        });
     }
 
     #[test]

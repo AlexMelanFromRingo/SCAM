@@ -67,8 +67,7 @@ use scam_stratum::{
     IdentityTranslator, JobDeclarator, MiningJob, MiningTemplate, NoiseSv2Transport,
     SUPPORTED_SV2_VERSION, SecureSv2Transport, SecureTransportMode, SequentialJobDeclarator,
     SessionConfig as Sv2SessionConfig, SessionEvent, Sv2Message, Sv2Session, Translator,
-    generate_noise_static_keypair, read_frame as read_sv2_frame,
-    read_frame_async as read_sv2_frame_async, write_frame as write_sv2_frame,
+    generate_noise_static_keypair, read_frame as read_sv2_frame, write_frame as write_sv2_frame,
     write_frame_async as write_sv2_frame_async,
 };
 use scam_wallet::{
@@ -544,8 +543,14 @@ struct RelayServeArgs {
     peers_dir: PathBuf,
     #[arg(long, default_value = "0.0.0.0:18444")]
     bind: String,
+    /// Exit after serving this many inbound connections (0 = run forever).
+    /// Meant for tests and one-shot tooling; to cap concurrency use
+    /// `--max-active-sessions`.
     #[arg(long, default_value_t = 0)]
     max_clients: u32,
+    /// Concurrent peer sessions (default 512, or `--max-clients` if set).
+    #[arg(long)]
+    max_active_sessions: Option<usize>,
     #[arg(long, default_value_t = 0)]
     max_messages_per_peer: u32,
     #[arg(long, default_value_t = 5)]
@@ -2431,6 +2436,7 @@ fn run_mode(args: RunModeArgs) -> Result<(), NodeError> {
             peers_dir: args.peers_dir.clone(),
             bind: args.relay_bind.clone(),
             max_clients: 0,
+            max_active_sessions: None,
             max_messages_per_peer: 0,
             read_timeout_sec: 5,
             write_timeout_sec: 5,
@@ -9790,7 +9796,7 @@ fn run_relay_outbound_supervisor(
         let effective_max_outbound_peers = relay_outbound_effective_max_peers_with_headroom(
             effective_max_outbound_peers,
             active_now,
-            relay_max_active_sessions(0),
+            relay_max_active_sessions(0, None),
         );
         match load_relay_outbound_targets_selected(
             &peers_dir,
@@ -10864,7 +10870,7 @@ async fn run_relay_outbound_supervisor_async(
         let effective_max_outbound_peers = relay_outbound_effective_max_peers_with_headroom(
             effective_max_outbound_peers,
             active_now,
-            relay_max_active_sessions(0),
+            relay_max_active_sessions(0, None),
         );
 
         let selected_targets = match load_relay_outbound_targets_selected(
@@ -11042,7 +11048,10 @@ fn relay_runtime_or_mempool_changed(
     (tip_after != tip_before, mempool_after != mempool_before)
 }
 
-fn relay_max_active_sessions(max_clients: u32) -> usize {
+fn relay_max_active_sessions(max_clients: u32, max_active_sessions: Option<usize>) -> usize {
+    if let Some(limit) = max_active_sessions {
+        return limit.max(1);
+    }
     if max_clients > 0 {
         max_clients as usize
     } else {
@@ -11921,7 +11930,7 @@ fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
     let max_clients = args.max_clients;
     let read_limit = args.max_messages_per_peer;
     let peer_reputation_store_for_runtime = peer_reputation_store.clone();
-    let max_active_sessions = relay_max_active_sessions(max_clients);
+    let max_active_sessions = relay_max_active_sessions(max_clients, args.max_active_sessions);
     let inbound_accept_window_sec = relay_inbound_accept_window_sec();
     let inbound_accept_base_max_per_ip =
         relay_inbound_accept_base_max_per_ip(max_active_sessions.max(1));
@@ -13206,20 +13215,29 @@ fn read_sv2_message(
     map_sv2_read_result(read_result)
 }
 
+/// Cancel-safe: bytes received before `read_timeout` fires stay in
+/// `frame_reader`, and a frame is decrypted only once it is complete.
 async fn read_sv2_message_async<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
+    frame_reader: &mut scam_stratum::Sv2StreamReader,
     secure: Option<&mut StratumSecureTransport>,
     read_timeout: Duration,
 ) -> Result<StratumReadOutcome, NodeError> {
     let read_result = timeout(read_timeout, async {
         match secure {
             Some(StratumSecureTransport::Legacy(transport)) => {
-                transport.read_message_async(stream).await
+                match frame_reader.read_secure_frame_async(stream).await? {
+                    Some(ciphertext) => transport.decrypt_frame(&ciphertext).map(Some),
+                    None => Ok(None),
+                }
             }
             Some(StratumSecureTransport::Noise(transport)) => {
-                transport.read_message_async(stream).await
+                match frame_reader.read_secure_frame_async(stream).await? {
+                    Some(ciphertext) => transport.decrypt_frame(&ciphertext).map(Some),
+                    None => Ok(None),
+                }
             }
-            None => read_sv2_frame_async(stream).await,
+            None => frame_reader.read_plain_frame_async(stream).await,
         }
     })
     .await;
@@ -13756,9 +13774,17 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
     };
     let mut worker_label = "default".to_owned();
     let mut last_stale_guard_log_unix_sec = 0u64;
+    let mut frame_reader = scam_stratum::Sv2StreamReader::new();
 
     loop {
-        match read_sv2_message_async(&mut stream, secure_transport.as_mut(), read_timeout).await? {
+        match read_sv2_message_async(
+            &mut stream,
+            &mut frame_reader,
+            secure_transport.as_mut(),
+            read_timeout,
+        )
+        .await?
+        {
             StratumReadOutcome::Closed => break,
             StratumReadOutcome::Timeout => {
                 if session.is_active() {
@@ -23003,9 +23029,14 @@ mod tests {
     #[test]
     fn helper_guards_for_limits_and_rates_are_consistent() {
         assert_eq!(super::RELAY_OUTBOUND_ROTATE_AFTER_SEC, 21_600);
-        assert_eq!(super::relay_max_active_sessions(0), 512);
-        assert_eq!(super::relay_max_active_sessions(1), 1);
-        assert_eq!(super::relay_max_active_sessions(7), 7);
+        assert_eq!(super::relay_max_active_sessions(0, None), 512);
+        assert_eq!(super::relay_max_active_sessions(1, None), 1);
+        assert_eq!(super::relay_max_active_sessions(7, None), 7);
+        // P11: an explicit concurrency cap wins and does not imply "exit
+        // after N connections".
+        assert_eq!(super::relay_max_active_sessions(0, Some(64)), 64);
+        assert_eq!(super::relay_max_active_sessions(3, Some(64)), 64);
+        assert_eq!(super::relay_max_active_sessions(0, Some(0)), 1);
         const ASYNC_READ_POLL_KEY: &str = "SCAM_RELAY_ASYNC_READ_POLL_MS";
         let saved_async_poll = std::env::var(ASYNC_READ_POLL_KEY).ok();
         unsafe {
@@ -28323,6 +28354,7 @@ mod tests {
             runtime_db: None,
             bind: "not-an-addr".to_owned(),
             max_clients: 1,
+            max_active_sessions: None,
             max_messages_per_peer: 1,
             read_timeout_sec: 1,
             write_timeout_sec: 1,
@@ -28423,6 +28455,7 @@ mod tests {
                 runtime_db: Some(runtime_db),
                 bind: server_bind,
                 max_clients: 1,
+                max_active_sessions: None,
                 max_messages_per_peer: 1,
                 read_timeout_sec: 1,
                 write_timeout_sec: 1,
@@ -28484,6 +28517,7 @@ mod tests {
                 runtime_db: Some(runtime_db),
                 bind: server_bind,
                 max_clients: 1,
+                max_active_sessions: None,
                 max_messages_per_peer: 1,
                 read_timeout_sec: 1,
                 write_timeout_sec: 1,
@@ -28545,6 +28579,7 @@ mod tests {
                 runtime_db: Some(runtime_db),
                 bind: server_bind,
                 max_clients: 1,
+                max_active_sessions: None,
                 max_messages_per_peer: 1,
                 read_timeout_sec: 2,
                 write_timeout_sec: 2,
@@ -28636,6 +28671,7 @@ mod tests {
                 runtime_db: Some(runtime_db),
                 bind: server_bind,
                 max_clients: 1,
+                max_active_sessions: None,
                 max_messages_per_peer: 0,
                 read_timeout_sec: 1,
                 write_timeout_sec: 1,
@@ -28704,6 +28740,7 @@ mod tests {
                 runtime_db: Some(runtime_db),
                 bind: server_bind,
                 max_clients: client_count,
+                max_active_sessions: None,
                 max_messages_per_peer: 8,
                 read_timeout_sec: 2,
                 write_timeout_sec: 2,
@@ -28822,6 +28859,7 @@ mod tests {
                     runtime_db: Some(runtime_db),
                     bind,
                     max_clients,
+                    max_active_sessions: None,
                     max_messages_per_peer: 0,
                     read_timeout_sec: 1,
                     write_timeout_sec: 1,
@@ -41246,6 +41284,7 @@ mod tests {
                     runtime_db: Some(runtime_db_b),
                     bind: bind_b,
                     max_clients: 16,
+                    max_active_sessions: None,
                     max_messages_per_peer: 0,
                     read_timeout_sec: 1,
                     write_timeout_sec: 1,
@@ -41295,6 +41334,7 @@ mod tests {
                     runtime_db: Some(runtime_db_a),
                     bind: bind_a,
                     max_clients: 1,
+                    max_active_sessions: None,
                     max_messages_per_peer: 0,
                     read_timeout_sec: 1,
                     write_timeout_sec: 1,

@@ -34,7 +34,7 @@ Baseline at start: `fmt`/`clippy -D warnings`/`cargo test --workspace
 | C17 | low | BIP113 not applied: absolute `lock_time` compared to header time, not MTP. | `consensus/src/utxo.rs` | fixed (lock_time vs MTP) |
 | C18 | low | BIP34 (height in coinbase) not a consensus rule; C1 covers safety. | consensus | deferred (C1 already prevents overwrites; BIP34 would only add txid uniqueness for spent coinbases at the cost of rewriting most block fixtures) |
 | C20 | low | CSV deviates from BIP68 by one: height locks need `spend > created + value` (BIP68: `>=`), time locks compare with the creating block's own header time (BIP68: MTP of its parent). Deterministic, not exploitable; docs claim "verbatim BIP68". | `consensus/src/csv.rs` | fixed (exact BIP68: `>=`, coin time = creation MTP) |
-| C19 | info | `config/mainnet.toml` has halvings disabled ⇒ constant 50/block forever. Policy decision for the owner. | config | deferred (owner decision) |
+| C19 | info | `config/mainnet.toml` has halvings disabled ⇒ constant 50/block forever. Policy decision for the owner. | config | decided: intentional (owner, 2026-10-28) |
 
 ## Mempool / block templates
 
@@ -65,7 +65,7 @@ Baseline at start: `fmt`/`clippy -D warnings`/`cargo test --workspace
 | P8 | medium | Per-peer `known_inventory` unbounded. | `gossip.rs` | fixed (50k per peer, oldest evicted) |
 | P9 | medium | O(chain)/O(mempool) work under the global mutex per message (GetHeaders clones all headers, mempool sorted per 250 ms poll). | `main.rs` | fixed (header/hash selection via runtime indexes; per-session mempool rescan only when its revision changes) |
 | P10 | medium | Peer tip height trusted from Version/Inv/unchecked headers ⇒ forced outbound churn ("lag mode"). | `main.rs` | open |
-| P11 | medium | `--max-clients N` is a lifetime connection limit; relay exits after N connections. | `main.rs` accept loop | open |
+| P11 | medium | `--max-clients N` is a lifetime connection limit; relay exits after N connections. | `main.rs` accept loop | fixed (`relay-serve --max-active-sessions` caps concurrency; `--max-clients` documented as the test-only "exit after N") |
 | P12 | medium | Compact short ids unsalted (8-byte txid prefix); no fallback to full block; BlockTxn accepted from any peer. | `main.rs` | fixed (SipHash-2-4 keyed by block hash; merkle mismatch → GetData full block, no penalty; BlockTxn only from the asked peer) |
 | P13 | low | Unpruned maps: `banned_peers`, `inbound_accept_history`, `peer_tip_by_address`. | `main.rs`, `gossip.rs` | partially fixed (`inbound_accept_history` pruned; `banned_ips` expire) |
 
@@ -93,7 +93,7 @@ Baseline at start: `fmt`/`clippy -D warnings`/`cargo test --workspace
 | ST5 | high | PPLNS earnings recomputed from capped history but compared with lifetime paid ⇒ workers stop being paid. | `main.rs` payout | fixed (split frozen per round at close; evicted rounds folded into `pplns_settled_atomic`; ledger schema v2) |
 | ST6 | medium | Shares for old-tip jobs still credited; tip only rechecked on read timeout. | `stratum/src/lib.rs`, `main.rs` | fixed (share credited only if its job builds on the current — refreshed — tip) |
 | ST7 | medium | Whole pool ledger DB rewritten per share. | `storage`, `main.rs` | mitigated (share bookkeeping flushed at most once per second, on session ticks and at session end; round closes/payouts persist immediately) — incremental ledger writes still open |
-| ST8 | low | Stratum async read timeout not cancel-safe. | `main.rs` | open |
+| ST8 | low | Stratum async read timeout not cancel-safe. | `main.rs` | fixed (`Sv2StreamReader`: buffered plain/secure frames, decrypt only complete frames) |
 | ST9 | low | `stratum_secure_transport=false` on mainnet ⇒ payout address in plaintext. | `config/mainnet.toml` | open |
 
 ## RPC / wallet / web
