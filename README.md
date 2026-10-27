@@ -502,16 +502,17 @@ cargo run -p scam-node -- wallet balance-address \
   --address <address>
 ```
 
-Send:
+Send (`--fee` is optional; without it the minimum relay fee for the
+transaction size is paid). Secrets can be passed via `SCAM_WALLET_MNEMONIC`,
+`SCAM_WALLET_PASSPHRASE` and `SCAM_WALLET_PASSWORD` instead of arguments, which
+are visible to other users in `ps`:
 
 ```bash
-cargo run -p scam-node -- wallet send \
+SCAM_WALLET_MNEMONIC="<words>" cargo run -p scam-node -- wallet send \
   --network devnet \
   --config config/devnet.toml \
-  --mnemonic "<words>" \
   --to <address> \
-  --amount 1000 \
-  --fee 1
+  --amount 1000
 ```
 
 ### 7.2 Encrypted wallet vault (recommended)

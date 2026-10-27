@@ -1209,8 +1209,9 @@ enum WalletCommand {
         to: String,
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
         amount: u64,
-        #[arg(long, default_value_t = 1)]
-        fee: u64,
+        /// Fee in atomic units; omitted = minimum relay fee for the size.
+        #[arg(long)]
+        fee: Option<u64>,
         #[arg(long, default_value_t = 0)]
         mine_blocks: u32,
         #[arg(long, default_value_t = 120)]
@@ -4128,13 +4129,14 @@ fn run_wallet_with_seed_mode(
             let seed = wallet_seed_from_mnemonic(&mnemonic, &passphrase, seed_mode)?;
             let (account, index) = resolve_wallet_account_index(path.as_deref(), account, index)?;
             let key = derive_wallet_key(&seed, account, index)?;
-            let signed = build_signed_transfer_tx(
+            let signed = build_signed_transfer_tx_auto_fee(
                 &runtime,
                 &cfg.network_id,
                 &key,
                 recipient.key_hash20,
                 amount,
                 fee,
+                &HashSet::new(),
             )?;
 
             println!("Transaction created and signed:");
@@ -4149,7 +4151,7 @@ fn run_wallet_with_seed_mode(
             println!("Input total: {}", signed.input_total);
             println!("To key-hash20: {}", hex::encode(recipient.key_hash20));
             println!("Amount: {}", amount);
-            println!("Fee: {}", fee);
+            println!("Fee: {}", signed.fee());
             println!("Change: {}", signed.change_value);
             println!("Self-transfer: {}", signed.is_self_transfer);
             println!("RawTx (hex): {}", hex::encode(signed.tx.encode_for_hash()));
@@ -4683,6 +4685,61 @@ fn build_signed_transfer_tx(
         fee,
         &HashSet::new(),
     )
+}
+
+/// Build a transfer with `fee`, or — when `fee` is `None` — with the
+/// minimum relay fee for the transaction's actual size (the old fixed
+/// default of 1 was below min relay, so default sends always failed).
+fn build_signed_transfer_tx_auto_fee(
+    runtime: &ChainRuntime,
+    network_id: &str,
+    sender_key: &WalletKey,
+    recipient_key_hash20: [u8; 20],
+    amount: u64,
+    fee: Option<u64>,
+    excluded_outpoints: &HashSet<OutPoint>,
+) -> Result<SignedTransferTx, NodeError> {
+    let build = |fee| {
+        build_signed_transfer_tx_with_exclusions(
+            runtime,
+            network_id,
+            sender_key,
+            recipient_key_hash20,
+            amount,
+            fee,
+            excluded_outpoints,
+        )
+    };
+    if let Some(fee) = fee {
+        return build(fee);
+    }
+    let rate = runtime.config().min_relay_fee_per_kb;
+    let mut fee = 0u64;
+    // Size grows with the inputs a higher fee needs; converges in a few steps.
+    for _ in 0..8 {
+        let signed = build(fee)?;
+        let size = signed.tx.encode_for_hash().len() as u64;
+        let required = size.saturating_mul(rate).div_ceil(1_000);
+        if fee >= required {
+            return Ok(signed);
+        }
+        fee = required;
+    }
+    Err(NodeError::Runtime(
+        "could not settle on a relay fee for this transfer".to_owned(),
+    ))
+}
+
+impl SignedTransferTx {
+    fn fee(&self) -> u64 {
+        let outputs = self
+            .tx
+            .outputs
+            .iter()
+            .map(|out| out.value)
+            .fold(0u64, u64::saturating_add);
+        self.input_total.saturating_sub(outputs)
+    }
 }
 
 fn build_signed_transfer_tx_with_exclusions(
@@ -17254,7 +17311,8 @@ struct HttpRequest {
     body: Vec<u8>,
 }
 
-#[derive(Debug, Deserialize)]
+// No `Debug`: the request carries wallet secrets that must not reach logs.
+#[derive(Deserialize)]
 #[serde(default)]
 struct WalletNewRpcRequest {
     words: usize,
@@ -17278,7 +17336,8 @@ impl Default for WalletNewRpcRequest {
     }
 }
 
-#[derive(Debug, Deserialize, Default)]
+// No `Debug`: the request carries wallet secrets that must not reach logs.
+#[derive(Deserialize, Default)]
 #[serde(default)]
 struct WalletAddressRpcRequest {
     mnemonic: String,
@@ -17295,7 +17354,8 @@ struct WalletDecodeRpcRequest {
     address: String,
 }
 
-#[derive(Debug, Deserialize, Default)]
+// No `Debug`: the request carries wallet secrets that must not reach logs.
+#[derive(Deserialize, Default)]
 #[serde(default)]
 struct WalletBalanceRpcRequest {
     mnemonic: String,
@@ -17328,7 +17388,8 @@ impl Default for WalletBalanceHistoryByAddressRpcRequest {
     }
 }
 
-#[derive(Debug, Deserialize)]
+// No `Debug`: the request carries wallet secrets that must not reach logs.
+#[derive(Deserialize, Default)]
 #[serde(default)]
 struct WalletSendPreviewRpcRequest {
     mnemonic: String,
@@ -17339,23 +17400,9 @@ struct WalletSendPreviewRpcRequest {
     index: u32,
     to: String,
     amount: u64,
-    fee: u64,
-}
-
-impl Default for WalletSendPreviewRpcRequest {
-    fn default() -> Self {
-        Self {
-            mnemonic: String::new(),
-            passphrase: String::new(),
-            seed_mode: None,
-            path: None,
-            account: 0,
-            index: 0,
-            to: String::new(),
-            amount: 0,
-            fee: 1,
-        }
-    }
+    /// Absolute fee in atomic units; omitted = minimum relay fee for the
+    /// transaction size.
+    fee: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -19125,7 +19172,7 @@ fn axum_wallet_send_preview_payload(
         derive_wallet_key_from_request(&seed, req.path.as_deref(), req.account, req.index)?;
     let reserved_outpoints = load_wallet_reserved_outpoints(&state.cfg, &state.mempool_db_path)?;
     let signed = axum_runtime_for_query(state, |runtime| {
-        build_signed_transfer_tx_with_exclusions(
+        build_signed_transfer_tx_auto_fee(
             runtime,
             &state.cfg.network_id,
             &key,
@@ -19145,7 +19192,7 @@ fn axum_wallet_send_preview_payload(
         raw_tx_hex: hex::encode(signed.tx.encode_for_hash()),
         tx_bincode_hex,
         amount: req.amount,
-        fee: req.fee,
+        fee: signed.fee(),
         input_total: signed.input_total,
         change: signed.change_value,
         is_self_transfer: signed.is_self_transfer,
@@ -21111,7 +21158,7 @@ fn run_rpc_serve_inner_legacy(
                     continue;
                 }
             };
-            let signed = match build_signed_transfer_tx_with_exclusions(
+            let signed = match build_signed_transfer_tx_auto_fee(
                 &runtime,
                 &cfg.network_id,
                 &key,
@@ -21136,7 +21183,7 @@ fn run_rpc_serve_inner_legacy(
                         .map_err(|e| NodeError::Runtime(format!("tx encode failed: {e}")))?,
                 ),
                 amount: req.amount,
-                fee: req.fee,
+                fee: signed.fee(),
                 input_total: signed.input_total,
                 change: signed.change_value,
                 is_self_transfer: signed.is_self_transfer,
@@ -21229,7 +21276,7 @@ fn run_rpc_serve_inner_legacy(
                     continue;
                 }
             };
-            let signed = match build_signed_transfer_tx_with_exclusions(
+            let signed = match build_signed_transfer_tx_auto_fee(
                 &runtime,
                 &cfg.network_id,
                 &key,
@@ -21251,7 +21298,7 @@ fn run_rpc_serve_inner_legacy(
                     &runtime,
                     &mempool_db_path,
                     signed.tx.clone(),
-                    req.fee,
+                    0,
                     rpc_db_retry_attempts(),
                     rpc_db_retry_backoff_ms(),
                 ) {
@@ -32610,7 +32657,7 @@ mod tests {
             index: 0,
             to: mainnet_address,
             amount: 1,
-            fee: 1,
+            fee: Some(1),
             mine_blocks: 0,
             interval_sec: 120,
             max_nonce: 500_000,
@@ -39794,6 +39841,58 @@ mod tests {
             ip,
             1_000 + super::RELAY_IP_BAN_SEC
         ));
+    }
+
+    /// M10: without an explicit fee the wallet pays exactly the minimum
+    /// relay fee for the transaction's size, and the mempool accepts it.
+    #[test]
+    fn wallet_auto_fee_meets_min_relay_fee() {
+        let (cfg, mut runtime, key, _outpoint) = relay_funded_runtime();
+        assert!(cfg.min_relay_fee_per_kb > 0);
+        // The wallet only spends coinbase outputs that are mature at the tip.
+        mine_blocks_on_runtime(
+            &mut runtime,
+            &super::MiningLoopParams {
+                count: 1,
+                interval_sec: cfg.target_block_time_sec,
+                max_nonce: 500_000,
+                miner_key_hash: scam_core::hash160_blake3(&key.pubkey_compressed()),
+                label_prefix: "auto-fee",
+                print_each: false,
+            },
+        )
+        .expect("mine");
+        let signed = super::build_signed_transfer_tx_auto_fee(
+            &runtime,
+            &cfg.network_id,
+            &key,
+            [9u8; 20],
+            1_000_000,
+            None,
+            &HashSet::new(),
+        )
+        .expect("auto fee transfer");
+        let size = signed.tx.encode_for_hash().len() as u64;
+        assert_eq!(
+            signed.fee(),
+            (size * cfg.min_relay_fee_per_kb).div_ceil(1_000)
+        );
+        let mut mempool = build_mempool_from_cfg(&cfg).expect("mempool");
+        mempool
+            .insert_with_fee(signed.tx.clone(), signed.fee())
+            .expect("min relay fee accepted");
+
+        let explicit = super::build_signed_transfer_tx_auto_fee(
+            &runtime,
+            &cfg.network_id,
+            &key,
+            [9u8; 20],
+            1_000_000,
+            Some(12_345),
+            &HashSet::new(),
+        )
+        .expect("explicit fee transfer");
+        assert_eq!(explicit.fee(), 12_345);
     }
 
     /// M1: a peer tx with a forged signature must not enter the mempool.

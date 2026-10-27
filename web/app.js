@@ -1204,10 +1204,13 @@ function initWalletActions() {
       seed_mode: raw.seed_mode || "bip39",
       to: raw.to,
       amount: parseNumber(raw.amount, 0),
-      fee: parseNumber(raw.fee, 1),
       account: parseNumber(raw.account, 0),
       index: parseNumber(raw.index, 0),
     };
+    // Empty fee = let the node pick the minimum relay fee for the tx size.
+    if (String(raw.fee ?? "").trim() !== "") {
+      payload.fee = parseNumber(raw.fee, 0);
+    }
     try {
       const data = await request("/wallet/send", { method: "POST", body: payload });
       setWalletResult(data);

@@ -49,7 +49,7 @@ Baseline at start: `fmt`/`clippy -D warnings`/`cargo test --workspace
 | M7 | high | Orphan pool: no per-tx byte cap (8 MiB × 5000), `insertion_order` never trimmed. | `mempool/src/lib.rs::OrphanPool` | fixed (16 MiB total cap, queue compaction; node checks max_tx_size before orphaning) |
 | M8 | medium | Eviction/replacement can remove a parent while keeping (or admitting) its child. | `mempool/src/lib.rs` | fixed |
 | M9 | medium | Replacement only needs +1 fee unit; per-peer replacement limit applied after insertion. | `mempool/src/lib.rs`, `main.rs` | partially fixed (BIP125 rule 4 incremental fee); rate-limit ordering open |
-| M10 | low | Wallet default fee 1 < min relay; fee not size-based; amounts in atomic units unlabeled. | wallet/RPC/web | open |
+| M10 | low | Wallet default fee 1 < min relay; fee not size-based; amounts in atomic units unlabeled. | wallet/RPC/web | fixed (fee optional in RPC/CLI/UI; omitted = minimum relay fee for the actual size; `/tx/submit` default fee 0 = actual) |
 
 ## P2P / relay
 
@@ -131,7 +131,10 @@ but **existing devnet/testnet chains and nodes must be upgraded together**:
 - Peers that send data invalid in every context (bad signature, wrong target,
   malformed frames) are banned by IP for 24 h.
 - `/tx/submit` stores the transaction's real fee; a `fee` field that differs
-  from it is rejected (send `0` or the exact fee).
+  from it is rejected (omit it, send `0`, or send the exact fee).
+- Wallet `fee` (RPC `/wallet/send|send-preview`, CLI `wallet send --fee`, web
+  console) is optional; when omitted the node pays the minimum relay fee for
+  the transaction's actual size.
 - RPC: see the security model in `README.md` (JSON-only POST, loopback
   Origin, bearer token for non-loopback binds, `--disable-wallet-rpc`).
 - `wallet secure-new|secure-restore` no longer overwrite an existing vault

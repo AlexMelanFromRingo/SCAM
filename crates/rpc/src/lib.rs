@@ -35,20 +35,13 @@ pub struct TxResponse {
     pub output_count: usize,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct TxSubmitRpcRequest {
     pub tx_hex: String,
+    /// 0 (the default) = store the transaction's actual fee; any other value
+    /// must equal it (the node never trusts a claimed fee).
     pub fee: u64,
-}
-
-impl Default for TxSubmitRpcRequest {
-    fn default() -> Self {
-        Self {
-            tx_hex: String::new(),
-            fee: 1,
-        }
-    }
 }
 
 pub fn decode_tx_submit_request(

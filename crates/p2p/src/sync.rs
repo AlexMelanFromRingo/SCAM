@@ -112,10 +112,7 @@ pub fn select_headers_with_lookup(
     max_headers: usize,
 ) -> Vec<BlockHeader> {
     let max_headers = max_headers.min(MAX_HEADERS_PER_MESSAGE);
-    let fork_height = locator
-        .iter()
-        .find_map(&main_chain_height)
-        .unwrap_or(0);
+    let fork_height = locator.iter().find_map(&main_chain_height).unwrap_or(0);
     let mut out = Vec::new();
     for hash in main_chain.iter().skip(fork_height.saturating_add(1)) {
         if out.len() >= max_headers || Some(*hash) == stop {
@@ -138,10 +135,7 @@ pub fn select_block_hashes_with_lookup(
     max_hashes: usize,
 ) -> Vec<Hash256> {
     let max_hashes = max_hashes.min(MAX_BLOCK_HASHES_PER_MESSAGE);
-    let fork_height = locator
-        .iter()
-        .find_map(&main_chain_height)
-        .unwrap_or(0);
+    let fork_height = locator.iter().find_map(&main_chain_height).unwrap_or(0);
     main_chain
         .iter()
         .skip(fork_height.saturating_add(1))

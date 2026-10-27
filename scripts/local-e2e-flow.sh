@@ -21,6 +21,8 @@ set -euo pipefail
 #   POLL_INTERVAL_SEC=1
 #   KEEP_RUNNING=false
 #   BUILD=true
+#   FRESH=true   (wipe CLUSTER_DIR first; stale data from older builds may
+#                 use an unsupported on-disk schema)
 #   SCAM_NODE_BIN=target/release/scam-node
 
 CLUSTER_DIR="${CLUSTER_DIR:-target/local-e2e-flow}"
@@ -32,6 +34,7 @@ WAIT_TIMEOUT_SEC="${WAIT_TIMEOUT_SEC:-120}"
 POLL_INTERVAL_SEC="${POLL_INTERVAL_SEC:-1}"
 KEEP_RUNNING="${KEEP_RUNNING:-false}"
 BUILD="${BUILD:-true}"
+FRESH="${FRESH:-true}"
 SCAM_NODE_BIN="${SCAM_NODE_BIN:-}"
 
 is_true() {
@@ -48,6 +51,16 @@ cleanup() {
 }
 trap cleanup EXIT
 
+if is_true "${FRESH}"; then
+  case "${CLUSTER_DIR}" in
+    ""|"/"|"."|"..")
+      echo "[e2e] refusing to wipe CLUSTER_DIR='${CLUSTER_DIR}'" >&2
+      exit 2
+      ;;
+  esac
+  CLUSTER_DIR="${CLUSTER_DIR}" ./scripts/local-test-lab.sh down >/dev/null 2>&1 || true
+  rm -rf -- "${CLUSTER_DIR}"
+fi
 mkdir -p "${CLUSTER_DIR}"
 
 if [[ ! -f "${CONFIG_TEMPLATE}" ]]; then
