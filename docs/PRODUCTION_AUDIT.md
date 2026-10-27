@@ -32,7 +32,7 @@ Baseline at start: `fmt`/`clippy -D warnings`/`cargo test --workspace
 | C15 | high | Stratum template and other node paths use `cfg.block_subsidy` instead of `subsidy_at_height(h)` ⇒ after the first halving every pool block is invalid. | `main.rs` (~20 non-test sites) | fixed (local miner, stratum template, TP request, round reward) |
 | C16 | medium | P2P consensus fingerprint omits `halving_interval_blocks`, `tail_emission`, versionbits params ⇒ peers with different monetary policy handshake and fork later. | `main.rs::consensus_fingerprint` | fixed (fingerprint v2) |
 | C17 | low | BIP113 not applied: absolute `lock_time` compared to header time, not MTP. | `consensus/src/utxo.rs` | fixed (lock_time vs MTP) |
-| C18 | low | BIP34 (height in coinbase) not a consensus rule; C1 covers safety. | consensus | deferred (C1 already prevents overwrites; BIP34 would only add txid uniqueness for spent coinbases at the cost of rewriting most block fixtures) |
+| C18 | low | BIP34 (height in coinbase) not a consensus rule; C1 covers safety. | consensus | fixed (consensus: from height 1 the coinbase script starts with the height as 8 LE bytes — `CoinbaseHeightMismatch`; genesis exempt so its hash is unchanged; every coinbase builder — local miner, stratum template, SV2 template provider, chaos tools — commits to the height) |
 | C20 | low | CSV deviates from BIP68 by one: height locks need `spend > created + value` (BIP68: `>=`), time locks compare with the creating block's own header time (BIP68: MTP of its parent). Deterministic, not exploitable; docs claim "verbatim BIP68". | `consensus/src/csv.rs` | fixed (exact BIP68: `>=`, coin time = creation MTP) |
 | C21 | high | The reorg depth cap introduced for C12 (`MAX_REORG_DEPTH`=720, ~1 day at 2-min blocks) is hard-coded; a node or network part partitioned longer stays on its branch forever, silently (no log/status signal that a heavier branch was refused); no documented resync procedure. Threshold value is the owner's decision before mainnet. | `chain/src/lib.rs`, `main.rs`, `OPERATOR_RUNBOOK.md` | open — owner decision (2026-10-28): the heaviest valid chain always wins; deeper than the in-memory undo window the node rebuilds its state along the heavier branch once its headers prove more cumulative work; signal in logs and `/status`; runbook section |
 | C19 | info | `config/mainnet.toml` has halvings disabled ⇒ constant 50/block forever. Policy decision for the owner. | config | decided: intentional (owner, 2026-10-28) |
@@ -113,6 +113,12 @@ Baseline at start: `fmt`/`clippy -D warnings`/`cargo test --workspace
 | R12 | low | QR payment URI label not percent-encoded ⇒ parameter injection. | `wallet/src/qr.rs` | fixed |
 | R13 | low | No zeroization of secrets; `json_error_body` does not escape control chars. | wallet, `main.rs` | fixed (JSON via serde; keys, mnemonics, passphrases, vault key and plaintext wiped on drop) |
 
+## Tooling / CI
+
+| ID | Sev | Finding | Where | Status |
+|---|---|---|---|---|
+| T1 | high | SV2 conformance gate could never fail on local stacks: `rc=$?` in the `else` branch read the preceding assignment's status (always 0); per-stack reports from earlier runs were counted as this run's results; the shared `data/` runtime DB let leftover state decide the outcome. | `scripts/sv2-conformance-matrix.sh` (CI) | fixed (`\|\| rc=$?`, stale reports deleted, private fresh `DATA_DIR` per run) |
+
 ## Behaviour changes operators must know
 
 These fixes change consensus or operational behaviour. SCAM has no live
@@ -151,6 +157,10 @@ but **existing devnet/testnet chains and nodes must be upgraded together**:
 - Every store carries `schema_version`. Pool ledgers written before the
   current format (v3) are refused — move the file aside to start a fresh
   ledger.
+- Consensus: from height 1 a coinbase's script must start with the block
+  height (8 bytes little-endian). Miners and pool software building their own
+  coinbase must prepend it (`scam_core::coinbase_script`); genesis is
+  unchanged.
 - Pool: PPLNS round credits become payable only after the round's block has
   `coinbase_maturity` confirmations; payouts spend only coins at least that
   deep and are final (worker `paid_total`, next payout allowed) after the

@@ -895,12 +895,12 @@ mod tests {
     };
     use crate::{BlockSubmissionOutcome, ChainError, ChainRuntime};
 
-    fn coinbase(value: u64, key_hash20: [u8; 20], tag: &[u8]) -> Transaction {
+    fn coinbase(height: u64, value: u64, key_hash20: [u8; 20], tag: &[u8]) -> Transaction {
         Transaction {
             version: 1,
             inputs: vec![TxIn {
                 prev_out: OutPoint::coinbase(),
-                signature: tag.to_vec(),
+                signature: scam_core::coinbase_script(height, tag),
                 pubkey_compressed: vec![],
                 sequence: u32::MAX,
             }],
@@ -924,6 +924,7 @@ mod tests {
     ) -> scam_core::Block {
         let config = runtime.config().clone();
         let mut txs = vec![coinbase(
+            runtime.height_of(&parent).expect("parent height") + 1,
             config.block_subsidy,
             config.genesis_reward_key_hash20().expect("key"),
             tag.as_bytes(),
@@ -1007,6 +1008,7 @@ mod tests {
             timestamp: genesis_ts + 3,
             target: scam_core::Target::MAX,
             transactions: vec![coinbase(
+                2,
                 config.block_subsidy,
                 config.genesis_reward_key_hash20().expect("key"),
                 b"cheap-side",
@@ -1034,7 +1036,12 @@ mod tests {
         let mut runtime = ChainRuntime::from_config(config.clone()).expect("runtime");
         let ts = runtime.tip_header().timestamp;
 
-        let cb1 = coinbase(config.block_subsidy, key_hash, b"b1-pay-me");
+        let cb1 = coinbase(
+            runtime.tip_height() + 1,
+            config.block_subsidy,
+            key_hash,
+            b"b1-pay-me",
+        );
         assert!(cb1.is_coinbase());
         let template = BlockTemplate {
             version: 1,
@@ -1128,6 +1135,7 @@ mod tests {
             timestamp: ts + 62,
             target: runtime.expected_target_for_child_of(f1_hash).expect("t"),
             transactions: vec![coinbase(
+                2,
                 config.block_subsidy + 1,
                 config.genesis_reward_key_hash20().expect("key"),
                 b"f2-greedy",
@@ -1141,6 +1149,7 @@ mod tests {
         f2_template.prev_block = f2_hash;
         f2_template.timestamp = ts + 93;
         f2_template.transactions = vec![coinbase(
+            3,
             config.block_subsidy,
             config.genesis_reward_key_hash20().expect("key"),
             b"f3",
@@ -1260,7 +1269,12 @@ mod tests {
             prev_block: runtime.tip_hash(),
             timestamp: runtime.tip_header().timestamp + 30,
             target,
-            transactions: vec![coinbase(config.block_subsidy, reward, b"accessor-work")],
+            transactions: vec![coinbase(
+                runtime.tip_height() + 1,
+                config.block_subsidy,
+                reward,
+                b"accessor-work",
+            )],
         };
         let block = mine_block(&template, 200_000).expect("mine");
         runtime.apply_next_block(block).expect("apply");
@@ -1303,7 +1317,12 @@ mod tests {
             prev_block: runtime.tip_hash(),
             timestamp: runtime.tip_header().timestamp.saturating_add(30),
             target: runtime.expected_target_for_next_block().expect("target"),
-            transactions: vec![coinbase(config.block_subsidy, reward, b"w1")],
+            transactions: vec![coinbase(
+                runtime.tip_height() + 1,
+                config.block_subsidy,
+                reward,
+                b"w1",
+            )],
         };
         let block = mine_block(&template, 200_000).expect("mine");
         runtime.apply_next_block(block).expect("apply");
@@ -1373,6 +1392,7 @@ mod tests {
                 timestamp: runtime.tip_header().timestamp + (i + 1) as u64 * 15,
                 target: runtime.expected_target_for_next_block().expect("target"),
                 transactions: vec![coinbase(
+                    runtime.tip_height() + 1,
                     config.block_subsidy,
                     reward,
                     format!("lwma-{i}").as_bytes(),
@@ -1431,7 +1451,12 @@ mod tests {
             prev_block: runtime.tip_hash(),
             timestamp: runtime.tip_header().timestamp.saturating_add(45),
             target: runtime.expected_target_for_next_block().expect("target"),
-            transactions: vec![coinbase(config.block_subsidy, reward, b"asert-1")],
+            transactions: vec![coinbase(
+                runtime.tip_height() + 1,
+                config.block_subsidy,
+                reward,
+                b"asert-1",
+            )],
         };
         let block = mine_block(&template, 200_000).expect("mine");
         runtime.apply_next_block(block).expect("apply");
@@ -1481,6 +1506,7 @@ mod tests {
                 nonce: 0,
             },
             transactions: vec![coinbase(
+                1,
                 config.block_subsidy,
                 config.genesis_reward_key_hash20().expect("key"),
                 b"unknown-parent",
@@ -1511,7 +1537,12 @@ mod tests {
             prev_block: runtime.tip_hash(),
             timestamp: runtime.tip_header().timestamp.saturating_add(30),
             target: wrong_target,
-            transactions: vec![coinbase(config.block_subsidy, reward, b"wrong-target")],
+            transactions: vec![coinbase(
+                runtime.tip_height() + 1,
+                config.block_subsidy,
+                reward,
+                b"wrong-target",
+            )],
         }
         .build_with_nonce(0);
         let err = runtime
@@ -1524,7 +1555,12 @@ mod tests {
             prev_block: runtime.tip_hash(),
             timestamp: runtime.tip_header().timestamp.saturating_add(30),
             target: expected_target,
-            transactions: vec![coinbase(config.block_subsidy, reward, b"right-target")],
+            transactions: vec![coinbase(
+                runtime.tip_height() + 1,
+                config.block_subsidy,
+                reward,
+                b"right-target",
+            )],
         };
         let mined = mine_block(&ok_block, 200_000).expect("mine");
         runtime.apply_next_block(mined).expect("accept block");
@@ -1550,6 +1586,7 @@ mod tests {
                 timestamp,
                 target,
                 transactions: vec![coinbase(
+                    runtime.tip_height() + 1,
                     config.block_subsidy,
                     config.genesis_reward_key_hash20().expect("key"),
                     format!("b{i}").as_bytes(),
@@ -1579,6 +1616,7 @@ mod tests {
                 timestamp,
                 target: runtime.expected_target_for_next_block().expect("target"),
                 transactions: vec![coinbase(
+                    runtime.tip_height() + 1,
                     config.block_subsidy,
                     config.genesis_reward_key_hash20().expect("key"),
                     format!("main-{i}").as_bytes(),
@@ -1609,6 +1647,7 @@ mod tests {
                 timestamp: fork_ts,
                 target: fork_target,
                 transactions: vec![coinbase(
+                    2 + i,
                     config.block_subsidy,
                     config.genesis_reward_key_hash20().expect("key"),
                     format!("fork-{i}").as_bytes(),
@@ -1642,6 +1681,7 @@ mod tests {
                 timestamp,
                 target: runtime.expected_target_for_next_block().expect("target"),
                 transactions: vec![coinbase(
+                    runtime.tip_height() + 1,
                     config.block_subsidy,
                     reward,
                     format!("fork-height-{i}").as_bytes(),
@@ -1677,7 +1717,12 @@ mod tests {
             prev_block: runtime.tip_hash(),
             timestamp: runtime.tip_header().timestamp + 30,
             target: runtime.expected_target_for_next_block().expect("target"),
-            transactions: vec![coinbase(config.block_subsidy, reward, b"disconnect-tip")],
+            transactions: vec![coinbase(
+                runtime.tip_height() + 1,
+                config.block_subsidy,
+                reward,
+                b"disconnect-tip",
+            )],
         };
         let block = mine_block(&template, 200_000).expect("mine");
         runtime.apply_next_block(block).expect("apply");
@@ -1705,6 +1750,7 @@ mod tests {
                 timestamp,
                 target: runtime.expected_target_for_next_block().expect("target"),
                 transactions: vec![coinbase(
+                    runtime.tip_height() + 1,
                     config.block_subsidy,
                     reward,
                     format!("mtp-main-{i}").as_bytes(),
@@ -1723,7 +1769,12 @@ mod tests {
             prev_block: runtime.tip_hash(),
             timestamp: mtp,
             target: runtime.expected_target_for_next_block().expect("target"),
-            transactions: vec![coinbase(config.block_subsidy, reward, b"mtp-reject")],
+            transactions: vec![coinbase(
+                runtime.tip_height() + 1,
+                config.block_subsidy,
+                reward,
+                b"mtp-reject",
+            )],
         };
         let block = mine_block(&template, 200_000).expect("mine");
         let err = runtime.apply_next_block(block).expect_err("must reject");
@@ -1747,6 +1798,7 @@ mod tests {
                 timestamp: base.saturating_add(delta),
                 target: runtime.expected_target_for_next_block().expect("target"),
                 transactions: vec![coinbase(
+                    runtime.tip_height() + 1,
                     config.block_subsidy,
                     reward,
                     format!("mtp-tip-{idx}").as_bytes(),
@@ -1791,6 +1843,7 @@ mod tests {
             timestamp: future_timestamp,
             target: runtime.expected_target_for_next_block().expect("target"),
             transactions: vec![coinbase(
+                runtime.tip_height() + 1,
                 config.block_subsidy,
                 config.genesis_reward_key_hash20().expect("key"),
                 b"future-reject",
@@ -1817,7 +1870,12 @@ mod tests {
             prev_block: runtime.tip_hash(),
             timestamp: near_future_timestamp,
             target: runtime.expected_target_for_next_block().expect("target"),
-            transactions: vec![coinbase(config.block_subsidy, reward, b"within-future")],
+            transactions: vec![coinbase(
+                runtime.tip_height() + 1,
+                config.block_subsidy,
+                reward,
+                b"within-future",
+            )],
         };
         let block = mine_block(&template, 200_000).expect("mine");
         runtime
@@ -1839,7 +1897,12 @@ mod tests {
             prev_block: runtime.tip_hash(),
             timestamp: boundary_timestamp,
             target: runtime.expected_target_for_next_block().expect("target"),
-            transactions: vec![coinbase(config.block_subsidy, reward, b"future-boundary")],
+            transactions: vec![coinbase(
+                runtime.tip_height() + 1,
+                config.block_subsidy,
+                reward,
+                b"future-boundary",
+            )],
         };
         let block = mine_block(&template, 200_000).expect("mine");
         runtime
@@ -1863,6 +1926,7 @@ mod tests {
                 timestamp: runtime.tip_header().timestamp + 30 + i as u64,
                 target: runtime.expected_target_for_next_block().expect("target"),
                 transactions: vec![coinbase(
+                    runtime.tip_height() + 1,
                     config.block_subsidy,
                     reward,
                     format!("window-boundary-{i}").as_bytes(),
@@ -1932,6 +1996,7 @@ mod tests {
                 timestamp: runtime.tip_header().timestamp + 40 + i as u64,
                 target: runtime.expected_target_for_next_block().expect("target"),
                 transactions: vec![coinbase(
+                    runtime.tip_height() + 1,
                     config.block_subsidy,
                     reward,
                     format!("lwma-window-{i}").as_bytes(),
@@ -1992,6 +2057,7 @@ mod tests {
                 timestamp: runtime.tip_header().timestamp + 20 + i as u64,
                 target: runtime.expected_target_for_next_block().expect("target"),
                 transactions: vec![coinbase(
+                    runtime.tip_height() + 1,
                     config.block_subsidy,
                     reward,
                     format!("window-start-{i}").as_bytes(),
@@ -2055,7 +2121,12 @@ mod tests {
             prev_block: runtime.tip_hash(),
             timestamp: runtime.tip_header().timestamp + 30,
             target: runtime.expected_target_for_next_block().expect("target"),
-            transactions: vec![coinbase(config.block_subsidy, reward, b"submit-extend")],
+            transactions: vec![coinbase(
+                runtime.tip_height() + 1,
+                config.block_subsidy,
+                reward,
+                b"submit-extend",
+            )],
         };
         let block = mine_block(&template, 200_000).expect("mine");
         let submitted_hash = block.header.block_hash();
@@ -2084,6 +2155,7 @@ mod tests {
             timestamp: runtime.tip_header().timestamp + 30,
             target: runtime.expected_target_for_next_block().expect("target"),
             transactions: vec![coinbase(
+                runtime.tip_height() + 1,
                 config.block_subsidy,
                 config.genesis_reward_key_hash20().expect("key"),
                 b"restore-1",

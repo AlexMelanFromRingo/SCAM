@@ -190,6 +190,11 @@ pub fn validate_and_apply_block_with_undo(
     }
 
     let coinbase = &block.transactions[0];
+    if !coinbase.coinbase_commits_to_height(ctx.current_height) {
+        return Err(TxValidationError::CoinbaseHeightMismatch {
+            height: ctx.current_height,
+        });
+    }
     let coinbase_value = tx_output_total(coinbase);
 
     let csv_time = ctx.median_time_past.unwrap_or(block.header.timestamp);
@@ -780,6 +785,8 @@ pub enum TxValidationError {
     InvalidBlockStructure(#[from] BlockValidationError),
     #[error("block header hash does not satisfy target")]
     PowMismatch,
+    #[error("coinbase script does not start with block height {height}")]
+    CoinbaseHeightMismatch { height: u64 },
     #[error("unexpected coinbase transaction at index {tx_index}")]
     UnexpectedCoinbase { tx_index: usize },
     #[error(
@@ -878,6 +885,62 @@ mod tests {
         (pubkey, scam_core::hash160_blake3(&pubkey), secret)
     }
 
+    /// C18 (BIP34): from height 1 the coinbase script starts with the block
+    /// height (8 bytes LE); genesis is exempt.
+    #[test]
+    fn coinbase_must_commit_to_block_height() {
+        let chain_domain = b"scam-bip34";
+        let coinbase = |script: Vec<u8>| Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: OutPoint::coinbase(),
+                signature: script,
+                pubkey_compressed: vec![],
+                sequence: u32::MAX,
+            }],
+            outputs: vec![TxOut {
+                value: 50,
+                key_hash20: [1u8; 20],
+            }],
+            lock_time: 0,
+        };
+        let genesis = make_block(
+            Hash256::ZERO,
+            100,
+            Target::MAX,
+            vec![coinbase(b"no height at genesis".to_vec())],
+        );
+        let mut utxos = UtxoSet::new();
+        validate_and_apply_block(&genesis, 0, 50, 1, chain_domain, &mut utxos)
+            .expect("genesis is exempt");
+        for script in [
+            b"tag only".to_vec(),
+            scam_core::coinbase_script(2, b"wrong height"),
+            1u32.to_le_bytes().to_vec(),
+        ] {
+            let block = make_block(
+                genesis.header.block_hash(),
+                200,
+                Target::MAX,
+                vec![coinbase(script)],
+            );
+            let err = validate_and_apply_block(&block, 1, 50, 1, chain_domain, &mut utxos)
+                .expect_err("missing height commitment");
+            assert!(matches!(
+                err,
+                TxValidationError::CoinbaseHeightMismatch { height: 1 }
+            ));
+        }
+        let block = make_block(
+            genesis.header.block_hash(),
+            200,
+            Target::MAX,
+            vec![coinbase(scam_core::coinbase_script(1, b"ok"))],
+        );
+        validate_and_apply_block(&block, 1, 50, 1, chain_domain, &mut utxos)
+            .expect("height-committing coinbase applies");
+    }
+
     fn make_block(prev: Hash256, timestamp: u64, target: Target, txs: Vec<Transaction>) -> Block {
         let txids: Vec<Hash256> = txs.iter().map(Transaction::txid).collect();
         let merkle = scam_core::merkle::merkle_root(&txids);
@@ -969,7 +1032,7 @@ mod tests {
             version: 1,
             inputs: vec![TxIn {
                 prev_out: OutPoint::coinbase(),
-                signature: b"b1-csv".to_vec(),
+                signature: scam_core::coinbase_script(1, b"b1-csv"),
                 pubkey_compressed: vec![],
                 sequence: u32::MAX,
             }],
@@ -1081,7 +1144,7 @@ mod tests {
             version: 1,
             inputs: vec![TxIn {
                 prev_out: OutPoint::coinbase(),
-                signature: b"b1".to_vec(),
+                signature: scam_core::coinbase_script(1, b"b1"),
                 pubkey_compressed: vec![],
                 sequence: u32::MAX,
             }],
@@ -1215,7 +1278,7 @@ mod tests {
             version: 1,
             inputs: vec![TxIn {
                 prev_out: OutPoint::coinbase(),
-                signature: b"b1-multisig-spend".to_vec(),
+                signature: scam_core::coinbase_script(1, b"b1-multisig-spend"),
                 pubkey_compressed: vec![],
                 sequence: u32::MAX,
             }],
@@ -1307,7 +1370,7 @@ mod tests {
             version: 1,
             inputs: vec![TxIn {
                 prev_out: OutPoint::coinbase(),
-                signature: b"b1".to_vec(),
+                signature: scam_core::coinbase_script(1, b"b1"),
                 pubkey_compressed: vec![],
                 sequence: u32::MAX,
             }],
@@ -1394,7 +1457,7 @@ mod tests {
             version: 1,
             inputs: vec![TxIn {
                 prev_out: OutPoint::coinbase(),
-                signature: b"b1".to_vec(),
+                signature: scam_core::coinbase_script(1, b"b1"),
                 pubkey_compressed: vec![],
                 sequence: u32::MAX,
             }],
@@ -1430,7 +1493,7 @@ mod tests {
             version: 1,
             inputs: vec![TxIn {
                 prev_out: OutPoint::coinbase(),
-                signature: b"same-tag".to_vec(),
+                signature: scam_core::coinbase_script(1, b"same-tag"),
                 pubkey_compressed: vec![],
                 sequence: u32::MAX,
             }],
@@ -1543,7 +1606,7 @@ mod tests {
             version: 1,
             inputs: vec![TxIn {
                 prev_out: OutPoint::coinbase(),
-                signature: b"b1-chain".to_vec(),
+                signature: scam_core::coinbase_script(1, b"b1-chain"),
                 pubkey_compressed: vec![],
                 sequence: u32::MAX,
             }],
@@ -1837,7 +1900,7 @@ mod tests {
             version: 1,
             inputs: vec![TxIn {
                 prev_out: OutPoint::coinbase(),
-                signature: b"b1".to_vec(),
+                signature: scam_core::coinbase_script(1, b"b1"),
                 pubkey_compressed: vec![],
                 sequence: u32::MAX,
             }],
@@ -1923,7 +1986,7 @@ mod tests {
             version: 1,
             inputs: vec![TxIn {
                 prev_out: OutPoint::coinbase(),
-                signature: b"b1".to_vec(),
+                signature: scam_core::coinbase_script(1, b"b1"),
                 pubkey_compressed: vec![],
                 sequence: u32::MAX,
             }],
@@ -2005,7 +2068,7 @@ mod tests {
                 version: 1,
                 inputs: vec![TxIn {
                     prev_out: OutPoint::coinbase(),
-                    signature: b"b1".to_vec(),
+                    signature: scam_core::coinbase_script(1, b"b1"),
                     pubkey_compressed: vec![],
                     sequence: u32::MAX,
                 }],
@@ -2094,7 +2157,7 @@ mod tests {
                 version: 1,
                 inputs: vec![TxIn {
                     prev_out: OutPoint::coinbase(),
-                    signature: b"b1".to_vec(),
+                    signature: scam_core::coinbase_script(1, b"b1"),
                     pubkey_compressed: vec![],
                     sequence: u32::MAX,
                 }],
@@ -2188,7 +2251,7 @@ mod tests {
             version: 1,
             inputs: vec![TxIn {
                 prev_out: OutPoint::coinbase(),
-                signature: b"b1".to_vec(),
+                signature: scam_core::coinbase_script(1, b"b1"),
                 pubkey_compressed: vec![],
                 sequence: u32::MAX,
             }],
@@ -2267,7 +2330,7 @@ mod tests {
             version: 1,
             inputs: vec![TxIn {
                 prev_out: OutPoint::coinbase(),
-                signature: b"b1".to_vec(),
+                signature: scam_core::coinbase_script(1, b"b1"),
                 pubkey_compressed: vec![],
                 sequence: u32::MAX,
             }],
@@ -2348,7 +2411,7 @@ mod tests {
             version: 1,
             inputs: vec![TxIn {
                 prev_out: OutPoint::coinbase(),
-                signature: b"b1".to_vec(),
+                signature: scam_core::coinbase_script(1, b"b1"),
                 pubkey_compressed: vec![],
                 sequence: u32::MAX,
             }],
@@ -2424,7 +2487,7 @@ mod tests {
             version: 1,
             inputs: vec![TxIn {
                 prev_out: OutPoint::coinbase(),
-                signature: b"b1".to_vec(),
+                signature: scam_core::coinbase_script(1, b"b1"),
                 pubkey_compressed: vec![],
                 sequence: u32::MAX,
             }],
@@ -2499,7 +2562,7 @@ mod tests {
             version: 1,
             inputs: vec![TxIn {
                 prev_out: OutPoint::coinbase(),
-                signature: b"b1".to_vec(),
+                signature: scam_core::coinbase_script(1, b"b1"),
                 pubkey_compressed: vec![],
                 sequence: u32::MAX,
             }],

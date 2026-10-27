@@ -2,7 +2,11 @@
 set -euo pipefail
 
 OUT_DIR="${OUT_DIR:-target/sv2-conformance}"
-RUNTIME_DB="${RUNTIME_DB:-data/devnet.runtime.redb}"
+# A fresh, private data dir per run: state left by other builds (e.g. an
+# older pool-ledger format next to a shared runtime DB) must not decide the
+# outcome.
+DATA_DIR="${DATA_DIR:-${OUT_DIR}/data}"
+RUNTIME_DB="${RUNTIME_DB:-${DATA_DIR}/devnet.runtime.redb}"
 CORPUS="${CORPUS:-docs/sv2-corpus/default.json}"
 POOL_BIND="${POOL_BIND:-127.0.0.1:3347}"
 SECURE_POOL_BIND="${SECURE_POOL_BIND:-127.0.0.1:3348}"
@@ -27,7 +31,13 @@ SV2_CONFORMANCE_FORBIDDEN_OBSERVED_KINDS="${SV2_CONFORMANCE_FORBIDDEN_OBSERVED_K
 unexpected_external_failures=0
 
 mkdir -p "${OUT_DIR}"
-rm -f "${EXTERNAL_RESULTS_JSONL}"
+# Per-stack reports from earlier runs would be counted as results of this one.
+rm -f "${EXTERNAL_RESULTS_JSONL}" "${OUT_DIR}"/*.json
+case "${DATA_DIR}" in
+  ""|"/"|"."|"..") echo "[sv2-matrix] refusing DATA_DIR='${DATA_DIR}'" >&2; exit 2 ;;
+esac
+rm -rf -- "${DATA_DIR}"
+mkdir -p "${DATA_DIR}" "$(dirname "${RUNTIME_DB}")"
 
 run_conformance_target() {
   local stack_name="$1"
@@ -188,12 +198,14 @@ run_conformance_target() {
   fi
 
   echo "[sv2-matrix] target=${stack_name} endpoint=${endpoint} secure=${secure} mode=${mode:-auto} expected=${expected}"
-  if cargo run -p scam-node -- sv2-conformance "${args[@]}"; then
+  # `rc=$?` inside an else-branch after another assignment read that
+  # assignment's status (always 0), so failures never failed the gate.
+  rc=0
+  cargo run -p scam-node -- sv2-conformance "${args[@]}" || rc=$?
+  if [[ ${rc} -eq 0 ]]; then
     result="pass"
-    rc=0
   else
     result="fail"
-    rc=$?
   fi
 
   python3 - <<'PY' "${EXTERNAL_RESULTS_JSONL}" "${stack_name}" "${endpoint}" "${secure}" "${mode}" "${expected}" "${vendor}" "${version}" "${role}" "${read_timeout_sec}" "${connect_timeout_sec}" "${connect_retries}" "${connect_retry_delay_ms}" "${expect_set_target}" "${min_job_messages}" "${workaround}" "${notes}" "${required_observed_kinds}" "${required_observed_sequence}" "${forbidden_observed_kinds}" "${require_setup_version}" "${require_setup_flags_mask}" "${forbid_setup_flags_mask}" "${setup_protocol}" "${setup_min_version}" "${setup_max_version}" "${setup_flags}" "${result}" "${rc}"

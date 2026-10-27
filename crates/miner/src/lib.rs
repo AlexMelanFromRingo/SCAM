@@ -20,6 +20,8 @@ pub struct BlockTemplate {
 #[derive(Clone, Debug)]
 pub struct MempoolTemplateParams {
     pub version: u32,
+    /// Height of the block being built (committed to in the coinbase).
+    pub height: u64,
     pub prev_block: Hash256,
     pub timestamp: u64,
     pub target: Target,
@@ -109,6 +111,7 @@ pub fn build_template_from_mempool(
                 total_fees,
             })?;
     let coinbase = build_coinbase_tx(
+        params.height,
         &params.coinbase_tag,
         coinbase_value,
         params.miner_key_hash20,
@@ -396,12 +399,12 @@ impl TemplateManager {
     }
 }
 
-fn build_coinbase_tx(tag: &str, value: u64, key_hash20: [u8; 20]) -> Transaction {
+fn build_coinbase_tx(height: u64, tag: &str, value: u64, key_hash20: [u8; 20]) -> Transaction {
     Transaction {
         version: 1,
         inputs: vec![TxIn {
             prev_out: OutPoint::coinbase(),
-            signature: tag.as_bytes().to_vec(),
+            signature: scam_core::coinbase_script(height, tag.as_bytes()),
             pubkey_compressed: vec![],
             sequence: u32::MAX,
         }],
@@ -544,6 +547,7 @@ mod tests {
         mempool.insert_with_fee(tx_high, 50).expect("insert high");
 
         let params = MempoolTemplateParams {
+            height: 1,
             version: 1,
             prev_block: scam_core::Hash256::ZERO,
             timestamp: 1_770_763_200,
@@ -570,6 +574,7 @@ mod tests {
         mempool.insert_with_fee(tx_b, 50).expect("insert b");
 
         let params = MempoolTemplateParams {
+            height: 1,
             version: 1,
             prev_block: scam_core::Hash256::ZERO,
             timestamp: 1_770_763_200,
@@ -598,6 +603,7 @@ mod tests {
         mempool.insert_with_fee(child, 100).expect("insert child");
 
         let params = MempoolTemplateParams {
+            height: 1,
             version: 1,
             prev_block: scam_core::Hash256::ZERO,
             timestamp: 1_770_763_200,
@@ -632,6 +638,7 @@ mod tests {
             .expect("insert unrelated");
 
         let params = MempoolTemplateParams {
+            height: 1,
             version: 1,
             prev_block: scam_core::Hash256::ZERO,
             timestamp: 1_770_763_200,
@@ -667,6 +674,7 @@ mod tests {
         mempool.insert_with_fee(mid_c, 300).expect("insert mid_c");
 
         let params = MempoolTemplateParams {
+            height: 1,
             version: 1,
             prev_block: scam_core::Hash256::ZERO,
             timestamp: 1_770_763_200,
@@ -688,6 +696,7 @@ mod tests {
 
     fn params(max_txs: usize, max_total_tx_bytes: usize) -> MempoolTemplateParams {
         MempoolTemplateParams {
+            height: 1,
             version: 1,
             prev_block: scam_core::Hash256::ZERO,
             timestamp: 1_770_763_200,
@@ -808,6 +817,7 @@ mod tests {
 
         let mut manager = TemplateManager::new();
         let params = MempoolTemplateParams {
+            height: 1,
             version: 1,
             prev_block: scam_core::Hash256::ZERO,
             timestamp: 1_770_763_200,
@@ -854,6 +864,7 @@ mod tests {
 
         let mut manager = TemplateManager::new();
         let params = MempoolTemplateParams {
+            height: 1,
             version: 1,
             prev_block: scam_core::Hash256::ZERO,
             timestamp: 1_770_763_200,

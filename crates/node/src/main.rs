@@ -5049,12 +5049,12 @@ fn template_tx_byte_budget(cfg: &ChainConfig, coinbase: &Transaction) -> usize {
     usize::try_from(u64::from(cfg.max_block_size).saturating_sub(overhead)).unwrap_or(0)
 }
 
-fn build_coinbase_tx(tag: String, subsidy: u64, key_hash20: [u8; 20]) -> Transaction {
+fn build_coinbase_tx(height: u64, tag: String, subsidy: u64, key_hash20: [u8; 20]) -> Transaction {
     Transaction {
         version: 1,
         inputs: vec![TxIn {
             prev_out: OutPoint::coinbase(),
-            signature: tag.into_bytes(),
+            signature: scam_core::coinbase_script(height, tag.as_bytes()),
             pubkey_compressed: vec![],
             sequence: u32::MAX,
         }],
@@ -5087,15 +5087,18 @@ fn mine_block_with_transactions(
     mut transactions: Vec<Transaction>,
 ) -> Result<(Hash256, scam_core::Target, u128), NodeError> {
     let next_height = runtime.tip_height().saturating_add(1);
-    // Subsidy follows the halving schedule, and the height in the tag makes
-    // every coinbase unique: a repeated tag+payee+value would recreate an
-    // unspent outpoint, which consensus rejects (BIP30 rule).
+    // Subsidy follows the halving schedule; the coinbase commits to the
+    // height (consensus rule), which also makes every coinbase unique.
     let subsidy = runtime.config().subsidy_at_height(next_height);
-    let coinbase_tag = format!("{coinbase_tag}@h{next_height}");
     let expected_target = runtime.expected_target_for_next_block()?;
     let timestamp = runtime.tip_header().timestamp.saturating_add(interval_sec);
     let mut block_txs = Vec::with_capacity(transactions.len() + 1);
-    block_txs.push(build_coinbase_tx(coinbase_tag, subsidy, miner_key_hash));
+    block_txs.push(build_coinbase_tx(
+        next_height,
+        coinbase_tag,
+        subsidy,
+        miner_key_hash,
+    ));
     block_txs.append(&mut transactions);
     let template = BlockTemplate {
         version: 1,
@@ -5169,7 +5172,12 @@ fn run_mine_once(args: MineOnceArgs) -> Result<(), NodeError> {
     )?;
 
     let miner_key_hash = cfg.genesis_reward_key_hash20()?;
-    let coinbase = build_coinbase_tx("mine-once".to_owned(), cfg.block_subsidy, miner_key_hash);
+    let coinbase = build_coinbase_tx(
+        1,
+        "mine-once".to_owned(),
+        cfg.subsidy_at_height(1),
+        miner_key_hash,
+    );
     let template = BlockTemplate {
         version: 1,
         prev_block: genesis.header.block_hash(),
@@ -13306,14 +13314,19 @@ fn run_reorg_demo(args: ReorgDemoArgs) -> Result<(), NodeError> {
 
     let mut reorg_count = 0u32;
     for i in 0..args.fork_blocks {
+        let fork_height = args
+            .fork_from_height
+            .saturating_add(u64::from(i))
+            .saturating_add(1);
         let template = BlockTemplate {
             version: 1,
             prev_block: fork_prev,
             timestamp: fork_ts,
             target: fork_target,
             transactions: vec![build_coinbase_tx(
+                fork_height,
                 format!("fork-{i}"),
-                cfg.block_subsidy,
+                cfg.subsidy_at_height(fork_height),
                 miner_key_hash,
             )],
         };
@@ -13382,6 +13395,8 @@ struct RpcMiningTemplate {
 struct TemplateProviderRequest {
     channel_id: u32,
     version: u32,
+    /// Height of the block to build (its coinbase commits to it).
+    height: u64,
     prev_hash_hex: String,
     ntime: u64,
     network_target_hex: String,
@@ -13624,10 +13639,16 @@ impl StratumTemplateProvider for RuntimeTemplateProvider {
         let coinbase_tag = stratum_coinbase_tag(coinbase_label, prev_block);
         let tx_byte_budget = template_tx_byte_budget(
             cfg,
-            &build_coinbase_tx(coinbase_tag.clone(), u64::MAX, reward_key_hash20),
+            &build_coinbase_tx(
+                next_height,
+                coinbase_tag.clone(),
+                u64::MAX,
+                reward_key_hash20,
+            ),
         );
         let params = MempoolTemplateParams {
             version: 1,
+            height: next_height,
             prev_block,
             timestamp: next_stratum_job_timestamp(runtime, cfg),
             target,
@@ -13662,6 +13683,7 @@ impl StratumTemplateProvider for RuntimeTemplateProvider {
             .ok_or_else(|| NodeError::Runtime("template coinbase value overflow".to_owned()))?;
         let mut block_txs = Vec::with_capacity(selection.accepted.len() + 1);
         block_txs.push(build_coinbase_tx(
+            next_height,
             coinbase_tag,
             coinbase_value,
             reward_key_hash20,
@@ -13878,6 +13900,7 @@ async fn issue_new_stratum_job_async<S: AsyncRead + AsyncWrite + Unpin>(
             let request = TemplateProviderRequest {
                 channel_id: session.channel_id(),
                 version: 1,
+                height: runtime.tip_height().saturating_add(1),
                 prev_hash_hex: runtime.tip_hash().to_hex(),
                 ntime: next_stratum_job_timestamp(&runtime, &ctx.cfg),
                 network_target_hex: target.to_hex(),
@@ -16164,6 +16187,7 @@ fn run_sv2_template_provider(args: Sv2TemplateProviderArgs) -> Result<(), NodeEr
                 &request.prev_hash_hex,
             )?);
             let coinbase = build_coinbase_tx(
+                request.height,
                 stratum_coinbase_tag(&request.coinbase_label, prev_hash),
                 request.block_subsidy,
                 reward_key_hash20,
@@ -23715,6 +23739,7 @@ mod tests {
     /// job header commits to the template merkle root); it is rejected.
     fn normalize_stratum_block_coinbase_rejects_mismatched_reward() {
         let mut block_txs = vec![super::build_coinbase_tx(
+            1,
             "test-coinbase".to_owned(),
             123,
             [0x11u8; 20],
@@ -23730,7 +23755,7 @@ mod tests {
 
     #[test]
     fn normalize_stratum_block_coinbase_rejects_non_coinbase() {
-        let mut tx = super::build_coinbase_tx("cb".to_owned(), 10, [0x22u8; 20]);
+        let mut tx = super::build_coinbase_tx(1, "cb".to_owned(), 10, [0x22u8; 20]);
         tx.inputs.push(TxIn {
             prev_out: OutPoint {
                 txid: Hash256([3u8; 32]),
@@ -25045,6 +25070,7 @@ mod tests {
 
         let template_params = super::MempoolTemplateParams {
             version: 1,
+            height: runtime.tip_height() + 1,
             prev_block: runtime.tip_hash(),
             timestamp: runtime
                 .tip_header()
@@ -27403,6 +27429,7 @@ mod tests {
             .expect("insert tx");
         let template_params = super::MempoolTemplateParams {
             version: 1,
+            height: runtime.tip_height() + 1,
             prev_block: runtime.tip_hash(),
             timestamp: runtime
                 .tip_header()
@@ -32282,6 +32309,7 @@ mod tests {
             .expect("insert tx");
         let template_params = super::MempoolTemplateParams {
             version: 1,
+            height: runtime.tip_height() + 1,
             prev_block: runtime.tip_hash(),
             timestamp: runtime
                 .tip_header()
@@ -37721,6 +37749,7 @@ mod tests {
                 .saturating_add(cfg.target_block_time_sec),
             target: runtime.expected_target_for_next_block().expect("target"),
             transactions: vec![build_coinbase_tx(
+                runtime.tip_height() + 1,
                 "reindex-test".to_owned(),
                 cfg.block_subsidy,
                 cfg.genesis_reward_key_hash20().expect("key hash"),
@@ -37940,6 +37969,7 @@ mod tests {
             .expect("insert transfer");
         let template_params = super::MempoolTemplateParams {
             version: 1,
+            height: runtime.tip_height() + 1,
             prev_block: runtime.tip_hash(),
             timestamp: runtime
                 .tip_header()
@@ -38682,6 +38712,7 @@ mod tests {
 
         let template_params = super::MempoolTemplateParams {
             version: 1,
+            height: producer_runtime.tip_height() + 1,
             prev_block: producer_runtime.tip_hash(),
             timestamp: producer_runtime
                 .tip_header()
@@ -38811,6 +38842,7 @@ mod tests {
         mempool.insert_with_fee(tx.clone(), 500).expect("insert");
         let template_params = super::MempoolTemplateParams {
             version: 1,
+            height: runtime.tip_height() + 1,
             prev_block: runtime.tip_hash(),
             timestamp: runtime
                 .tip_header()
@@ -38890,6 +38922,7 @@ mod tests {
             .expect("insert self tx");
         let template_params = super::MempoolTemplateParams {
             version: 1,
+            height: runtime.tip_height() + 1,
             prev_block: runtime.tip_hash(),
             timestamp: runtime
                 .tip_header()
@@ -38964,6 +38997,7 @@ mod tests {
             .expect("insert outgoing-only tx");
         let template_params = super::MempoolTemplateParams {
             version: 1,
+            height: runtime.tip_height() + 1,
             prev_block: runtime.tip_hash(),
             timestamp: runtime
                 .tip_header()
@@ -39230,6 +39264,7 @@ mod tests {
                 .saturating_add(cfg.target_block_time_sec),
             target,
             transactions: vec![build_coinbase_tx(
+                state.runtime.tip_height() + 1,
                 "headers-announcement".to_owned(),
                 cfg.block_subsidy,
                 reward_key,
@@ -39286,6 +39321,7 @@ mod tests {
                 .saturating_add(cfg.target_block_time_sec),
             target,
             transactions: vec![build_coinbase_tx(
+                state.runtime.tip_height() + 1,
                 "ibd-scheduler-timeout".to_owned(),
                 cfg.block_subsidy,
                 reward_key,
@@ -39368,6 +39404,7 @@ mod tests {
                 .saturating_add(cfg.target_block_time_sec),
             target,
             transactions: vec![build_coinbase_tx(
+                state.runtime.tip_height() + 1,
                 "ibd-notfound-retry".to_owned(),
                 cfg.block_subsidy,
                 reward_key,
@@ -39532,6 +39569,7 @@ mod tests {
             timestamp: base_ts,
             target,
             transactions: vec![build_coinbase_tx(
+                state.runtime.tip_height() + 1,
                 "headers-parent-known".to_owned(),
                 cfg.block_subsidy,
                 cfg.genesis_reward_key_hash20().expect("reward"),
@@ -39544,6 +39582,7 @@ mod tests {
             timestamp: base_ts.saturating_add(cfg.target_block_time_sec),
             target,
             transactions: vec![build_coinbase_tx(
+                state.runtime.tip_height() + 2,
                 "headers-parent-chain".to_owned(),
                 cfg.block_subsidy,
                 cfg.genesis_reward_key_hash20().expect("reward"),
@@ -39641,6 +39680,7 @@ mod tests {
             timestamp: base_ts,
             target,
             transactions: vec![build_coinbase_tx(
+                state.runtime.tip_height() + 1,
                 "headers-prefix-known".to_owned(),
                 cfg.block_subsidy,
                 reward,
@@ -39654,6 +39694,7 @@ mod tests {
             timestamp: base_ts.saturating_add(cfg.target_block_time_sec),
             target,
             transactions: vec![build_coinbase_tx(
+                state.runtime.tip_height() + 2,
                 "headers-gap".to_owned(),
                 cfg.block_subsidy,
                 reward,
@@ -39727,6 +39768,7 @@ mod tests {
                 .saturating_add(cfg.target_block_time_sec),
             target: expected_target,
             transactions: vec![build_coinbase_tx(
+                state.runtime.tip_height() + 1,
                 "relay-block-catchup".to_owned(),
                 cfg.block_subsidy,
                 cfg.genesis_reward_key_hash20().expect("reward"),
@@ -39906,6 +39948,7 @@ mod tests {
             target: expected_target,
             transactions: vec![
                 build_coinbase_tx(
+                    runtime.tip_height() + 1,
                     "compact-test".to_owned(),
                     cfg.block_subsidy,
                     sender_key_hash20,
@@ -42251,6 +42294,7 @@ mod tests {
             .expect("insert tx");
         let template_params = super::MempoolTemplateParams {
             version: 1,
+            height: main_runtime.tip_height() + 1,
             prev_block: main_runtime.tip_hash(),
             timestamp: main_runtime
                 .tip_header()
@@ -42295,6 +42339,7 @@ mod tests {
                 timestamp: fork_timestamp,
                 target: fork_target,
                 transactions: vec![build_coinbase_tx(
+                    fork_from_height + u64::from(idx) + 1,
                     format!("relay-reorg-fork-{idx}"),
                     cfg.block_subsidy,
                     sender_key_hash20,
@@ -42412,6 +42457,7 @@ mod tests {
             .expect("insert tx");
         let template_params = super::MempoolTemplateParams {
             version: 1,
+            height: runtime.tip_height() + 1,
             prev_block: runtime.tip_hash(),
             timestamp: runtime
                 .tip_header()
@@ -42699,6 +42745,7 @@ mod tests {
         let request = TemplateProviderRequest {
             channel_id: 1,
             version: 1,
+            height: 1,
             prev_hash_hex: Hash256::ZERO.to_hex(),
             ntime: 1_800_000_000,
             network_target_hex: scam_core::Target::MAX.to_hex(),
