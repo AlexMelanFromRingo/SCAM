@@ -431,6 +431,39 @@ impl GossipEngine {
         Ok(self.apply_mempool_inventory_delta_inner(announced_txs, removed_txids))
     }
 
+    /// Charge one replacement against `from_peer`'s rate limit *before* its
+    /// transaction is inserted (the check used to run after the mempool had
+    /// already changed, so it only suppressed the announcement).
+    pub fn reserve_peer_replacement(
+        &mut self,
+        from_peer: PeerId,
+        now_unix_sec: u64,
+    ) -> Result<(), GossipError> {
+        if self.banned_peers.contains(&from_peer) {
+            return Err(GossipError::BannedPeer { peer_id: from_peer });
+        }
+        self.enforce_replacement_rate(from_peer, now_unix_sec)?;
+        self.telemetry.inbound_replacement_events_total = self
+            .telemetry
+            .inbound_replacement_events_total
+            .saturating_add(1);
+        Ok(())
+    }
+
+    /// Apply a mempool change whose replacement budget was already charged
+    /// with [`GossipEngine::reserve_peer_replacement`].
+    pub fn apply_reserved_mempool_inventory_delta(
+        &mut self,
+        from_peer: PeerId,
+        announced_txs: Vec<Transaction>,
+        removed_txids: &[Hash256],
+    ) -> Result<Vec<OutboundMessage>, GossipError> {
+        if !self.peers.contains_key(&from_peer) {
+            return Err(GossipError::UnknownPeer { peer_id: from_peer });
+        }
+        Ok(self.apply_mempool_inventory_delta_inner(announced_txs, removed_txids))
+    }
+
     fn apply_mempool_inventory_delta_inner(
         &mut self,
         announced_txs: Vec<Transaction>,

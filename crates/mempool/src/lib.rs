@@ -534,6 +534,16 @@ impl Mempool {
         Some(entry)
     }
 
+    /// Whether inserting `tx` could remove other transactions (it spends an
+    /// outpoint already spent in the pool, or the pool is full).
+    pub fn insert_may_remove(&self, tx: &Transaction) -> bool {
+        self.txs.len() >= self.max_txs
+            || tx
+                .inputs
+                .iter()
+                .any(|input| self.spent_outpoints.contains_key(&input.prev_out))
+    }
+
     /// Changes made since the last [`Mempool::clear_persist_delta`]. Call
     /// `clear_persist_delta` once they are durably stored.
     pub fn persist_delta(&self) -> MempoolPersistDelta {

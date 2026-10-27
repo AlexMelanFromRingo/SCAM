@@ -48,7 +48,7 @@ Baseline at start: `fmt`/`clippy -D warnings`/`cargo test --workspace
 | M6 | high | `/tx/submit` stores caller-claimed fee (any value ≥ implied); sanitizer falls back to stored fee ⇒ eviction/priority gaming and `CoinbaseRewardTooHigh` pool blocks; the "rewrite coinbase and retry" path invalidates the PoW. | `main.rs` submit + `sanitize_template_mempool_fees` | fixed (actual fee only; sanitizer defers unresolved) — dead retry path left in place |
 | M7 | high | Orphan pool: no per-tx byte cap (8 MiB × 5000), `insertion_order` never trimmed. | `mempool/src/lib.rs::OrphanPool` | fixed (16 MiB total cap, queue compaction; node checks max_tx_size before orphaning) |
 | M8 | medium | Eviction/replacement can remove a parent while keeping (or admitting) its child. | `mempool/src/lib.rs` | fixed |
-| M9 | medium | Replacement only needs +1 fee unit; per-peer replacement limit applied after insertion. | `mempool/src/lib.rs`, `main.rs` | partially fixed (BIP125 rule 4 incremental fee); rate-limit ordering open |
+| M9 | medium | Replacement only needs +1 fee unit; per-peer replacement limit applied after insertion. | `mempool/src/lib.rs`, `main.rs` | fixed (BIP125 rule 4 incremental fee; replacement budget charged before the pool changes) |
 | M10 | low | Wallet default fee 1 < min relay; fee not size-based; amounts in atomic units unlabeled. | wallet/RPC/web | fixed (fee optional in RPC/CLI/UI; omitted = minimum relay fee for the actual size; `/tx/submit` default fee 0 = actual) |
 
 ## P2P / relay
@@ -64,7 +64,7 @@ Baseline at start: `fmt`/`clippy -D warnings`/`cargo test --workspace
 | P7 | high | Addr: unbounded peer book, no address validation/length cap, stamps `max(seen, now)`, string-sorted truncation ⇒ eclipse aid; O(n²) rewrite per message. | `main.rs` addr handling | partially fixed (validation, timestamp clamp, keyed-random eviction); source-group bucketing and peer-book rewrite cost open |
 | P8 | medium | Per-peer `known_inventory` unbounded. | `gossip.rs` | fixed (50k per peer, oldest evicted) |
 | P9 | medium | O(chain)/O(mempool) work under the global mutex per message (GetHeaders clones all headers, mempool sorted per 250 ms poll). | `main.rs` | fixed (header/hash selection via runtime indexes; per-session mempool rescan only when its revision changes) |
-| P10 | medium | Peer tip height trusted from Version/Inv/unchecked headers ⇒ forced outbound churn ("lag mode"). | `main.rs` | open |
+| P10 | medium | Peer tip height trusted from Version/Inv/unchecked headers ⇒ forced outbound churn ("lag mode"). | `main.rs` | fixed (claimed tips capped at base lead 6 + 2 blocks per elapsed target interval since our tip; base lead below the lag threshold) |
 | P11 | medium | `--max-clients N` is a lifetime connection limit; relay exits after N connections. | `main.rs` accept loop | fixed (`relay-serve --max-active-sessions` caps concurrency; `--max-clients` documented as the test-only "exit after N") |
 | P12 | medium | Compact short ids unsalted (8-byte txid prefix); no fallback to full block; BlockTxn accepted from any peer. | `main.rs` | fixed (SipHash-2-4 keyed by block hash; merkle mismatch → GetData full block, no penalty; BlockTxn only from the asked peer) |
 | P13 | low | Unpruned maps: `banned_peers`, `inbound_accept_history`, `peer_tip_by_address`. | `main.rs`, `gossip.rs` | partially fixed (`inbound_accept_history` pruned; `banned_ips` expire) |

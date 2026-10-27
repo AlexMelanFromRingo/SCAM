@@ -7153,12 +7153,29 @@ fn nonempty_parent_dir(path: &Path) -> Option<&Path> {
     }
 }
 
+/// Unverified peer tips (Version start height, unknown Inv counts, header
+/// announcements) are capped at what is physically plausible: a peer can be
+/// at most a few blocks ahead of a fresh tip, plus about two blocks per
+/// target interval since our tip was mined. A peer lying about a huge lead
+/// used to push outbound into "lag mode" (32 peers, 90 s rotation), which
+/// helps an eclipse attempt.
+const RELAY_PEER_TIP_BASE_LEAD: u64 = 6;
+
+fn relay_plausible_peer_tip(state: &RelayServerState, claimed: u64, now_unix_sec: u64) -> u64 {
+    let local_tip = state.runtime.tip_height();
+    let interval = state.runtime.config().target_block_time_sec.max(1);
+    let elapsed = now_unix_sec.saturating_sub(state.runtime.tip_header().timestamp);
+    let lead = RELAY_PEER_TIP_BASE_LEAD.saturating_add((elapsed / interval).saturating_mul(2));
+    claimed.min(local_tip.saturating_add(lead))
+}
+
 fn relay_record_peer_tip_height_at(
     state: &mut RelayServerState,
     peer_id: u64,
     tip_height: u64,
     now_unix_sec: u64,
 ) {
+    let tip_height = relay_plausible_peer_tip(state, tip_height, now_unix_sec);
     let entry = state
         .peer_reported_tip_heights
         .entry(peer_id)
@@ -7191,6 +7208,7 @@ fn relay_register_peer_session_address(
     tip_height: u64,
     now_unix_sec: u64,
 ) {
+    let tip_height = relay_plausible_peer_tip(state, tip_height, now_unix_sec);
     state
         .peer_session_addresses
         .insert(peer_id, address.to_owned());
@@ -12388,6 +12406,13 @@ fn admit_peer_tx_into_relay(
                 Err(_) => continue,
             };
 
+        // Charge the peer's replacement budget before the pool can change.
+        let reserved = relay.mempool.insert_may_remove(&candidate_tx);
+        if reserved {
+            relay
+                .gossip
+                .reserve_peer_replacement(peer_id, now_unix_sec)?;
+        }
         let outcome = relay.mempool.insert_with_fee(candidate_tx, effective_fee)?;
         let inserted_txid = match outcome {
             InsertOutcome::Accepted { txid } => Some(txid),
@@ -12405,12 +12430,20 @@ fn admit_peer_tx_into_relay(
                 .iter()
                 .filter_map(|txid| relay.mempool.get(txid).cloned())
                 .collect::<Vec<_>>();
-            let _ = relay.gossip.apply_mempool_inventory_delta_from_peer(
-                peer_id,
-                announced_txs,
-                &delta.removed_txids,
-                now_unix_sec,
-            )?;
+            if reserved {
+                let _ = relay.gossip.apply_reserved_mempool_inventory_delta(
+                    peer_id,
+                    announced_txs,
+                    &delta.removed_txids,
+                )?;
+            } else {
+                let _ = relay.gossip.apply_mempool_inventory_delta_from_peer(
+                    peer_id,
+                    announced_txs,
+                    &delta.removed_txids,
+                    now_unix_sec,
+                )?;
+            }
         }
 
         if let Some(txid) = inserted_txid
@@ -40366,11 +40399,18 @@ mod tests {
         let tx2 = signed_relay_tx(&cfg, &key, base_outpoint.clone(), 20_000, 12);
         let tx3 = signed_relay_tx(&cfg, &key, base_outpoint.clone(), 10_000, 13);
 
+        let (tx2_id, tx3_id) = (tx2.txid(), tx3.txid());
         admit_peer_tx_into_relay(&mut relay, &runtime, 1, tx1, 1_000, 1_000).expect("first");
         admit_peer_tx_into_relay(&mut relay, &runtime, 1, tx2, 1_001, 1_001)
             .expect("replacement 1");
         let err = admit_peer_tx_into_relay(&mut relay, &runtime, 1, tx3, 1_002, 1_002)
             .expect_err("replacement 2 should be rate limited");
+        // M9: the limit is enforced before the pool changes.
+        assert!(
+            relay.mempool.contains(&tx2_id),
+            "rate-limited peer cannot evict"
+        );
+        assert!(!relay.mempool.contains(&tx3_id));
         assert!(matches!(
             err,
             super::NodeError::Gossip(scam_p2p::GossipError::ReplacementRateLimited {
@@ -41698,6 +41738,28 @@ mod tests {
         assert!(
             !state.relay.mempool.contains(&txid),
             "connected-only transition must still clean stale mempool transactions"
+        );
+    }
+
+    /// P10: a peer cannot claim an implausible lead over a fresh tip.
+    #[test]
+    fn relay_peer_tip_claims_are_capped_by_elapsed_time() {
+        let mut state = relay_state_for_tests();
+        let tip_ts = state.runtime.tip_header().timestamp;
+        let interval = state.runtime.config().target_block_time_sec;
+        let local = state.runtime.tip_height();
+        // Right after our tip was mined: at most the base lead.
+        super::relay_record_peer_tip_height_at(&mut state, 5, u64::MAX, tip_ts);
+        assert_eq!(
+            state.peer_reported_tip_heights.get(&5).copied(),
+            Some(local + super::RELAY_PEER_TIP_BASE_LEAD)
+        );
+        const { assert!(super::RELAY_PEER_TIP_BASE_LEAD < super::RELAY_OUTBOUND_SPAWN_LAG_THRESHOLD) };
+        // Ten intervals later a 20-block lead is plausible again.
+        super::relay_record_peer_tip_height_at(&mut state, 6, local + 20, tip_ts + 10 * interval);
+        assert_eq!(
+            state.peer_reported_tip_heights.get(&6).copied(),
+            Some(local + 20)
         );
     }
 
