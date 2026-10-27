@@ -721,7 +721,13 @@ struct StratumServeArgs {
     secure_transport_mode: Option<SecureTransportModeArg>,
     #[arg(long)]
     secure_rekey_interval_messages: Option<u64>,
-    #[arg(long)]
+    /// Noise static private key (hex). Prefer the environment variable:
+    /// argv is visible to other users in `ps`.
+    #[arg(
+        long,
+        env = "SCAM_STRATUM_STATIC_SECRET_KEY_HEX",
+        hide_env_values = true
+    )]
     secure_static_secret_key_hex: Option<String>,
     #[arg(long)]
     secure_expected_remote_static_pubkey_hex: Option<String>,
@@ -796,7 +802,13 @@ struct StratumMineArgs {
     secure_transport_mode: Option<SecureTransportModeArg>,
     #[arg(long, default_value_t = 10_000)]
     secure_rekey_interval_messages: u64,
-    #[arg(long)]
+    /// Noise static private key (hex). Prefer the environment variable:
+    /// argv is visible to other users in `ps`.
+    #[arg(
+        long,
+        env = "SCAM_STRATUM_STATIC_SECRET_KEY_HEX",
+        hide_env_values = true
+    )]
     secure_static_secret_key_hex: Option<String>,
     #[arg(long)]
     secure_expected_remote_static_pubkey_hex: Option<String>,
@@ -868,7 +880,13 @@ struct Sv2ConformanceArgs {
     secure_transport_mode: Option<SecureTransportModeArg>,
     #[arg(long, default_value_t = 10_000)]
     secure_rekey_interval_messages: u64,
-    #[arg(long)]
+    /// Noise static private key (hex). Prefer the environment variable:
+    /// argv is visible to other users in `ps`.
+    #[arg(
+        long,
+        env = "SCAM_STRATUM_STATIC_SECRET_KEY_HEX",
+        hide_env_values = true
+    )]
     secure_static_secret_key_hex: Option<String>,
     #[arg(long)]
     secure_expected_remote_static_pubkey_hex: Option<String>,

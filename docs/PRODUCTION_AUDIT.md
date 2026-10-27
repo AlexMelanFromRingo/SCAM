@@ -94,7 +94,7 @@ Baseline at start: `fmt`/`clippy -D warnings`/`cargo test --workspace
 | ST6 | medium | Shares for old-tip jobs still credited; tip only rechecked on read timeout. | `stratum/src/lib.rs`, `main.rs` | fixed (share credited only if its job builds on the current — refreshed — tip) |
 | ST7 | medium | Whole pool ledger DB rewritten per share. | `storage`, `main.rs` | mitigated (share bookkeeping flushed at most once per second, on session ticks and at session end; round closes/payouts persist immediately) — incremental ledger writes still open |
 | ST8 | low | Stratum async read timeout not cancel-safe. | `main.rs` | fixed (`Sv2StreamReader`: buffered plain/secure frames, decrypt only complete frames) |
-| ST9 | low | `stratum_secure_transport=false` on mainnet ⇒ payout address in plaintext. | `config/mainnet.toml` | open |
+| ST9 | low | `stratum_secure_transport=false` on mainnet ⇒ payout address in plaintext. | `config/mainnet.toml` | fixed (mainnet defaults to noise_xx; server key via `SCAM_STRATUM_STATIC_SECRET_KEY_HEX`; miners connect with `--secure-transport`) |
 
 ## RPC / wallet / web
 
@@ -143,6 +143,10 @@ but **existing devnet/testnet chains and nodes must be upgraded together**:
 - Consensus now follows BIP68/BIP113 exactly: relative locks are met at
   `created + value` (height) / `coin MTP + value*512` (time), and absolute
   time locks compare with median-time-past.
+- Mainnet stratum is encrypted (noise_xx) by default: `stratum-serve` needs
+  a static key (`scam-node stratum-keygen`, pass it via
+  `SCAM_STRATUM_STATIC_SECRET_KEY_HEX`), miners use `--secure-transport`.
+  `docs/mainnet-freeze.lock.json` was regenerated (genesis unchanged).
 - Every store carries `schema_version`. Pool ledgers written before this
   pass (v1) are refused — move the file aside to start a fresh ledger.
 - The runtime archive is written incrementally with recorded tip work; a
