@@ -66,7 +66,7 @@ Baseline at start: `fmt`/`clippy -D warnings`/`cargo test --workspace
 | P9 | medium | O(chain)/O(mempool) work under the global mutex per message (GetHeaders clones all headers, mempool sorted per 250 ms poll). | `main.rs` | fixed (header/hash selection via runtime indexes; per-session mempool rescan only when its revision changes) |
 | P10 | medium | Peer tip height trusted from Version/Inv/unchecked headers ⇒ forced outbound churn ("lag mode"). | `main.rs` | open |
 | P11 | medium | `--max-clients N` is a lifetime connection limit; relay exits after N connections. | `main.rs` accept loop | open |
-| P12 | medium | Compact short ids unsalted (8-byte txid prefix); no fallback to full block; BlockTxn accepted from any peer. | `main.rs` | open |
+| P12 | medium | Compact short ids unsalted (8-byte txid prefix); no fallback to full block; BlockTxn accepted from any peer. | `main.rs` | fixed (SipHash-2-4 keyed by block hash; merkle mismatch → GetData full block, no penalty; BlockTxn only from the asked peer) |
 | P13 | low | Unpruned maps: `banned_peers`, `inbound_accept_history`, `peer_tip_by_address`. | `main.rs`, `gossip.rs` | partially fixed (`inbound_accept_history` pruned; `banned_ips` expire) |
 
 ## Storage / process model
@@ -92,7 +92,7 @@ Baseline at start: `fmt`/`clippy -D warnings`/`cargo test --workspace
 | ST4 | high | Payout txs pick the same pool coins; conflict outcome reported as success; txid recorded after broadcast ⇒ stuck or double payouts. | `main.rs::build_signed_transfer_tx` & payout loop | partially fixed (mempool-spent coins excluded, conflict outcome is a failure); txid-before-broadcast + stuck-payout expiry open |
 | ST5 | high | PPLNS earnings recomputed from capped history but compared with lifetime paid ⇒ workers stop being paid. | `main.rs` payout | fixed (split frozen per round at close; evicted rounds folded into `pplns_settled_atomic`; ledger schema v2) |
 | ST6 | medium | Shares for old-tip jobs still credited; tip only rechecked on read timeout. | `stratum/src/lib.rs`, `main.rs` | fixed (share credited only if its job builds on the current — refreshed — tip) |
-| ST7 | medium | Whole pool ledger DB rewritten per share. | `storage`, `main.rs` | open |
+| ST7 | medium | Whole pool ledger DB rewritten per share. | `storage`, `main.rs` | mitigated (share bookkeeping flushed at most once per second, on session ticks and at session end; round closes/payouts persist immediately) — incremental ledger writes still open |
 | ST8 | low | Stratum async read timeout not cancel-safe. | `main.rs` | open |
 | ST9 | low | `stratum_secure_transport=false` on mainnet ⇒ payout address in plaintext. | `config/mainnet.toml` | open |
 

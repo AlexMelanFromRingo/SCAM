@@ -1803,6 +1803,7 @@ dependencies = [
  "scam-wallet",
  "serde",
  "serde_json",
+ "siphasher",
  "thiserror 2.0.18",
  "tokio",
  "tokio-socks",

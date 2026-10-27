@@ -23,6 +23,7 @@ scam-tui = { path = "../tui" }
 scam-wallet = { path = "../wallet" }
 serde.workspace = true
 serde_json.workspace = true
+siphasher.workspace = true
 thiserror.workspace = true
 toml.workspace = true
 tokio.workspace = true

@@ -5934,6 +5934,8 @@ impl RelayServerState {
 #[derive(Clone)]
 struct PendingCompactBlock {
     header: scam_core::BlockHeader,
+    /// Only this peer's `BlockTxn` may complete the block.
+    requested_from: u64,
     tx_count: usize,
     transactions: Vec<Option<Transaction>>,
     missing_indexes: Vec<u32>,
@@ -7737,13 +7739,28 @@ fn append_role_service_telemetry(
     append_jsonl_record(path, &snapshot, "role-service")
 }
 
-fn compact_short_txid(txid: Hash256) -> u64 {
-    let mut short = [0u8; 8];
-    short.copy_from_slice(&txid.0[..8]);
-    u64::from_be_bytes(short)
+/// Short transaction id for compact blocks: SipHash-2-4 of the txid keyed
+/// by the block's header hash (as in BIP152). An unkeyed txid prefix let
+/// anyone grind a colliding transaction in ~2^32 work and make honest
+/// compact-block relay fail.
+fn compact_short_txid(block_hash: Hash256, txid: Hash256) -> u64 {
+    use std::hash::Hasher;
+    let mut keyed = Vec::with_capacity(48);
+    keyed.extend_from_slice(b"scam-compact-short-id-v1");
+    keyed.extend_from_slice(&block_hash.0);
+    let key = scam_core::hash::hash256(&keyed);
+    let mut k0 = [0u8; 8];
+    let mut k1 = [0u8; 8];
+    k0.copy_from_slice(&key.0[..8]);
+    k1.copy_from_slice(&key.0[8..16]);
+    let mut hasher =
+        siphasher::sip::SipHasher24::new_with_keys(u64::from_le_bytes(k0), u64::from_le_bytes(k1));
+    hasher.write(&txid.0);
+    hasher.finish()
 }
 
 fn relay_compact_block_from_block(block: &scam_core::Block) -> CompactBlock {
+    let block_hash = block.header.block_hash();
     let prefilled = block
         .transactions
         .first()
@@ -7758,7 +7775,7 @@ fn relay_compact_block_from_block(block: &scam_core::Block) -> CompactBlock {
         .transactions
         .iter()
         .skip(1)
-        .map(|tx| compact_short_txid(tx.txid()))
+        .map(|tx| compact_short_txid(block_hash, tx.txid()))
         .collect::<Vec<_>>();
     CompactBlock {
         header: block.header.clone(),
@@ -7770,10 +7787,12 @@ fn relay_compact_block_from_block(block: &scam_core::Block) -> CompactBlock {
 
 /// Short-id → txid index of the mempool, built once per compact block
 /// (the old per-slot lookup re-sorted the whole mempool for every slot).
-fn relay_mempool_short_txid_index(mempool: &Mempool) -> HashMap<u64, Hash256> {
+fn relay_mempool_short_txid_index(mempool: &Mempool, block_hash: Hash256) -> HashMap<u64, Hash256> {
     let mut index = HashMap::new();
     for txid in mempool.txids_by_feerate_desc() {
-        index.entry(compact_short_txid(txid)).or_insert(txid);
+        index
+            .entry(compact_short_txid(block_hash, txid))
+            .or_insert(txid);
     }
     index
 }
@@ -7854,7 +7873,7 @@ fn relay_reconstruct_compact_transactions(
         transactions[index] = Some(entry.tx.clone());
     }
 
-    let short_index = relay_mempool_short_txid_index(mempool);
+    let short_index = relay_mempool_short_txid_index(mempool, compact.header.block_hash());
     let mut short_iter = compact.short_txids.iter().copied();
     let mut missing = Vec::<u32>::new();
     for (index, slot) in transactions.iter_mut().enumerate() {
@@ -7896,6 +7915,23 @@ fn relay_try_build_block_from_compact(
             .filter_map(Clone::clone)
             .collect::<Vec<_>>(),
     })
+}
+
+/// Submit a block rebuilt from a compact announcement. A merkle mismatch
+/// means a short-id collision picked the wrong mempool tx: that is not the
+/// peer's fault, so fetch the full block instead of rejecting (and
+/// banning) an honest peer.
+fn relay_submit_reconstructed_block(
+    state: &mut RelayServerState,
+    block: scam_core::Block,
+    now_unix_sec: u64,
+) -> Result<Vec<WireMessage>, NodeError> {
+    if !block.has_valid_merkle_root() {
+        return Ok(vec![WireMessage::GetData {
+            items: vec![InventoryItem::Block(block.header.block_hash())],
+        }]);
+    }
+    relay_submit_incoming_block(state, block, now_unix_sec)
 }
 
 fn relay_compact_announcement_enabled(state: &RelayServerState, peer_id: u64) -> bool {
@@ -9049,7 +9085,7 @@ fn process_relay_wire_message_inner(
                             "compact block reconstruction expected all transactions".to_owned(),
                         )
                     })?;
-                return relay_submit_incoming_block(state, block, now_unix_sec);
+                return relay_submit_reconstructed_block(state, block, now_unix_sec);
             }
             if state.pending_compact_blocks.len() >= RELAY_MAX_PENDING_COMPACT_BLOCKS
                 && !state.pending_compact_blocks.contains_key(&block_hash)
@@ -9063,6 +9099,7 @@ fn process_relay_wire_message_inner(
                 block_hash,
                 PendingCompactBlock {
                     header: block.header,
+                    requested_from: peer_id,
                     tx_count: transactions.len(),
                     transactions,
                     missing_indexes: missing_indexes.clone(),
@@ -9116,6 +9153,15 @@ fn process_relay_wire_message_inner(
             block_hash,
             transactions,
         } => {
+            if state
+                .pending_compact_blocks
+                .get(&block_hash)
+                .is_none_or(|pending| pending.requested_from != peer_id)
+            {
+                // Unsolicited, or from a peer we did not ask: ignore it
+                // without consuming the pending entry.
+                return Ok(Vec::new());
+            }
             relay_clear_inflight_block_request(state, block_hash);
             let Some(mut pending) = state.pending_compact_blocks.remove(&block_hash) else {
                 return Ok(Vec::new());
@@ -9153,7 +9199,7 @@ fn process_relay_wire_message_inner(
                 )));
             };
             let tip_before = state.runtime.tip_height();
-            let mut out = relay_submit_incoming_block(state, block, now_unix_sec)?;
+            let mut out = relay_submit_reconstructed_block(state, block, now_unix_sec)?;
             let tip_after = state.runtime.tip_height();
             relay_record_peer_tip_height(state, peer_id, tip_after);
             if relay_should_request_followup_sync(
@@ -9177,7 +9223,7 @@ fn process_relay_wire_message_inner(
         WireMessage::Block { block } => {
             relay_clear_inflight_block_request(state, block.header.block_hash());
             let tip_before = state.runtime.tip_height();
-            let mut out = relay_submit_incoming_block(state, block, now_unix_sec)?;
+            let mut out = relay_submit_reconstructed_block(state, block, now_unix_sec)?;
             let tip_after = state.runtime.tip_height();
             relay_record_peer_tip_height(state, peer_id, tip_after);
             if relay_should_request_followup_sync(
@@ -13223,6 +13269,9 @@ struct StratumServerContext {
     job_declarator_addr: Option<String>,
     telemetry_state: Arc<Mutex<StratumPoolTelemetryState>>,
     pool_ledger_state: Arc<Mutex<StratumPoolLedgerState>>,
+    /// Share bookkeeping is flushed at most every `POOL_LEDGER_SHARE_FLUSH_MS`
+    /// (the whole ledger used to be rewritten on every single share).
+    pool_ledger_flush: Arc<PoolLedgerFlush>,
     pool_ledger_db_path: PathBuf,
     relay_telemetry_path: Option<PathBuf>,
     stale_guard_max_lag_blocks: u64,
@@ -14523,6 +14572,14 @@ fn record_stratum_share_rejected(ctx: &StratumServerContext, worker: &str) {
     }
 }
 
+const POOL_LEDGER_SHARE_FLUSH_MS: u64 = 1_000;
+
+#[derive(Default)]
+struct PoolLedgerFlush {
+    dirty: AtomicBool,
+    last_persist_unix_ms: AtomicU64,
+}
+
 fn persist_pool_ledger_with_warning(ctx: &StratumServerContext) {
     let guard = match ctx.pool_ledger_state.lock() {
         Ok(guard) => guard,
@@ -14531,9 +14588,42 @@ fn persist_pool_ledger_with_warning(ctx: &StratumServerContext) {
             return;
         }
     };
-    if let Err(err) = persist_pool_ledger_db_with_retry(&ctx.pool_ledger_db_path, &guard, 40, 20) {
-        eprintln!("warning: failed to persist pool ledger db: {err}");
+    match persist_pool_ledger_db_with_retry(&ctx.pool_ledger_db_path, &guard, 40, 20) {
+        Ok(()) => {
+            ctx.pool_ledger_flush.dirty.store(false, Ordering::Relaxed);
+            ctx.pool_ledger_flush
+                .last_persist_unix_ms
+                .store(current_unix_ms(), Ordering::Relaxed);
+        }
+        Err(err) => eprintln!("warning: failed to persist pool ledger db: {err}"),
     }
+}
+
+/// For per-share updates: mark the ledger dirty and persist at most every
+/// `POOL_LEDGER_SHARE_FLUSH_MS`. Round closes and payouts still persist
+/// immediately; `flush_pool_ledger_if_dirty` runs on every session tick.
+fn persist_pool_ledger_debounced(ctx: &StratumServerContext) {
+    ctx.pool_ledger_flush.dirty.store(true, Ordering::Relaxed);
+    let last = ctx
+        .pool_ledger_flush
+        .last_persist_unix_ms
+        .load(Ordering::Relaxed);
+    if current_unix_ms().saturating_sub(last) >= POOL_LEDGER_SHARE_FLUSH_MS {
+        persist_pool_ledger_with_warning(ctx);
+    }
+}
+
+fn flush_pool_ledger_if_dirty(ctx: &StratumServerContext) {
+    if ctx.pool_ledger_flush.dirty.load(Ordering::Relaxed) {
+        persist_pool_ledger_with_warning(ctx);
+    }
+}
+
+fn current_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -14572,7 +14662,7 @@ fn record_pool_share_accepted(
         )
     };
     if inserted {
-        persist_pool_ledger_with_warning(ctx);
+        persist_pool_ledger_debounced(ctx);
     }
 }
 
@@ -14588,7 +14678,7 @@ fn record_pool_share_rejected(ctx: &StratumServerContext, worker: &str) {
         };
         ledger.register_rejected_only(worker, now_unix_sec);
     }
-    persist_pool_ledger_with_warning(ctx);
+    persist_pool_ledger_debounced(ctx);
 }
 
 fn record_pool_round_closed(
@@ -14844,6 +14934,7 @@ fn new_pool_worker_record(worker: &str) -> PoolWorkerAccrualRecord {
 }
 
 fn run_pool_payout_tick_with_warning(ctx: &StratumServerContext) {
+    flush_pool_ledger_if_dirty(ctx);
     if let Err(err) = maybe_process_pool_payouts(ctx) {
         eprintln!("warning: pool payout tick failed: {err}");
     }
@@ -15896,6 +15987,7 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
         job_declarator_addr: args.job_declarator_addr.clone(),
         telemetry_state: Arc::new(Mutex::new(StratumPoolTelemetryState::default())),
         pool_ledger_state: Arc::new(Mutex::new(pool_ledger_state)),
+        pool_ledger_flush: Arc::default(),
         pool_ledger_db_path,
         relay_telemetry_path,
         stale_guard_max_lag_blocks,
@@ -16003,8 +16095,11 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
             let active_clients = ctx.active_clients.clone();
             active_clients.fetch_add(1, Ordering::Relaxed);
             workers.spawn(async move {
+                let flush_ctx = client_ctx.clone();
                 let result = run_stratum_client_async(stream, client_ctx, permit).await;
                 active_clients.fetch_sub(1, Ordering::Relaxed);
+                // Don't leave debounced share bookkeeping unwritten.
+                flush_pool_ledger_if_dirty(&flush_ctx);
                 if let Err(err) = &result {
                     eprintln!("stratum worker error: {err}");
                 }
@@ -21941,6 +22036,28 @@ mod tests {
         let _ = fs::remove_dir_all(work_dir);
     }
 
+    /// ST7: share bookkeeping is persisted at most once per flush window,
+    /// and a flush writes anything left dirty.
+    #[test]
+    fn pool_ledger_share_persistence_is_debounced() {
+        let flush = super::PoolLedgerFlush::default();
+        flush.last_persist_unix_ms.store(
+            super::current_unix_ms(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        flush
+            .dirty
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let last = flush
+            .last_persist_unix_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            super::current_unix_ms().saturating_sub(last) < super::POOL_LEDGER_SHARE_FLUSH_MS,
+            "a share right after a persist stays pending"
+        );
+        assert!(flush.dirty.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
     /// ST5: PPLNS credits are frozen when a round closes, so trimming the
     /// share history or evicting old rounds never shrinks what a worker has
     /// earned (it used to drop below `paid_total` and stop payouts).
@@ -22339,6 +22456,7 @@ mod tests {
                 super::StratumPoolTelemetryState::default(),
             )),
             pool_ledger_state: std::sync::Arc::new(std::sync::Mutex::new(pool_ledger_state)),
+            pool_ledger_flush: Arc::default(),
             pool_ledger_db_path,
             relay_telemetry_path: None,
             stale_guard_max_lag_blocks: super::STRATUM_STALE_GUARD_MAX_LAG_BLOCKS,
@@ -27056,6 +27174,7 @@ mod tests {
                 super::StratumPoolTelemetryState::default(),
             )),
             pool_ledger_state: std::sync::Arc::new(std::sync::Mutex::new(pool_ledger_state)),
+            pool_ledger_flush: Arc::default(),
             pool_ledger_db_path,
             relay_telemetry_path: None,
             stale_guard_max_lag_blocks: super::STRATUM_STALE_GUARD_MAX_LAG_BLOCKS,
@@ -38599,10 +38718,23 @@ mod tests {
     #[test]
     fn relay_compact_short_txid_and_lookup_are_stable() {
         let hash = Hash256([0xAB; 32]);
-        let short = super::compact_short_txid(hash);
-        assert_eq!(short, u64::from_be_bytes([0xAB; 8]));
-        assert_ne!(short, 0);
-        assert_ne!(short, 1);
+        let block_a = Hash256([0x01; 32]);
+        let short = super::compact_short_txid(block_a, hash);
+        assert_eq!(
+            short,
+            super::compact_short_txid(block_a, hash),
+            "deterministic"
+        );
+        assert_ne!(
+            short,
+            super::compact_short_txid(Hash256([0x02; 32]), hash),
+            "keyed per block"
+        );
+        assert_ne!(
+            short,
+            u64::from_be_bytes([0xAB; 8]),
+            "not the bare txid prefix"
+        );
 
         let cfg: ChainConfig =
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
@@ -38631,12 +38763,12 @@ mod tests {
             .insert_with_fee(tx_b.clone(), 2_000)
             .expect("insert tx_b");
 
-        let index = super::relay_mempool_short_txid_index(&mempool);
-        let short_b = super::compact_short_txid(txid_b);
+        let index = super::relay_mempool_short_txid_index(&mempool, block_a);
+        let short_b = super::compact_short_txid(block_a, txid_b);
         let found = index.get(&short_b).expect("lookup by short txid");
         assert_eq!(*found, txid_b);
 
-        let short_a = super::compact_short_txid(txid_a);
+        let short_a = super::compact_short_txid(block_a, txid_a);
         let mut missing = short_b.wrapping_add(1);
         while missing == short_a || missing == short_b {
             missing = missing.wrapping_add(1);
@@ -39749,6 +39881,60 @@ mod tests {
         )
         .expect_err("count mismatch must be rejected");
         assert!(err.to_string().contains("short ids"), "{err}");
+    }
+
+    /// P12: only the peer we asked may complete a pending compact block, and
+    /// a merkle mismatch after reconstruction (short-id collision) falls back
+    /// to fetching the full block instead of failing the honest peer.
+    #[test]
+    fn compact_block_txn_is_peer_bound_and_mismatch_falls_back_to_full_block() {
+        let (cfg, runtime, _key, _outpoint) = relay_funded_runtime();
+        let header = runtime.tip_header().clone();
+        let block_hash = header.block_hash();
+        let relay = RelayAdmissionState {
+            mempool: build_mempool_from_cfg(&cfg).expect("mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip: GossipEngine::new(256).expect("gossip"),
+        };
+        let mut state = RelayServerState::new(runtime, relay);
+        state.pending_compact_blocks.insert(
+            block_hash,
+            super::PendingCompactBlock {
+                header: header.clone(),
+                requested_from: 7,
+                tx_count: 1,
+                transactions: vec![None],
+                missing_indexes: vec![0],
+            },
+        );
+        let stranger = process_relay_wire_message(
+            &mut state,
+            8,
+            WireMessage::BlockTxn {
+                block_hash,
+                transactions: vec![],
+            },
+            1_000,
+        )
+        .expect("ignored");
+        assert!(stranger.is_empty());
+        assert!(state.pending_compact_blocks.contains_key(&block_hash));
+
+        let mut wrong = state
+            .runtime
+            .block_by_hash(&block_hash)
+            .expect("tip block")
+            .clone();
+        wrong.header.merkle_root = Hash256([0x99; 32]);
+        let out = super::relay_submit_reconstructed_block(&mut state, wrong.clone(), 1_000)
+            .expect("fallback, not an error");
+        assert_eq!(
+            out,
+            vec![WireMessage::GetData {
+                items: vec![InventoryItem::Block(wrong.header.block_hash())]
+            }]
+        );
     }
 
     /// P2: duplicate GetData items are served once and the item count is
