@@ -344,6 +344,25 @@ impl Mempool {
                     conflicting,
                 });
             }
+            // BIP125 rule 2: a replacement may only spend unconfirmed outputs
+            // of transactions the original already depended on; otherwise
+            // it could pull new, possibly low-feerate ancestors into blocks.
+            let conflict_parents = existing
+                .tx
+                .inputs
+                .iter()
+                .map(|input| input.prev_out.txid)
+                .filter(|parent| self.txs.contains_key(parent))
+                .collect::<HashSet<_>>();
+            if let Some(input) = tx.inputs.iter().find(|input| {
+                self.txs.contains_key(&input.prev_out.txid)
+                    && !conflict_parents.contains(&input.prev_out.txid)
+            }) {
+                return Err(MempoolError::ReplacementAddsUnconfirmedInput {
+                    incoming: txid,
+                    parent: input.prev_out.txid,
+                });
+            }
             // BIP125 rule 4: besides out-paying what it replaces, the
             // replacement pays relay fee for its own bytes, so replacement
             // chains cannot be relayed for (almost) free.
@@ -958,6 +977,10 @@ pub enum MempoolError {
         bytes: usize,
         max_bytes: usize,
     },
+    #[error(
+        "replacement {incoming} spends unconfirmed parent {parent} that the replaced tx did not depend on"
+    )]
+    ReplacementAddsUnconfirmedInput { incoming: Hash256, parent: Hash256 },
     #[error("replacement {incoming} spends an output of {conflicting}, which it would evict")]
     ReplacementSpendsConflictingTx {
         incoming: Hash256,
@@ -1283,6 +1306,40 @@ mod tests {
         assert!(matches!(
             err,
             MempoolError::ReplacementSpendsConflictingTx { .. }
+        ));
+        assert!(mempool.contains(&original_id));
+    }
+
+    /// M9 / BIP125 rule 2: a replacement may not add unconfirmed parents the
+    /// original did not have.
+    #[test]
+    fn replacement_may_not_add_new_unconfirmed_parent() {
+        let mut mempool = Mempool::with_policy(10, 0).expect("mempool");
+        let unrelated_parent = mk_tx([40u8; 32], 0, b"other-parent", 1);
+        let other_id = unrelated_parent.txid();
+        mempool
+            .insert_with_fee(unrelated_parent, 1)
+            .expect("parent");
+        let original = mk_tx([41u8; 32], 0, b"original", 2);
+        let original_id = original.txid();
+        mempool.insert_with_fee(original, 1).expect("original");
+
+        let mut replacement = mk_tx([41u8; 32], 0, b"replacement", 3);
+        replacement.inputs.push(TxIn {
+            prev_out: OutPoint {
+                txid: other_id,
+                vout: 0,
+            },
+            signature: b"y".to_vec(),
+            pubkey_compressed: vec![2u8; 33],
+            sequence: 0,
+        });
+        let err = mempool
+            .insert_with_fee(replacement, 1_000)
+            .expect_err("new unconfirmed parent must be refused");
+        assert!(matches!(
+            err,
+            MempoolError::ReplacementAddsUnconfirmedInput { parent, .. } if parent == other_id
         ));
         assert!(mempool.contains(&original_id));
     }

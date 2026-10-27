@@ -1329,6 +1329,10 @@ enum WalletCommand {
         /// Example: `--multisig-input 0:5343414d…`
         #[arg(long = "multisig-input", value_name = "INDEX:BLOB_HEX")]
         multisig_inputs: Vec<String>,
+        /// bincode hex of every transaction whose outputs the tx spends.
+        /// Signers verify amounts and the fee against these.
+        #[arg(long = "prev-tx-hex", value_name = "TX_HEX")]
+        prev_txs: Vec<String>,
     },
     /// Add one party's signature to a PMT envelope. Reads the envelope
     /// JSON from `--in`, signs every multisig input the wallet key
@@ -4273,7 +4277,17 @@ fn run_wallet_with_seed_mode(
             chain_domain,
             tx_hex,
             multisig_inputs,
+            prev_txs,
         } => {
+            let prev_txs = prev_txs
+                .iter()
+                .map(|raw| {
+                    let bytes = hex::decode(raw.trim())
+                        .map_err(|e| NodeError::Runtime(format!("--prev-tx-hex: {e}")))?;
+                    bincode::deserialize::<scam_core::Transaction>(&bytes)
+                        .map_err(|e| NodeError::Runtime(format!("--prev-tx-hex decode: {e}")))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             let tx_bytes = hex::decode(tx_hex.trim())
                 .map_err(|e| NodeError::Runtime(format!("--tx-hex: {e}")))?;
             let tx: scam_core::Transaction = bincode::deserialize(&tx_bytes)
@@ -4292,9 +4306,13 @@ fn run_wallet_with_seed_mode(
                     .map_err(|e| NodeError::Runtime(format!("input #{idx} blob: {e}")))?;
                 parsed_inputs.push((idx, blob));
             }
-            let pmt =
-                scam_wallet::PartialMultisigTx::new(chain_domain.as_bytes(), tx, &parsed_inputs)
-                    .map_err(|e| NodeError::Runtime(format!("pmt new: {e}")))?;
+            let pmt = scam_wallet::PartialMultisigTx::new(
+                chain_domain.as_bytes(),
+                tx,
+                &parsed_inputs,
+                &prev_txs,
+            )
+            .map_err(|e| NodeError::Runtime(format!("pmt new: {e}")))?;
             println!(
                 "{}",
                 pmt.to_json()
@@ -4322,6 +4340,10 @@ fn run_wallet_with_seed_mode(
                 "signing for chain domain: {}",
                 String::from_utf8_lossy(&domain)
             );
+            let fee = pmt
+                .fee()
+                .map_err(|e| NodeError::Runtime(format!("refusing to sign: {e}")))?;
+            println!("signing a transaction that pays fee {fee}");
             let seed_mode: WalletSeedMode = seed_mode.into();
             let seed = wallet_seed_from_mnemonic(&mnemonic, &passphrase, seed_mode)?;
             let key = derive_wallet_key(&seed, account, index)?;
@@ -4363,8 +4385,24 @@ fn run_wallet_with_seed_mode(
             let report = pmt
                 .inspect()
                 .map_err(|e| NodeError::Runtime(format!("inspect: {e}")))?;
+            let values = pmt
+                .input_values()
+                .map_err(|e| NodeError::Runtime(format!("input amounts: {e}")))?;
+            let fee = pmt
+                .fee()
+                .map_err(|e| NodeError::Runtime(format!("fee: {e}")))?;
             println!("envelope version : {}", pmt.version);
             println!("chain_domain hex : {}", pmt.chain_domain_hex);
+            println!("input amounts    : {values:?} (verified against prev txs)");
+            println!(
+                "outputs          : {:?}",
+                pmt.tx
+                    .outputs
+                    .iter()
+                    .map(|out| out.value)
+                    .collect::<Vec<_>>()
+            );
+            println!("fee              : {fee}");
             println!("inputs           : {}", report.len());
             for s in report {
                 println!(
@@ -7178,6 +7216,50 @@ fn nonempty_parent_dir(path: &Path) -> Option<&Path> {
 /// used to push outbound into "lag mode" (32 peers, 90 s rotation), which
 /// helps an eclipse attempt.
 const RELAY_PEER_TIP_BASE_LEAD: u64 = 6;
+/// Address-keyed peer tip hints kept for outbound selection.
+const RELAY_MAX_TRACKED_PEER_TIP_ADDRESSES: usize = 4_096;
+const RELAY_PEER_TIP_ADDRESS_TTL_SEC: u64 = 6 * 60 * 60;
+
+/// Keep the address-keyed tip hints bounded: drop stale entries, never the
+/// ones of currently connected peers, then the oldest if still over cap.
+fn relay_prune_peer_tip_addresses(state: &mut RelayServerState, now_unix_sec: u64) {
+    if state.peer_tip_by_address.len() <= RELAY_MAX_TRACKED_PEER_TIP_ADDRESSES {
+        return;
+    }
+    let connected = state
+        .peer_session_addresses
+        .values()
+        .cloned()
+        .collect::<HashSet<_>>();
+    let updated = &state.peer_tip_last_update_by_address;
+    let mut keep = state
+        .peer_tip_by_address
+        .keys()
+        .filter(|address| {
+            connected.contains(*address)
+                || updated.get(*address).is_some_and(|ts| {
+                    now_unix_sec.saturating_sub(*ts) < RELAY_PEER_TIP_ADDRESS_TTL_SEC
+                })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if keep.len() > RELAY_MAX_TRACKED_PEER_TIP_ADDRESSES {
+        keep.sort_by_key(|address| {
+            (
+                !connected.contains(address),
+                std::cmp::Reverse(updated.get(address).copied().unwrap_or(0)),
+            )
+        });
+        keep.truncate(RELAY_MAX_TRACKED_PEER_TIP_ADDRESSES);
+    }
+    let keep = keep.into_iter().collect::<HashSet<_>>();
+    state
+        .peer_tip_by_address
+        .retain(|address, _| keep.contains(address));
+    state
+        .peer_tip_last_update_by_address
+        .retain(|address, _| keep.contains(address));
+}
 
 fn relay_plausible_peer_tip(state: &RelayServerState, claimed: u64, now_unix_sec: u64) -> u64 {
     let local_tip = state.runtime.tip_height();
@@ -7213,6 +7295,7 @@ fn relay_record_peer_tip_height_at(
             .or_insert(0);
         *updated_entry = (*updated_entry).max(now_unix_sec);
     }
+    relay_prune_peer_tip_addresses(state, now_unix_sec);
 }
 
 fn relay_record_peer_tip_height(state: &mut RelayServerState, peer_id: u64, tip_height: u64) {
@@ -12096,14 +12179,6 @@ fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
                 relay_log_finished_session(join_result, &mut first_error);
             }
             let now_unix_sec = current_unix_sec().unwrap_or(0);
-            if inbound_accept_history.len() > RELAY_ACCEPT_HISTORY_PRUNE_THRESHOLD {
-                let window = inbound_accept_window_sec.max(1);
-                inbound_accept_history.retain(|_, events| {
-                    events
-                        .back()
-                        .is_some_and(|ts| now_unix_sec.saturating_sub(*ts) < window)
-                });
-            }
             let banned = state
                 .lock()
                 .map(|guard| relay_ip_is_banned(&guard, peer_addr.ip(), now_unix_sec))
@@ -13365,45 +13440,9 @@ fn tx_outputs_value_sum_u64(tx: &Transaction) -> Option<u64> {
     u64::try_from(total).ok()
 }
 
-fn rewrite_coinbase_to_expected_value(
-    coinbase: &mut Transaction,
-    expected_value: u64,
-) -> Result<(), NodeError> {
-    if !coinbase.is_coinbase() {
-        return Err(NodeError::Runtime(
-            "stratum template first tx is not coinbase".to_owned(),
-        ));
-    }
-    if coinbase.outputs.is_empty() {
-        return Err(NodeError::Runtime(
-            "stratum template coinbase has no outputs".to_owned(),
-        ));
-    }
-    let expected = expected_value as u128;
-    let other_outputs_sum = coinbase.outputs.iter().skip(1).fold(0u128, |acc, output| {
-        acc.saturating_add(output.value as u128)
-    });
-    let primary = coinbase_primary_value(expected_value, expected, other_outputs_sum)?;
-    coinbase.outputs[0].value = primary;
-    Ok(())
-}
-
-fn coinbase_primary_value(
-    expected_value: u64,
-    expected_total: u128,
-    other_outputs_sum: u128,
-) -> Result<u64, NodeError> {
-    if expected_total < other_outputs_sum {
-        return Err(NodeError::Runtime(format!(
-            "stratum template coinbase outputs exceed expected reward: expected={expected_value}, non_primary_outputs={other_outputs_sum}"
-        )));
-    }
-    let primary = expected_total - other_outputs_sum;
-    u64::try_from(primary).map_err(|_| {
-        NodeError::Runtime("stratum template coinbase primary output overflow".to_owned())
-    })
-}
-
+/// The job's header commits to the template's merkle root, so a coinbase
+/// that differs from the job's expected value cannot be "fixed" by
+/// rewriting it (the PoW would no longer match): reject instead.
 fn normalize_stratum_block_coinbase(
     block_txs: &mut [Transaction],
     expected_coinbase_value: u64,
@@ -13424,42 +13463,10 @@ fn normalize_stratum_block_coinbase(
         NodeError::Runtime("stratum template coinbase output sum overflow".to_owned())
     })?;
     if observed != expected_coinbase_value {
-        eprintln!(
-            "warning: stratum coinbase mismatch for channel={} job={}: expected={}, got={}; rewriting coinbase output",
-            channel_id, job_id, expected_coinbase_value, observed
-        );
-        rewrite_coinbase_to_expected_value(coinbase, expected_coinbase_value)?;
-    }
-    let final_total = tx_outputs_value_sum_u64(coinbase).ok_or_else(|| {
-        NodeError::Runtime("stratum template coinbase output sum overflow".to_owned())
-    })?;
-    if final_total != expected_coinbase_value {
         return Err(NodeError::Runtime(format!(
-            "stratum coinbase normalization failed: expected {}, got {}",
-            expected_coinbase_value, final_total
+            "stratum coinbase for channel={channel_id} job={job_id} pays {observed}, job expects {expected_coinbase_value}"
         )));
     }
-    Ok(())
-}
-
-fn rewrite_block_coinbase_to_allowed_reward(
-    block: &mut scam_core::Block,
-    allowed_coinbase_reward: u128,
-    channel_id: u32,
-    job_id: u32,
-) -> Result<(), NodeError> {
-    let allowed = u64::try_from(allowed_coinbase_reward).map_err(|_| {
-        NodeError::Runtime(format!(
-            "stratum allowed coinbase reward does not fit u64: allowed={allowed_coinbase_reward}"
-        ))
-    })?;
-    normalize_stratum_block_coinbase(&mut block.transactions, allowed, channel_id, job_id)?;
-    let txids = block
-        .transactions
-        .iter()
-        .map(Transaction::txid)
-        .collect::<Vec<_>>();
-    block.header.merkle_root = scam_core::merkle::merkle_root(&txids);
     Ok(())
 }
 
@@ -13987,7 +13994,7 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
                                     .skip(1)
                                     .map(Transaction::txid)
                                     .collect::<Vec<_>>();
-                                let mut block = scam_core::Block {
+                                let block = scam_core::Block {
                                     header: scam_core::BlockHeader {
                                         version: work.job.version,
                                         prev_block: work.job.prev_hash,
@@ -14019,25 +14026,10 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
                                             work.job.prev_hash
                                         );
                                     } else {
-                                        let submission = match runtime.submit_block(block.clone()) {
-                                            Ok(submission) => Ok(submission),
-                                            Err(ChainError::Validation(
-                                                TxValidationError::CoinbaseRewardTooHigh {
-                                                    allowed,
-                                                    got,
-                                                },
-                                            )) => {
-                                                eprintln!(
-                                                    "warning: stratum coinbase reward mismatch for channel={} job={}: allowed={}, got={}; rewriting and retrying",
-                                                    channel_id, job_id, allowed, got
-                                                );
-                                                rewrite_block_coinbase_to_allowed_reward(
-                                                    &mut block, allowed, channel_id, job_id,
-                                                )?;
-                                                runtime.submit_block(block.clone())
-                                            }
-                                            Err(err) => Err(err),
-                                        };
+                                        // Templates are validated with exact fees; a
+                                        // rejected block is a bug to surface, and
+                                        // rewriting its coinbase would break the PoW.
+                                        let submission = runtime.submit_block(block.clone());
                                         match submission {
                                             Ok(submission) => {
                                                 handle_runtime_persist_result(
@@ -14301,6 +14293,15 @@ fn relay_inbound_accept_rate_limited(
 ) -> bool {
     let window_sec = window_sec.max(1);
     let max_accepts = max_accepts.max(1);
+    // Keep one entry per *recent* source only (relay and stratum both use
+    // this limiter; entries for every IP ever seen used to stay forever).
+    if history.len() > RELAY_ACCEPT_HISTORY_PRUNE_THRESHOLD {
+        history.retain(|_, events| {
+            events
+                .back()
+                .is_some_and(|ts| now_unix_sec.saturating_sub(*ts) < window_sec)
+        });
+    }
     let events = history.entry(ip).or_default();
     while let Some(ts) = events.front().copied() {
         if now_unix_sec.saturating_sub(ts) >= window_sec {
@@ -15735,6 +15736,18 @@ fn validate_pool_payout_config(payout_cfg: &PoolPayoutConfig) -> Result<(), Node
             "pps_share_atomic must be > 0 when payout mode includes pps".to_owned(),
         ));
     }
+    // PPS pays for shares before blocks are found; without a cap the pool's
+    // liability is unbounded (a miner pool-hopping on easy shares could
+    // accrue more than the pool can ever pay).
+    if matches!(
+        payout_cfg.mode,
+        PoolPayoutModeArg::Pps | PoolPayoutModeArg::Hybrid
+    ) && payout_cfg.pps_max_liability_atomic == 0
+    {
+        return Err(NodeError::Runtime(
+            "pps_max_liability_atomic must be > 0 when payout mode includes pps".to_owned(),
+        ));
+    }
     Ok(())
 }
 
@@ -16137,6 +16150,13 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
                 .accept()
                 .await
                 .map_err(|e| NodeError::Runtime(format!("stratum accept failed: {e}")))?;
+            // Reap finished sessions as we go (errors were logged by the
+            // task); they used to accumulate until shutdown.
+            while let Some(finished) = workers.try_join_next() {
+                if let Err(join_err) = finished {
+                    eprintln!("stratum worker task failed: {join_err}");
+                }
+            }
             let now_unix_sec = current_unix_sec()?;
             if relay_inbound_accept_rate_limited(
                 &mut inbound_accept_history,
@@ -22997,16 +23017,21 @@ mod tests {
     }
 
     #[test]
-    fn normalize_stratum_block_coinbase_rewrites_mismatched_reward() {
+    /// M6: a coinbase that does not match the job cannot be rewritten (the
+    /// job header commits to the template merkle root); it is rejected.
+    fn normalize_stratum_block_coinbase_rejects_mismatched_reward() {
         let mut block_txs = vec![super::build_coinbase_tx(
             "test-coinbase".to_owned(),
             123,
             [0x11u8; 20],
         )];
-        block_txs[0].outputs[0].value = 9_999;
         super::normalize_stratum_block_coinbase(&mut block_txs, 123, 7, 99)
-            .expect("coinbase reward should be rewritten");
-        assert_eq!(block_txs[0].outputs[0].value, 123);
+            .expect("matching coinbase passes");
+        block_txs[0].outputs[0].value = 9_999;
+        let err = super::normalize_stratum_block_coinbase(&mut block_txs, 123, 7, 99)
+            .expect_err("mismatch must be rejected");
+        assert!(err.to_string().contains("job expects 123"), "{err}");
+        assert_eq!(block_txs[0].outputs[0].value, 9_999, "not rewritten");
     }
 
     #[test]
@@ -23028,53 +23053,6 @@ mod tests {
             err.to_string()
                 .contains("stratum template first tx is not coinbase")
         );
-    }
-
-    #[test]
-    fn rewrite_block_coinbase_to_allowed_reward_updates_value_and_merkle_root() {
-        let mut block = scam_core::Block {
-            header: scam_core::BlockHeader {
-                version: 1,
-                prev_block: Hash256([0x11; 32]),
-                merkle_root: Hash256::ZERO,
-                timestamp: 1_770_763_200,
-                target: Target::MAX,
-                nonce: 0,
-            },
-            transactions: vec![
-                super::build_coinbase_tx("rewrite".to_owned(), 9_999, [0x33; 20]),
-                Transaction {
-                    version: 1,
-                    inputs: vec![TxIn {
-                        prev_out: OutPoint {
-                            txid: Hash256([0x44; 32]),
-                            vout: 0,
-                        },
-                        signature: vec![0x55; 64],
-                        pubkey_compressed: vec![0x02; 33],
-                        sequence: u32::MAX,
-                    }],
-                    outputs: vec![TxOut {
-                        value: 1,
-                        key_hash20: [0x66; 20],
-                    }],
-                    lock_time: 0,
-                },
-            ],
-        };
-        let old_merkle = block.header.merkle_root;
-        super::rewrite_block_coinbase_to_allowed_reward(&mut block, 123, 7, 88)
-            .expect("rewrite should succeed");
-        assert_eq!(block.transactions[0].outputs[0].value, 123);
-        assert_ne!(block.header.merkle_root, old_merkle);
-        let recomputed = scam_core::merkle::merkle_root(
-            &block
-                .transactions
-                .iter()
-                .map(Transaction::txid)
-                .collect::<Vec<_>>(),
-        );
-        assert_eq!(block.header.merkle_root, recomputed);
     }
 
     #[test]
@@ -25625,6 +25603,10 @@ mod tests {
         );
 
         pps_cfg.pps_share_atomic = 1;
+        let cap_err = super::validate_pool_payout_config(&pps_cfg)
+            .expect_err("ST3: pps liability must be capped");
+        assert!(cap_err.to_string().contains("pps_max_liability_atomic"));
+        pps_cfg.pps_max_liability_atomic = 1_000_000;
         super::validate_pool_payout_config(&pps_cfg).expect("valid pps config");
     }
 
@@ -37391,47 +37373,6 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_coinbase_primary_value_uses_subtraction_and_boundary() {
-        let mut coinbase = Transaction {
-            version: 1,
-            inputs: vec![TxIn {
-                prev_out: OutPoint::coinbase(),
-                signature: b"coinbase".to_vec(),
-                pubkey_compressed: vec![0x02; 33],
-                sequence: 0,
-            }],
-            outputs: vec![
-                TxOut {
-                    value: 0,
-                    key_hash20: [1u8; 20],
-                },
-                TxOut {
-                    value: 3_000,
-                    key_hash20: [2u8; 20],
-                },
-            ],
-            lock_time: 0,
-        };
-        super::rewrite_coinbase_to_expected_value(&mut coinbase, 5_000).expect("rewrite");
-        assert_eq!(coinbase.outputs[0].value, 2_000);
-
-        super::rewrite_coinbase_to_expected_value(&mut coinbase, 3_000).expect("exact boundary");
-        assert_eq!(coinbase.outputs[0].value, 0);
-
-        let err = super::rewrite_coinbase_to_expected_value(&mut coinbase, 2_999)
-            .expect_err("expected lower than secondary outputs must fail");
-        assert!(
-            err.to_string().contains("exceed expected reward"),
-            "unexpected rewrite error: {err}"
-        );
-
-        assert_eq!(
-            super::coinbase_primary_value(5_000, 5_000, 3_000).expect("primary"),
-            2_000
-        );
-    }
-
-    #[test]
     fn tx_submit_mine_and_sync_updates_receiver_balance() {
         let _net_guard = network_test_guard();
         let mut cfg: ChainConfig =
@@ -41756,6 +41697,30 @@ mod tests {
         assert!(
             !state.relay.mempool.contains(&txid),
             "connected-only transition must still clean stale mempool transactions"
+        );
+    }
+
+    /// P13: address-keyed tip hints stay bounded and keep connected peers.
+    #[test]
+    fn relay_peer_tip_address_hints_are_bounded() {
+        let mut state = relay_state_for_tests();
+        let now = 10_000_000u64;
+        for i in 0..(super::RELAY_MAX_TRACKED_PEER_TIP_ADDRESSES as u64 + 100) {
+            let address = format!("198.18.{}.{}:18444", i / 250, i % 250);
+            state.peer_tip_by_address.insert(address.clone(), 1);
+            state
+                .peer_tip_last_update_by_address
+                .insert(address, now - super::RELAY_PEER_TIP_ADDRESS_TTL_SEC - 1);
+        }
+        state
+            .peer_session_addresses
+            .insert(1, "198.18.0.0:18444".to_owned());
+        super::relay_record_peer_tip_height_at(&mut state, 1, 2, now);
+        assert!(state.peer_tip_by_address.len() <= super::RELAY_MAX_TRACKED_PEER_TIP_ADDRESSES);
+        assert!(state.peer_tip_by_address.contains_key("198.18.0.0:18444"));
+        assert_eq!(
+            state.peer_tip_by_address.len(),
+            state.peer_tip_last_update_by_address.len()
         );
     }
 

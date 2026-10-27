@@ -241,6 +241,9 @@ impl GossipEngine {
 
     pub fn disconnect_peer(&mut self, peer_id: PeerId) {
         self.peers.remove(&peer_id);
+        // Peer ids are per connection and never reused, so a ban keyed by
+        // the id has no effect after disconnect; the relay bans by IP.
+        self.banned_peers.remove(&peer_id);
     }
 
     pub fn peer_count(&self) -> usize {
@@ -2698,6 +2701,16 @@ mod tests {
     /// P1: minisketch-rs `deserialize` reads `serialized_size()` bytes from
     /// a raw pointer; any other length must be rejected before it is called
     /// (an empty payload used to segfault the node).
+    /// P13: per-connection ban entries do not outlive the connection.
+    #[test]
+    fn disconnect_forgets_per_connection_ban() {
+        let mut engine = GossipEngine::new(8).expect("engine");
+        engine.connect_peer(5);
+        engine.banned_peers.insert(5);
+        engine.disconnect_peer(5);
+        assert!(engine.banned_peers.is_empty());
+    }
+
     /// P8: a peer flooding random inventory cannot grow our memory beyond
     /// the per-peer cap.
     #[test]

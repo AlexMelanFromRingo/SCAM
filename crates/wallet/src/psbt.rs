@@ -56,7 +56,8 @@ use thiserror::Error;
 
 use crate::signer::WalletKey;
 
-pub const PARTIAL_MULTISIG_TX_VERSION: u32 = 1;
+/// v2 adds `prev_txs` so signers can verify input amounts and the fee.
+pub const PARTIAL_MULTISIG_TX_VERSION: u32 = 2;
 
 /// JSON envelope for an unsigned-or-partially-signed multisig
 /// transaction.
@@ -74,6 +75,11 @@ pub struct PartialMultisigTx {
     /// the multisig inputs appear here; non-multisig inputs are
     /// expected to be already-signed in `tx.inputs[i].signature`.
     pub inputs: BTreeMap<u32, PartialMultisigInput>,
+    /// The transactions that created every output `tx` spends. Each is
+    /// re-hashed and matched against the input's `prev_out.txid`, so the
+    /// amounts cannot be forged: signers see exactly what they spend and
+    /// what fee they pay.
+    pub prev_txs: Vec<Transaction>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -95,6 +101,7 @@ impl PartialMultisigTx {
         chain_domain: &[u8],
         tx: Transaction,
         multisig_inputs: &[(u32, Vec<u8>)],
+        prev_txs: &[Transaction],
     ) -> Result<Self, PartialMultisigError> {
         for (idx, blob) in multisig_inputs {
             if !looks_like_multisig_blob(blob) {
@@ -128,11 +135,75 @@ impl PartialMultisigTx {
                 },
             );
         }
-        Ok(Self {
+        let mut seen = std::collections::HashSet::new();
+        let prev_txs = prev_txs
+            .iter()
+            .filter(|prev| seen.insert(prev.txid()))
+            .cloned()
+            .collect::<Vec<_>>();
+        let envelope = Self {
             version: PARTIAL_MULTISIG_TX_VERSION,
             chain_domain_hex: hex::encode(chain_domain),
             tx,
             inputs,
+            prev_txs,
+        };
+        envelope.input_values()?;
+        Ok(envelope)
+    }
+
+    /// Value of every input, resolved through `prev_txs` and verified: the
+    /// previous tx must hash to the input's `prev_out.txid`, the output must
+    /// exist, and a multisig input must spend an output locked to its
+    /// descriptor.
+    pub fn input_values(&self) -> Result<Vec<u64>, PartialMultisigError> {
+        let by_txid = self
+            .prev_txs
+            .iter()
+            .map(|prev| (prev.txid(), prev))
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut values = Vec::with_capacity(self.tx.inputs.len());
+        for (index, input) in self.tx.inputs.iter().enumerate() {
+            let input_index = index as u32;
+            let prev = by_txid
+                .get(&input.prev_out.txid)
+                .ok_or(PartialMultisigError::MissingPrevTx { input_index })?;
+            let output = prev
+                .outputs
+                .get(input.prev_out.vout as usize)
+                .ok_or(PartialMultisigError::MissingPrevTx { input_index })?;
+            if let Some(entry) = self.inputs.get(&input_index) {
+                let blob = hex::decode(&entry.descriptor_hex).map_err(|_| {
+                    PartialMultisigError::BadEnvelope("descriptor_hex bad".to_owned())
+                })?;
+                if MultisigDescriptor::script_hash20(&blob) != output.key_hash20 {
+                    return Err(PartialMultisigError::PrevOutputNotMultisig { input_index });
+                }
+            }
+            values.push(output.value);
+        }
+        Ok(values)
+    }
+
+    /// Fee the finalized transaction pays (inputs − outputs), from verified
+    /// input amounts.
+    pub fn fee(&self) -> Result<u64, PartialMultisigError> {
+        let inputs = self
+            .input_values()?
+            .into_iter()
+            .try_fold(0u64, u64::checked_add)
+            .ok_or_else(|| PartialMultisigError::BadEnvelope("input sum overflow".to_owned()))?;
+        let outputs = self
+            .tx
+            .outputs
+            .iter()
+            .map(|out| out.value)
+            .try_fold(0u64, u64::checked_add)
+            .ok_or_else(|| PartialMultisigError::BadEnvelope("output sum overflow".to_owned()))?;
+        inputs.checked_sub(outputs).ok_or_else(|| {
+            PartialMultisigError::BadEnvelope(format!(
+                "outputs ({outputs}) exceed inputs ({inputs})"
+            ))
         })
     }
 
@@ -198,6 +269,9 @@ impl PartialMultisigTx {
                 source,
             }
         })?;
+        // Never sign without verified amounts: the fee is part of what the
+        // signer agrees to.
+        self.fee()?;
 
         let our_pubkey = wallet_key.pubkey_compressed();
         if !descriptor.pubkeys.iter().any(|pk| pk == &our_pubkey) {
@@ -312,6 +386,7 @@ impl PartialMultisigTx {
     /// Returns the finalized tx ready for submission, or a typed
     /// error if any input is under-signed.
     pub fn finalize(&self) -> Result<Transaction, PartialMultisigError> {
+        self.fee()?;
         let mut tx = self.tx.clone();
         for (idx, entry) in &self.inputs {
             let input_index = *idx as usize;
@@ -441,6 +516,12 @@ pub enum PartialMultisigError {
     SigningFailed(String),
     #[error("serde: {0}")]
     Serde(String),
+    #[error(
+        "input #{input_index}: previous transaction missing from the envelope (or vout out of range)"
+    )]
+    MissingPrevTx { input_index: u32 },
+    #[error("input #{input_index} spends an output that is not locked to its multisig descriptor")]
+    PrevOutputNotMultisig { input_index: u32 },
 }
 
 // The MULTISIG_TAG re-export keeps API ergonomics: callers don't have
@@ -458,12 +539,31 @@ mod tests {
         derive_wallet_key(&[seed; 64], 0, 0).expect("derive")
     }
 
-    fn unsigned_tx_with_one_multisig_input(blob: &[u8]) -> Transaction {
-        Transaction {
+    /// The previous tx paying 1_000 to the descriptor, and an unsigned tx
+    /// spending it with a 999 fee.
+    fn unsigned_tx_with_one_multisig_input(blob: &[u8]) -> (Transaction, Transaction) {
+        let prev = Transaction {
             version: 1,
             inputs: vec![TxIn {
                 prev_out: OutPoint {
                     txid: Hash256([0xAA; 32]),
+                    vout: 0,
+                },
+                signature: vec![1; 64],
+                pubkey_compressed: vec![2; 33],
+                sequence: u32::MAX,
+            }],
+            outputs: vec![TxOut {
+                value: 1_000,
+                key_hash20: MultisigDescriptor::script_hash20(blob),
+            }],
+            lock_time: 0,
+        };
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: OutPoint {
+                    txid: prev.txid(),
                     vout: 0,
                 },
                 signature: Vec::new(),
@@ -475,7 +575,8 @@ mod tests {
                 key_hash20: [0xBB; 20],
             }],
             lock_time: 0,
-        }
+        };
+        (tx, prev)
     }
 
     fn three_party_descriptor() -> (Vec<u8>, [WalletKey; 3]) {
@@ -510,16 +611,72 @@ mod tests {
             }],
             lock_time: 0,
         };
-        let err = PartialMultisigTx::new(b"devnet", tx, &[(0, vec![0x02; 33])])
+        let err = PartialMultisigTx::new(b"devnet", tx, &[(0, vec![0x02; 33])], &[])
             .expect_err("33-byte blob is not multisig");
         assert!(matches!(err, PartialMultisigError::NotMultisigBlob { .. }));
+    }
+
+    /// R8: signers see verified input amounts and the fee; forged or
+    /// missing previous transactions are refused before anyone signs.
+    #[test]
+    fn envelope_verifies_input_amounts_and_reports_fee() {
+        let (blob, keys) = three_party_descriptor();
+        let (tx, prev) = unsigned_tx_with_one_multisig_input(&blob);
+        let pmt = PartialMultisigTx::new(
+            b"devnet",
+            tx.clone(),
+            &[(0, blob.clone())],
+            std::slice::from_ref(&prev),
+        )
+        .expect("new");
+        assert_eq!(pmt.input_values().expect("values"), vec![1_000]);
+        assert_eq!(pmt.fee().expect("fee"), 999);
+
+        assert!(matches!(
+            PartialMultisigTx::new(b"devnet", tx.clone(), &[(0, blob.clone())], &[]),
+            Err(PartialMultisigError::MissingPrevTx { input_index: 0 })
+        ));
+
+        // Inflating the amount changes the prev tx hash: no longer matches.
+        let mut forged = prev.clone();
+        forged.outputs[0].value = 1_000_000;
+        assert!(matches!(
+            PartialMultisigTx::new(
+                b"devnet",
+                tx.clone(),
+                &[(0, blob.clone())],
+                &[forged.clone()]
+            ),
+            Err(PartialMultisigError::MissingPrevTx { .. })
+        ));
+
+        // A tampered envelope cannot be signed.
+        let mut tampered = pmt.clone();
+        tampered.prev_txs = vec![forged];
+        assert!(tampered.sign_input(0, &keys[0]).is_err());
+
+        // The spent output must be locked to the descriptor.
+        let mut not_ours = prev;
+        not_ours.outputs[0].key_hash20 = [0x55; 20];
+        let mut spend = tx;
+        spend.inputs[0].prev_out.txid = not_ours.txid();
+        assert!(matches!(
+            PartialMultisigTx::new(b"devnet", spend, &[(0, blob)], &[not_ours]),
+            Err(PartialMultisigError::PrevOutputNotMultisig { input_index: 0 })
+        ));
     }
 
     #[test]
     fn json_roundtrip_preserves_signatures() {
         let (blob, keys) = three_party_descriptor();
-        let tx = unsigned_tx_with_one_multisig_input(&blob);
-        let mut pmt = PartialMultisigTx::new(b"devnet", tx, &[(0, blob.clone())]).expect("new");
+        let (tx, prev) = unsigned_tx_with_one_multisig_input(&blob);
+        let mut pmt = PartialMultisigTx::new(
+            b"devnet",
+            tx,
+            &[(0, blob.clone())],
+            std::slice::from_ref(&prev),
+        )
+        .expect("new");
         pmt.sign_input(0, &keys[0]).expect("sign 0");
         let json = pmt.to_json().expect("encode");
         let parsed = PartialMultisigTx::from_json(&json).expect("decode");
@@ -528,17 +685,22 @@ mod tests {
 
     #[test]
     fn from_json_rejects_version_mismatch() {
-        let bad = r#"{"version":99,"chain_domain_hex":"","tx":{"version":1,"inputs":[],"outputs":[],"lock_time":0},"inputs":{}}"#;
+        let bad = r#"{"version":99,"chain_domain_hex":"","tx":{"version":1,"inputs":[],"outputs":[],"lock_time":0},"inputs":{},"prev_txs":[]}"#;
         let err = PartialMultisigTx::from_json(bad).expect_err("must reject");
         assert!(matches!(err, PartialMultisigError::BadEnvelope(_)));
+        // A v1 envelope (no verifiable amounts) is refused too.
+        let v1 = r#"{"version":1,"chain_domain_hex":"","tx":{"version":1,"inputs":[],"outputs":[],"lock_time":0},"inputs":{}}"#;
+        assert!(PartialMultisigTx::from_json(v1).is_err());
     }
 
     #[test]
     fn sign_input_rejects_non_participant_key() {
         let (blob, _keys) = three_party_descriptor();
         let stranger = key(99); // not in descriptor
-        let tx = unsigned_tx_with_one_multisig_input(&blob);
-        let mut pmt = PartialMultisigTx::new(b"devnet", tx, &[(0, blob)]).expect("new");
+        let (tx, prev) = unsigned_tx_with_one_multisig_input(&blob);
+        let mut pmt =
+            PartialMultisigTx::new(b"devnet", tx, &[(0, blob)], std::slice::from_ref(&prev))
+                .expect("new");
         let err = pmt
             .sign_input(0, &stranger)
             .expect_err("stranger key must be rejected");
@@ -551,8 +713,14 @@ mod tests {
     #[test]
     fn inspect_reports_threshold_status() {
         let (blob, keys) = three_party_descriptor();
-        let tx = unsigned_tx_with_one_multisig_input(&blob);
-        let mut pmt = PartialMultisigTx::new(b"devnet", tx, &[(0, blob.clone())]).expect("new");
+        let (tx, prev) = unsigned_tx_with_one_multisig_input(&blob);
+        let mut pmt = PartialMultisigTx::new(
+            b"devnet",
+            tx,
+            &[(0, blob.clone())],
+            std::slice::from_ref(&prev),
+        )
+        .expect("new");
         // 0/2 sigs.
         let status = pmt.inspect().expect("inspect");
         assert_eq!(status[0].valid_sigs, 0);
@@ -574,9 +742,15 @@ mod tests {
     #[test]
     fn finalize_verifies_when_initiator_left_pubkey_field_empty() {
         let (blob, keys) = three_party_descriptor();
-        let mut tx = unsigned_tx_with_one_multisig_input(&blob);
+        let (mut tx, prev) = unsigned_tx_with_one_multisig_input(&blob);
         tx.inputs[0].pubkey_compressed = Vec::new();
-        let mut pmt = PartialMultisigTx::new(b"devnet", tx, &[(0, blob.clone())]).expect("new");
+        let mut pmt = PartialMultisigTx::new(
+            b"devnet",
+            tx,
+            &[(0, blob.clone())],
+            std::slice::from_ref(&prev),
+        )
+        .expect("new");
         pmt.sign_input(0, &keys[0]).expect("sign 0");
         pmt.sign_input(0, &keys[1]).expect("sign 1");
         let finalized = pmt.finalize().expect("finalize");
@@ -596,8 +770,14 @@ mod tests {
     #[test]
     fn finalize_under_threshold_rejects() {
         let (blob, keys) = three_party_descriptor();
-        let tx = unsigned_tx_with_one_multisig_input(&blob);
-        let mut pmt = PartialMultisigTx::new(b"devnet", tx, &[(0, blob.clone())]).expect("new");
+        let (tx, prev) = unsigned_tx_with_one_multisig_input(&blob);
+        let mut pmt = PartialMultisigTx::new(
+            b"devnet",
+            tx,
+            &[(0, blob.clone())],
+            std::slice::from_ref(&prev),
+        )
+        .expect("new");
         pmt.sign_input(0, &keys[0]).expect("sign 0");
         let err = pmt.finalize().expect_err("1/2 must fail");
         assert!(matches!(
@@ -613,8 +793,14 @@ mod tests {
     #[test]
     fn finalize_produces_consensus_verifiable_tx() {
         let (blob, keys) = three_party_descriptor();
-        let tx = unsigned_tx_with_one_multisig_input(&blob);
-        let mut pmt = PartialMultisigTx::new(b"devnet", tx, &[(0, blob.clone())]).expect("new");
+        let (tx, prev) = unsigned_tx_with_one_multisig_input(&blob);
+        let mut pmt = PartialMultisigTx::new(
+            b"devnet",
+            tx,
+            &[(0, blob.clone())],
+            std::slice::from_ref(&prev),
+        )
+        .expect("new");
         pmt.sign_input(0, &keys[0]).expect("sign 0");
         pmt.sign_input(0, &keys[2]).expect("sign 2");
 
@@ -642,8 +828,10 @@ mod tests {
     #[test]
     fn sign_input_is_idempotent() {
         let (blob, keys) = three_party_descriptor();
-        let tx = unsigned_tx_with_one_multisig_input(&blob);
-        let mut pmt = PartialMultisigTx::new(b"devnet", tx, &[(0, blob)]).expect("new");
+        let (tx, prev) = unsigned_tx_with_one_multisig_input(&blob);
+        let mut pmt =
+            PartialMultisigTx::new(b"devnet", tx, &[(0, blob)], std::slice::from_ref(&prev))
+                .expect("new");
         pmt.sign_input(0, &keys[0]).expect("sign 0");
         let snapshot = pmt.clone();
         pmt.sign_input(0, &keys[0]).expect("idempotent second sign");
