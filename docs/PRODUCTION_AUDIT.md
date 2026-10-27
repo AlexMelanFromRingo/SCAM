@@ -34,6 +34,7 @@ Baseline at start: `fmt`/`clippy -D warnings`/`cargo test --workspace
 | C17 | low | BIP113 not applied: absolute `lock_time` compared to header time, not MTP. | `consensus/src/utxo.rs` | fixed (lock_time vs MTP) |
 | C18 | low | BIP34 (height in coinbase) not a consensus rule; C1 covers safety. | consensus | deferred (C1 already prevents overwrites; BIP34 would only add txid uniqueness for spent coinbases at the cost of rewriting most block fixtures) |
 | C20 | low | CSV deviates from BIP68 by one: height locks need `spend > created + value` (BIP68: `>=`), time locks compare with the creating block's own header time (BIP68: MTP of its parent). Deterministic, not exploitable; docs claim "verbatim BIP68". | `consensus/src/csv.rs` | fixed (exact BIP68: `>=`, coin time = creation MTP) |
+| C21 | high | The reorg depth cap introduced for C12 (`MAX_REORG_DEPTH`=720, ~1 day at 2-min blocks) is hard-coded; a node or network part partitioned longer stays on its branch forever, silently (no log/status signal that a heavier branch was refused); no documented resync procedure. Threshold value is the owner's decision before mainnet. | `chain/src/lib.rs`, `main.rs`, `OPERATOR_RUNBOOK.md` | open — owner decision (2026-10-28): the heaviest valid chain always wins; deeper than the in-memory undo window the node rebuilds its state along the heavier branch once its headers prove more cumulative work; signal in logs and `/status`; runbook section |
 | C19 | info | `config/mainnet.toml` has halvings disabled ⇒ constant 50/block forever. Policy decision for the owner. | config | decided: intentional (owner, 2026-10-28) |
 
 ## Mempool / block templates
@@ -80,19 +81,19 @@ Baseline at start: `fmt`/`clippy -D warnings`/`cargo test --workspace
 | S5 | medium | Mempool DB: load-modify-rewrite from RPC, relay and stratum ⇒ lost updates; `GET /mempool` writes. | `main.rs` | fixed (mempool tracks its own delta; `apply_mempool_delta_db` writes only inserts/removals in one txn; relay refresh merges instead of replacing) |
 | S6 | medium | redb exclusive open per access; nested retry sleeps while holding locks / in async tasks. | `main.rs` | open |
 | S7 | low | No on-disk schema version; `#[serde(default)]` useless under bincode. | `storage` | fixed (`schema_version` in every store; unknown versions refused; pool ledger requires v2) |
-| S8 | low | Temp files leaked on error; rename while temp DB still open. | `storage` | fixed for the runtime archive (no temp file anymore) |
+| S8 | low | Temp files leaked on error; rename while temp DB still open. | `storage` | fixed (every whole-store rewrite happens in place inside one redb transaction — no temp DB, no rename; the bincode snapshot file is written temp+fsync+rename with the temp removed on error) |
 
 ## Stratum / pool
 
 | ID | Sev | Finding | Where | Status |
 |---|---|---|---|---|
-| ST1 | critical | stratum-serve works on a stale tip forever (see S1); ledger never sees reorgs ⇒ orphaned rounds paid. | `main.rs` stratum | fixed (merge-refresh on every tip poll and before found-block validation); ledger reorg handling still open (see ST4/ST5) |
+| ST1 | critical | stratum-serve works on a stale tip forever (see S1); ledger never sees reorgs ⇒ orphaned rounds paid. | `main.rs` stratum | fixed (merge-refresh on every tip poll and before found-block validation; PPLNS credits of a round count only once its block has `coinbase_maturity` confirmations, an immature round is never settled by retention eviction, reorgs re-evaluate maturity and orphaning on every maintenance tick) |
 | ST2 | critical | Sanitizer uses claimed fee when parent not yet resolved (children first by feerate) ⇒ `CoinbaseRewardTooHigh`; retry path rewrites coinbase ⇒ PoW lost. | `main.rs` | fixed (see M6/M5) |
 | ST3 | high | PPS credit fixed per share regardless of share difficulty; min share target = any hash; liability cap 0 = unlimited. | `main.rs` payout | fixed (credit scales with share expected hashes vs the hardest share target; PPS/Hybrid require a non-zero liability cap) |
-| ST4 | high | Payout txs pick the same pool coins; conflict outcome reported as success; txid recorded after broadcast ⇒ stuck or double payouts. | `main.rs::build_signed_transfer_tx` & payout loop | partially fixed (mempool-spent coins excluded, conflict outcome is a failure); txid-before-broadcast + stuck-payout expiry open |
+| ST4 | high | Payout txs pick the same pool coins; conflict outcome reported as success; txid recorded after broadcast ⇒ stuck or double payouts. | `main.rs::build_signed_transfer_tx` & payout loop | fixed (signed payout persisted before broadcast; on restart or mempool loss the same tx is re-broadcast; a version is replaced only when an input was spent elsewhere, by a version spending the same lineage coin, or — lineage coin gone — after the conflict is `coinbase_maturity` deep; every version txid is tracked; payouts use only coins ≥ maturity deep, are final after maturity confirmations and undone by reorgs; chain search is incremental from a fork-aware anchor; one payout processor) |
 | ST5 | high | PPLNS earnings recomputed from capped history but compared with lifetime paid ⇒ workers stop being paid. | `main.rs` payout | fixed (split frozen per round at close; evicted rounds folded into `pplns_settled_atomic`; ledger schema v2) |
 | ST6 | medium | Shares for old-tip jobs still credited; tip only rechecked on read timeout. | `stratum/src/lib.rs`, `main.rs` | fixed (share credited only if its job builds on the current — refreshed — tip) |
-| ST7 | medium | Whole pool ledger DB rewritten per share. | `storage`, `main.rs` | mitigated (share bookkeeping flushed at most once per second, on session ticks and at session end; round closes/payouts persist immediately) — incremental ledger writes still open |
+| ST7 | medium | Whole pool ledger DB rewritten per share. | `storage`, `main.rs` | fixed (ledger schema v3: shares keyed by arrival `seq`; flushes write only changed rows via `apply_pool_ledger_delta_db` in one txn, outside the ledger lock, from one maintenance thread; sessions never write) |
 | ST8 | low | Stratum async read timeout not cancel-safe. | `main.rs` | fixed (`Sv2StreamReader`: buffered plain/secure frames, decrypt only complete frames) |
 | ST9 | low | `stratum_secure_transport=false` on mainnet ⇒ payout address in plaintext. | `config/mainnet.toml` | fixed (mainnet defaults to noise_xx; server key via `SCAM_STRATUM_STATIC_SECRET_KEY_HEX`; miners connect with `--secure-transport`) |
 
@@ -147,8 +148,16 @@ but **existing devnet/testnet chains and nodes must be upgraded together**:
   a static key (`scam-node stratum-keygen`, pass it via
   `SCAM_STRATUM_STATIC_SECRET_KEY_HEX`), miners use `--secure-transport`.
   `docs/mainnet-freeze.lock.json` was regenerated (genesis unchanged).
-- Every store carries `schema_version`. Pool ledgers written before this
-  pass (v1) are refused — move the file aside to start a fresh ledger.
+- Every store carries `schema_version`. Pool ledgers written before the
+  current format (v3) are refused — move the file aside to start a fresh
+  ledger.
+- Pool: PPLNS round credits become payable only after the round's block has
+  `coinbase_maturity` confirmations; payouts spend only coins at least that
+  deep and are final (worker `paid_total`, next payout allowed) after the
+  same number of confirmations. A signed payout tx is stored in the ledger
+  before broadcast and re-broadcast unchanged after restarts. Ledger writes
+  and payouts run on a `pool-maintenance` thread; `stratum-serve` refuses to
+  start if the ledger DB cannot be written.
 - The runtime archive is written incrementally with recorded tip work; a
   process whose chain is behind the archive gets `StaleArchiveWriter` instead
   of overwriting it. Archives written by older versions are accepted.

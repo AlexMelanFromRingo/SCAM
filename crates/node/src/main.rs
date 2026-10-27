@@ -53,16 +53,17 @@ use scam_rpc::{
     StatusResponse, TxResponse, TxSubmitRpcRequest, decode_tx_submit_request,
     header_to_block_response, to_pretty_json,
 };
-#[cfg(test)]
-use scam_storage::MempoolSnapshot;
 use scam_storage::{
-    ChainStateSnapshot, MempoolTxRecord, PeerAddressBook, PeerAddressRecord, PoolLedgerSnapshot,
-    PoolPayoutRecord, PoolRoundCredit, PoolRoundRecord, PoolShareRecord, PoolWorkerAccrualRecord,
-    StorageError, apply_mempool_delta_db, load_block_by_hash_db, load_chain_archive_db,
+    ChainStateSnapshot, MempoolTxRecord, PeerAddressBook, PeerAddressRecord, PoolChainPoint,
+    PoolLedgerDelta, PoolLedgerSnapshot, PoolPayoutRecord, PoolRoundCredit, PoolRoundRecord,
+    PoolShareRecord, PoolWorkerAccrualRecord, StorageError, apply_mempool_delta_db,
+    apply_pool_ledger_delta_db, load_block_by_hash_db, load_chain_archive_db,
     load_chain_archive_range_db, load_chain_archive_tip_db, load_mempool_db, load_peer_book_db,
     load_pool_ledger_db, load_snapshot, load_snapshot_db, persist_chain_archive_incremental_db,
-    save_peer_book_db, save_pool_ledger_db, save_snapshot, save_snapshot_db,
+    save_peer_book_db, save_snapshot, save_snapshot_db,
 };
+#[cfg(test)]
+use scam_storage::{MempoolSnapshot, save_pool_ledger_db};
 use scam_stratum::{
     IdentityTranslator, JobDeclarator, MiningJob, MiningTemplate, NoiseSv2Transport,
     SUPPORTED_SV2_VERSION, SecureSv2Transport, SecureTransportMode, SequentialJobDeclarator,
@@ -2032,10 +2033,30 @@ fn remove_confirmed_txids_from_mempool_db(
 }
 
 fn remove_confirmed_txids_present_on_chain(runtime: &ChainRuntime, mempool: &mut Mempool) -> usize {
-    let confirmed_txids = mempool
+    // A confirmed tx has spent its inputs, so only txs with an input missing
+    // from the UTXO set are candidates, and one pass over the chain finds
+    // them (each tx used to trigger its own full-chain scan).
+    let utxos = runtime.utxo_set();
+    let candidates = mempool
         .txids_by_feerate_desc()
         .into_iter()
-        .filter(|txid| runtime_contains_txid(runtime, *txid))
+        .filter(|txid| {
+            mempool.get(txid).is_some_and(|tx| {
+                tx.inputs
+                    .iter()
+                    .any(|input| !utxos.contains_key(&input.prev_out))
+            })
+        })
+        .collect::<HashSet<_>>();
+    if candidates.is_empty() {
+        return 0;
+    }
+    let confirmed_txids = runtime
+        .block_hashes()
+        .iter()
+        .filter_map(|hash| runtime.block_by_hash(hash))
+        .flat_map(|block| block.transactions.iter().skip(1).map(Transaction::txid))
+        .filter(|txid| candidates.contains(txid))
         .collect::<Vec<_>>();
     if confirmed_txids.is_empty() {
         return 0;
@@ -2108,19 +2129,23 @@ fn load_pool_ledger_from_db_or_new(
     pool_ledger_db_path: &Path,
     max_share_records: usize,
     max_round_records: usize,
+    payout_cfg: PoolPayoutConfig,
 ) -> Result<StratumPoolLedgerState, NodeError> {
     let now_unix_sec = current_unix_sec()?;
     let start_height = runtime.tip_height();
     let start_tip_hash = runtime.tip_hash();
     if !pool_ledger_db_path.exists() {
-        return Ok(StratumPoolLedgerState::new(
+        let mut state = StratumPoolLedgerState::new(
             cfg.network_id.clone(),
             start_height,
             start_tip_hash,
             now_unix_sec,
             max_share_records,
             max_round_records,
-        ));
+        );
+        state.set_payout_config(payout_cfg);
+        let _ = state.reconcile_with_runtime(runtime, now_unix_sec);
+        return Ok(state);
     }
     let snapshot = load_pool_ledger_db(pool_ledger_db_path)?;
     if snapshot.network_id != cfg.network_id {
@@ -2137,16 +2162,43 @@ fn load_pool_ledger_from_db_or_new(
         max_share_records,
         max_round_records,
     );
+    // Maturity and payout rules must be known before the first reconcile
+    // settles anything.
+    state.set_payout_config(payout_cfg);
     let _ = state.reconcile_with_runtime(runtime, now_unix_sec);
     Ok(state)
 }
 
-fn persist_pool_ledger_db(
+/// Write the ledger's changes since the last flush. `writer` serializes
+/// flushes (deltas must reach the DB in order); the DB I/O runs without the
+/// ledger lock, so share accounting never waits on the disk.
+fn persist_pool_ledger_state(
+    ledger: &Mutex<StratumPoolLedgerState>,
+    writer: &Mutex<()>,
     pool_ledger_db_path: &Path,
-    state: &StratumPoolLedgerState,
+    attempts: usize,
+    backoff_ms: u64,
 ) -> Result<(), NodeError> {
-    let snapshot = state.snapshot();
-    save_pool_ledger_db(pool_ledger_db_path, &snapshot)?;
+    let poisoned = || NodeError::Runtime("stratum pool ledger mutex poisoned".to_owned());
+    let _writer = writer.lock().map_err(|_| poisoned())?;
+    let (network_id, delta) = {
+        let ledger = ledger.lock().map_err(|_| poisoned())?;
+        (ledger.network_id.clone(), ledger.persist_delta())
+    };
+    let Some(delta) = delta else {
+        return Ok(());
+    };
+    persist_with_retry(
+        attempts,
+        backoff_ms,
+        is_pool_ledger_db_lock_conflict,
+        "pool ledger db persist failed for unknown reason",
+        || {
+            apply_pool_ledger_delta_db(pool_ledger_db_path, &network_id, &delta)
+                .map_err(NodeError::from)
+        },
+    )?;
+    ledger.lock().map_err(|_| poisoned())?.mark_persisted(delta);
     Ok(())
 }
 
@@ -2232,21 +2284,6 @@ fn persist_mempool_db_with_retry(
         is_mempool_db_lock_conflict,
         "mempool db persist failed for unknown reason",
         || persist_mempool_db(cfg, mempool, mempool_db_path),
-    )
-}
-
-fn persist_pool_ledger_db_with_retry(
-    pool_ledger_db_path: &Path,
-    state: &StratumPoolLedgerState,
-    attempts: usize,
-    backoff_ms: u64,
-) -> Result<(), NodeError> {
-    persist_with_retry(
-        attempts,
-        backoff_ms,
-        is_pool_ledger_db_lock_conflict,
-        "pool ledger db persist failed for unknown reason",
-        || persist_pool_ledger_db(pool_ledger_db_path, state),
     )
 }
 
@@ -4822,10 +4859,7 @@ fn build_signed_transfer_tx_with_exclusions(
     let needed = amount
         .checked_add(fee)
         .ok_or_else(|| NodeError::Runtime("amount + fee overflow".to_owned()))?;
-    let sender_pubkey = sender_key.pubkey_compressed();
-    let sender_key_hash20 = scam_core::hash160_blake3(&sender_pubkey);
-    let is_self_transfer = recipient_key_hash20 == sender_key_hash20;
-
+    let sender_key_hash20 = scam_core::hash160_blake3(&sender_key.pubkey_compressed());
     let (spendable, spendable_total) =
         collect_spendable_utxos_excluding(runtime, sender_key_hash20, excluded_outpoints);
     let (selected, selected_total) =
@@ -4833,6 +4867,112 @@ fn build_signed_transfer_tx_with_exclusions(
             needed,
             spendable_total,
         })?;
+    sign_transfer_tx(
+        network_id,
+        sender_key,
+        recipient_key_hash20,
+        amount,
+        needed,
+        selected,
+        selected_total,
+    )
+}
+
+/// Which coins a pool payout may spend.
+struct PayoutCoinRules<'a> {
+    excluded: &'a HashSet<OutPoint>,
+    /// A payout must not rest on a coin a reorg can remove.
+    min_confirmations: u64,
+    /// Spent first when given (the payout's lineage coin).
+    required_input: Option<&'a OutPoint>,
+}
+
+fn build_signed_payout_tx(
+    runtime: &ChainRuntime,
+    network_id: &str,
+    sender_key: &WalletKey,
+    recipient_key_hash20: [u8; 20],
+    amount: u64,
+    fee: u64,
+    rules: &PayoutCoinRules<'_>,
+) -> Result<SignedTransferTx, NodeError> {
+    let PayoutCoinRules {
+        excluded: excluded_outpoints,
+        min_confirmations,
+        required_input,
+    } = *rules;
+    if amount == 0 {
+        return Err(NodeError::Runtime(
+            "amount must be > 0 (zero-value outputs are invalid)".to_owned(),
+        ));
+    }
+    let needed = amount
+        .checked_add(fee)
+        .ok_or_else(|| NodeError::Runtime("amount + fee overflow".to_owned()))?;
+    let sender_key_hash20 = scam_core::hash160_blake3(&sender_key.pubkey_compressed());
+    let tip_height = runtime.tip_height();
+    let (mut spendable, _) =
+        collect_spendable_utxos_excluding(runtime, sender_key_hash20, excluded_outpoints);
+    spendable.retain(|utxo| {
+        runtime.utxo_set().get(&utxo.outpoint).is_some_and(|entry| {
+            tx_output_confirmations(tip_height, entry.created_height) >= min_confirmations
+        })
+    });
+    let spendable_total = spendable.iter().fold(0u128, |acc, utxo| {
+        acc.saturating_add(u128::from(utxo.value))
+    });
+    let insufficient = NodeError::InsufficientFunds {
+        needed,
+        spendable_total,
+    };
+    let (selected, selected_total) = match required_input {
+        Some(required) => {
+            let first = spendable
+                .iter()
+                .find(|utxo| &utxo.outpoint == required)
+                .cloned()
+                .ok_or_else(|| {
+                    NodeError::Runtime(format!(
+                        "payout lineage coin {}:{} is not spendable",
+                        required.txid, required.vout
+                    ))
+                })?;
+            let rest = spendable
+                .iter()
+                .filter(|utxo| &utxo.outpoint != required)
+                .cloned()
+                .collect::<Vec<_>>();
+            let (more, more_total) =
+                select_utxos_for_amount(&rest, needed.saturating_sub(first.value))
+                    .ok_or(insufficient)?;
+            let total = first.value.saturating_add(more_total);
+            (std::iter::once(first).chain(more).collect(), total)
+        }
+        None => select_utxos_for_amount(&spendable, needed).ok_or(insufficient)?,
+    };
+    sign_transfer_tx(
+        network_id,
+        sender_key,
+        recipient_key_hash20,
+        amount,
+        needed,
+        selected,
+        selected_total,
+    )
+}
+
+fn sign_transfer_tx(
+    network_id: &str,
+    sender_key: &WalletKey,
+    recipient_key_hash20: [u8; 20],
+    amount: u64,
+    needed: u64,
+    selected: Vec<SpendableUtxo>,
+    selected_total: u64,
+) -> Result<SignedTransferTx, NodeError> {
+    let sender_pubkey = sender_key.pubkey_compressed();
+    let sender_key_hash20 = scam_core::hash160_blake3(&sender_pubkey);
+    let is_self_transfer = recipient_key_hash20 == sender_key_hash20;
     let change_value = selected_total.checked_sub(needed).ok_or_else(|| {
         NodeError::Runtime("selected UTXO total is smaller than needed amount".to_owned())
     })?;
@@ -6116,6 +6256,10 @@ struct PoolPayoutConfig {
     /// so a miner kept at "any hash" difficulty is not paid like one doing
     /// real work.
     pps_reference_expected_hashes: f64,
+    /// Confirmations a found block needs before its round's PPLNS credits
+    /// count (the coinbase maturity): an immature round can still be
+    /// orphaned by a reorg, and the pool must not pay for it.
+    round_maturity_blocks: u64,
     pps_max_liability_atomic: u128,
     pps_reserve_floor_atomic: u128,
     payout_threshold_atomic: u128,
@@ -6131,6 +6275,7 @@ impl Default for PoolPayoutConfig {
             pplns_window_shares: 300,
             pps_share_atomic: 0,
             pps_reference_expected_hashes: 1.0,
+            round_maturity_blocks: 0,
             pps_max_liability_atomic: 0,
             pps_reserve_floor_atomic: 0,
             payout_threshold_atomic: 100_000_000,
@@ -6189,6 +6334,123 @@ struct StratumPoolLedgerState {
     payout_cfg: PoolPayoutConfig,
     last_payout_run_unix_sec: u64,
     pps_guardrail_alerts_total: u64,
+    /// Active-chain tip as of the last reconcile; `None` until known.
+    chain_tip_height: Option<u64>,
+    /// Arrival number for the next share (`PoolShareRecord::seq`).
+    next_share_seq: u64,
+    /// What the ledger DB holds, so a flush writes only the difference.
+    persisted: PoolLedgerPersisted,
+}
+
+/// Completed payouts kept in the ledger (workers' `paid_total_atomic`
+/// keeps the sum of everything older).
+const POOL_COMPLETED_PAYOUT_RETENTION: usize = 4_096;
+
+/// The rows of the ledger DB as of the last successful flush.
+#[derive(Clone, Debug, Default)]
+struct PoolLedgerPersisted {
+    current_round_id: Option<u64>,
+    /// `seq` range of the shares on disk.
+    share_seqs: Option<(u64, u64)>,
+    rounds: HashMap<u64, PoolRoundRecord>,
+    workers: HashMap<String, PoolWorkerAccrualRecord>,
+    pending: HashMap<String, PoolPayoutRecord>,
+    completed: HashSet<String>,
+}
+
+impl PoolLedgerPersisted {
+    fn from_snapshot(snapshot: &PoolLedgerSnapshot) -> Self {
+        Self {
+            current_round_id: Some(snapshot.current_round_id),
+            share_seqs: snapshot
+                .shares
+                .first()
+                .zip(snapshot.shares.last())
+                .map(|(first, last)| (first.seq, last.seq)),
+            rounds: snapshot
+                .rounds
+                .iter()
+                .map(|round| (round.round_id, round.clone()))
+                .collect(),
+            workers: snapshot
+                .workers
+                .iter()
+                .map(|worker| (worker.worker.clone(), worker.clone()))
+                .collect(),
+            pending: snapshot
+                .pending_payouts
+                .iter()
+                .map(|payout| (payout.payout_id.clone(), payout.clone()))
+                .collect(),
+            completed: snapshot
+                .completed_payouts
+                .iter()
+                .map(|payout| payout.payout_id.clone())
+                .collect(),
+        }
+    }
+
+    fn apply(&mut self, delta: PoolLedgerDelta) {
+        self.current_round_id = Some(delta.current_round_id);
+        if let (Some(from), Some((lo, hi))) = (delta.shares_retained_from_seq, self.share_seqs) {
+            self.share_seqs = (from <= hi).then_some((lo.max(from), hi));
+        }
+        for share in &delta.shares_appended {
+            self.share_seqs = Some(match self.share_seqs {
+                Some((lo, hi)) => (lo, hi.max(share.seq)),
+                None => (share.seq, share.seq),
+            });
+        }
+        for round_id in &delta.rounds_removed {
+            self.rounds.remove(round_id);
+        }
+        for round in delta.rounds_upserted {
+            self.rounds.insert(round.round_id, round);
+        }
+        for worker in &delta.workers_removed {
+            self.workers.remove(worker);
+        }
+        for worker in delta.workers_upserted {
+            self.workers.insert(worker.worker.clone(), worker);
+        }
+        for payout_id in &delta.pending_removed {
+            self.pending.remove(payout_id);
+        }
+        for payout in delta.pending_upserted {
+            self.pending.insert(payout.payout_id.clone(), payout);
+        }
+        for payout_id in &delta.completed_removed {
+            self.completed.remove(payout_id);
+        }
+        for payout in delta.completed_upserted {
+            self.completed.insert(payout.payout_id);
+        }
+    }
+}
+
+/// Upserts and removals turning `persisted` into `current` (keyed rows).
+fn keyed_rows_delta<'a, K, V>(
+    current: impl Iterator<Item = (&'a K, &'a V)>,
+    persisted: &HashMap<K, V>,
+) -> (Vec<V>, Vec<K>)
+where
+    K: std::hash::Hash + Eq + Clone + 'a,
+    V: PartialEq + Clone + 'a,
+{
+    let mut seen = HashSet::<&K>::new();
+    let mut upserted = Vec::new();
+    for (key, value) in current {
+        seen.insert(key);
+        if persisted.get(key) != Some(value) {
+            upserted.push(value.clone());
+        }
+    }
+    let removed = persisted
+        .keys()
+        .filter(|key| !seen.contains(key))
+        .cloned()
+        .collect();
+    (upserted, removed)
 }
 
 impl StratumPoolLedgerState {
@@ -6232,6 +6494,9 @@ impl StratumPoolLedgerState {
             payout_cfg: PoolPayoutConfig::default(),
             last_payout_run_unix_sec: 0,
             pps_guardrail_alerts_total: 0,
+            chain_tip_height: None,
+            next_share_seq: 1,
+            persisted: PoolLedgerPersisted::default(),
         }
     }
 
@@ -6243,6 +6508,11 @@ impl StratumPoolLedgerState {
         max_share_records: usize,
         max_round_records: usize,
     ) -> Self {
+        let persisted = PoolLedgerPersisted::from_snapshot(&snapshot);
+        let next_share_seq = snapshot
+            .shares
+            .last()
+            .map_or(1, |share| share.seq.saturating_add(1));
         let mut shares = snapshot.shares.into_iter().collect::<VecDeque<_>>();
         let shares_overflow = shares.len().saturating_sub(max_share_records.max(1));
         for _ in 0..shares_overflow {
@@ -6252,11 +6522,9 @@ impl StratumPoolLedgerState {
             .iter()
             .map(|share| share.share_key.clone())
             .collect::<HashSet<_>>();
-        let mut rounds = snapshot.rounds.into_iter().collect::<VecDeque<_>>();
-        let rounds_overflow = rounds.len().saturating_sub(max_round_records.max(1));
-        for _ in 0..rounds_overflow {
-            let _ = rounds.pop_front();
-        }
+        // Rounds over the cap are settled (not dropped) by the first
+        // reconcile, once the chain tip and the maturity rule are known.
+        let rounds = snapshot.rounds.into_iter().collect::<VecDeque<_>>();
         let workers = snapshot
             .workers
             .into_iter()
@@ -6288,6 +6556,9 @@ impl StratumPoolLedgerState {
             payout_cfg: PoolPayoutConfig::default(),
             last_payout_run_unix_sec: 0,
             pps_guardrail_alerts_total: 0,
+            chain_tip_height: None,
+            next_share_seq,
+            persisted,
         };
         if let Some(open) = state.rounds.back()
             && open.end_height.is_none()
@@ -6462,7 +6733,7 @@ impl StratumPoolLedgerState {
         self.freeze_round_credits();
         let mut credited = Vec::new();
         for round in &self.rounds {
-            if round.orphaned || round.end_unix_sec.is_none() {
+            if round.orphaned || round.end_unix_sec.is_none() || !self.round_is_mature(round) {
                 continue;
             }
             credited.extend(round.pplns_credits.iter().cloned());
@@ -6475,6 +6746,27 @@ impl StratumPoolLedgerState {
             entry.pplns_accrual_atomic = entry
                 .pplns_accrual_atomic
                 .saturating_add(credit.amount_atomic);
+        }
+    }
+
+    fn mature_round_ids(&self) -> Vec<u64> {
+        self.rounds
+            .iter()
+            .filter(|round| round.end_unix_sec.is_some() && self.round_is_mature(round))
+            .map(|round| round.round_id)
+            .collect()
+    }
+
+    /// Whether a closed round's block has `round_maturity_blocks`
+    /// confirmations on the active chain (unknown tip = not yet checked).
+    fn round_is_mature(&self, round: &PoolRoundRecord) -> bool {
+        let maturity = self.payout_cfg.round_maturity_blocks;
+        if maturity == 0 {
+            return true;
+        }
+        match (self.chain_tip_height, round.end_height) {
+            (Some(tip), Some(end_height)) => end_height.saturating_add(maturity) <= tip,
+            _ => false,
         }
     }
 
@@ -6543,9 +6835,16 @@ impl StratumPoolLedgerState {
                         .saturating_add(1)
                 ),
                 worker: worker.clone(),
-                amount_atomic: outstanding,
+                amount_atomic: outstanding.min(u128::from(u64::MAX)),
                 created_unix_sec: now_unix_sec,
+                signed_tx_hex: None,
                 submitted_txid_hex: None,
+                superseded_txids: Vec::new(),
+                lineage_input: None,
+                broadcast_accepted: false,
+                searched_through: None,
+                confirmed_in: None,
+                dead_since_height: None,
                 confirmed: false,
             };
             self.pending_payouts.push_back(payout.clone());
@@ -6554,26 +6853,35 @@ impl StratumPoolLedgerState {
         created
     }
 
-    fn mark_pending_payout_submitted(&mut self, payout_id: &str, txid_hex: &str) -> bool {
-        for payout in &mut self.pending_payouts {
-            if payout.payout_id == payout_id {
-                payout.submitted_txid_hex = Some(txid_hex.to_owned());
-                return true;
-            }
-        }
-        false
+    /// Confirmations before a payout is final (paid, worker eligible
+    /// again): a shallower reorg could still drop it.
+    fn payout_settle_confirmations(&self) -> u64 {
+        self.payout_cfg.round_maturity_blocks.max(1)
     }
 
-    fn settle_confirmed_payouts(&mut self, runtime: &ChainRuntime) -> usize {
+    /// Follow every signed payout on the active chain (any of its versions),
+    /// undo a confirmation a reorg removed, and settle final payouts.
+    fn track_payouts_on_chain(&mut self, runtime: &ChainRuntime) -> bool {
+        let tip = PoolChainPoint {
+            height: runtime.tip_height(),
+            hash: runtime.tip_hash(),
+        };
+        let mut changed = false;
+        for payout in &mut self.pending_payouts {
+            changed |= track_payout_on_chain(runtime, payout, tip);
+        }
+        changed | (self.settle_confirmed_payouts(tip.height) > 0)
+    }
+
+    fn settle_confirmed_payouts(&mut self, tip_height: u64) -> usize {
+        let required = self.payout_settle_confirmations();
         let mut moved = 0usize;
         let mut keep = VecDeque::<PoolPayoutRecord>::new();
         while let Some(mut payout) = self.pending_payouts.pop_front() {
-            let confirmed = payout
-                .submitted_txid_hex
-                .as_deref()
-                .and_then(|hex| Hash256::from_hex(hex).ok())
-                .is_some_and(|txid| runtime_contains_txid(runtime, txid));
-            if confirmed {
+            let is_final = payout.confirmed_in.is_some_and(|point| {
+                tip_height.saturating_sub(point.height).saturating_add(1) >= required
+            });
+            if is_final {
                 payout.confirmed = true;
                 if let Some(worker) = self.workers.get_mut(&payout.worker) {
                     worker.paid_total_atomic = worker
@@ -6587,6 +6895,9 @@ impl StratumPoolLedgerState {
             }
         }
         self.pending_payouts = keep;
+        while self.completed_payouts.len() > POOL_COMPLETED_PAYOUT_RETENTION {
+            self.completed_payouts.pop_front();
+        }
         moved
     }
 
@@ -6612,7 +6923,10 @@ impl StratumPoolLedgerState {
         if !self.share_index.insert(key.clone()) {
             return false;
         }
+        let seq = self.next_share_seq;
+        self.next_share_seq = seq.saturating_add(1);
         self.shares.push_back(PoolShareRecord {
+            seq,
             share_key: key,
             worker: worker.to_owned(),
             timestamp_unix_sec: now_unix_sec,
@@ -6710,6 +7024,7 @@ impl StratumPoolLedgerState {
             self.recompute_pplns_accruals();
         }
         self.open_next_round(end_height, end_tip_hash, now_unix_sec);
+        self.evict_settled_rounds();
     }
 
     fn open_next_round(&mut self, start_height: u64, start_tip_hash: Hash256, now_unix_sec: u64) {
@@ -6731,7 +7046,20 @@ impl StratumPoolLedgerState {
             orphaned: false,
             pplns_credits: Vec::new(),
         });
+    }
+
+    /// Trims the round history to `max_round_records`, settling evicted
+    /// credits. An immature round may still be orphaned, so it is never
+    /// settled; rounds end at increasing heights, so once the oldest is
+    /// immature all newer ones are too (the overshoot is bounded by the
+    /// maturity window).
+    fn evict_settled_rounds(&mut self) {
         while self.rounds.len() > self.max_round_records {
+            if self.rounds.front().is_some_and(|round| {
+                round.end_unix_sec.is_some() && !round.orphaned && !self.round_is_mature(round)
+            }) {
+                break;
+            }
             let Some(evicted) = self.rounds.pop_front() else {
                 break;
             };
@@ -6740,7 +7068,10 @@ impl StratumPoolLedgerState {
     }
 
     fn reconcile_with_runtime(&mut self, runtime: &ChainRuntime, now_unix_sec: u64) -> bool {
-        let mut changed = false;
+        // Rounds mature (or, after a reorg, un-mature) as the tip moves.
+        let mature_before = self.mature_round_ids();
+        self.chain_tip_height = Some(runtime.tip_height());
+        let mut changed = self.mature_round_ids() != mature_before;
         for round in &mut self.rounds {
             let on_active_chain = match (round.end_height, round.end_tip_hash) {
                 (Some(end_height), Some(end_tip_hash)) => {
@@ -6773,6 +7104,9 @@ impl StratumPoolLedgerState {
             }
         }
 
+        let retained = self.rounds.len();
+        self.evict_settled_rounds();
+        changed |= self.rounds.len() != retained;
         if changed
             && matches!(
                 self.payout_cfg.mode,
@@ -6785,18 +7119,75 @@ impl StratumPoolLedgerState {
         changed
     }
 
-    fn snapshot(&self) -> PoolLedgerSnapshot {
-        let mut workers = self.workers.values().cloned().collect::<Vec<_>>();
-        workers.sort_by(|a, b| a.worker.cmp(&b.worker));
-        PoolLedgerSnapshot {
-            network_id: self.network_id.clone(),
+    /// Rows changed since the last flush (`None`: nothing to write).
+    fn persist_delta(&self) -> Option<PoolLedgerDelta> {
+        let persisted = &self.persisted;
+        let disk_max_seq = persisted.share_seqs.map(|(_, hi)| hi);
+        let mut shares_appended = self
+            .shares
+            .iter()
+            .rev()
+            .take_while(|share| disk_max_seq.is_none_or(|hi| share.seq > hi))
+            .cloned()
+            .collect::<Vec<_>>();
+        shares_appended.reverse();
+        let keep_from_seq = self
+            .shares
+            .front()
+            .map_or(self.next_share_seq, |share| share.seq);
+        let shares_retained_from_seq = persisted
+            .share_seqs
+            .filter(|(lo, _)| *lo < keep_from_seq)
+            .map(|_| keep_from_seq);
+        let (rounds_upserted, rounds_removed) = keyed_rows_delta(
+            self.rounds.iter().map(|round| (&round.round_id, round)),
+            &persisted.rounds,
+        );
+        let (workers_upserted, workers_removed) =
+            keyed_rows_delta(self.workers.iter(), &persisted.workers);
+        let (pending_upserted, pending_removed) = keyed_rows_delta(
+            self.pending_payouts
+                .iter()
+                .map(|payout| (&payout.payout_id, payout)),
+            &persisted.pending,
+        );
+        let completed_ids = self
+            .completed_payouts
+            .iter()
+            .map(|payout| payout.payout_id.as_str())
+            .collect::<HashSet<_>>();
+        let completed_upserted = self
+            .completed_payouts
+            .iter()
+            .filter(|payout| !persisted.completed.contains(&payout.payout_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let completed_removed = persisted
+            .completed
+            .iter()
+            .filter(|id| !completed_ids.contains(id.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        let delta = PoolLedgerDelta {
             current_round_id: self.current_round_id,
-            shares: self.shares.iter().cloned().collect(),
-            rounds: self.rounds.iter().cloned().collect(),
-            workers,
-            pending_payouts: self.pending_payouts.iter().cloned().collect(),
-            completed_payouts: self.completed_payouts.iter().cloned().collect(),
-        }
+            shares_appended,
+            shares_retained_from_seq,
+            rounds_upserted,
+            rounds_removed,
+            workers_upserted,
+            workers_removed,
+            pending_upserted,
+            pending_removed,
+            completed_upserted,
+            completed_removed,
+        };
+        let unchanged = delta.is_empty_besides_round_id()
+            && persisted.current_round_id == Some(self.current_round_id);
+        (!unchanged).then_some(delta)
+    }
+
+    fn mark_persisted(&mut self, delta: PoolLedgerDelta) {
+        self.persisted.apply(delta);
     }
 }
 
@@ -13873,7 +14264,6 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
                         send_sv2_async!(&Sv2Message::KeepAlive);
                         last_keepalive = Instant::now();
                     }
-                    run_pool_payout_tick_with_warning(&ctx);
                 }
                 if nonzero_limit_reached(ctx.idle_timeout_sec, last_activity.elapsed().as_secs()) {
                     break;
@@ -14136,7 +14526,6 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
                                         last_tip_hash = new_tip_hash;
                                     }
                                 }
-                                run_pool_payout_tick_with_warning(&ctx);
                             }
                             record_pool_share_accepted(
                                 &ctx,
@@ -14650,51 +15039,96 @@ fn record_stratum_share_rejected(ctx: &StratumServerContext, worker: &str) {
     }
 }
 
-const POOL_LEDGER_SHARE_FLUSH_MS: u64 = 1_000;
+/// Pool maintenance cadence: ledger flush, chain reconcile.
+const POOL_MAINTENANCE_TICK_MS: u64 = 250;
+/// Payout processing cadence (it may read the mempool DB).
+const POOL_PAYOUT_TICK_MS: u64 = 2_000;
 
+/// Ledger persistence and payouts run on one maintenance thread
+/// (`spawn_pool_maintenance`); sessions only change the in-memory ledger.
+/// The whole ledger used to be rewritten from session tasks, per share.
 #[derive(Default)]
 struct PoolLedgerFlush {
-    dirty: AtomicBool,
-    last_persist_unix_ms: AtomicU64,
+    /// Serializes ledger writes so deltas reach the DB in order.
+    writer: Mutex<()>,
+    /// One payout processor at a time: two could sign the same payout.
+    payouts: Mutex<()>,
+    last_payout_tick_unix_ms: AtomicU64,
+    wake: (Mutex<bool>, std::sync::Condvar),
+}
+
+impl PoolLedgerFlush {
+    /// Ask the maintenance thread to flush now (round closes, reorgs).
+    fn request_flush(&self) {
+        if let Ok(mut woken) = self.wake.0.lock() {
+            *woken = true;
+            self.wake.1.notify_all();
+        }
+    }
+
+    fn wait_for_work(&self, timeout: Duration) {
+        let Ok(woken) = self.wake.0.lock() else {
+            return;
+        };
+        if let Ok((mut woken, _)) = self.wake.1.wait_timeout_while(woken, timeout, |w| !*w) {
+            *woken = false;
+        }
+    }
+}
+
+fn persist_pool_ledger(ctx: &StratumServerContext) -> Result<(), NodeError> {
+    persist_pool_ledger_state(
+        &ctx.pool_ledger_state,
+        &ctx.pool_ledger_flush.writer,
+        &ctx.pool_ledger_db_path,
+        40,
+        20,
+    )
 }
 
 fn persist_pool_ledger_with_warning(ctx: &StratumServerContext) {
-    let guard = match ctx.pool_ledger_state.lock() {
-        Ok(guard) => guard,
-        Err(_) => {
-            eprintln!("warning: stratum pool ledger mutex poisoned");
-            return;
-        }
-    };
-    match persist_pool_ledger_db_with_retry(&ctx.pool_ledger_db_path, &guard, 40, 20) {
-        Ok(()) => {
-            ctx.pool_ledger_flush.dirty.store(false, Ordering::Relaxed);
-            ctx.pool_ledger_flush
-                .last_persist_unix_ms
-                .store(current_unix_ms(), Ordering::Relaxed);
-        }
-        Err(err) => eprintln!("warning: failed to persist pool ledger db: {err}"),
+    if let Err(err) = persist_pool_ledger(ctx) {
+        eprintln!("warning: failed to persist pool ledger db: {err}");
     }
 }
 
-/// For per-share updates: mark the ledger dirty and persist at most every
-/// `POOL_LEDGER_SHARE_FLUSH_MS`. Round closes and payouts still persist
-/// immediately; `flush_pool_ledger_if_dirty` runs on every session tick.
-fn persist_pool_ledger_debounced(ctx: &StratumServerContext) {
-    ctx.pool_ledger_flush.dirty.store(true, Ordering::Relaxed);
+/// One maintenance pass: follow the chain other processes extend (rounds
+/// mature or are orphaned, payouts confirm), write the ledger delta, and
+/// process payouts at their own cadence.
+fn run_pool_maintenance_tick(ctx: &StratumServerContext) {
+    let now_unix_ms = current_unix_ms();
+    if let Err(err) = load_runtime_tip_hash(ctx) {
+        eprintln!("warning: pool maintenance runtime refresh failed: {err}");
+    }
+    reconcile_pool_ledger_with_runtime(ctx, now_unix_ms / 1_000);
+    persist_pool_ledger_with_warning(ctx);
     let last = ctx
         .pool_ledger_flush
-        .last_persist_unix_ms
+        .last_payout_tick_unix_ms
         .load(Ordering::Relaxed);
-    if current_unix_ms().saturating_sub(last) >= POOL_LEDGER_SHARE_FLUSH_MS {
-        persist_pool_ledger_with_warning(ctx);
+    if now_unix_ms.saturating_sub(last) >= POOL_PAYOUT_TICK_MS {
+        ctx.pool_ledger_flush
+            .last_payout_tick_unix_ms
+            .store(now_unix_ms, Ordering::Relaxed);
+        run_pool_payout_tick_with_warning(ctx);
     }
 }
 
-fn flush_pool_ledger_if_dirty(ctx: &StratumServerContext) {
-    if ctx.pool_ledger_flush.dirty.load(Ordering::Relaxed) {
-        persist_pool_ledger_with_warning(ctx);
-    }
+fn spawn_pool_maintenance(
+    ctx: StratumServerContext,
+    stop: Arc<AtomicBool>,
+) -> Result<std::thread::JoinHandle<()>, NodeError> {
+    std::thread::Builder::new()
+        .name("pool-maintenance".to_owned())
+        .spawn(move || {
+            while !stop.load(Ordering::Acquire) {
+                run_pool_maintenance_tick(&ctx);
+                ctx.pool_ledger_flush
+                    .wait_for_work(Duration::from_millis(POOL_MAINTENANCE_TICK_MS));
+            }
+            persist_pool_ledger_with_warning(&ctx);
+        })
+        .map_err(|e| NodeError::Runtime(format!("pool maintenance thread spawn failed: {e}")))
 }
 
 fn current_unix_ms() -> u64 {
@@ -14739,9 +15173,7 @@ fn record_pool_share_accepted(
             reserve_spendable_atomic,
         )
     };
-    if inserted {
-        persist_pool_ledger_debounced(ctx);
-    }
+    let _ = inserted;
 }
 
 fn record_pool_share_rejected(ctx: &StratumServerContext, worker: &str) {
@@ -14756,7 +15188,6 @@ fn record_pool_share_rejected(ctx: &StratumServerContext, worker: &str) {
         };
         ledger.register_rejected_only(worker, now_unix_sec);
     }
-    persist_pool_ledger_debounced(ctx);
 }
 
 fn record_pool_round_closed(
@@ -14786,7 +15217,7 @@ fn record_pool_round_closed(
             now_unix_sec,
         );
     }
-    persist_pool_ledger_with_warning(ctx);
+    ctx.pool_ledger_flush.request_flush();
 }
 
 fn reconcile_pool_ledger_with_runtime(ctx: &StratumServerContext, fallback_unix_sec: u64) {
@@ -14809,7 +15240,7 @@ fn reconcile_pool_ledger_with_runtime(ctx: &StratumServerContext, fallback_unix_
         ledger.reconcile_with_runtime(&runtime, now_unix_sec)
     };
     if changed {
-        persist_pool_ledger_with_warning(ctx);
+        ctx.pool_ledger_flush.request_flush();
     }
 }
 
@@ -14834,14 +15265,6 @@ fn runtime_spendable_balance_for_key_hash(runtime: &ChainRuntime, key_hash20: [u
         .fold(0u128, |acc, value| acc.saturating_add(value))
 }
 
-fn runtime_contains_txid(runtime: &ChainRuntime, needle_txid: Hash256) -> bool {
-    runtime.block_hashes().iter().copied().any(|hash| {
-        runtime
-            .block_by_hash(&hash)
-            .is_some_and(|block| find_tx_by_txid(block, needle_txid).is_some())
-    })
-}
-
 fn pool_payout_amount_from_atomic(amount_atomic: u128) -> Option<u64> {
     match u64::try_from(amount_atomic) {
         Ok(value) if value > 0 => Some(value),
@@ -14849,142 +15272,365 @@ fn pool_payout_amount_from_atomic(amount_atomic: u128) -> Option<u64> {
     }
 }
 
+fn payout_signed_tx(payout: &PoolPayoutRecord) -> Option<Transaction> {
+    let bytes = hex::decode(payout.signed_tx_hex.as_deref()?).ok()?;
+    bincode::deserialize(&bytes).ok()
+}
+
+/// Txids of every version of a payout (the current one and those it
+/// replaced): whichever confirms completes the payout.
+fn payout_version_txids(payout: &PoolPayoutRecord) -> HashSet<Hash256> {
+    payout
+        .superseded_txids
+        .iter()
+        .chain(payout.submitted_txid_hex.iter())
+        .filter_map(|hex| Hash256::from_hex(hex).ok())
+        .collect()
+}
+
+/// First active-chain height a tx known absent through `anchor` can be at:
+/// just above the anchor, or above the fork point when a reorg removed it.
+fn payout_scan_start(runtime: &ChainRuntime, anchor: PoolChainPoint) -> u64 {
+    let mut hash = anchor.hash;
+    loop {
+        let Some(height) = runtime.height_of(&hash) else {
+            return 1;
+        };
+        if runtime.block_hash_at_height(height) == Some(hash) {
+            return height.saturating_add(1);
+        }
+        let Some(header) = runtime.header_by_hash(&hash) else {
+            return 1;
+        };
+        hash = header.prev_block;
+    }
+}
+
+fn find_txids_on_active_chain(
+    runtime: &ChainRuntime,
+    txids: &HashSet<Hash256>,
+    from_height: u64,
+) -> Option<PoolChainPoint> {
+    if txids.is_empty() {
+        return None;
+    }
+    (from_height.max(1)..=runtime.tip_height()).find_map(|height| {
+        let hash = runtime.block_hash_at_height(height)?;
+        let block = runtime.block_by_hash(&hash)?;
+        block
+            .transactions
+            .iter()
+            .skip(1)
+            .any(|tx| txids.contains(&tx.txid()))
+            .then_some(PoolChainPoint { height, hash })
+    })
+}
+
+/// Scan only blocks not yet searched (the old code walked the whole chain
+/// for every pending payout on every tick).
+fn track_payout_on_chain(
+    runtime: &ChainRuntime,
+    payout: &mut PoolPayoutRecord,
+    tip: PoolChainPoint,
+) -> bool {
+    if payout.signed_tx_hex.is_none() {
+        return false;
+    }
+    let before = payout.clone();
+    if let Some(point) = payout.confirmed_in
+        && runtime.block_hash_at_height(point.height) != Some(point.hash)
+    {
+        // Reorged out: search again from the fork point.
+        payout.confirmed_in = None;
+        payout.searched_through = Some(point);
+    }
+    if payout.confirmed_in.is_none() {
+        let from_height = payout
+            .searched_through
+            .map_or(1, |anchor| payout_scan_start(runtime, anchor));
+        match find_txids_on_active_chain(runtime, &payout_version_txids(payout), from_height) {
+            Some(point) => {
+                payout.confirmed_in = Some(point);
+                payout.dead_since_height = None;
+            }
+            None => payout.searched_through = Some(tip),
+        }
+    }
+    *payout != before
+}
+
+#[derive(Debug, PartialEq)]
+enum PayoutStep {
+    Wait,
+    Broadcast(Transaction),
+    /// Sign a new version; spending `required_input` (the lineage coin)
+    /// makes it conflict with every earlier version.
+    Sign {
+        required_input: Option<OutPoint>,
+    },
+}
+
+/// Next step for a payout not (yet) confirmed on the active chain. A signed
+/// version is only ever replaced when it can no longer confirm, and then
+/// either by a version spending the same lineage coin, or — once the coin
+/// itself is gone — after whatever spent it is `settle_confirmations` deep.
+fn plan_payout_step(
+    runtime: &ChainRuntime,
+    mempool: &Mempool,
+    mempool_spent: &HashSet<OutPoint>,
+    payout: &mut PoolPayoutRecord,
+    settle_confirmations: u64,
+) -> PayoutStep {
+    if payout.signed_tx_hex.is_none() {
+        return PayoutStep::Sign {
+            required_input: None,
+        };
+    }
+    let Some(tx) = payout_signed_tx(payout) else {
+        // Unreadable record of a possibly broadcast tx: never sign another.
+        eprintln!(
+            "warning: payout {} has an undecodable signed tx; leaving it for the operator",
+            payout.payout_id
+        );
+        return PayoutStep::Wait;
+    };
+    if payout_version_txids(payout)
+        .iter()
+        .any(|txid| mempool.contains(txid))
+    {
+        payout.dead_since_height = None;
+        return PayoutStep::Wait;
+    }
+    let utxos = runtime.utxo_set();
+    if tx
+        .inputs
+        .iter()
+        .all(|input| utxos.contains_key(&input.prev_out))
+    {
+        payout.dead_since_height = None;
+        if tx
+            .inputs
+            .iter()
+            .any(|input| mempool_spent.contains(&input.prev_out))
+        {
+            // A conflicting tx is pending: wait until it confirms or leaves.
+            return PayoutStep::Wait;
+        }
+        return PayoutStep::Broadcast(tx);
+    }
+    // An input was spent by another confirmed tx: this version is dead.
+    if let Some(lineage) = payout
+        .lineage_input
+        .clone()
+        .filter(|op| utxos.contains_key(op) && !mempool_spent.contains(op))
+    {
+        return PayoutStep::Sign {
+            required_input: Some(lineage),
+        };
+    }
+    if !payout.broadcast_accepted && payout.superseded_txids.is_empty() {
+        // No mempool ever took a version: nothing else can confirm.
+        return PayoutStep::Sign {
+            required_input: None,
+        };
+    }
+    let tip_height = runtime.tip_height();
+    let since = *payout.dead_since_height.get_or_insert(tip_height);
+    if tip_height >= since.saturating_add(settle_confirmations) {
+        PayoutStep::Sign {
+            required_input: None,
+        }
+    } else {
+        PayoutStep::Wait
+    }
+}
+
+fn record_payout_version(payout: &mut PoolPayoutRecord, tx: &Transaction, tip: PoolChainPoint) {
+    if payout.signed_tx_hex.is_some()
+        && let Some(previous) = payout.submitted_txid_hex.take()
+    {
+        payout.superseded_txids.push(previous);
+    }
+    payout.signed_tx_hex = Some(hex::encode(
+        bincode::serialize(tx).expect("invariant: transactions serialize"),
+    ));
+    payout.submitted_txid_hex = Some(tx.txid().to_hex());
+    payout.broadcast_accepted = false;
+    payout.searched_through = Some(tip);
+    payout.confirmed_in = None;
+    payout.dead_since_height = None;
+    let keeps_lineage = tx
+        .inputs
+        .iter()
+        .any(|input| payout.lineage_input.as_ref() == Some(&input.prev_out));
+    if !keeps_lineage {
+        payout.lineage_input = tx.inputs.first().map(|input| input.prev_out.clone());
+    }
+}
+
+/// Validate against the pool's chain view without holding the runtime lock
+/// across the mempool DB I/O.
+fn submit_pool_payout_tx(
+    ctx: &StratumServerContext,
+    tx: &Transaction,
+) -> Result<String, NodeError> {
+    submit_tx_with_retry(80, 25, || {
+        let mut mempool = load_mempool_from_db_or_empty_strict_with_retry(
+            &ctx.cfg,
+            &ctx.mempool_db_path,
+            10,
+            25,
+        )?;
+        let fee = {
+            let runtime = lock_runtime(&ctx.runtime)?;
+            validate_tx_for_local_admission(&ctx.cfg, &runtime, &mempool, tx)?
+        };
+        let outcome = mempool.insert_with_fee(tx.clone(), fee)?;
+        persist_mempool_db_with_retry(&ctx.cfg, &mut mempool, &ctx.mempool_db_path, 10, 25)?;
+        Ok(mempool_outcome_label(&outcome).to_owned())
+    })
+}
+
 fn maybe_process_pool_payouts(ctx: &StratumServerContext) -> Result<(), NodeError> {
     if ctx.pool_payout_cfg.mode == PoolPayoutModeArg::Solo {
         return Ok(());
     }
+    let poisoned = || NodeError::Runtime("stratum pool ledger mutex poisoned".to_owned());
+    let _processor = ctx
+        .pool_ledger_flush
+        .payouts
+        .lock()
+        .map_err(|_| poisoned())?;
     let now_unix_sec = current_unix_sec()?;
-    let mut changed = false;
-    {
-        let mut ledger = ctx
-            .pool_ledger_state
-            .lock()
-            .map_err(|_| NodeError::Runtime("stratum pool ledger mutex poisoned".to_owned()))?;
-        let created = ledger.queue_due_payouts(now_unix_sec);
-        if !created.is_empty() {
-            changed = true;
-        }
-    }
-    if changed {
-        persist_pool_ledger_with_warning(ctx);
-    }
-
-    let Some(pool_key) = ctx.pool_payout_key.as_ref() else {
-        return Ok(());
-    };
-    let to_submit = {
-        let ledger = ctx
-            .pool_ledger_state
-            .lock()
-            .map_err(|_| NodeError::Runtime("stratum pool ledger mutex poisoned".to_owned()))?;
+    let awaiting_mempool = {
+        let mut ledger = ctx.pool_ledger_state.lock().map_err(|_| poisoned())?;
+        ledger.queue_due_payouts(now_unix_sec);
         ledger
             .pending_payouts
             .iter()
-            .filter(|payout| !payout.confirmed && payout.submitted_txid_hex.is_none())
-            .cloned()
-            .collect::<Vec<_>>()
+            .any(|payout| payout.confirmed_in.is_none())
     };
-
-    // Outpoints already spent by unconfirmed txs (earlier payouts included):
-    // building two payouts from the same pool coin made the second one a
-    // conflict that could never confirm.
-    let mut reserved = if to_submit.is_empty() {
-        HashSet::new()
-    } else {
-        mempool_spent_outpoints(&load_mempool_from_db_or_empty_with_retry(
+    let Some(pool_key) = ctx.pool_payout_key.as_ref() else {
+        return persist_pool_ledger(ctx);
+    };
+    let mempool = if awaiting_mempool {
+        Some(load_mempool_from_db_or_empty_with_retry(
             &ctx.cfg,
             &ctx.mempool_db_path,
             10,
             25,
         )?)
+    } else {
+        None
     };
-    for payout in to_submit {
-        let decoded = match parse_address(&payout.worker) {
-            Ok(decoded) => decoded,
-            Err(_) => continue,
-        };
-        let Some(amount) = pool_payout_amount_from_atomic(payout.amount_atomic) else {
-            continue;
-        };
-        let signed = {
-            let runtime = lock_runtime(&ctx.runtime)?;
-            build_signed_transfer_tx_with_exclusions(
-                &runtime,
-                &ctx.cfg.network_id,
-                pool_key,
-                decoded.key_hash20,
-                amount,
-                ctx.pool_payout_cfg.payout_tx_fee_atomic,
-                &reserved,
-            )
-        };
-        let signed = match signed {
-            Ok(signed) => signed,
-            Err(err) => {
-                eprintln!(
-                    "warning: payout tx build failed for worker={} amount={}: {err}",
-                    payout.worker, payout.amount_atomic
-                );
-                continue;
-            }
-        };
-        let spent_inputs = signed
-            .tx
-            .inputs
-            .iter()
-            .map(|input| input.prev_out.clone())
-            .collect::<Vec<_>>();
-        let submit = submit_tx_via_mempool_db_with_retry(
-            &ctx.cfg,
-            &ctx.runtime_db_path,
-            &ctx.mempool_db_path,
-            signed.tx,
-            0,
-            80,
-            25,
-        );
-        let (txid, outcome, _fee) = match submit {
-            Ok(ok) => ok,
-            Err(err) => {
-                eprintln!(
-                    "warning: payout tx submit failed for worker={} amount={}: {err}",
-                    payout.worker, payout.amount_atomic
-                );
-                continue;
-            }
-        };
-        // A rejected conflict is not a payout: it would never confirm and the
-        // worker would be skipped forever.
-        if !pool_payout_submit_outcome_is_live(&outcome) {
-            eprintln!(
-                "warning: payout tx for worker={} amount={} not admitted (outcome={outcome})",
-                payout.worker, payout.amount_atomic
-            );
-            continue;
-        }
-        reserved.extend(spent_inputs);
-        let mut ledger = ctx
-            .pool_ledger_state
-            .lock()
-            .map_err(|_| NodeError::Runtime("stratum pool ledger mutex poisoned".to_owned()))?;
-        if ledger.mark_pending_payout_submitted(&payout.payout_id, &txid.to_hex()) {
-            changed = true;
-        }
-    }
 
+    let mut to_broadcast = Vec::<(String, Transaction)>::new();
     {
+        // Tracking, planning and signing see one chain state: a version
+        // confirmed in between could otherwise go unnoticed.
         let runtime = lock_runtime(&ctx.runtime)?;
-        let mut ledger = ctx
-            .pool_ledger_state
-            .lock()
-            .map_err(|_| NodeError::Runtime("stratum pool ledger mutex poisoned".to_owned()))?;
-        if ledger.settle_confirmed_payouts(&runtime) > 0 {
-            changed = true;
+        let mut ledger = ctx.pool_ledger_state.lock().map_err(|_| poisoned())?;
+        ledger.track_payouts_on_chain(&runtime);
+        if let Some(mempool) = mempool.as_ref() {
+            let settle_confirmations = ledger.payout_settle_confirmations();
+            let tip = PoolChainPoint {
+                height: runtime.tip_height(),
+                hash: runtime.tip_hash(),
+            };
+            let mempool_spent = mempool_spent_outpoints(mempool);
+            // Coins another payout's current version holds, or the mempool.
+            let mut reserved = mempool_spent.clone();
+            for payout in &ledger.pending_payouts {
+                if let Some(tx) = payout_signed_tx(payout) {
+                    reserved.extend(tx.inputs.into_iter().map(|input| input.prev_out));
+                }
+            }
+            for payout in ledger
+                .pending_payouts
+                .iter_mut()
+                .filter(|payout| payout.confirmed_in.is_none())
+            {
+                let required_input = match plan_payout_step(
+                    &runtime,
+                    mempool,
+                    &mempool_spent,
+                    payout,
+                    settle_confirmations,
+                ) {
+                    PayoutStep::Wait => continue,
+                    PayoutStep::Broadcast(tx) => {
+                        to_broadcast.push((payout.payout_id.clone(), tx));
+                        continue;
+                    }
+                    PayoutStep::Sign { required_input } => required_input,
+                };
+                let (Ok(decoded), Some(amount)) = (
+                    parse_address(&payout.worker),
+                    pool_payout_amount_from_atomic(payout.amount_atomic),
+                ) else {
+                    continue;
+                };
+                let mut excluded = reserved.clone();
+                if let Some(required) = required_input.as_ref() {
+                    excluded.remove(required);
+                }
+                match build_signed_payout_tx(
+                    &runtime,
+                    &ctx.cfg.network_id,
+                    pool_key,
+                    decoded.key_hash20,
+                    amount,
+                    ctx.pool_payout_cfg.payout_tx_fee_atomic,
+                    &PayoutCoinRules {
+                        excluded: &excluded,
+                        min_confirmations: settle_confirmations,
+                        required_input: required_input.as_ref(),
+                    },
+                ) {
+                    Ok(signed) => {
+                        reserved
+                            .extend(signed.tx.inputs.iter().map(|input| input.prev_out.clone()));
+                        record_payout_version(payout, &signed.tx, tip);
+                        to_broadcast.push((payout.payout_id.clone(), signed.tx));
+                    }
+                    Err(err) => eprintln!(
+                        "warning: payout tx build failed for worker={} amount={}: {err}",
+                        payout.worker, payout.amount_atomic
+                    ),
+                }
+            }
         }
     }
-
-    if changed {
-        persist_pool_ledger_with_warning(ctx);
+    // A signed payout is on disk before it can reach the network.
+    persist_pool_ledger(ctx)?;
+    if to_broadcast.is_empty() {
+        return Ok(());
+    }
+    let mut accepted = HashSet::<String>::new();
+    for (payout_id, tx) in to_broadcast {
+        match submit_pool_payout_tx(ctx, &tx) {
+            Ok(outcome) if pool_payout_submit_outcome_is_live(&outcome) => {
+                accepted.insert(payout_id);
+            }
+            Ok(outcome) => eprintln!(
+                "warning: payout {payout_id} tx {} not admitted (outcome={outcome}); retrying later",
+                tx.txid()
+            ),
+            Err(err) => eprintln!(
+                "warning: payout {payout_id} tx {} submit failed: {err}; retrying later",
+                tx.txid()
+            ),
+        }
+    }
+    if !accepted.is_empty() {
+        let mut ledger = ctx.pool_ledger_state.lock().map_err(|_| poisoned())?;
+        for payout in ledger.pending_payouts.iter_mut() {
+            if accepted.contains(&payout.payout_id) {
+                payout.broadcast_accepted = true;
+            }
+        }
+        drop(ledger);
+        persist_pool_ledger(ctx)?;
     }
     Ok(())
 }
@@ -15012,7 +15658,6 @@ fn new_pool_worker_record(worker: &str) -> PoolWorkerAccrualRecord {
 }
 
 fn run_pool_payout_tick_with_warning(ctx: &StratumServerContext) {
-    flush_pool_ledger_if_dirty(ctx);
     if let Err(err) = maybe_process_pool_payouts(ctx) {
         eprintln!("warning: pool payout tick failed: {err}");
     }
@@ -15292,6 +15937,7 @@ fn mempool_outcome_label(outcome: &InsertOutcome) -> &'static str {
     }
 }
 
+#[cfg(test)]
 fn submit_tx_via_mempool_db(
     cfg: &ChainConfig,
     runtime_db_path: &Path,
@@ -15360,26 +16006,6 @@ fn submit_tx_via_mempool_db_for_runtime_with_retry(
         submit_tx_via_mempool_db_for_runtime(
             cfg,
             runtime,
-            mempool_db_path,
-            tx.clone(),
-            requested_fee,
-        )
-    })
-}
-
-fn submit_tx_via_mempool_db_with_retry(
-    cfg: &ChainConfig,
-    runtime_db_path: &Path,
-    mempool_db_path: &Path,
-    tx: Transaction,
-    requested_fee: u64,
-    attempts: usize,
-    backoff_ms: u64,
-) -> Result<(Hash256, String, u64), NodeError> {
-    submit_tx_with_retry(attempts, backoff_ms, || {
-        submit_tx_via_mempool_db(
-            cfg,
-            runtime_db_path,
             mempool_db_path,
             tx.clone(),
             requested_fee,
@@ -15768,13 +16394,6 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
     let stale_guard_max_lag_blocks = stratum_stale_guard_max_lag_blocks();
     let stale_guard_max_snapshot_age_sec = stratum_stale_guard_max_snapshot_age_sec();
     let (runtime, source) = load_runtime_from_db_or_genesis(&cfg, &runtime_db_path)?;
-    let mut pool_ledger_state = load_pool_ledger_from_db_or_new(
-        &cfg,
-        &runtime,
-        &pool_ledger_db_path,
-        args.pool_share_retention,
-        args.pool_round_retention,
-    )?;
     let payout_cfg = PoolPayoutConfig {
         mode: args.pool_payout_mode,
         pool_fee_bps: args.pool_fee_bps,
@@ -15789,6 +16408,7 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
             .map_err(|e| NodeError::Runtime(format!("invalid min_share_target_hex: {e}")))?,
         )
         .max(1.0),
+        round_maturity_blocks: u64::from(cfg.coinbase_maturity),
         pps_max_liability_atomic: args.pps_max_liability_atomic,
         pps_reserve_floor_atomic: args.pps_reserve_floor_atomic,
         payout_threshold_atomic: args.pool_payout_threshold_atomic.max(1),
@@ -15821,7 +16441,14 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
             .ok_or_else(|| NodeError::Runtime("pool payout key is missing".to_owned()))?;
         scam_core::hash160_blake3(&key.pubkey_compressed())
     };
-    pool_ledger_state.set_payout_config(payout_cfg.clone());
+    let pool_ledger_state = load_pool_ledger_from_db_or_new(
+        &cfg,
+        &runtime,
+        &pool_ledger_db_path,
+        args.pool_share_retention,
+        args.pool_round_retention,
+        payout_cfg.clone(),
+    )?;
     let share_target_hex = args
         .share_target_hex
         .as_deref()
@@ -16086,12 +16713,11 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
         pool_payout_key,
         pool_coinbase_key_hash20,
     };
-    if let Ok(guard) = ctx.pool_ledger_state.lock()
-        && let Err(err) =
-            persist_pool_ledger_db_with_retry(&ctx.pool_ledger_db_path, &guard, 40, 20)
-    {
-        eprintln!("warning: failed to initialize pool ledger db: {err}");
-    }
+    // Payouts depend on the ledger reaching the disk: refuse to run without it.
+    persist_pool_ledger(&ctx)
+        .map_err(|e| NodeError::Runtime(format!("failed to initialize pool ledger db: {e}")))?;
+    let maintenance_stop = Arc::new(AtomicBool::new(false));
+    let maintenance = spawn_pool_maintenance(ctx.clone(), maintenance_stop.clone())?;
     let worker_threads = stratum_tokio_worker_threads();
     let runtime = TokioRuntimeBuilder::new_multi_thread()
         .enable_all()
@@ -16102,7 +16728,8 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
 
     let bind = args.bind.clone();
     let max_clients = args.max_clients;
-    runtime.block_on(async move {
+    let maintenance_flush = ctx.pool_ledger_flush.clone();
+    let served = runtime.block_on(async move {
         let listener = tokio::net::TcpListener::bind(&bind)
             .await
             .map_err(|e| NodeError::Runtime(format!("stratum bind failed on {bind}: {e}")))?;
@@ -16195,8 +16822,8 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
                 let flush_ctx = client_ctx.clone();
                 let result = run_stratum_client_async(stream, client_ctx, permit).await;
                 active_clients.fetch_sub(1, Ordering::Relaxed);
-                // Don't leave debounced share bookkeeping unwritten.
-                flush_pool_ledger_if_dirty(&flush_ctx);
+                // Write the session's share bookkeeping promptly.
+                flush_ctx.pool_ledger_flush.request_flush();
                 if let Err(err) = &result {
                     eprintln!("stratum worker error: {err}");
                 }
@@ -16226,7 +16853,14 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
             let _ = handle.await;
         }
         Ok(())
-    })
+    });
+    // The maintenance thread writes the final ledger delta on its way out.
+    maintenance_stop.store(true, Ordering::Release);
+    maintenance_flush.request_flush();
+    if maintenance.join().is_err() {
+        eprintln!("warning: pool maintenance thread panicked");
+    }
+    served
 }
 
 fn try_find_share_for_job(
@@ -22133,26 +22767,86 @@ mod tests {
         let _ = fs::remove_dir_all(work_dir);
     }
 
-    /// ST7: share bookkeeping is persisted at most once per flush window,
-    /// and a flush writes anything left dirty.
+    /// ST7: a flush writes only what changed since the last one (shares by
+    /// arrival number, changed workers/rounds), and a reloaded ledger has
+    /// nothing left to write and keeps the share arrival order.
     #[test]
-    fn pool_ledger_share_persistence_is_debounced() {
-        let flush = super::PoolLedgerFlush::default();
-        flush.last_persist_unix_ms.store(
-            super::current_unix_ms(),
-            std::sync::atomic::Ordering::Relaxed,
-        );
-        flush
-            .dirty
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        let last = flush
-            .last_persist_unix_ms
-            .load(std::sync::atomic::Ordering::Relaxed);
+    fn pool_ledger_flush_writes_only_the_delta() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let work_dir = temp_dir("test-pool-ledger-delta");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let path = work_dir.join("pool.ledger.redb");
+        let writer = std::sync::Mutex::new(());
+        let ledger = std::sync::Mutex::new(super::StratumPoolLedgerState::new(
+            cfg.network_id.clone(),
+            runtime.tip_height(),
+            runtime.tip_hash(),
+            1_770_000_000,
+            4,
+            16,
+        ));
+        let share = |ledger: &std::sync::Mutex<super::StratumPoolLedgerState>, nonce: u64| {
+            // Nonces chosen so key order differs from arrival order.
+            assert!(
+                ledger
+                    .lock()
+                    .expect("lock")
+                    .register_share("worker-a", 1, 1, nonce, 10, 1.0, true, false, 10, None)
+            );
+        };
+        for nonce in [30, 20, 10] {
+            share(&ledger, nonce);
+        }
+        super::persist_pool_ledger_state(&ledger, &writer, &path, 2, 1).expect("first flush");
         assert!(
-            super::current_unix_ms().saturating_sub(last) < super::POOL_LEDGER_SHARE_FLUSH_MS,
-            "a share right after a persist stays pending"
+            ledger.lock().expect("lock").persist_delta().is_none(),
+            "nothing left after a flush"
         );
-        assert!(flush.dirty.load(std::sync::atomic::Ordering::Relaxed));
+        for nonce in [5, 4, 3] {
+            share(&ledger, nonce);
+        }
+        let delta = ledger
+            .lock()
+            .expect("lock")
+            .persist_delta()
+            .expect("pending delta");
+        assert_eq!(
+            delta
+                .shares_appended
+                .iter()
+                .map(|share| share.seq)
+                .collect::<Vec<_>>(),
+            vec![4, 5, 6]
+        );
+        assert_eq!(delta.shares_retained_from_seq, Some(3));
+        assert_eq!(delta.workers_upserted.len(), 1);
+        assert!(delta.rounds_upserted.is_empty(), "rounds did not change");
+        super::persist_pool_ledger_state(&ledger, &writer, &path, 2, 1).expect("second flush");
+
+        let on_disk = super::load_pool_ledger_db(&path).expect("load");
+        assert_eq!(
+            on_disk
+                .shares
+                .iter()
+                .map(|share| share.nonce)
+                .collect::<Vec<_>>(),
+            vec![10, 5, 4, 3],
+            "arrival order survives a reload"
+        );
+        let reloaded = super::load_pool_ledger_from_db_or_new(
+            &cfg,
+            &runtime,
+            &path,
+            4,
+            16,
+            super::PoolPayoutConfig::default(),
+        )
+        .expect("reload");
+        assert!(reloaded.persist_delta().is_none());
+        assert_eq!(reloaded.next_share_seq, 7);
+        let _ = fs::remove_dir_all(work_dir);
     }
 
     /// ST5: PPLNS credits are frozen when a round closes, so trimming the
@@ -25321,9 +26015,11 @@ mod tests {
         assert!(!pool_ledger_db.exists());
         super::reconcile_pool_ledger_with_runtime(&ctx, 1_770_000_000);
         assert!(
-            pool_ledger_db.exists(),
-            "reconcile must persist ledger when state changes"
+            *ctx.pool_ledger_flush.wake.0.lock().expect("wake"),
+            "a reconcile change asks the maintenance thread to flush"
         );
+        super::run_pool_maintenance_tick(&ctx);
+        assert!(pool_ledger_db.exists(), "the change reaches the ledger db");
 
         let ledger = ctx.pool_ledger_state.lock().expect("ledger lock");
         let closed_round = ledger.rounds.front().expect("closed round");
@@ -25353,6 +26049,7 @@ mod tests {
             pplns_window_shares: 10,
             pps_share_atomic: 0,
             pps_reference_expected_hashes: 1.0,
+            round_maturity_blocks: 0,
             pps_max_liability_atomic: 0,
             pps_reserve_floor_atomic: 0,
             payout_threshold_atomic: 1,
@@ -25389,6 +26086,85 @@ mod tests {
     }
 
     #[test]
+    fn pool_ledger_pplns_credits_wait_for_round_maturity() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let mut runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let mut ledger = super::StratumPoolLedgerState::new(
+            cfg.network_id.clone(),
+            runtime.tip_height(),
+            runtime.tip_hash(),
+            1_770_000_000,
+            1_024,
+            1,
+        );
+        ledger.set_payout_config(super::PoolPayoutConfig {
+            mode: super::PoolPayoutModeArg::Pplns,
+            pplns_window_shares: 10,
+            round_maturity_blocks: 3,
+            payout_threshold_atomic: 1,
+            payout_interval_sec: 1,
+            payout_tx_fee_atomic: 1,
+            ..super::PoolPayoutConfig::default()
+        });
+        assert!(ledger.register_share("worker-a", 1, 1, 1, 10, 10.0, true, false, 10, None));
+        let mine = |runtime: &mut ChainRuntime, tag: &str| {
+            mine_block_with_transactions(runtime, 30, 500_000, [7u8; 20], tag.to_owned(), vec![])
+                .expect("mine")
+                .0
+        };
+        let found = mine(&mut runtime, "found");
+        ledger.close_round_with_block(
+            "worker-a",
+            found,
+            cfg.block_subsidy as u128,
+            runtime.tip_height(),
+            found,
+            11,
+        );
+        assert!(!ledger.reconcile_with_runtime(&runtime, 12));
+        let accrual = |ledger: &super::StratumPoolLedgerState| {
+            ledger
+                .workers
+                .get("worker-a")
+                .expect("worker-a")
+                .pplns_accrual_atomic
+        };
+        assert_eq!(accrual(&ledger), 0, "immature round must not be credited");
+        assert_eq!(
+            ledger.rounds.len(),
+            2,
+            "an immature round is kept past the retention cap"
+        );
+
+        mine(&mut runtime, "c1");
+        mine(&mut runtime, "c2");
+        assert!(!ledger.reconcile_with_runtime(&runtime, 13));
+        assert_eq!(accrual(&ledger), 0, "two confirmations are not enough");
+
+        mine(&mut runtime, "c3");
+        assert!(
+            ledger.reconcile_with_runtime(&runtime, 14),
+            "maturing a round changes the ledger"
+        );
+        assert!(accrual(&ledger) > 0, "mature round is credited");
+        assert_eq!(ledger.rounds.len(), 1, "mature round evicted once settled");
+        assert_eq!(
+            accrual(&ledger),
+            ledger
+                .workers
+                .get("worker-a")
+                .expect("worker-a")
+                .pplns_settled_atomic,
+            "evicted round credits move into settled"
+        );
+        assert!(
+            !ledger.reconcile_with_runtime(&runtime, 15),
+            "no further change at the same tip"
+        );
+    }
+
+    #[test]
     fn pool_ledger_pps_guardrails_block_credit_when_limits_trip() {
         let cfg: ChainConfig =
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
@@ -25407,6 +26183,7 @@ mod tests {
             pplns_window_shares: 10,
             pps_share_atomic: 100,
             pps_reference_expected_hashes: 1.0,
+            round_maturity_blocks: 0,
             pps_max_liability_atomic: 150,
             pps_reserve_floor_atomic: 50,
             payout_threshold_atomic: 1,
@@ -25465,6 +26242,7 @@ mod tests {
             pplns_window_shares: 10,
             pps_share_atomic: 250,
             pps_reference_expected_hashes: 1.0,
+            round_maturity_blocks: 0,
             pps_max_liability_atomic: 0,
             pps_reserve_floor_atomic: 0,
             payout_threshold_atomic: 200,
@@ -25499,8 +26277,12 @@ mod tests {
             .expect("genesis")
             .transactions[0]
             .txid();
-        assert!(ledger.mark_pending_payout_submitted(&payout.payout_id, &genesis_txid.to_hex()));
-        assert_eq!(ledger.settle_confirmed_payouts(&runtime), 1);
+        let _ = genesis_txid;
+        ledger.pending_payouts[0].confirmed_in = Some(super::PoolChainPoint {
+            height: runtime.tip_height(),
+            hash: runtime.tip_hash(),
+        });
+        assert!(ledger.track_payouts_on_chain(&runtime));
         assert!(ledger.pending_payouts.is_empty());
         assert_eq!(ledger.completed_payouts.len(), 1);
         assert_eq!(
@@ -25619,19 +26401,27 @@ mod tests {
         fs::create_dir_all(&work_dir).expect("mkdir");
         let path = work_dir.join("pool.ledger.redb");
 
-        let state = super::StratumPoolLedgerState::new(
+        let state = std::sync::Mutex::new(super::StratumPoolLedgerState::new(
             cfg.network_id.clone(),
             runtime.tip_height(),
             runtime.tip_hash(),
             1_770_000_100,
             64,
             16,
-        );
-        super::persist_pool_ledger_db_with_retry(&path, &state, 2, 1).expect("persist with retry");
+        ));
+        super::persist_pool_ledger_state(&state, &std::sync::Mutex::new(()), &path, 2, 1)
+            .expect("persist with retry");
         assert!(path.exists(), "persist should create pool ledger db file");
 
-        let loaded = super::load_pool_ledger_from_db_or_new(&cfg, &runtime, &path, 64, 16)
-            .expect("load from persisted db");
+        let loaded = super::load_pool_ledger_from_db_or_new(
+            &cfg,
+            &runtime,
+            &path,
+            64,
+            16,
+            super::PoolPayoutConfig::default(),
+        )
+        .expect("load from persisted db");
         assert_eq!(loaded.network_id, cfg.network_id);
 
         let mismatch_path = work_dir.join("pool.ledger.mismatch.redb");
@@ -25648,8 +26438,15 @@ mod tests {
             },
         )
         .expect("persist mismatch snapshot");
-        let err = super::load_pool_ledger_from_db_or_new(&cfg, &runtime, &mismatch_path, 64, 16)
-            .expect_err("network mismatch must fail");
+        let err = super::load_pool_ledger_from_db_or_new(
+            &cfg,
+            &runtime,
+            &mismatch_path,
+            64,
+            16,
+            super::PoolPayoutConfig::default(),
+        )
+        .expect_err("network mismatch must fail");
         assert!(err.to_string().contains("pool ledger db network mismatch"));
 
         let _ = fs::remove_dir_all(work_dir);
@@ -25930,6 +26727,7 @@ mod tests {
         let mut shares = Vec::new();
         for idx in 0..4u64 {
             shares.push(super::PoolShareRecord {
+                seq: idx + 1,
                 share_key: format!("k-{idx}"),
                 worker: format!("worker-{idx}"),
                 timestamp_unix_sec: 100 + idx,
@@ -25972,7 +26770,7 @@ mod tests {
                 pplns_credits: Vec::new(),
             },
         ];
-        let state = super::StratumPoolLedgerState::from_snapshot(
+        let mut state = super::StratumPoolLedgerState::from_snapshot(
             super::PoolLedgerSnapshot {
                 network_id: "devnet".to_owned(),
                 current_round_id: 2,
@@ -25993,6 +26791,12 @@ mod tests {
             2,
             "shares should be trimmed to retention"
         );
+        assert_eq!(
+            state.rounds.len(),
+            3,
+            "rounds over the cap wait for the maturity-aware eviction"
+        );
+        state.evict_settled_rounds();
         assert_eq!(
             state.rounds.len(),
             2,
@@ -26221,6 +27025,7 @@ mod tests {
 
         ledger.open_next_round(1, Hash256([1; 32]), 30);
         ledger.open_next_round(2, Hash256([2; 32]), 31);
+        ledger.evict_settled_rounds();
         assert_eq!(ledger.rounds.len(), 2, "round retention must be capped");
         assert_eq!(
             ledger.rounds.back().expect("latest round").round_id,
@@ -26638,16 +27443,243 @@ mod tests {
         );
     }
 
+    fn test_pool_payout_record() -> super::PoolPayoutRecord {
+        super::PoolPayoutRecord {
+            payout_id: "payout".to_owned(),
+            worker: "worker".to_owned(),
+            amount_atomic: 0,
+            created_unix_sec: 0,
+            signed_tx_hex: None,
+            submitted_txid_hex: None,
+            superseded_txids: Vec::new(),
+            lineage_input: None,
+            broadcast_accepted: false,
+            searched_through: None,
+            confirmed_in: None,
+            dead_since_height: None,
+            confirmed: false,
+        }
+    }
+
+    /// ST4: a payout confirmed in a block a reorg removes goes back to
+    /// unconfirmed, the search resumes from the fork point, and the tx is
+    /// found again when the new branch includes it.
     #[test]
-    fn runtime_contains_txid_detects_present_and_absent_transactions() {
-        let cfg: ChainConfig =
+    fn pool_payout_tracking_follows_reorgs() {
+        let (cfg, mut runtime, key, outpoint) = relay_funded_runtime_for_pool();
+        let tx = signed_pool_test_tx(&cfg, &key, outpoint, 1_000);
+        let mut payout = test_pool_payout_record();
+        let genesis = super::PoolChainPoint {
+            height: 0,
+            hash: runtime.tip_hash(),
+        };
+        super::record_payout_version(&mut payout, &tx, genesis);
+        let mut fork = ChainRuntime::from_config(cfg.clone()).expect("fork runtime");
+
+        let mine = |runtime: &mut ChainRuntime, tag: &str, txs: Vec<Transaction>| {
+            mine_block_with_transactions(runtime, 30, 500_000, [7u8; 20], tag.to_owned(), txs)
+                .expect("mine")
+                .0
+        };
+        let a1 = mine(&mut runtime, "a1", vec![tx.clone()]);
+        let tip = |runtime: &ChainRuntime| super::PoolChainPoint {
+            height: runtime.tip_height(),
+            hash: runtime.tip_hash(),
+        };
+        assert!(super::track_payout_on_chain(
+            &runtime,
+            &mut payout,
+            tip(&runtime)
+        ));
+        assert_eq!(
+            payout.confirmed_in,
+            Some(super::PoolChainPoint {
+                height: 1,
+                hash: a1
+            })
+        );
+
+        // A heavier branch without the tx replaces block a1.
+        mine(&mut fork, "b1", vec![]);
+        mine(&mut fork, "b2", vec![]);
+        for height in 1..=fork.tip_height() {
+            let hash = fork.block_hash_at_height(height).expect("hash");
+            let block = fork.block_by_hash(&hash).expect("block").clone();
+            runtime.submit_block(block).expect("submit fork block");
+        }
+        assert_eq!(runtime.tip_hash(), fork.tip_hash(), "reorged");
+        assert_eq!(
+            super::payout_scan_start(
+                &runtime,
+                super::PoolChainPoint {
+                    height: 1,
+                    hash: a1
+                }
+            ),
+            1,
+            "search resumes above the fork point"
+        );
+        assert!(super::track_payout_on_chain(
+            &runtime,
+            &mut payout,
+            tip(&runtime)
+        ));
+        assert_eq!(payout.confirmed_in, None, "reorged out");
+        assert_eq!(payout.searched_through, Some(tip(&runtime)));
+
+        mine(&mut runtime, "b3", vec![tx.clone()]);
+        assert!(super::track_payout_on_chain(
+            &runtime,
+            &mut payout,
+            tip(&runtime)
+        ));
+        assert_eq!(payout.confirmed_in.map(|point| point.height), Some(3));
+        assert!(
+            !super::track_payout_on_chain(&runtime, &mut payout, tip(&runtime)),
+            "stable once found"
+        );
+    }
+
+    fn relay_funded_runtime_for_pool()
+    -> (ChainConfig, ChainRuntime, scam_wallet::WalletKey, OutPoint) {
+        let mut cfg: ChainConfig =
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
-        let runtime = ChainRuntime::from_config(cfg).expect("runtime");
-        let tip_hash = runtime.tip_hash();
-        let block = runtime.block_by_hash(&tip_hash).expect("tip block");
-        let known_txid = block.transactions[0].txid();
-        assert!(super::runtime_contains_txid(&runtime, known_txid));
-        assert!(!super::runtime_contains_txid(&runtime, Hash256([0xAA; 32]),));
+        let mnemonic = WalletMnemonic::parse(SOAK_FLOW_MNEMONIC).expect("mnemonic");
+        let key = derive_wallet_key(&mnemonic.to_seed(""), 0, 0).expect("key");
+        cfg.genesis_reward_key_hash20 =
+            hex::encode(scam_core::hash160_blake3(&key.pubkey_compressed()));
+        cfg.coinbase_maturity = 1;
+        cfg.validate().expect("config validate");
+        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        let outpoint = runtime
+            .utxo_set()
+            .keys()
+            .next()
+            .cloned()
+            .expect("genesis utxo");
+        (cfg, runtime, key, outpoint)
+    }
+
+    fn signed_pool_test_tx(
+        cfg: &ChainConfig,
+        key: &scam_wallet::WalletKey,
+        spend: OutPoint,
+        value: u64,
+    ) -> Transaction {
+        let mut tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: spend,
+                signature: vec![],
+                pubkey_compressed: key.pubkey_compressed().to_vec(),
+                sequence: 0,
+            }],
+            outputs: vec![TxOut {
+                value,
+                key_hash20: [3u8; 20],
+            }],
+            lock_time: 0,
+        };
+        let digest = tx
+            .signing_digest_with_chain_domain(0, cfg.network_id.as_bytes())
+            .expect("digest");
+        tx.inputs[0].signature = super::sign_digest(key, digest.0).expect("sign").to_vec();
+        tx
+    }
+
+    /// ST4: a version is replaced only when it can no longer confirm, and
+    /// then by a version spending the same lineage coin; with the lineage
+    /// coin gone a relayed version is replaced only after the conflict is
+    /// `settle_confirmations` deep.
+    #[test]
+    fn pool_payout_replacement_keeps_versions_mutually_exclusive() {
+        let (cfg, mut runtime, key, lineage) = relay_funded_runtime_for_pool();
+        let missing = OutPoint {
+            txid: Hash256([0xEE; 32]),
+            vout: 0,
+        };
+        let mut tx = signed_pool_test_tx(&cfg, &key, lineage.clone(), 1_000);
+        tx.inputs.push(TxIn {
+            prev_out: missing.clone(),
+            signature: vec![],
+            pubkey_compressed: key.pubkey_compressed().to_vec(),
+            sequence: 0,
+        });
+        let tip = super::PoolChainPoint {
+            height: runtime.tip_height(),
+            hash: runtime.tip_hash(),
+        };
+        let mut payout = test_pool_payout_record();
+        super::record_payout_version(&mut payout, &tx, tip);
+        payout.broadcast_accepted = true;
+        assert_eq!(payout.lineage_input, Some(lineage.clone()));
+        let mempool = Mempool::new(cfg.max_mempool_txs as usize).expect("mempool");
+        let none_spent = HashSet::new();
+
+        // Lineage coin unspent: replace now, spending it.
+        assert_eq!(
+            super::plan_payout_step(&runtime, &mempool, &none_spent, &mut payout, 3),
+            super::PayoutStep::Sign {
+                required_input: Some(lineage.clone())
+            }
+        );
+        // Every input unspent: re-broadcast the same tx, never re-sign.
+        let live = signed_pool_test_tx(&cfg, &key, lineage.clone(), 1_000);
+        let mut live_payout = test_pool_payout_record();
+        super::record_payout_version(&mut live_payout, &live, tip);
+        assert_eq!(
+            super::plan_payout_step(&runtime, &mempool, &none_spent, &mut live_payout, 3),
+            super::PayoutStep::Broadcast(live.clone())
+        );
+        // A conflicting mempool spend: wait for it to resolve.
+        let spent = HashSet::from([lineage.clone()]);
+        assert_eq!(
+            super::plan_payout_step(&runtime, &mempool, &spent, &mut live_payout, 3),
+            super::PayoutStep::Wait
+        );
+
+        // Lineage coin spent elsewhere (here: mempool view) and the version
+        // was relayed: wait `settle_confirmations` blocks first.
+        assert_eq!(
+            super::plan_payout_step(&runtime, &mempool, &spent, &mut payout, 2),
+            super::PayoutStep::Wait
+        );
+        let since = payout.dead_since_height.expect("dead since");
+        assert_eq!(since, runtime.tip_height());
+        for step in 0..2 {
+            mine_block_with_transactions(
+                &mut runtime,
+                30,
+                500_000,
+                [7u8; 20],
+                format!("deepen-{step}"),
+                vec![],
+            )
+            .expect("mine");
+        }
+        assert_eq!(
+            super::plan_payout_step(&runtime, &mempool, &spent, &mut payout, 2),
+            super::PayoutStep::Sign {
+                required_input: None
+            }
+        );
+        // Never accepted by any mempool: replace freely.
+        let mut unsent = test_pool_payout_record();
+        super::record_payout_version(&mut unsent, &tx, tip);
+        assert_eq!(
+            super::plan_payout_step(&runtime, &mempool, &spent, &mut unsent, 100),
+            super::PayoutStep::Sign {
+                required_input: None
+            }
+        );
+        // A replacement records the old txid and keeps the lineage coin.
+        let replacement = signed_pool_test_tx(&cfg, &key, lineage.clone(), 900);
+        let old_txid = payout.submitted_txid_hex.clone().expect("txid");
+        super::record_payout_version(&mut payout, &replacement, tip);
+        assert_eq!(payout.superseded_txids, vec![old_txid]);
+        assert_eq!(payout.lineage_input, Some(lineage));
+        assert!(!payout.broadcast_accepted);
+        assert_eq!(super::payout_version_txids(&payout).len(), 2);
     }
 
     #[test]
@@ -26757,6 +27789,7 @@ mod tests {
                 1_770_000_001,
             );
         }
+        super::persist_pool_ledger(&ctx).expect("maintenance flush");
         let persisted_len = fs::metadata(&ctx.pool_ledger_db_path)
             .expect("pool ledger db metadata")
             .len();
@@ -26864,46 +27897,65 @@ mod tests {
             payout_tx_fee_atomic: 1_000,
             ..super::PoolPayoutConfig::default()
         });
-        pool_ledger
-            .pending_payouts
-            .push_back(super::PoolPayoutRecord {
+        let tip = super::PoolChainPoint {
+            height: runtime.tip_height(),
+            hash: runtime.tip_hash(),
+        };
+        // Signed version whose input no longer exists, already relayed.
+        let dead_tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: OutPoint {
+                    txid: Hash256([0xCD; 32]),
+                    vout: 0,
+                },
+                signature: vec![],
+                pubkey_compressed: pool_key.pubkey_compressed().to_vec(),
+                sequence: 0,
+            }],
+            outputs: vec![TxOut {
+                value: 10_000,
+                key_hash20: [9u8; 20],
+            }],
+            lock_time: 0,
+        };
+        let mut dead = super::PoolPayoutRecord {
+            payout_id: "pending-dead-broadcast".to_owned(),
+            worker: worker_address.clone(),
+            amount_atomic: 10_000,
+            created_unix_sec: 1_770_000_003,
+            ..test_pool_payout_record()
+        };
+        super::record_payout_version(&mut dead, &dead_tx, tip);
+        dead.broadcast_accepted = true;
+        for payout in [
+            super::PoolPayoutRecord {
                 payout_id: "pending-zero".to_owned(),
                 worker: worker_address.clone(),
                 amount_atomic: 0,
                 created_unix_sec: 1_770_000_000,
-                submitted_txid_hex: None,
-                confirmed: false,
-            });
-        pool_ledger
-            .pending_payouts
-            .push_back(super::PoolPayoutRecord {
+                ..test_pool_payout_record()
+            },
+            super::PoolPayoutRecord {
                 payout_id: "pending-positive".to_owned(),
                 worker: worker_address.clone(),
                 amount_atomic: 10_000,
                 created_unix_sec: 1_770_000_001,
-                submitted_txid_hex: None,
-                confirmed: false,
-            });
-        pool_ledger
-            .pending_payouts
-            .push_back(super::PoolPayoutRecord {
-                payout_id: "pending-confirmed".to_owned(),
+                ..test_pool_payout_record()
+            },
+            super::PoolPayoutRecord {
+                payout_id: "pending-in-chain".to_owned(),
                 worker: worker_address.clone(),
                 amount_atomic: 10_000,
                 created_unix_sec: 1_770_000_002,
-                submitted_txid_hex: None,
-                confirmed: true,
-            });
-        pool_ledger
-            .pending_payouts
-            .push_back(super::PoolPayoutRecord {
-                payout_id: "pending-already-submitted".to_owned(),
-                worker: worker_address.clone(),
-                amount_atomic: 10_000,
-                created_unix_sec: 1_770_000_003,
-                submitted_txid_hex: Some(Hash256([0xCD; 32]).to_hex()),
-                confirmed: false,
-            });
+                signed_tx_hex: Some(String::new()),
+                confirmed_in: Some(tip),
+                ..test_pool_payout_record()
+            },
+            dead,
+        ] {
+            pool_ledger.pending_payouts.push_back(payout);
+        }
 
         let payout_cfg = super::PoolPayoutConfig {
             mode: super::PoolPayoutModeArg::Pps,
@@ -26925,38 +27977,227 @@ mod tests {
 
         super::maybe_process_pool_payouts(&ctx).expect("process payouts");
         let ledger = ctx.pool_ledger_state.lock().expect("ledger lock");
-        let zero = ledger
-            .pending_payouts
-            .iter()
-            .find(|p| p.payout_id == "pending-zero")
-            .expect("zero payout");
-        assert!(zero.submitted_txid_hex.is_none());
-        let positive = ledger
+        let find = |id: &str| {
+            ledger
+                .pending_payouts
+                .iter()
+                .find(|p| p.payout_id == id)
+                .cloned()
+                .expect("payout")
+        };
+        assert!(find("pending-zero").signed_tx_hex.is_none());
+        let positive = find("pending-positive");
+        assert!(positive.signed_tx_hex.is_some() && positive.submitted_txid_hex.is_some());
+        assert!(positive.broadcast_accepted, "the mempool took it");
+        assert!(positive.lineage_input.is_some() && positive.searched_through.is_some());
+        let positive_txid =
+            Hash256::from_hex(positive.submitted_txid_hex.as_deref().expect("txid")).expect("hex");
+        assert!(
+            super::load_mempool_from_db_or_empty_with_retry(&cfg, &mempool_db, 1, 1)
+                .expect("mempool")
+                .contains(&positive_txid)
+        );
+        // Recorded on disk (signed tx included) before it was broadcast.
+        let on_disk = super::load_pool_ledger_db(&ctx.pool_ledger_db_path).expect("ledger db");
+        let disk_positive = on_disk
             .pending_payouts
             .iter()
             .find(|p| p.payout_id == "pending-positive")
-            .expect("positive payout");
-        assert!(
-            positive.submitted_txid_hex.is_some(),
-            "positive pending payout should be submitted"
-        );
-        let confirmed = ledger
-            .pending_payouts
+            .expect("on disk");
+        assert_eq!(disk_positive.signed_tx_hex, positive.signed_tx_hex);
+        let in_chain = ledger
+            .completed_payouts
             .iter()
-            .find(|p| p.payout_id == "pending-confirmed")
-            .expect("confirmed payout");
-        assert!(confirmed.submitted_txid_hex.is_none());
-        let already = ledger
-            .pending_payouts
-            .iter()
-            .find(|p| p.payout_id == "pending-already-submitted")
-            .expect("already submitted payout");
+            .find(|p| p.payout_id == "pending-in-chain")
+            .expect("confirmed payout settled");
         assert_eq!(
-            already.submitted_txid_hex,
-            Some(Hash256([0xCD; 32]).to_hex())
+            in_chain.signed_tx_hex.as_deref(),
+            Some(""),
+            "a confirmed payout is never re-signed"
+        );
+        let dead = find("pending-dead-broadcast");
+        assert_eq!(
+            dead.superseded_txids.len(),
+            0,
+            "a relayed version is not replaced before its conflict is deep"
+        );
+        assert_eq!(
+            dead.dead_since_height,
+            Some(ctx.runtime.lock().expect("rt").tip_height())
         );
 
         drop(ledger);
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
+    /// ST4 end to end: the signed payout is on disk before it is broadcast;
+    /// after a restart (ledger reloaded from disk) and after the tx falls out
+    /// of the mempool, the very same tx is re-broadcast — never a second,
+    /// differently funded one; it settles after the required confirmations.
+    #[test]
+    fn pool_payout_survives_restart_and_mempool_loss_without_double_pay() {
+        let mut cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        cfg.coinbase_maturity = 1;
+        cfg.validate().expect("config validate");
+        let work_dir = temp_dir("test-pool-payout-restart");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let runtime_db = work_dir.join("runtime.redb");
+        let mempool_db = work_dir.join("mempool.redb");
+        let pool_ledger_db = work_dir.join("pool-ledger.redb");
+        let mnemonic = WalletMnemonic::parse(SOAK_FLOW_MNEMONIC).expect("mnemonic");
+        let seed = mnemonic.to_seed("");
+        let pool_key = derive_wallet_key(&seed, 0, 0).expect("pool key");
+        let pool_key_hash20 = scam_core::hash160_blake3(&pool_key.pubkey_compressed());
+        let worker_key = derive_wallet_key(&seed, 0, 1).expect("worker key");
+        let worker_address =
+            scam_wallet::to_address("sd", worker_key.pubkey_compressed()).expect("worker address");
+
+        let mut runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
+        mine_blocks_on_runtime(
+            &mut runtime,
+            &super::MiningLoopParams {
+                count: 4,
+                interval_sec: cfg.target_block_time_sec,
+                max_nonce: 500_000,
+                miner_key_hash: pool_key_hash20,
+                label_prefix: "pool-payout-restart",
+                print_each: false,
+            },
+        )
+        .expect("mine pool funds");
+        persist_runtime_db(&runtime, &runtime_db).expect("persist runtime");
+        let payout_cfg = super::PoolPayoutConfig {
+            mode: super::PoolPayoutModeArg::Pps,
+            round_maturity_blocks: 2,
+            payout_threshold_atomic: u128::MAX,
+            payout_interval_sec: u64::MAX,
+            payout_tx_fee_atomic: 1_000,
+            ..super::PoolPayoutConfig::default()
+        };
+        let mut pool_ledger = super::StratumPoolLedgerState::new(
+            cfg.network_id.clone(),
+            runtime.tip_height(),
+            runtime.tip_hash(),
+            1_770_000_000,
+            64,
+            32,
+        );
+        pool_ledger.set_payout_config(payout_cfg.clone());
+        pool_ledger.workers.insert(
+            worker_address.clone(),
+            super::new_pool_worker_record(&worker_address),
+        );
+        pool_ledger
+            .pending_payouts
+            .push_back(super::PoolPayoutRecord {
+                payout_id: "p1".to_owned(),
+                worker: worker_address.clone(),
+                amount_atomic: 10_000,
+                created_unix_sec: 1_770_000_000,
+                ..test_pool_payout_record()
+            });
+        let ctx = build_stratum_context_for_tests(
+            &cfg,
+            runtime,
+            runtime_db.clone(),
+            mempool_db.clone(),
+            pool_ledger_db.clone(),
+            pool_ledger,
+            payout_cfg.clone(),
+            Some(pool_key.clone()),
+        );
+        super::maybe_process_pool_payouts(&ctx).expect("first tick");
+        let first = ctx
+            .pool_ledger_state
+            .lock()
+            .expect("ledger")
+            .pending_payouts[0]
+            .clone();
+        let txid = first.submitted_txid_hex.clone().expect("signed");
+        let in_mempool = |txid: &str| {
+            super::load_mempool_from_db_or_empty_with_retry(&cfg, &mempool_db, 1, 1)
+                .expect("mempool")
+                .contains(&Hash256::from_hex(txid).expect("hex"))
+        };
+        assert!(in_mempool(&txid));
+        drop(ctx);
+
+        // Restart: the ledger comes back from disk with the signed tx.
+        let restart = || {
+            let (runtime, _) =
+                super::load_runtime_from_db_or_genesis(&cfg, &runtime_db).expect("runtime");
+            let ledger = super::load_pool_ledger_from_db_or_new(
+                &cfg,
+                &runtime,
+                &pool_ledger_db,
+                64,
+                32,
+                payout_cfg.clone(),
+            )
+            .expect("ledger");
+            build_stratum_context_for_tests(
+                &cfg,
+                runtime,
+                runtime_db.clone(),
+                mempool_db.clone(),
+                pool_ledger_db.clone(),
+                ledger,
+                payout_cfg.clone(),
+                Some(pool_key.clone()),
+            )
+        };
+        let ctx = restart();
+        super::maybe_process_pool_payouts(&ctx).expect("tick after restart");
+        let payout = ctx
+            .pool_ledger_state
+            .lock()
+            .expect("ledger")
+            .pending_payouts[0]
+            .clone();
+        assert_eq!(payout.submitted_txid_hex.as_deref(), Some(txid.as_str()));
+        assert!(payout.superseded_txids.is_empty(), "no second version");
+
+        // The tx falls out of the mempool: the same tx goes back in.
+        fs::remove_file(&mempool_db).expect("drop mempool");
+        super::maybe_process_pool_payouts(&ctx).expect("rebroadcast tick");
+        assert!(in_mempool(&txid), "re-broadcast the same transaction");
+        let payout = ctx
+            .pool_ledger_state
+            .lock()
+            .expect("ledger")
+            .pending_payouts[0]
+            .clone();
+        assert_eq!(payout.submitted_txid_hex.as_deref(), Some(txid.as_str()));
+        assert!(payout.superseded_txids.is_empty());
+
+        // Mined: confirmed but not final until two confirmations.
+        let tx = super::payout_signed_tx(&payout).expect("signed tx");
+        let mine = |txs: Vec<Transaction>, tag: &str| {
+            let mut runtime = ctx.runtime.lock().expect("runtime");
+            mine_block_with_transactions(&mut runtime, 30, 500_000, [7u8; 20], tag.to_owned(), txs)
+                .expect("mine");
+        };
+        mine(vec![tx], "with-payout");
+        super::maybe_process_pool_payouts(&ctx).expect("confirm tick");
+        {
+            let ledger = ctx.pool_ledger_state.lock().expect("ledger");
+            assert_eq!(ledger.pending_payouts.len(), 1);
+            assert!(ledger.pending_payouts[0].confirmed_in.is_some());
+            assert_eq!(
+                ledger.workers[&worker_address].paid_total_atomic, 0,
+                "one confirmation is not final"
+            );
+        }
+        mine(vec![], "second-confirmation");
+        super::maybe_process_pool_payouts(&ctx).expect("settle tick");
+        let ledger = ctx.pool_ledger_state.lock().expect("ledger");
+        assert!(ledger.pending_payouts.is_empty());
+        assert_eq!(ledger.completed_payouts.len(), 1);
+        assert_eq!(ledger.workers[&worker_address].paid_total_atomic, 10_000);
+        drop(ledger);
+        let on_disk = super::load_pool_ledger_db(&pool_ledger_db).expect("ledger db");
+        assert_eq!(on_disk.completed_payouts.len(), 1);
         let _ = fs::remove_dir_all(work_dir);
     }
 
@@ -27015,11 +28256,17 @@ mod tests {
             Some(pool_key),
         );
 
-        assert!(!pool_ledger_db.exists());
+        super::persist_pool_ledger(&ctx).expect("initial flush");
+        let written = fs::metadata(&pool_ledger_db)
+            .and_then(|meta| meta.modified())
+            .expect("mtime");
         super::maybe_process_pool_payouts(&ctx).expect("process payouts");
-        assert!(
-            !pool_ledger_db.exists(),
-            "no-op payout tick must not persist ledger"
+        assert_eq!(
+            fs::metadata(&pool_ledger_db)
+                .and_then(|meta| meta.modified())
+                .expect("mtime"),
+            written,
+            "no-op payout tick must not write the ledger"
         );
         let _ = fs::remove_dir_all(work_dir);
     }
@@ -27080,8 +28327,13 @@ mod tests {
                 worker: worker_address,
                 amount_atomic: 42,
                 created_unix_sec: 1_770_000_000,
+                signed_tx_hex: Some(String::new()),
                 submitted_txid_hex: Some(confirmed_txid),
-                confirmed: false,
+                confirmed_in: Some(super::PoolChainPoint {
+                    height: runtime.tip_height(),
+                    hash: runtime.tip_hash(),
+                }),
+                ..test_pool_payout_record()
             });
         let payout_cfg = super::PoolPayoutConfig {
             mode: super::PoolPayoutModeArg::Pps,
