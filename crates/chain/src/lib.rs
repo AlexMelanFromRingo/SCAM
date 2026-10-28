@@ -8,7 +8,9 @@ use scam_consensus::{
     UndoError, UtxoSet, asert_next, chainwork_for_target, lwma_next, retarget_next,
     revert_block_undo, validate_and_apply_block_with_undo, validate_block_basic,
 };
-use scam_core::{Block, BlockHeader, ChainConfig, DifficultyAlgorithm, Hash256, Target};
+use scam_core::{
+    Block, BlockHeader, ChainConfig, DifficultyAlgorithm, Hash256, Target, block_meets_pow,
+};
 use thiserror::Error;
 
 const MEDIAN_TIME_PAST_WINDOW: usize = 11;
@@ -94,6 +96,84 @@ impl ChainRuntime {
             runtime.apply_next_block_inner(block, false)?;
         }
         Ok(runtime)
+    }
+
+    /// Resume a chain from state this node persisted itself: the main chain
+    /// plus the UTXO set of its tip and the undo data of its newest blocks,
+    /// all written in one transaction. Blocks are not re-validated (the
+    /// full replay of `from_ordered_blocks` made every start re-check every
+    /// signature); headers are checked to link up from the genesis block,
+    /// meet their own proof of work, and commit to their transactions.
+    pub fn from_trusted_state(
+        config: ChainConfig,
+        blocks_by_height: Vec<Block>,
+        utxos: UtxoSet,
+        undo_data: HashMap<Hash256, BlockUndoData>,
+    ) -> Result<Self, ChainError> {
+        config.validate()?;
+        let expected_genesis = config.build_genesis_block()?.header.block_hash();
+        let mut blocks = HashMap::with_capacity(blocks_by_height.len());
+        let mut headers = HashMap::with_capacity(blocks_by_height.len());
+        let mut heights = HashMap::with_capacity(blocks_by_height.len());
+        let mut cumulative_work = HashMap::with_capacity(blocks_by_height.len());
+        let mut main_chain = Vec::with_capacity(blocks_by_height.len());
+        let mut work = BigUint::default();
+        for (height, block) in blocks_by_height.into_iter().enumerate() {
+            let hash = block.header.block_hash();
+            match main_chain.last() {
+                None if hash != expected_genesis => {
+                    return Err(ChainError::UnexpectedGenesis {
+                        expected: expected_genesis,
+                        got: hash,
+                    });
+                }
+                Some(parent) if block.header.prev_block != *parent => {
+                    return Err(ChainError::InvalidRuntime(format!(
+                        "persisted chain does not link at height {height}"
+                    )));
+                }
+                _ => {}
+            }
+            if !block_meets_pow(&block) || !block.has_valid_merkle_root() {
+                return Err(ChainError::InvalidRuntime(format!(
+                    "persisted block {hash} at height {height} fails proof of work or merkle check"
+                )));
+            }
+            work += chainwork_for_target(block.header.target);
+            headers.insert(hash, block.header.clone());
+            heights.insert(hash, height as u64);
+            cumulative_work.insert(hash, work.clone());
+            main_chain.push(hash);
+            blocks.insert(hash, block);
+        }
+        if main_chain.is_empty() {
+            return Err(ChainError::InvalidRuntime(
+                "persisted chain cannot be empty".to_owned(),
+            ));
+        }
+        let main_set = main_chain.iter().copied().collect::<HashSet<_>>();
+        let undo_data = undo_data
+            .into_iter()
+            .filter(|(hash, _)| main_set.contains(hash))
+            .collect();
+        Ok(Self {
+            config,
+            utxos,
+            blocks,
+            headers,
+            heights,
+            cumulative_work,
+            main_chain,
+            undo_data,
+            invalid_blocks: HashSet::new(),
+            max_reorg_depth: MAX_REORG_DEPTH,
+            tip_changes: 0,
+        })
+    }
+
+    /// Undo data of a block (kept for the reorg window).
+    pub fn undo_for(&self, hash: &Hash256) -> Option<&BlockUndoData> {
+        self.undo_data.get(hash)
     }
 
     pub fn new(config: ChainConfig, genesis: Block) -> Result<Self, ChainError> {

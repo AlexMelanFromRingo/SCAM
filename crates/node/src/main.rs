@@ -56,12 +56,13 @@ use scam_rpc::{
 #[cfg(test)]
 use scam_storage::save_pool_ledger_db;
 use scam_storage::{
-    ChainStateSnapshot, MempoolTxRecord, PeerAddressBook, PeerAddressRecord, PoolChainPoint,
-    PoolLedgerDelta, PoolLedgerSnapshot, PoolPayoutRecord, PoolRoundCredit, PoolRoundRecord,
-    PoolShareRecord, PoolWorkerAccrualRecord, StorageError, apply_mempool_delta_db,
-    apply_peer_book_delta_db, apply_pool_ledger_delta_db, load_block_by_hash_db,
-    load_chain_archive_db, load_mempool_db, load_peer_book_db, load_pool_ledger_db, load_snapshot,
-    load_snapshot_db, persist_chain_archive_incremental_db, pin_database, save_peer_book_db,
+    ChainStateSnapshot, ChainstateSource, MempoolTxRecord, PeerAddressBook, PeerAddressRecord,
+    PoolChainPoint, PoolLedgerDelta, PoolLedgerSnapshot, PoolPayoutRecord, PoolRoundCredit,
+    PoolRoundRecord, PoolShareRecord, PoolWorkerAccrualRecord, StorageError,
+    apply_mempool_delta_db, apply_peer_book_delta_db, apply_pool_ledger_delta_db,
+    load_block_by_hash_db, load_chain_archive_db, load_chainstate_db, load_mempool_db,
+    load_peer_book_db, load_pool_ledger_db, load_snapshot, load_snapshot_db,
+    persist_chain_archive_incremental_db, pin_database, reset_chainstate_db, save_peer_book_db,
     save_snapshot, save_snapshot_db, unpin_database,
 };
 use scam_stratum::{
@@ -1807,20 +1808,44 @@ fn run_mode_relay_telemetry_enabled(run_relay: bool, relay_telemetry_path: &Path
     run_relay || relay_telemetry_path.exists()
 }
 
+/// A server that had to replay its archive stores the chainstate right away,
+/// so its next start resumes without replay.
+fn persist_chainstate_after_replay(
+    runtime: &ChainRuntime,
+    runtime_db_path: &Path,
+    source: &str,
+) -> Result<(), NodeError> {
+    if source == "db-replay" {
+        persist_runtime_db(runtime, runtime_db_path)?;
+    }
+    Ok(())
+}
+
 fn load_runtime_from_db_or_genesis(
     cfg: &ChainConfig,
     runtime_db_path: &Path,
 ) -> Result<(ChainRuntime, &'static str), NodeError> {
     if runtime_db_path.exists() {
-        let archive = load_with_retry(80, 25, is_runtime_db_lock_conflict, || {
-            load_chain_archive_db(runtime_db_path).map_err(NodeError::from)
-        })?
-        .ok_or_else(|| {
-            NodeError::Runtime(format!(
-                "runtime db is lock-contended: {}",
-                runtime_db_path.display()
-            ))
-        })?;
+        // Resume from the persisted chainstate: no block replay.
+        if let Some(state) = load_chainstate_db(runtime_db_path)? {
+            ensure_network_id_match(
+                &cfg.network_id,
+                &state.network_id,
+                "runtime db network mismatch",
+            )?;
+            return Ok((
+                ChainRuntime::from_trusted_state(
+                    cfg.clone(),
+                    state.blocks_by_height,
+                    state.utxos,
+                    state.undo,
+                )?,
+                "db",
+            ));
+        }
+        // An archive without a chainstate (older format, or after a
+        // reindex): replay it once; the next write stores the chainstate.
+        let archive = load_chain_archive_db(runtime_db_path)?;
         if archive.network_id != cfg.network_id {
             return Err(NodeError::Runtime(format!(
                 "runtime db network mismatch: db='{}', config='{}'",
@@ -1829,7 +1854,7 @@ fn load_runtime_from_db_or_genesis(
         }
         Ok((
             ChainRuntime::from_ordered_blocks(cfg.clone(), archive.blocks_by_height)?,
-            "db",
+            "db-replay",
         ))
     } else {
         Ok((ChainRuntime::from_config(cfg.clone())?, "genesis"))
@@ -1841,30 +1866,28 @@ fn load_runtime_from_db_or_genesis(
 /// behind the archive gets `StaleArchiveWriter` instead of rolling the
 /// shared archive back.
 fn persist_runtime_db(runtime: &ChainRuntime, runtime_db_path: &Path) -> Result<(), NodeError> {
-    let persisted = persist_chain_archive_incremental_db(
+    let utxos = runtime.utxo_set();
+    // The node owns its stores, so a write that would roll the archive back
+    // (`StaleArchiveWriter`) is a real error, never another process's data.
+    persist_chain_archive_incremental_db(
         runtime_db_path,
         &runtime.config().network_id,
         runtime.block_hashes(),
         &runtime.cumulative_work().to_bytes_be(),
         &|hash| runtime.block_by_hash(hash).cloned(),
-    );
-    match persisted {
-        Ok(_) => Ok(()),
-        // Another process already stored a chain with at least as much work.
-        // Nothing is lost: this process merges it on its next refresh and its
-        // own blocks are written once its branch is the heaviest. Failing the
-        // caller here would drop an innocent peer session.
-        Err(StorageError::StaleArchiveWriter {
-            disk_tip,
-            disk_height,
-        }) => {
-            eprintln!(
-                "warning: runtime db holds a chain with at least as much work (tip {disk_tip} at height {disk_height}); not overwriting"
-            );
-            Ok(())
-        }
-        Err(err) => Err(err.into()),
-    }
+        &ChainstateSource {
+            utxo: &|outpoint| utxos.get(outpoint).cloned(),
+            all_utxos: &|| {
+                utxos
+                    .iter()
+                    .map(|(outpoint, entry)| (outpoint.clone(), entry.clone()))
+                    .collect()
+            },
+            undo: &|hash| runtime.undo_for(hash).cloned(),
+            undo_window: scam_chain::MAX_REORG_DEPTH,
+        },
+    )?;
+    Ok(())
 }
 
 /// Persist only what changed in `mempool` since it was loaded or last
@@ -12367,6 +12390,7 @@ fn run_relay_node(
     let peers_db_path = peer_book_paths(&args.peers_dir, &cfg.network_id).0;
     let _stores = OwnedStores::claim(&[&runtime_db_path, &mempool_db_path, &peers_db_path])?;
     let (runtime, source) = load_runtime_from_db_or_genesis(&cfg, &runtime_db_path)?;
+    persist_chainstate_after_replay(&runtime, &runtime_db_path, source)?;
 
     let max_inv_items = args.max_inv_items.unwrap_or(cfg.p2p_max_inv_items).max(1);
     let ban_threshold = args.ban_threshold.unwrap_or(cfg.p2p_ban_threshold).max(1);
@@ -12762,6 +12786,8 @@ fn run_reindex_runtime(args: ReindexRuntimeArgs) -> Result<(), NodeError> {
     }
 
     let runtime = ChainRuntime::from_ordered_blocks(cfg.clone(), archive.blocks_by_height)?;
+    // Rebuild the chainstate from the replay instead of trusting the stored one.
+    reset_chainstate_db(&runtime_db_path)?;
     persist_runtime_db(&runtime, &runtime_db_path)?;
 
     println!("Runtime reindex complete");
@@ -16647,6 +16673,7 @@ fn run_stratum_service(args: StratumServeArgs, node: Option<SharedNode>) -> Resu
             let stores =
                 OwnedStores::claim(&[&runtime_db_path, &mempool_db_path, &pool_ledger_db_path])?;
             let (runtime, source) = load_runtime_from_db_or_genesis(&cfg, &runtime_db_path)?;
+            persist_chainstate_after_replay(&runtime, &runtime_db_path, source)?;
             (
                 ChainHandle::Own(Arc::new(Mutex::new(runtime))),
                 source,
@@ -21375,7 +21402,13 @@ mod tests {
         )
         .expect("mine");
         persist_runtime_db(&relay_view, &runtime_db).expect("relay persists");
-        persist_runtime_db(&stale_view, &runtime_db).expect("stale writer is not an error");
+        // The node owns its stores: a write that would roll the archive back
+        // is refused as an error, never silently skipped.
+        let err = persist_runtime_db(&stale_view, &runtime_db).expect_err("stale writer refused");
+        assert!(matches!(
+            err,
+            super::NodeError::Storage(super::StorageError::StaleArchiveWriter { .. })
+        ));
 
         let (reloaded, _) =
             super::load_runtime_from_db_or_genesis(&cfg, &runtime_db).expect("reload");
@@ -25796,6 +25829,66 @@ mod tests {
             .expect("digest");
         tx.inputs[0].signature = super::sign_digest(key, digest.0).expect("sign").to_vec();
         tx
+    }
+
+    /// S4: a restart resumes from the persisted chainstate (no replay), with
+    /// the same UTXO set a full replay produces and the undo data a reorg
+    /// right after the restart needs.
+    #[test]
+    fn restart_resumes_from_chainstate_and_can_reorg() {
+        let (cfg, mut runtime, key, outpoint) = relay_funded_runtime_for_pool();
+        let work_dir = temp_dir("test-chainstate-restart");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let runtime_db = work_dir.join("runtime.redb");
+        let value = runtime.utxo_set().get(&outpoint).expect("utxo").value;
+        let spend = signed_pool_test_tx(&cfg, &key, outpoint, value - 100_000);
+        let mine = |runtime: &mut ChainRuntime, tag: &str, txs: Vec<Transaction>| {
+            mine_block_with_transactions(runtime, 30, 500_000, [7u8; 20], tag.to_owned(), txs)
+                .expect("mine")
+                .0
+        };
+        mine(&mut runtime, "a1", vec![spend]);
+        mine(&mut runtime, "a2", vec![]);
+        super::persist_runtime_db(&runtime, &runtime_db).expect("persist");
+
+        let (resumed, source) =
+            super::load_runtime_from_db_or_genesis(&cfg, &runtime_db).expect("resume");
+        assert_eq!(source, "db", "resumed from the chainstate, no replay");
+        assert_eq!(resumed.tip_hash(), runtime.tip_hash());
+        assert_eq!(resumed.utxo_set(), runtime.utxo_set());
+        assert_eq!(resumed.cumulative_work(), runtime.cumulative_work());
+        let archive = super::load_chain_archive_db(&runtime_db).expect("archive");
+        let replayed = ChainRuntime::from_ordered_blocks(cfg.clone(), archive.blocks_by_height)
+            .expect("replay");
+        assert_eq!(
+            resumed.utxo_set(),
+            replayed.utxo_set(),
+            "same state as a replay"
+        );
+
+        // A heavier branch from height 1 forces disconnecting a2 with the
+        // undo data that came from disk.
+        let mut resumed = resumed;
+        let mut fork = ChainRuntime::from_config(cfg.clone()).expect("fork");
+        let a1 = runtime.block_hash_at_height(1).expect("a1");
+        fork.submit_block(runtime.block_by_hash(&a1).expect("a1 block").clone())
+            .expect("a1 on fork");
+        mine(&mut fork, "b2", vec![]);
+        mine(&mut fork, "b3", vec![]);
+        for height in 2..=fork.tip_height() {
+            let hash = fork.block_hash_at_height(height).expect("hash");
+            resumed
+                .submit_block(fork.block_by_hash(&hash).expect("block").clone())
+                .expect("fork block");
+        }
+        assert_eq!(resumed.tip_hash(), fork.tip_hash(), "reorged after restart");
+        assert_eq!(resumed.utxo_set(), fork.utxo_set());
+        super::persist_runtime_db(&resumed, &runtime_db).expect("persist reorg");
+        let (again, source) =
+            super::load_runtime_from_db_or_genesis(&cfg, &runtime_db).expect("resume again");
+        assert_eq!(source, "db");
+        assert_eq!(again.utxo_set(), fork.utxo_set());
+        let _ = fs::remove_dir_all(work_dir);
     }
 
     #[test]
@@ -34939,6 +35032,14 @@ mod tests {
         let archive = load_chain_archive_db(&runtime_db_path).expect("load archive");
         assert_eq!(archive.network_id, "devnet");
         assert_eq!(archive.blocks_by_height.len(), 2);
+        // S4: the chainstate is rebuilt from the replay and resumed from.
+        let state = super::load_chainstate_db(&runtime_db_path)
+            .expect("load chainstate")
+            .expect("chainstate rebuilt");
+        assert_eq!(&state.utxos, runtime.utxo_set());
+        let (_, source) =
+            super::load_runtime_from_db_or_genesis(&cfg, &runtime_db_path).expect("resume");
+        assert_eq!(source, "db");
 
         let _ = fs::remove_dir_all(work_dir);
     }

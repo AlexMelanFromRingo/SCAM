@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use redb::{Database, ReadableTable, TableDefinition};
-use scam_consensus::{UtxoEntry, UtxoSet};
+use scam_consensus::{BlockUndoData, UtxoEntry, UtxoSet};
 use scam_core::{Block, BlockHeader, Hash256, OutPoint, Transaction};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -28,6 +28,14 @@ const UTXO_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("utxos");
 const BLOCK_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("blocks_by_hash");
 const HEADER_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("headers_by_hash");
 const BLOCK_INDEX_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("block_index");
+/// UTXO set of the archive tip, written in the same transaction as the tip.
+const CHAINSTATE_UTXO_TABLE: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("chainstate_utxos");
+/// Undo data of the newest blocks (the reorg window), by block hash.
+const CHAINSTATE_UNDO_TABLE: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("chainstate_undo");
+/// Archive meta key: the block whose UTXO set `chainstate_utxos` holds.
+const CHAINSTATE_TIP_KEY: &str = "chainstate_tip";
 const PEER_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("peers");
 const MEMPOOL_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("mempool_by_txid");
 const POOL_META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("pool_meta");
@@ -450,6 +458,8 @@ pub fn save_chain_archive_db(path: &Path, archive: &ChainArchive) -> Result<(), 
     delete_table(&write_txn, BLOCK_TABLE)?;
     delete_table(&write_txn, HEADER_TABLE)?;
     delete_table(&write_txn, BLOCK_INDEX_TABLE)?;
+    delete_table(&write_txn, CHAINSTATE_UTXO_TABLE)?;
+    delete_table(&write_txn, CHAINSTATE_UNDO_TABLE)?;
     {
         let mut meta = write_txn
             .open_table(META_TABLE)
@@ -557,6 +567,43 @@ pub struct ArchiveTip {
 }
 
 /// Result of [`persist_chain_archive_incremental_db`].
+/// What the archive writer needs from the in-memory chain to keep the
+/// persisted chainstate (UTXO set and recent undo data) equal to it, so a
+/// restart loads the state instead of replaying every block.
+pub struct ChainstateSource<'a> {
+    /// The current entry of an outpoint (`None`: not in the UTXO set).
+    pub utxo: &'a dyn Fn(&OutPoint) -> Option<UtxoEntry>,
+    /// Every UTXO: the first write of an archive without a chainstate.
+    pub all_utxos: &'a dyn Fn() -> Vec<(OutPoint, UtxoEntry)>,
+    /// Undo data of a main-chain block, if the chain still keeps it.
+    pub undo: &'a dyn Fn(&Hash256) -> Option<BlockUndoData>,
+    /// Undo is kept for this many newest blocks (the reorg window).
+    pub undo_window: u64,
+}
+
+/// A persisted chain plus the state needed to resume it without replay.
+pub struct PersistedChainstate {
+    pub network_id: String,
+    pub blocks_by_height: Vec<Block>,
+    pub utxos: UtxoSet,
+    pub undo: std::collections::HashMap<Hash256, BlockUndoData>,
+}
+
+/// Outpoints a block reads or creates: their final state is all that a
+/// connect or disconnect of the block can change.
+fn block_touched_outpoints(block: &Block, touched: &mut std::collections::HashSet<OutPoint>) {
+    for tx in &block.transactions {
+        if !tx.is_coinbase() {
+            touched.extend(tx.inputs.iter().map(|input| input.prev_out.clone()));
+        }
+        let txid = tx.txid();
+        touched.extend((0..tx.outputs.len()).map(|vout| OutPoint {
+            txid,
+            vout: vout as u32,
+        }));
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ArchivePersistOutcome {
     /// First height whose index entry was (re)written; `None` if the archive
@@ -690,6 +737,7 @@ pub fn persist_chain_archive_incremental_db(
     main_chain: &[Hash256],
     tip_work_be: &[u8],
     get_block: &dyn Fn(&Hash256) -> Option<Block>,
+    chainstate: &ChainstateSource<'_>,
 ) -> Result<ArchivePersistOutcome, StorageError> {
     let Some(new_tip_hash) = main_chain.last().copied() else {
         return Err(StorageError::InvalidArchive(
@@ -768,6 +816,21 @@ pub fn persist_chain_archive_incremental_db(
             }
         };
 
+        // Blocks leaving the main chain (their index entries are replaced).
+        let mut disconnected = Vec::<Hash256>::new();
+        if let Some(tip) = &disk_tip {
+            for height in first_diff..=tip.height {
+                if let Some(hash) = index_hash_at(&index_table, height)? {
+                    disconnected.push(hash);
+                }
+            }
+        }
+        let chainstate_tip = meta
+            .get(CHAINSTATE_TIP_KEY)
+            .map_err(|e| StorageError::Db(e.to_string()))?
+            .map(|raw| bytes_to_hash(raw.value(), CHAINSTATE_TIP_KEY))
+            .transpose()?;
+
         let mut blocks_table = write_txn
             .open_table(BLOCK_TABLE)
             .map_err(|e| StorageError::Db(e.to_string()))?;
@@ -775,17 +838,47 @@ pub fn persist_chain_archive_incremental_db(
             .open_table(HEADER_TABLE)
             .map_err(|e| StorageError::Db(e.to_string()))?;
         let mut blocks_written = 0usize;
+        let mut touched = std::collections::HashSet::<OutPoint>::new();
+        for hash in &disconnected {
+            if let Some(raw) = blocks_table
+                .get(hash.0.as_slice())
+                .map_err(|e| StorageError::Db(e.to_string()))?
+            {
+                let block: Block =
+                    bincode::deserialize(raw.value()).map_err(StorageError::Decode)?;
+                block_touched_outpoints(&block, &mut touched);
+            }
+        }
         for height in first_diff..=new_tip_height {
             let hash = main_chain[height as usize];
             let already_stored = blocks_table
                 .get(hash.0.as_slice())
                 .map_err(|e| StorageError::Db(e.to_string()))?
                 .is_some();
-            if !already_stored {
-                let block = get_block(&hash).ok_or_else(|| StorageError::MissingArchiveRecord {
-                    table: "writer main chain",
-                    key: hash.to_string(),
-                })?;
+            let block = if already_stored {
+                None
+            } else {
+                Some(
+                    get_block(&hash).ok_or_else(|| StorageError::MissingArchiveRecord {
+                        table: "writer main chain",
+                        key: hash.to_string(),
+                    })?,
+                )
+            };
+            match &block {
+                Some(block) => block_touched_outpoints(block, &mut touched),
+                None => {
+                    if let Some(raw) = blocks_table
+                        .get(hash.0.as_slice())
+                        .map_err(|e| StorageError::Db(e.to_string()))?
+                    {
+                        let stored: Block =
+                            bincode::deserialize(raw.value()).map_err(StorageError::Decode)?;
+                        block_touched_outpoints(&stored, &mut touched);
+                    }
+                }
+            }
+            if let Some(block) = block {
                 let block_bytes = bincode::serialize(&block).map_err(StorageError::Encode)?;
                 let header_bytes =
                     bincode::serialize(&block.header).map_err(StorageError::Encode)?;
@@ -809,6 +902,84 @@ pub fn persist_chain_archive_incremental_db(
             }
         }
 
+        // Chainstate: the UTXO set and recent undo of the new tip.
+        let mut utxo_table = write_txn
+            .open_table(CHAINSTATE_UTXO_TABLE)
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+        let mut undo_table = write_txn
+            .open_table(CHAINSTATE_UNDO_TABLE)
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+        let incremental =
+            chainstate_tip.is_some() && chainstate_tip == disk_tip.as_ref().map(|t| t.hash);
+        if incremental {
+            for outpoint in &touched {
+                let key = bincode::serialize(outpoint).map_err(StorageError::Encode)?;
+                match (chainstate.utxo)(outpoint) {
+                    Some(entry) => {
+                        let value = bincode::serialize(&entry).map_err(StorageError::Encode)?;
+                        utxo_table
+                            .insert(key.as_slice(), value.as_slice())
+                            .map_err(|e| StorageError::Db(e.to_string()))?;
+                    }
+                    None => {
+                        utxo_table
+                            .remove(key.as_slice())
+                            .map_err(|e| StorageError::Db(e.to_string()))?;
+                    }
+                }
+            }
+            for hash in &disconnected {
+                undo_table
+                    .remove(hash.0.as_slice())
+                    .map_err(|e| StorageError::Db(e.to_string()))?;
+            }
+        } else {
+            // No (or a stale) chainstate yet: write the whole set once.
+            utxo_table
+                .retain(|_, _| false)
+                .map_err(|e| StorageError::Db(e.to_string()))?;
+            undo_table
+                .retain(|_, _| false)
+                .map_err(|e| StorageError::Db(e.to_string()))?;
+            for (outpoint, entry) in (chainstate.all_utxos)() {
+                let key = bincode::serialize(&outpoint).map_err(StorageError::Encode)?;
+                let value = bincode::serialize(&entry).map_err(StorageError::Encode)?;
+                utxo_table
+                    .insert(key.as_slice(), value.as_slice())
+                    .map_err(|e| StorageError::Db(e.to_string()))?;
+            }
+        }
+        // Undo for the window's blocks (new ones, or all of them on a full
+        // write); blocks that left the window lose theirs.
+        let window_start = new_tip_height.saturating_sub(chainstate.undo_window.saturating_sub(1));
+        let undo_from = if incremental {
+            first_diff.max(window_start)
+        } else {
+            window_start
+        };
+        for height in undo_from..=new_tip_height {
+            let hash = main_chain[height as usize];
+            if let Some(undo) = (chainstate.undo)(&hash) {
+                let value = bincode::serialize(&undo).map_err(StorageError::Encode)?;
+                undo_table
+                    .insert(hash.0.as_slice(), value.as_slice())
+                    .map_err(|e| StorageError::Db(e.to_string()))?;
+            }
+        }
+        let old_window_start = disk_tip.as_ref().map_or(0, |tip| {
+            tip.height
+                .saturating_sub(chainstate.undo_window.saturating_sub(1))
+        });
+        for height in old_window_start..window_start {
+            if let Some(hash) = main_chain.get(height as usize) {
+                undo_table
+                    .remove(hash.0.as_slice())
+                    .map_err(|e| StorageError::Db(e.to_string()))?;
+            }
+        }
+        meta.insert(CHAINSTATE_TIP_KEY, new_tip_hash.0.as_slice())
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+
         meta.insert("network_id", network_id.as_bytes())
             .map_err(|e| StorageError::Db(e.to_string()))?;
         write_schema_version(&mut meta, STORE_SCHEMA_VERSION)?;
@@ -828,6 +999,112 @@ pub fn persist_chain_archive_incremental_db(
         .commit()
         .map_err(|e| StorageError::Db(e.to_string()))?;
     Ok(outcome)
+}
+
+/// Drop the persisted chainstate (reindex): the next archive write stores
+/// a complete one rebuilt from the replayed chain.
+pub fn reset_chainstate_db(path: &Path) -> Result<(), StorageError> {
+    let db = open_existing_db(path)?;
+    let write_txn = db
+        .begin_write()
+        .map_err(|e| StorageError::Db(e.to_string()))?;
+    delete_table(&write_txn, CHAINSTATE_UTXO_TABLE)?;
+    delete_table(&write_txn, CHAINSTATE_UNDO_TABLE)?;
+    {
+        let mut meta = write_txn
+            .open_table(META_TABLE)
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+        meta.remove(CHAINSTATE_TIP_KEY)
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+    }
+    write_txn
+        .commit()
+        .map_err(|e| StorageError::Db(e.to_string()))?;
+    Ok(())
+}
+
+/// The archive's main chain with its persisted chainstate, or `None` when
+/// the archive has none for its tip (written before chainstates existed):
+/// the caller then replays the chain once and the next write stores one.
+pub fn load_chainstate_db(path: &Path) -> Result<Option<PersistedChainstate>, StorageError> {
+    let db = open_existing_db(path)?;
+    let read_txn = db
+        .begin_read()
+        .map_err(|e| StorageError::Db(e.to_string()))?;
+    let meta = read_txn
+        .open_table(META_TABLE)
+        .map_err(|e| StorageError::Db(e.to_string()))?;
+    check_schema_version(&meta, "chain archive", STORE_SCHEMA_VERSION, Some(1))?;
+    let Some(tip) = read_archive_tip(&meta)? else {
+        return Ok(None);
+    };
+    let chainstate_tip = meta
+        .get(CHAINSTATE_TIP_KEY)
+        .map_err(|e| StorageError::Db(e.to_string()))?
+        .map(|raw| bytes_to_hash(raw.value(), CHAINSTATE_TIP_KEY))
+        .transpose()?;
+    if chainstate_tip != Some(tip.hash) {
+        return Ok(None);
+    }
+    let index = read_txn
+        .open_table(BLOCK_INDEX_TABLE)
+        .map_err(|e| StorageError::Db(e.to_string()))?;
+    let blocks = read_txn
+        .open_table(BLOCK_TABLE)
+        .map_err(|e| StorageError::Db(e.to_string()))?;
+    let mut blocks_by_height = Vec::with_capacity(tip.height as usize + 1);
+    for height in 0..=tip.height {
+        let hash = index
+            .get(height)
+            .map_err(|e| StorageError::Db(e.to_string()))?
+            .map(|raw| bytes_to_hash(raw.value(), "block_index hash"))
+            .transpose()?
+            .ok_or_else(|| StorageError::MissingArchiveRecord {
+                table: "block_index",
+                key: height.to_string(),
+            })?;
+        let raw = blocks
+            .get(hash.0.as_slice())
+            .map_err(|e| StorageError::Db(e.to_string()))?
+            .ok_or_else(|| StorageError::MissingArchiveRecord {
+                table: "blocks_by_hash",
+                key: hash.to_string(),
+            })?;
+        let block: Block = bincode::deserialize(raw.value()).map_err(StorageError::Decode)?;
+        blocks_by_height.push(block);
+    }
+    let mut utxos = UtxoSet::new();
+    for row in read_txn
+        .open_table(CHAINSTATE_UTXO_TABLE)
+        .map_err(|e| StorageError::Db(e.to_string()))?
+        .iter()
+        .map_err(|e| StorageError::Db(e.to_string()))?
+    {
+        let (key, value) = row.map_err(|e| StorageError::Db(e.to_string()))?;
+        utxos.insert(
+            bincode::deserialize(key.value()).map_err(StorageError::Decode)?,
+            bincode::deserialize(value.value()).map_err(StorageError::Decode)?,
+        );
+    }
+    let mut undo = std::collections::HashMap::new();
+    for row in read_txn
+        .open_table(CHAINSTATE_UNDO_TABLE)
+        .map_err(|e| StorageError::Db(e.to_string()))?
+        .iter()
+        .map_err(|e| StorageError::Db(e.to_string()))?
+    {
+        let (key, value) = row.map_err(|e| StorageError::Db(e.to_string()))?;
+        undo.insert(
+            bytes_to_hash(key.value(), "chainstate_undo key")?,
+            bincode::deserialize(value.value()).map_err(StorageError::Decode)?,
+        );
+    }
+    Ok(Some(PersistedChainstate {
+        network_id: tip.network_id,
+        blocks_by_height,
+        utxos,
+        undo,
+    }))
 }
 
 pub fn load_chain_archive_db(path: &Path) -> Result<ChainArchive, StorageError> {
@@ -2114,7 +2391,152 @@ mod tests {
             &hashes,
             &work.to_be_bytes(),
             &lookup,
+            &crate::ChainstateSource {
+                utxo: &|_| None,
+                all_utxos: &Vec::new,
+                undo: &|_| None,
+                undo_window: 720,
+            },
         )
+    }
+
+    /// S4: the archive writer keeps the persisted UTXO set equal to the
+    /// chain's (connects, reorgs) and undo data for the reorg window only;
+    /// a loader resumes from it.
+    #[test]
+    fn chainstate_tracks_utxo_set_and_undo_window_across_reorgs() {
+        use scam_consensus::{BlockUndoData, UtxoEntry};
+        let path = temp_test_file("archive-chainstate", "redb");
+        let block = |prev: Hash256, tag: u8| {
+            let coinbase = Transaction {
+                version: 1,
+                inputs: vec![TxIn {
+                    prev_out: OutPoint::coinbase(),
+                    signature: vec![tag],
+                    pubkey_compressed: vec![],
+                    sequence: u32::MAX,
+                }],
+                outputs: vec![TxOut {
+                    value: u64::from(tag),
+                    key_hash20: [tag; 20],
+                }],
+                lock_time: 0,
+            };
+            let txids = vec![coinbase.txid()];
+            Block {
+                header: BlockHeader {
+                    version: 1,
+                    prev_block: prev,
+                    merkle_root: scam_core::merkle::merkle_root(&txids),
+                    timestamp: u64::from(tag),
+                    target: Target::MAX,
+                    nonce: u64::from(tag),
+                },
+                transactions: vec![coinbase],
+            }
+        };
+        let utxos_of = |blocks: &[Block]| {
+            blocks
+                .iter()
+                .map(|b| {
+                    let tx = &b.transactions[0];
+                    (
+                        OutPoint {
+                            txid: tx.txid(),
+                            vout: 0,
+                        },
+                        UtxoEntry {
+                            value: tx.outputs[0].value,
+                            key_hash20: tx.outputs[0].key_hash20,
+                            created_height: 0,
+                            created_time: 0,
+                            is_coinbase: true,
+                        },
+                    )
+                })
+                .collect::<std::collections::HashMap<_, _>>()
+        };
+        let write = |chain: &[Block], work: u64| {
+            let hashes = chain
+                .iter()
+                .map(|b| b.header.block_hash())
+                .collect::<Vec<_>>();
+            let utxos = utxos_of(chain);
+            crate::persist_chain_archive_incremental_db(
+                &path,
+                "devnet",
+                &hashes,
+                &work.to_be_bytes(),
+                &|hash: &Hash256| {
+                    chain
+                        .iter()
+                        .find(|b| b.header.block_hash() == *hash)
+                        .cloned()
+                },
+                &crate::ChainstateSource {
+                    utxo: &|op| utxos.get(op).cloned(),
+                    all_utxos: &|| utxos.clone().into_iter().collect(),
+                    undo: &|_| Some(BlockUndoData::default()),
+                    undo_window: 2,
+                },
+            )
+            .expect("persist");
+        };
+        let mut chain = vec![block(Hash256::ZERO, 1)];
+        for tag in 2..=4 {
+            let prev = chain.last().expect("tip").header.block_hash();
+            chain.push(block(prev, tag));
+        }
+        write(&chain, 10);
+        let loaded = crate::load_chainstate_db(&path)
+            .expect("load")
+            .expect("chainstate");
+        assert_eq!(loaded.blocks_by_height, chain);
+        assert_eq!(loaded.utxos, utxos_of(&chain));
+        let mut undo_keys = loaded.undo.keys().copied().collect::<Vec<_>>();
+        undo_keys.sort();
+        let mut window = chain[2..]
+            .iter()
+            .map(|b| b.header.block_hash())
+            .collect::<Vec<_>>();
+        window.sort();
+        assert_eq!(undo_keys, window, "undo only for the window");
+
+        // Reorg: blocks 3 and 4 are replaced by 3', 4', 5'.
+        let mut fork = chain[..2].to_vec();
+        for tag in 30..=32 {
+            let prev = fork.last().expect("tip").header.block_hash();
+            fork.push(block(prev, tag));
+        }
+        write(&fork, 20);
+        let loaded = crate::load_chainstate_db(&path)
+            .expect("load")
+            .expect("chainstate");
+        assert_eq!(loaded.blocks_by_height, fork);
+        assert_eq!(
+            loaded.utxos,
+            utxos_of(&fork),
+            "disconnected outputs are gone"
+        );
+        assert_eq!(loaded.undo.len(), 2);
+        assert!(
+            loaded
+                .undo
+                .keys()
+                .all(|hash| fork[3..].iter().any(|b| b.header.block_hash() == *hash))
+        );
+
+        // A full archive rewrite drops the chainstate: loaders replay.
+        crate::save_chain_archive_db(
+            &path,
+            &crate::ChainArchive {
+                network_id: "devnet".to_owned(),
+                blocks_by_height: fork.clone(),
+            },
+        )
+        .expect("full save");
+        assert!(crate::load_chainstate_db(&path).expect("load").is_none());
+        let _ = std::fs::remove_file(path);
     }
 
     /// S3: persisting writes only blocks above what the archive already has.
