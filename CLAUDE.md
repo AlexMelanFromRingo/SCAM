@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-SCAM ("Smart Computing Alternative Money") is a Rust 2024 implementation of a PoW L1 blockchain (BLAKE3-256 PoW, Schnorr/secp256k1 signatures, Bech32m addresses, UTXO model, SV2 stratum subset). The workspace is currently at `0.3.0-rc3` (`Cargo.toml`); the operator-facing README is the canonical end-user reference.
+SCAM ("Smart Computing Alternative Money") is a Rust 2024 implementation of a PoW L1 blockchain (BLAKE3-256 PoW, Schnorr/secp256k1 signatures, Bech32m addresses, UTXO model, SV2 stratum subset). The workspace is currently at `0.3.0` (`Cargo.toml`); the operator-facing README is the canonical end-user reference.
 
 ## Quality gates (must all pass before considering work done)
 
