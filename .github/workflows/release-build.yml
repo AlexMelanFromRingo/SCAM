@@ -77,10 +77,20 @@ jobs:
       - name: Install libclang (minisketch-rs bindgen)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang libclang-dev
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.rust_target || '' }}
+      - name: Install Rust (toolchain pinned in rust-toolchain.toml)
+        # cargo builds with the toolchain pinned in rust-toolchain.toml, so the
+        # cross target must be added to that toolchain, not to `stable`.
+        shell: bash
+        env:
+          RUST_TARGET: ${{ matrix.rust_target || '' }}
+        run: |
+          set -euo pipefail
+          rustup toolchain install --no-self-update
+          if [[ -n "${RUST_TARGET}" ]]; then
+            rustup target add "${RUST_TARGET}"
+          fi
+          rustc --version --verbose
+          rustup target list --installed
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
         with:
@@ -108,7 +118,8 @@ jobs:
     needs:
       - detect-version
       - build
-    if: needs.detect-version.outputs.changed == 'true'
+    # A manual run on another branch only builds the binaries.
+    if: needs.detect-version.outputs.changed == 'true' && github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
     steps:
       - name: Download release artifacts
