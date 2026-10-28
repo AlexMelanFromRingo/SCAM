@@ -1789,6 +1789,7 @@ dependencies = [
  "clap 4.5.57",
  "hex",
  "num-traits",
+ "rand 0.8.5",
  "redb",
  "scam-chain",
  "scam-consensus",
