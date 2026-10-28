@@ -41,17 +41,17 @@ cargo run -p scam-node -- stratum-key-rotate \
   --archive-dir data/stratum-keys/archive
 ```
 
-Start pool server with secure noise mode:
+Start the node with its pool in secure noise mode (the pool runs inside the
+node process, on the node's chain and mempool):
 
 ```bash
-cargo run -p scam-node -- stratum-serve \
+export SCAM_STRATUM_STATIC_SECRET_KEY_HEX=<hex32>
+cargo run -p scam-node -- serve \
   --network devnet \
   --config config/devnet.toml \
   --runtime-db data/devnet.runtime.redb \
-  --bind 0.0.0.0:3347 \
-  --secure-transport \
-  --secure-transport-mode noise-xx \
-  --secure-static-secret-key-hex <hex32>
+  --bind 0.0.0.0:18444 \
+  --stratum "--bind 0.0.0.0:3347 --secure-transport --secure-transport-mode noise-xx"
 ```
 
 Worker client:
@@ -76,16 +76,15 @@ cargo run -p scam-node -- sv2-job-declarator --bind 127.0.0.1:3551 --telemetry-o
 cargo run -p scam-node -- sv2-translator --bind 127.0.0.1:3552 --telemetry-out data/sv2-translator.telemetry.jsonl
 ```
 
-Wire pool server to external roles:
+Wire the node's pool to external roles:
 
 ```bash
-cargo run -p scam-node -- stratum-serve \
+cargo run -p scam-node -- serve \
   --network devnet \
   --config config/devnet.toml \
   --runtime-db data/devnet.runtime.redb \
-  --bind 127.0.0.1:3347 \
-  --template-provider-addr 127.0.0.1:3550 \
-  --job-declarator-addr 127.0.0.1:3551
+  --bind 0.0.0.0:18444 \
+  --stratum "--bind 127.0.0.1:3347 --template-provider-addr 127.0.0.1:3550 --job-declarator-addr 127.0.0.1:3551"
 ```
 
 Role telemetry dashboard:

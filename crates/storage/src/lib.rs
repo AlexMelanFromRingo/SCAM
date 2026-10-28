@@ -1,6 +1,7 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use redb::{Database, ReadableTable, TableDefinition};
@@ -298,7 +299,7 @@ pub fn save_snapshot_db(path: &Path, snapshot: &ChainStateSnapshot) -> Result<()
         })?;
     }
 
-    let db = Database::create(path).map_err(|e| StorageError::Db(e.to_string()))?;
+    let db = open_or_create_db(path)?;
     let write_txn = db
         .begin_write()
         .map_err(|e| StorageError::Db(e.to_string()))?;
@@ -340,7 +341,7 @@ pub fn save_snapshot_db(path: &Path, snapshot: &ChainStateSnapshot) -> Result<()
 }
 
 pub fn load_snapshot_db(path: &Path) -> Result<ChainStateSnapshot, StorageError> {
-    let db = Database::open(path).map_err(|e| StorageError::Db(e.to_string()))?;
+    let db = open_existing_db(path)?;
     let read_txn = db
         .begin_read()
         .map_err(|e| StorageError::Db(e.to_string()))?;
@@ -441,7 +442,7 @@ pub fn save_chain_archive_db(path: &Path, archive: &ChainArchive) -> Result<(), 
         })?;
     }
 
-    let db = Database::create(path).map_err(|e| StorageError::Db(e.to_string()))?;
+    let db = open_or_create_db(path)?;
     let write_txn = db
         .begin_write()
         .map_err(|e| StorageError::Db(e.to_string()))?;
@@ -612,7 +613,7 @@ fn read_archive_tip<T: redb::ReadableTable<&'static str, &'static [u8]>>(
 
 /// Read only the tip metadata of a chain archive.
 pub fn load_chain_archive_tip_db(path: &Path) -> Result<Option<ArchiveTip>, StorageError> {
-    let db = Database::open(path).map_err(|e| StorageError::Db(e.to_string()))?;
+    let db = open_existing_db(path)?;
     let read_txn = db
         .begin_read()
         .map_err(|e| StorageError::Db(e.to_string()))?;
@@ -628,7 +629,7 @@ pub fn load_chain_archive_range_db(
     path: &Path,
     from_height: u64,
 ) -> Result<(String, Vec<(u64, Block)>), StorageError> {
-    let db = Database::open(path).map_err(|e| StorageError::Db(e.to_string()))?;
+    let db = open_existing_db(path)?;
     let read_txn = db
         .begin_read()
         .map_err(|e| StorageError::Db(e.to_string()))?;
@@ -702,7 +703,7 @@ pub fn persist_chain_archive_incremental_db(
             source,
         })?;
     }
-    let db = Database::create(path).map_err(|e| StorageError::Db(e.to_string()))?;
+    let db = open_or_create_db(path)?;
     let write_txn = db
         .begin_write()
         .map_err(|e| StorageError::Db(e.to_string()))?;
@@ -830,7 +831,7 @@ pub fn persist_chain_archive_incremental_db(
 }
 
 pub fn load_chain_archive_db(path: &Path) -> Result<ChainArchive, StorageError> {
-    let db = Database::open(path).map_err(|e| StorageError::Db(e.to_string()))?;
+    let db = open_existing_db(path)?;
     let read_txn = db
         .begin_read()
         .map_err(|e| StorageError::Db(e.to_string()))?;
@@ -912,7 +913,7 @@ pub fn load_chain_archive_db(path: &Path) -> Result<ChainArchive, StorageError> 
 }
 
 pub fn load_block_by_hash_db(path: &Path, hash: Hash256) -> Result<Option<Block>, StorageError> {
-    let db = Database::open(path).map_err(|e| StorageError::Db(e.to_string()))?;
+    let db = open_existing_db(path)?;
     let read_txn = db
         .begin_read()
         .map_err(|e| StorageError::Db(e.to_string()))?;
@@ -956,7 +957,7 @@ pub fn save_peer_book_db(path: &Path, peer_book: &PeerAddressBook) -> Result<(),
     let mut peers = dedup.into_values().collect::<Vec<_>>();
     peers.sort_by(|a, b| a.address.cmp(&b.address));
 
-    let db = Database::create(path).map_err(|e| StorageError::Db(e.to_string()))?;
+    let db = open_or_create_db(path)?;
     let write_txn = db
         .begin_write()
         .map_err(|e| StorageError::Db(e.to_string()))?;
@@ -1010,7 +1011,7 @@ pub fn apply_peer_book_delta_db(
             source,
         })?;
     }
-    let db = Database::create(path).map_err(|e| StorageError::Db(e.to_string()))?;
+    let db = open_or_create_db(path)?;
     let write_txn = db
         .begin_write()
         .map_err(|e| StorageError::Db(e.to_string()))?;
@@ -1061,7 +1062,7 @@ pub fn apply_peer_book_delta_db(
 }
 
 pub fn load_peer_book_db(path: &Path) -> Result<PeerAddressBook, StorageError> {
-    let db = Database::open(path).map_err(|e| StorageError::Db(e.to_string()))?;
+    let db = open_existing_db(path)?;
     let read_txn = db
         .begin_read()
         .map_err(|e| StorageError::Db(e.to_string()))?;
@@ -1126,7 +1127,7 @@ pub fn save_mempool_db(path: &Path, snapshot: &MempoolSnapshot) -> Result<(), St
     let mut entries = dedup.into_values().collect::<Vec<_>>();
     entries.sort_by_key(|e| e.txid);
 
-    let db = Database::create(path).map_err(|e| StorageError::Db(e.to_string()))?;
+    let db = open_or_create_db(path)?;
     let write_txn = db
         .begin_write()
         .map_err(|e| StorageError::Db(e.to_string()))?;
@@ -1188,7 +1189,7 @@ pub fn apply_mempool_delta_db(
             )));
         }
     }
-    let db = Database::create(path).map_err(|e| StorageError::Db(e.to_string()))?;
+    let db = open_or_create_db(path)?;
     let write_txn = db
         .begin_write()
         .map_err(|e| StorageError::Db(e.to_string()))?;
@@ -1239,7 +1240,7 @@ pub fn apply_mempool_delta_db(
 }
 
 pub fn load_mempool_db(path: &Path) -> Result<MempoolSnapshot, StorageError> {
-    let db = Database::open(path).map_err(|e| StorageError::Db(e.to_string()))?;
+    let db = open_existing_db(path)?;
     let read_txn = db
         .begin_read()
         .map_err(|e| StorageError::Db(e.to_string()))?;
@@ -1367,7 +1368,7 @@ fn write_pool_ledger(
             source,
         })?;
     }
-    let db = Database::create(path).map_err(|e| StorageError::Db(e.to_string()))?;
+    let db = open_or_create_db(path)?;
     let write_txn = db
         .begin_write()
         .map_err(|e| StorageError::Db(e.to_string()))?;
@@ -1482,7 +1483,7 @@ fn write_pool_ledger(
 }
 
 pub fn load_pool_ledger_db(path: &Path) -> Result<PoolLedgerSnapshot, StorageError> {
-    let db = Database::open(path).map_err(|e| StorageError::Db(e.to_string()))?;
+    let db = open_existing_db(path)?;
     let read_txn = db
         .begin_read()
         .map_err(|e| StorageError::Db(e.to_string()))?;
@@ -1636,6 +1637,115 @@ pub fn load_pool_ledger_db(path: &Path) -> Result<PoolLedgerSnapshot, StorageErr
     })
 }
 
+/// Databases a long-running process owns, opened once and shared by every
+/// store call in the process. redb lets one process hold a database file:
+/// opening it per call made every access contend (and sleep-retry) with the
+/// other server processes on the same files. A server pins its stores at
+/// startup; another process opening them then fails fast with
+/// [`StorageError::OwnedByOtherProcess`].
+type PinnedRegistry = std::collections::HashMap<PathBuf, (usize, PinnedDb)>;
+
+static PINNED_DATABASES: std::sync::OnceLock<std::sync::Mutex<PinnedRegistry>> =
+    std::sync::OnceLock::new();
+
+enum PinnedDb {
+    /// Pinned before the file existed; opened by the first write.
+    Pending,
+    Open(Arc<Database>),
+}
+
+/// Pins are counted: services of one process may each pin a shared store;
+/// it closes when the last one releases it.
+fn pinned_databases() -> std::sync::MutexGuard<'static, PinnedRegistry> {
+    PINNED_DATABASES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Canonical key for a database path that may not exist yet.
+fn database_key(path: &Path) -> PathBuf {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent = fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+    match path.file_name() {
+        Some(name) => parent.join(name),
+        None => parent,
+    }
+}
+
+fn map_open_error(path: &Path, err: redb::DatabaseError) -> StorageError {
+    match err {
+        redb::DatabaseError::DatabaseAlreadyOpen => {
+            StorageError::OwnedByOtherProcess(path.display().to_string())
+        }
+        other => StorageError::Db(other.to_string()),
+    }
+}
+
+/// Keep `path` open for the life of the process (see `PINNED_DATABASES`).
+/// An existing file is opened (and locked) now; a missing one on its first
+/// write.
+pub fn pin_database(path: &Path) -> Result<(), StorageError> {
+    let key = database_key(path);
+    let mut pinned = pinned_databases();
+    if let Some((count, _)) = pinned.get_mut(&key) {
+        *count += 1;
+        return Ok(());
+    }
+    let entry = if path.exists() {
+        PinnedDb::Open(Arc::new(
+            Database::create(path).map_err(|e| map_open_error(path, e))?,
+        ))
+    } else {
+        PinnedDb::Pending
+    };
+    pinned.insert(key, (1, entry));
+    Ok(())
+}
+
+/// Release one pin of `path`; the database closes with the last one.
+pub fn unpin_database(path: &Path) {
+    let key = database_key(path);
+    let mut pinned = pinned_databases();
+    if let Some((count, _)) = pinned.get_mut(&key) {
+        *count -= 1;
+        if *count == 0 {
+            pinned.remove(&key);
+        }
+    }
+}
+
+fn open_existing_db(path: &Path) -> Result<Arc<Database>, StorageError> {
+    if let Some((_, PinnedDb::Open(db))) = pinned_databases().get(&database_key(path)) {
+        return Ok(db.clone());
+    }
+    Database::open(path)
+        .map(Arc::new)
+        .map_err(|e| map_open_error(path, e))
+}
+
+fn open_or_create_db(path: &Path) -> Result<Arc<Database>, StorageError> {
+    let key = database_key(path);
+    let mut pinned = pinned_databases();
+    match pinned.get_mut(&key) {
+        Some((_, PinnedDb::Open(db))) => Ok(db.clone()),
+        Some((_, entry @ PinnedDb::Pending)) => {
+            let db = Arc::new(Database::create(path).map_err(|e| map_open_error(path, e))?);
+            *entry = PinnedDb::Open(db.clone());
+            Ok(db)
+        }
+        None => {
+            drop(pinned);
+            Database::create(path)
+                .map(Arc::new)
+                .map_err(|e| map_open_error(path, e))
+        }
+    }
+}
+
 /// Whole-store rewrites happen in place: the old rows are dropped and the
 /// new ones written inside one redb write transaction, which is atomic and
 /// crash-safe. (Building a temp database and renaming it over the live file
@@ -1708,6 +1818,10 @@ fn temp_file_path(path: &Path) -> PathBuf {
 
 #[derive(Debug, Error)]
 pub enum StorageError {
+    #[error(
+        "database {0} is held by another running process (one node process owns its data directory; use its RPC)"
+    )]
+    OwnedByOtherProcess(String),
     #[error("cannot create directory {path}: {source}")]
     CreateDir {
         path: String,
@@ -2268,6 +2382,41 @@ mod tests {
             Err(crate::StorageError::UnsupportedSchema { found: None, .. })
         ));
         let _ = std::fs::remove_file(old);
+    }
+
+    /// S6: a pinned store is opened once and serves every call in the
+    /// process; any other opener is refused while it is pinned.
+    #[test]
+    fn pinned_database_is_shared_in_process_and_exclusive_outside() {
+        let path = temp_test_file("pinned-peer-book", "redb");
+        crate::pin_database(&path).expect("pin (file created lazily)");
+        assert!(!path.exists(), "pinning a missing store does not create it");
+        let book = PeerAddressBook {
+            network_id: "devnet".to_owned(),
+            peers: vec![PeerAddressRecord {
+                address: "1.2.3.4:1".to_owned(),
+                ..Default::default()
+            }],
+        };
+        save_peer_book_db(&path, &book).expect("save through pinned handle");
+        for _ in 0..3 {
+            assert_eq!(load_peer_book_db(&path).expect("load").peers.len(), 1);
+        }
+        apply_peer_book_delta_db(&path, "devnet", &[], &["1.2.3.4:1".to_owned()])
+            .expect("delta through pinned handle");
+        // Anyone else (here: a direct open) is locked out while pinned.
+        assert!(redb::Database::open(&path).is_err());
+        crate::unpin_database(&path);
+        assert!(load_peer_book_db(&path).expect("reopen").peers.is_empty());
+        // A store pinned while it exists is opened (locked) immediately;
+        // pins are counted and the last release closes it.
+        crate::pin_database(&path).expect("pin existing");
+        crate::pin_database(&path).expect("second pin");
+        assert!(redb::Database::create(&path).is_err());
+        crate::unpin_database(&path);
+        assert!(redb::Database::create(&path).is_err(), "still pinned once");
+        crate::unpin_database(&path);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

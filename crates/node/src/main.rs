@@ -53,17 +53,17 @@ use scam_rpc::{
     StatusResponse, TxResponse, TxSubmitRpcRequest, decode_tx_submit_request,
     header_to_block_response, to_pretty_json,
 };
+#[cfg(test)]
+use scam_storage::save_pool_ledger_db;
 use scam_storage::{
     ChainStateSnapshot, MempoolTxRecord, PeerAddressBook, PeerAddressRecord, PoolChainPoint,
     PoolLedgerDelta, PoolLedgerSnapshot, PoolPayoutRecord, PoolRoundCredit, PoolRoundRecord,
     PoolShareRecord, PoolWorkerAccrualRecord, StorageError, apply_mempool_delta_db,
     apply_peer_book_delta_db, apply_pool_ledger_delta_db, load_block_by_hash_db,
-    load_chain_archive_db, load_chain_archive_range_db, load_chain_archive_tip_db, load_mempool_db,
-    load_peer_book_db, load_pool_ledger_db, load_snapshot, load_snapshot_db,
-    persist_chain_archive_incremental_db, save_peer_book_db, save_snapshot, save_snapshot_db,
+    load_chain_archive_db, load_mempool_db, load_peer_book_db, load_pool_ledger_db, load_snapshot,
+    load_snapshot_db, persist_chain_archive_incremental_db, pin_database, save_peer_book_db,
+    save_snapshot, save_snapshot_db, unpin_database,
 };
-#[cfg(test)]
-use scam_storage::{MempoolSnapshot, save_pool_ledger_db};
 use scam_stratum::{
     IdentityTranslator, JobDeclarator, MiningJob, MiningTemplate, NoiseSv2Transport,
     SUPPORTED_SV2_VERSION, SecureSv2Transport, SecureTransportMode, SequentialJobDeclarator,
@@ -125,6 +125,9 @@ enum Command {
     NetDemo(NetDemoArgs),
     SyncPeer(SyncPeerArgs),
     SyncBook(SyncBookArgs),
+    /// Run the node: P2P relay plus, optionally, the RPC/web console and the
+    /// stratum pool, in one process that owns the data directory.
+    Serve(ServeArgs),
     RelayServe(RelayServeArgs),
     ReindexRuntime(ReindexRuntimeArgs),
     Soak(SoakArgs),
@@ -530,6 +533,34 @@ struct ReindexRuntimeArgs {
     config: Option<PathBuf>,
     #[arg(long)]
     runtime_db: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct ServeArgs {
+    #[command(flatten)]
+    relay: RelayServeArgs,
+    /// Serve the HTTP RPC / web console from the node. Value: `rpc-serve`
+    /// options, e.g. "--bind 127.0.0.1:19080 --ui-dir web". Network, config
+    /// and runtime DB are the node's.
+    #[arg(long, allow_hyphen_values = true)]
+    rpc: Option<String>,
+    /// Run the stratum pool on the node's chain and mempool. Value:
+    /// `stratum-serve` options, e.g. "--bind 127.0.0.1:3333". Network,
+    /// config and runtime DB are the node's.
+    #[arg(long, allow_hyphen_values = true)]
+    stratum: Option<String>,
+}
+
+#[derive(Parser)]
+struct RpcServiceCli {
+    #[command(flatten)]
+    args: RpcServeArgs,
+}
+
+#[derive(Parser)]
+struct StratumServiceCli {
+    #[command(flatten)]
+    args: StratumServeArgs,
 }
 
 #[derive(Debug, Args)]
@@ -1776,15 +1807,6 @@ fn run_mode_relay_telemetry_enabled(run_relay: bool, relay_telemetry_path: &Path
     run_relay || relay_telemetry_path.exists()
 }
 
-#[cfg(test)]
-fn runtime_to_archive(runtime: &ChainRuntime) -> Result<scam_storage::ChainArchive, NodeError> {
-    let blocks_by_height = runtime.main_chain_blocks()?;
-    Ok(scam_storage::ChainArchive {
-        network_id: runtime.config().network_id.clone(),
-        blocks_by_height,
-    })
-}
-
 fn load_runtime_from_db_or_genesis(
     cfg: &ChainConfig,
     runtime_db_path: &Path,
@@ -1842,28 +1864,6 @@ fn persist_runtime_db(runtime: &ChainRuntime, runtime_db_path: &Path) -> Result<
             Ok(())
         }
         Err(err) => Err(err.into()),
-    }
-}
-
-#[cfg(test)]
-fn mempool_snapshot_from_pool(cfg: &ChainConfig, mempool: &Mempool) -> MempoolSnapshot {
-    let mut entries = mempool
-        .txids_by_feerate_desc()
-        .into_iter()
-        .filter_map(|txid| {
-            mempool
-                .get_with_fee(&txid)
-                .map(|(tx, fee)| MempoolTxRecord {
-                    txid,
-                    tx: tx.clone(),
-                    fee,
-                })
-        })
-        .collect::<Vec<_>>();
-    entries.sort_by_key(|e| e.txid);
-    MempoolSnapshot {
-        network_id: cfg.network_id.clone(),
-        entries,
     }
 }
 
@@ -2487,6 +2487,78 @@ fn run_mode(args: RunModeArgs) -> Result<(), NodeError> {
 
     let (done_tx, done_rx) = mpsc::channel::<(&'static str, Result<(), NodeError>)>();
 
+    let rpc_args = plan.run_rpc.then(|| RpcServeArgs {
+        network: args.network,
+        config: Some(config_path.clone()),
+        runtime_db: Some(runtime_db_path.clone()),
+        bind: args.rpc_bind.clone(),
+        ui_dir: args.ui_dir.clone(),
+        relay_telemetry: if relay_telemetry_enabled {
+            Some(relay_telemetry_path.clone())
+        } else {
+            None
+        },
+        stratum_telemetry: None,
+        pool_ledger: Some(default_pool_ledger_db_path(&runtime_db_path)),
+        mine_blocks: 0,
+        interval_sec: cfg.target_block_time_sec,
+        max_nonce: 500_000,
+        max_requests: 0,
+        auth_token_file: None,
+        disable_wallet_rpc: false,
+    });
+    let stratum_args = plan.run_stratum.then(|| StratumServeArgs {
+        network: args.network,
+        config: Some(config_path.clone()),
+        runtime_db: Some(runtime_db_path.clone()),
+        bind: args.stratum_bind.clone(),
+        share_target_hex: None,
+        max_jobs_per_channel: None,
+        max_clients: 0,
+        max_active_clients: None,
+        max_protocol_violations: None,
+        read_timeout_sec: None,
+        handshake_timeout_sec: None,
+        keepalive_sec: None,
+        idle_timeout_sec: None,
+        inbound_accept_window_sec: None,
+        inbound_max_accepts_per_ip: None,
+        vardiff_target_shares_per_minute: None,
+        vardiff_retarget_interval_shares: None,
+        vardiff_clamp_up: None,
+        vardiff_clamp_down: None,
+        max_rejected_shares: None,
+        min_share_target_hex: None,
+        max_share_target_hex: None,
+        secure_transport: false,
+        secure_transport_mode: None,
+        secure_rekey_interval_messages: None,
+        secure_static_secret_key_hex: None,
+        secure_expected_remote_static_pubkey_hex: None,
+        template_provider_addr: None,
+        job_declarator_addr: None,
+        telemetry_out: None,
+        telemetry_every_sec: 5,
+        pool_ledger_db: Some(default_pool_ledger_db_path(&runtime_db_path)),
+        pool_share_retention: POOL_DEFAULT_SHARE_RETENTION,
+        pool_round_retention: POOL_DEFAULT_ROUND_RETENTION,
+        pool_payout_mode: PoolPayoutModeArg::Solo,
+        pool_fee_bps: 100,
+        pplns_window_shares: 300,
+        pps_share_atomic: 0,
+        pps_max_liability_atomic: 0,
+        pps_reserve_floor_atomic: 0,
+        pool_payout_threshold_atomic: 100_000_000,
+        pool_payout_interval_sec: 120,
+        pool_payout_tx_fee_atomic: 500,
+        pool_payout_mnemonic: None,
+        pool_payout_passphrase: String::new(),
+        pool_payout_account: 0,
+        pool_payout_index: 0,
+    });
+
+    // RPC and stratum run on the relay's node state (one chain, one
+    // mempool, stores opened once); without a relay the pool owns its data.
     if plan.run_relay {
         let relay_args = RelayServeArgs {
             network: args.network,
@@ -2510,86 +2582,32 @@ fn run_mode(args: RunModeArgs) -> Result<(), NodeError> {
             outbound_redial_sec: args.relay_outbound_redial_sec,
         };
         let tx = done_tx.clone();
-        spawn_mode_service("relay-serve", tx, move || run_relay_serve(relay_args));
-    }
-
-    if plan.run_rpc {
-        let rpc_args = RpcServeArgs {
-            network: args.network,
-            config: Some(config_path.clone()),
-            runtime_db: Some(runtime_db_path.clone()),
-            bind: args.rpc_bind.clone(),
-            ui_dir: args.ui_dir.clone(),
-            relay_telemetry: if relay_telemetry_enabled {
-                Some(relay_telemetry_path.clone())
-            } else {
-                None
-            },
-            stratum_telemetry: None,
-            pool_ledger: Some(default_pool_ledger_db_path(&runtime_db_path)),
-            mine_blocks: 0,
-            interval_sec: cfg.target_block_time_sec,
-            max_nonce: 500_000,
-            max_requests: 0,
-            auth_token_file: None,
-            disable_wallet_rpc: false,
-        };
-        let tx = done_tx.clone();
-        spawn_mode_service("rpc-serve", tx, move || run_rpc_serve(rpc_args));
-    }
-
-    if plan.run_stratum {
-        let stratum_args = StratumServeArgs {
-            network: args.network,
-            config: Some(config_path.clone()),
-            runtime_db: Some(runtime_db_path.clone()),
-            bind: args.stratum_bind.clone(),
-            share_target_hex: None,
-            max_jobs_per_channel: None,
-            max_clients: 0,
-            max_active_clients: None,
-            max_protocol_violations: None,
-            read_timeout_sec: None,
-            handshake_timeout_sec: None,
-            keepalive_sec: None,
-            idle_timeout_sec: None,
-            inbound_accept_window_sec: None,
-            inbound_max_accepts_per_ip: None,
-            vardiff_target_shares_per_minute: None,
-            vardiff_retarget_interval_shares: None,
-            vardiff_clamp_up: None,
-            vardiff_clamp_down: None,
-            max_rejected_shares: None,
-            min_share_target_hex: None,
-            max_share_target_hex: None,
-            secure_transport: false,
-            secure_transport_mode: None,
-            secure_rekey_interval_messages: None,
-            secure_static_secret_key_hex: None,
-            secure_expected_remote_static_pubkey_hex: None,
-            template_provider_addr: None,
-            job_declarator_addr: None,
-            telemetry_out: None,
-            telemetry_every_sec: 5,
-            pool_ledger_db: Some(default_pool_ledger_db_path(&runtime_db_path)),
-            pool_share_retention: POOL_DEFAULT_SHARE_RETENTION,
-            pool_round_retention: POOL_DEFAULT_ROUND_RETENTION,
-            pool_payout_mode: PoolPayoutModeArg::Solo,
-            pool_fee_bps: 100,
-            pplns_window_shares: 300,
-            pps_share_atomic: 0,
-            pps_max_liability_atomic: 0,
-            pps_reserve_floor_atomic: 0,
-            pool_payout_threshold_atomic: 100_000_000,
-            pool_payout_interval_sec: 120,
-            pool_payout_tx_fee_atomic: 500,
-            pool_payout_mnemonic: None,
-            pool_payout_passphrase: String::new(),
-            pool_payout_account: 0,
-            pool_payout_index: 0,
-        };
-        let tx = done_tx.clone();
-        spawn_mode_service("stratum-serve", tx, move || run_stratum_serve(stratum_args));
+        let services_tx = done_tx.clone();
+        spawn_mode_service("relay-serve", tx, move || {
+            run_relay_node(relay_args, move |node| {
+                if let Some(rpc_args) = rpc_args {
+                    let node = node.clone();
+                    spawn_mode_service("rpc-serve", services_tx.clone(), move || {
+                        run_rpc_serve_inner_axum(rpc_args, None, Some(node))
+                    });
+                }
+                if let Some(stratum_args) = stratum_args {
+                    spawn_mode_service("stratum-serve", services_tx, move || {
+                        run_stratum_service(stratum_args, Some(node))
+                    });
+                }
+                Ok(())
+            })
+        });
+    } else {
+        if let Some(rpc_args) = rpc_args {
+            let tx = done_tx.clone();
+            spawn_mode_service("rpc-serve", tx, move || run_rpc_serve(rpc_args));
+        }
+        if let Some(stratum_args) = stratum_args {
+            let tx = done_tx.clone();
+            spawn_mode_service("stratum-serve", tx, move || run_stratum_serve(stratum_args));
+        }
     }
 
     if plan.run_miner {
@@ -3222,7 +3240,28 @@ fn save_peer_anchor_book(path: &Path, book: &PeerAnchorBook) -> Result<(), NodeE
     Ok(())
 }
 
+/// Guards the JSON reputation/anchor stores: their updates are
+/// read-modify-write through one temp file, so concurrent writers lost
+/// updates and could rename a half-written temp file.
+fn peer_json_store_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn update_peer_anchor_store_attempt(
+    store: &PeerAnchorStore,
+    address: &str,
+    now_unix_sec: u64,
+    success: bool,
+) -> Result<(), NodeError> {
+    // Called from async relay tasks too: file I/O must not stall them.
+    blocking_section(|| {
+        update_peer_anchor_store_attempt_inner(store, address, now_unix_sec, success)
+    })
+}
+
+fn update_peer_anchor_store_attempt_inner(
     store: &PeerAnchorStore,
     address: &str,
     now_unix_sec: u64,
@@ -3231,6 +3270,8 @@ fn update_peer_anchor_store_attempt(
     if address.trim().is_empty() {
         return Ok(());
     }
+    // Outbound workers update concurrently: serialize load-modify-save.
+    let _guard = peer_json_store_lock();
     let mut book = load_peer_anchor_book(&store.path, &store.network_id)?;
     let mut updated = false;
     for anchor in &mut book.anchors {
@@ -3330,11 +3371,23 @@ fn update_peer_reputation_store(
     delta: RuntimePeerReputation,
     now_unix_sec: u64,
 ) -> Result<(), NodeError> {
+    // Called from async relay tasks too: file I/O must not stall them.
+    blocking_section(|| update_peer_reputation_store_inner(store, address, delta, now_unix_sec))
+}
+
+fn update_peer_reputation_store_inner(
+    store: &PeerReputationStore,
+    address: &str,
+    delta: RuntimePeerReputation,
+    now_unix_sec: u64,
+) -> Result<(), NodeError> {
     if address.trim().is_empty()
         || (delta.replacement_rate_limited_total == 0 && delta.protocol_violation_total == 0)
     {
         return Ok(());
     }
+    // Sessions update concurrently: serialize load-modify-save.
+    let _guard = peer_json_store_lock();
     let mut book = load_peer_reputation_book(&store.path, &store.network_id)?;
     let mut updated = false;
     for peer in &mut book.peers {
@@ -4746,22 +4799,6 @@ fn mempool_spent_outpoints(mempool: &Mempool) -> HashSet<OutPoint> {
     spent
 }
 
-fn load_wallet_reserved_outpoints(
-    cfg: &ChainConfig,
-    mempool_db_path: &Path,
-) -> Result<HashSet<OutPoint>, NodeError> {
-    if !mempool_db_path.exists() {
-        return Ok(HashSet::new());
-    }
-    let mempool = load_mempool_from_db_or_empty_strict_with_retry(
-        cfg,
-        mempool_db_path,
-        rpc_db_retry_attempts(),
-        rpc_db_retry_backoff_ms(),
-    )?;
-    Ok(mempool_spent_outpoints(&mempool))
-}
-
 fn build_signed_transfer_tx(
     runtime: &ChainRuntime,
     network_id: &str,
@@ -5423,14 +5460,6 @@ fn rpc_db_retry_backoff_ms() -> u64 {
         .and_then(|raw| raw.parse::<u64>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(20)
-}
-
-fn mempool_summary_should_fallback_on_error(err: &NodeError) -> bool {
-    is_mempool_db_lock_conflict(err)
-}
-
-fn mempool_cleanup_persist_is_fatal(err: &NodeError) -> bool {
-    !is_mempool_db_lock_conflict(err)
 }
 
 fn ensure_expected_hash(expected: Hash256, got: Hash256, context: &str) -> Result<(), NodeError> {
@@ -6206,7 +6235,6 @@ const RELAY_MAX_INFLIGHT_BLOCK_REQUESTS: usize = 2_048;
 const RELAY_MAX_INFLIGHT_BLOCK_REQUESTS_PER_PEER: usize = 256;
 const RELAY_DISCOVERY_REFRESH_SEC: u64 = 30;
 const RELAY_DISCOVERY_REFRESH_JITTER_SEC: u64 = 5;
-const RELAY_SESSION_DB_REFRESH_INTERVAL_SEC: u64 = 1;
 const RELAY_ASYNC_READ_POLL_INTERVAL_MS: u64 = 250;
 
 static RELAY_TX_DIFFUSION_BASE_MS: AtomicU64 = AtomicU64::new(0);
@@ -10996,11 +11024,6 @@ fn relay_discovery_refresh_jitter_sec() -> u64 {
         .min(300)
 }
 
-fn relay_session_db_refresh_interval_sec() -> u64 {
-    env_nonzero_u64("SCAM_RELAY_SESSION_DB_REFRESH_INTERVAL_SEC")
-        .unwrap_or(RELAY_SESSION_DB_REFRESH_INTERVAL_SEC)
-}
-
 fn relay_discovery_refresh_due(
     now_unix_sec: u64,
     last_discovery_request_unix_sec: u64,
@@ -12041,20 +12064,20 @@ async fn run_relay_peer_session_async<S: AsyncRead + AsyncWrite + Unpin>(
 
             seen = seen.saturating_add(1);
             let now = current_unix_sec()?;
-            let (outbound, runtime_changed, mempool_changed) = match inbound {
+            let outbound = match inbound {
                 WireMessage::GetData { items } => {
                     let outbound =
                         process_relay_getdata_with_archive_async(state, items, runtime_db_path)
                             .await?;
-                    let outbound = {
-                        let guard = state.lock().map_err(|_| {
-                            NodeError::Runtime("relay state mutex poisoned".to_owned())
-                        })?;
-                        relay_messages_for_peer(&guard, peer_id, outbound)
-                    };
-                    (outbound, false, false)
+                    let guard = state
+                        .lock()
+                        .map_err(|_| NodeError::Runtime("relay state mutex poisoned".to_owned()))?;
+                    relay_messages_for_peer(&guard, peer_id, outbound)
                 }
-                inbound => {
+                // A change is persisted in the same critical section that
+                // made it, so no other writer can interleave; the node owns
+                // its stores, so the write never waits on another process.
+                inbound => blocking_section(|| -> Result<Vec<WireMessage>, NodeError> {
                     let mut guard = state
                         .lock()
                         .map_err(|_| NodeError::Runtime("relay state mutex poisoned".to_owned()))?;
@@ -12068,39 +12091,21 @@ async fn run_relay_peer_session_async<S: AsyncRead + AsyncWrite + Unpin>(
                         Some(runtime_db_path),
                     )?;
                     let outbound = relay_messages_for_peer(&guard, peer_id, outbound);
-                    let tip_after = guard.runtime.tip_hash();
-                    let mempool_after = guard.relay.mempool.revision();
                     let (runtime_changed, mempool_changed) = relay_runtime_or_mempool_changed(
                         tip_before,
-                        tip_after,
+                        guard.runtime.tip_hash(),
                         mempool_before,
-                        mempool_after,
+                        guard.relay.mempool.revision(),
                     );
-                    (outbound, runtime_changed, mempool_changed)
-                }
+                    if runtime_changed {
+                        persist_runtime_db(&guard.runtime, runtime_db_path)?;
+                    }
+                    if mempool_changed {
+                        persist_mempool_db(cfg, &mut guard.relay.mempool, mempool_db_path)?;
+                    }
+                    Ok(outbound)
+                })?,
             };
-
-            if runtime_changed {
-                let guard = state
-                    .lock()
-                    .map_err(|_| NodeError::Runtime("relay state mutex poisoned".to_owned()))?;
-                persist_runtime_db_with_retry(&guard.runtime, runtime_db_path, 80, 25)?;
-            }
-            if mempool_changed {
-                let mut guard = state
-                    .lock()
-                    .map_err(|_| NodeError::Runtime("relay state mutex poisoned".to_owned()))?;
-                persist_mempool_db_with_retry(
-                    cfg,
-                    &mut guard.relay.mempool,
-                    mempool_db_path,
-                    80,
-                    25,
-                )?;
-            }
-            if let Err(err) = relay_flush_pending_peer_book_updates(state) {
-                eprintln!("warning: cannot flush discovered peer addresses: {err}");
-            }
             if !relay_send_messages_until_closed_async(
                 stream,
                 &outbound,
@@ -12122,9 +12127,6 @@ async fn run_relay_peer_session_async<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
 
-        if let Err(err) = relay_flush_pending_peer_book_updates(state) {
-            eprintln!("warning: cannot flush discovered peer addresses: {err}");
-        }
         Ok(())
     }
     .await;
@@ -12198,66 +12200,162 @@ async fn relay_handshake_async_with_timeout<S: AsyncRead + AsyncWrite + Unpin>(
     }
 }
 
-async fn run_relay_state_sync_task_async(
+/// The relay owns its data directory (see `pin_database`): nothing else
+/// writes its chain or mempool, so there is nothing to merge back from
+/// disk. What remains periodic is writing address-table changes.
+async fn run_relay_peer_book_flush_task_async(
     stop_flag: Arc<AtomicBool>,
     state: Arc<Mutex<RelayServerState>>,
-    cfg: ChainConfig,
-    runtime_db_path: PathBuf,
-    mempool_db_path: PathBuf,
 ) {
-    let refresh_interval = Duration::from_secs(relay_session_db_refresh_interval_sec().max(1));
-    let mut runtime_db_seen_mtime = runtime_db_mtime(&runtime_db_path);
-    let mut mempool_db_seen_mtime = mempool_db_mtime(&mempool_db_path);
-
-    loop {
-        if stop_flag.load(Ordering::Relaxed) {
-            break;
-        }
-        sleep(refresh_interval).await;
-        if stop_flag.load(Ordering::Relaxed) {
-            break;
-        }
-        let now_unix_sec = current_unix_sec().unwrap_or(0);
-        {
-            let mut guard = match state.lock() {
-                Ok(guard) => guard,
-                Err(_) => continue,
-            };
-            if let Err(err) = refresh_relay_runtime_from_db_if_changed(
-                &cfg,
-                &mut guard,
-                &runtime_db_path,
-                &mut runtime_db_seen_mtime,
-                now_unix_sec,
-            ) && relay_should_log_runtime_refresh_error(&err)
-            {
-                eprintln!("warning: relay runtime background refresh failed: {err}");
-            }
-            if let Err(err) = refresh_mempool_from_db_if_changed(
-                &cfg,
-                &mut guard.relay,
-                &mempool_db_path,
-                &mut mempool_db_seen_mtime,
-            ) && relay_should_log_mempool_refresh_error(&err)
-            {
-                eprintln!("warning: relay mempool background refresh failed: {err}");
-            }
-        }
-        if let Err(err) = relay_flush_pending_peer_book_updates(&state) {
-            eprintln!("warning: relay peer book background flush failed: {err}");
+    let interval = Duration::from_secs(RELAY_PEER_BOOK_FLUSH_INTERVAL_SEC);
+    while !stop_flag.load(Ordering::Relaxed) {
+        sleep(interval).await;
+        let flush_state = state.clone();
+        let flushed = tokio::task::spawn_blocking(move || {
+            relay_flush_pending_peer_book_updates(&flush_state)
+        })
+        .await;
+        match flushed {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => eprintln!("warning: relay peer book flush failed: {err}"),
+            Err(err) => eprintln!("warning: relay peer book flush task failed: {err}"),
         }
     }
 }
 
-fn relay_should_log_runtime_refresh_error(err: &NodeError) -> bool {
-    !is_runtime_db_lock_conflict(err)
-}
-
-fn relay_should_log_mempool_refresh_error(err: &NodeError) -> bool {
-    !is_mempool_db_lock_conflict(err)
-}
+const RELAY_PEER_BOOK_FLUSH_INTERVAL_SEC: u64 = 5;
 
 fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
+    run_relay_node(args, |_node| Ok(()))
+}
+
+/// Split a service option string into words: whitespace-separated, with
+/// '…' and "…" quoting and backslash escapes.
+fn split_service_args(raw: &str) -> Result<Vec<String>, NodeError> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut in_word = false;
+    let mut quote = None::<char>;
+    let mut chars = raw.chars();
+    while let Some(ch) = chars.next() {
+        match (quote, ch) {
+            (Some(q), c) if c == q => quote = None,
+            // `\` escapes only quotes, itself and whitespace, so Windows
+            // paths (`C:\web`) pass through unquoted.
+            (Some('"') | None, '\\') => match chars.clone().next() {
+                Some(next) if matches!(next, '"' | '\'' | '\\') || next.is_whitespace() => {
+                    chars.next();
+                    word.push(next);
+                    in_word = true;
+                }
+                _ => {
+                    word.push('\\');
+                    in_word = true;
+                }
+            },
+            (Some(_), c) => word.push(c),
+            (None, '\'' | '"') => {
+                quote = Some(ch);
+                in_word = true;
+            }
+            (None, c) if c.is_whitespace() => {
+                if in_word {
+                    words.push(std::mem::take(&mut word));
+                    in_word = false;
+                }
+            }
+            (None, c) => {
+                word.push(c);
+                in_word = true;
+            }
+        }
+    }
+    if quote.is_some() {
+        return Err(NodeError::Runtime(
+            "unterminated quote in service options".to_owned(),
+        ));
+    }
+    if in_word {
+        words.push(word);
+    }
+    Ok(words)
+}
+
+fn parse_service_args<T: Parser>(service: &str, raw: &str) -> Result<T, NodeError> {
+    let words = split_service_args(raw)?;
+    T::try_parse_from(std::iter::once(format!("serve --{service}")).chain(words))
+        .map_err(|e| NodeError::Runtime(format!("--{service}: {e}")))
+}
+
+/// `serve`: the relay owns the node; the RPC and the stratum pool run as
+/// threads on the relay's state (one chain, one mempool, stores opened once).
+fn run_serve(args: ServeArgs) -> Result<(), NodeError> {
+    let ServeArgs {
+        relay,
+        rpc,
+        stratum,
+    } = args;
+    let rpc_args = rpc
+        .map(|raw| parse_service_args::<RpcServiceCli>("rpc", &raw))
+        .transpose()?
+        .map(|cli| RpcServeArgs {
+            network: relay.network,
+            config: relay.config.clone(),
+            runtime_db: relay.runtime_db.clone(),
+            ..cli.args
+        });
+    let stratum_args = stratum
+        .map(|raw| parse_service_args::<StratumServiceCli>("stratum", &raw))
+        .transpose()?
+        .map(|cli| StratumServeArgs {
+            network: relay.network,
+            config: relay.config.clone(),
+            runtime_db: relay.runtime_db.clone(),
+            ..cli.args
+        });
+    run_relay_node(relay, move |node| {
+        if let Some(rpc_args) = rpc_args {
+            spawn_node_service("rpc", node.clone(), move |node| {
+                run_rpc_serve_inner_axum(rpc_args, None, Some(node))
+            })?;
+        }
+        if let Some(stratum_args) = stratum_args {
+            spawn_node_service("stratum", node, move |node| {
+                run_stratum_service(stratum_args, Some(node))
+            })?;
+        }
+        Ok(())
+    })
+}
+
+/// A service of `serve` failing (bind error, store error) stops the node:
+/// running without a requested service would go unnoticed.
+fn spawn_node_service(
+    name: &'static str,
+    node: SharedNode,
+    service: impl FnOnce(SharedNode) -> Result<(), NodeError> + Send + 'static,
+) -> Result<(), NodeError> {
+    thread::Builder::new()
+        .name(format!("node-{name}"))
+        .spawn(move || match service(node) {
+            Ok(()) => {}
+            Err(err) => {
+                eprintln!("error: node {name} service stopped: {err}");
+                std::process::exit(1);
+            }
+        })
+        .map(|_| ())
+        .map_err(|e| NodeError::Runtime(format!("{name} service thread spawn failed: {e}")))
+}
+
+/// The relay owns the node: chain, mempool and the stores of its data
+/// directory, each opened once for the life of the process (`pin_database`;
+/// another process on the same files is refused). `start_services` runs the
+/// in-process services of `serve` (RPC, stratum) on the same state.
+fn run_relay_node(
+    args: RelayServeArgs,
+    start_services: impl FnOnce(SharedNode) -> Result<(), NodeError>,
+) -> Result<(), NodeError> {
     let config_path = args
         .config
         .unwrap_or_else(|| PathBuf::from(format!("config/{}.toml", args.network.as_str())));
@@ -12266,6 +12364,8 @@ fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
         .runtime_db
         .unwrap_or_else(|| default_runtime_db_path(args.network));
     let mempool_db_path = default_mempool_db_path(&runtime_db_path);
+    let peers_db_path = peer_book_paths(&args.peers_dir, &cfg.network_id).0;
+    let _stores = OwnedStores::claim(&[&runtime_db_path, &mempool_db_path, &peers_db_path])?;
     let (runtime, source) = load_runtime_from_db_or_genesis(&cfg, &runtime_db_path)?;
 
     let max_inv_items = args.max_inv_items.unwrap_or(cfg.p2p_max_inv_items).max(1);
@@ -12371,6 +12471,7 @@ fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
             .map_err(|_| NodeError::Runtime("relay state mutex poisoned".to_owned()))?;
         persist_mempool_db_with_retry(&cfg, &mut guard.relay.mempool, &mempool_db_path, 20, 25)?;
     }
+    start_services(state.clone())?;
 
     let stop_flag = Arc::new(AtomicBool::new(false));
     let peer_reputation_store =
@@ -12454,18 +12555,8 @@ fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
         let state_sync_handle = {
             let stop_clone = stop_flag.clone();
             let state_clone = state.clone();
-            let cfg_clone = cfg.clone();
-            let runtime_db_path_clone = runtime_db_path.clone();
-            let mempool_db_path_clone = mempool_db_path.clone();
             Some(tokio::spawn(async move {
-                run_relay_state_sync_task_async(
-                    stop_clone,
-                    state_clone,
-                    cfg_clone,
-                    runtime_db_path_clone,
-                    mempool_db_path_clone,
-                )
-                .await;
+                run_relay_peer_book_flush_task_async(stop_clone, state_clone).await;
             }))
         };
 
@@ -12629,7 +12720,14 @@ fn run_relay_serve(args: RelayServeArgs) -> Result<(), NodeError> {
             let _ = handle.await;
         }
         if let Some(handle) = state_sync_handle {
+            // Stop waiting out the flush interval; write what is left now.
+            handle.abort();
             let _ = handle.await;
+            let flush_state = state.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                relay_flush_pending_peer_book_updates(&flush_state)
+            })
+            .await;
         }
         if let Some(err) = first_error {
             Err(err)
@@ -13508,7 +13606,7 @@ trait StratumTemplateProvider {
         &self,
         runtime: &ChainRuntime,
         cfg: &ChainConfig,
-        mempool_db_path: &Path,
+        mempool: &Mempool,
         max_template_txs: usize,
         reward_key_hash20: [u8; 20],
         coinbase_label: &str,
@@ -13570,7 +13668,7 @@ impl StratumTemplateProvider for RuntimeTemplateProvider {
         &self,
         runtime: &ChainRuntime,
         cfg: &ChainConfig,
-        mempool_db_path: &Path,
+        mempool: &Mempool,
         max_template_txs: usize,
         reward_key_hash20: [u8; 20],
         coinbase_label: &str,
@@ -13578,8 +13676,7 @@ impl StratumTemplateProvider for RuntimeTemplateProvider {
         let prev_block = runtime.tip_hash();
         let next_height = runtime.tip_height().saturating_add(1);
         let target = runtime.expected_target_for_next_block()?;
-        let mempool = load_mempool_from_db_or_empty_with_retry(cfg, mempool_db_path, 10, 25)?;
-        let mempool = sanitize_template_mempool_fees(runtime, cfg, &mempool)?;
+        let mempool = sanitize_template_mempool_fees(runtime, cfg, mempool)?;
         let block_subsidy = cfg.subsidy_at_height(next_height);
         let coinbase_tag = stratum_coinbase_tag(coinbase_label, prev_block);
         let tx_byte_budget = template_tx_byte_budget(
@@ -13737,11 +13834,8 @@ async fn read_sv2_message_async<S: AsyncRead + AsyncWrite + Unpin>(
 #[derive(Clone)]
 struct StratumServerContext {
     cfg: ChainConfig,
-    runtime: Arc<Mutex<ChainRuntime>>,
+    runtime: ChainHandle,
     runtime_db_path: PathBuf,
-    /// Last runtime-DB mtime merged into `runtime`; other processes (the
-    /// relay) extend the chain on disk and the pool must follow.
-    runtime_db_seen_mtime: Arc<Mutex<Option<SystemTime>>>,
     mempool_db_path: PathBuf,
     max_template_txs: usize,
     share_target: Target,
@@ -13781,6 +13875,206 @@ struct StratumServerContext {
     pool_payout_cfg: PoolPayoutConfig,
     pool_payout_key: Option<WalletKey>,
     pool_coinbase_key_hash20: [u8; 20],
+}
+
+/// Stores a server owns for its lifetime: opened once and kept (see
+/// `pin_database`), refused to every other process, released on return.
+struct OwnedStores(Vec<PathBuf>);
+
+impl OwnedStores {
+    fn claim(paths: &[&Path]) -> Result<Self, NodeError> {
+        let mut owned = Self(Vec::with_capacity(paths.len()));
+        for path in paths {
+            pin_database(path)?;
+            owned.0.push(path.to_path_buf());
+        }
+        Ok(owned)
+    }
+}
+
+impl Drop for OwnedStores {
+    fn drop(&mut self) {
+        for path in &self.0 {
+            unpin_database(path);
+        }
+    }
+}
+
+/// The node's chain and mempool, owned by the relay and shared in-process
+/// with the RPC and stratum services of `serve`.
+type SharedNode = Arc<Mutex<RelayServerState>>;
+
+/// Where a service's chain view lives.
+#[derive(Clone)]
+enum ChainHandle {
+    /// A standalone service owning its own data directory.
+    Own(Arc<Mutex<ChainRuntime>>),
+    /// `serve`: the node's chain and mempool (no copy, no DB re-reads).
+    Node(SharedNode),
+}
+
+impl ChainHandle {
+    fn lock(&self) -> Result<ChainHandleGuard<'_>, NodeError> {
+        match self {
+            Self::Own(runtime) => lock_runtime(runtime).map(ChainHandleGuard::Own),
+            Self::Node(node) => node
+                .lock()
+                .map(ChainHandleGuard::Node)
+                .map_err(|_| NodeError::Runtime("node state mutex poisoned".to_owned())),
+        }
+    }
+
+    fn is_node(&self) -> bool {
+        matches!(self, Self::Node(_))
+    }
+
+    /// Admit a tx into the node's mempool (relayed from there), or into
+    /// the mempool DB of a standalone service. `requested_fee` 0 accepts
+    /// the tx's actual fee; any other value must match it.
+    fn submit_tx(
+        &self,
+        cfg: &ChainConfig,
+        mempool_db_path: &Path,
+        tx: &Transaction,
+        requested_fee: u64,
+    ) -> Result<(Hash256, String, u64), NodeError> {
+        match self {
+            Self::Node(node) => {
+                let mut guard = node
+                    .lock()
+                    .map_err(|_| NodeError::Runtime("node state mutex poisoned".to_owned()))?;
+                let state = &mut *guard;
+                let fee =
+                    validate_tx_for_local_admission(cfg, &state.runtime, &state.relay.mempool, tx)?;
+                if requested_fee != 0 && requested_fee != fee {
+                    return Err(NodeError::Runtime(format!(
+                        "provided fee {requested_fee} does not match the transaction's actual fee {fee}"
+                    )));
+                }
+                let outcome = state.relay.mempool.insert_with_fee(tx.clone(), fee)?;
+                persist_mempool_db(cfg, &mut state.relay.mempool, mempool_db_path)?;
+                Ok((tx.txid(), mempool_outcome_label(&outcome).to_owned(), fee))
+            }
+            Self::Own(runtime) => {
+                let runtime = lock_runtime(runtime)?;
+                submit_tx_via_mempool_db_for_runtime_with_retry(
+                    cfg,
+                    &runtime,
+                    mempool_db_path,
+                    tx.clone(),
+                    requested_fee,
+                    80,
+                    25,
+                )
+            }
+        }
+    }
+
+    /// Run `view` on the chain and the mempool (the node's live one, or the
+    /// service's mempool DB).
+    fn with_mempool<T>(
+        &self,
+        cfg: &ChainConfig,
+        mempool_db_path: &Path,
+        view: impl FnOnce(&ChainRuntime, &Mempool) -> Result<T, NodeError>,
+    ) -> Result<T, NodeError> {
+        match self {
+            Self::Node(node) => {
+                let guard = node
+                    .lock()
+                    .map_err(|_| NodeError::Runtime("node state mutex poisoned".to_owned()))?;
+                view(&guard.runtime, &guard.relay.mempool)
+            }
+            Self::Own(runtime) => {
+                let mempool =
+                    load_mempool_from_db_or_empty_with_retry(cfg, mempool_db_path, 10, 25)?;
+                let runtime = lock_runtime(runtime)?;
+                view(&runtime, &mempool)
+            }
+        }
+    }
+}
+
+enum ChainHandleGuard<'a> {
+    Own(std::sync::MutexGuard<'a, ChainRuntime>),
+    Node(std::sync::MutexGuard<'a, RelayServerState>),
+}
+
+impl std::ops::Deref for ChainHandleGuard<'_> {
+    type Target = ChainRuntime;
+    fn deref(&self) -> &ChainRuntime {
+        match self {
+            Self::Own(runtime) => runtime,
+            Self::Node(node) => &node.runtime,
+        }
+    }
+}
+
+impl std::ops::DerefMut for ChainHandleGuard<'_> {
+    fn deref_mut(&mut self) -> &mut ChainRuntime {
+        match self {
+            Self::Own(runtime) => runtime,
+            Self::Node(node) => &mut node.runtime,
+        }
+    }
+}
+
+impl ChainHandleGuard<'_> {
+    /// The chain and, on a node, its live mempool (`None`: the pool reads
+    /// the mempool DB of its own data directory).
+    fn chain_and_node_mempool(&self) -> (&ChainRuntime, Option<&Mempool>) {
+        match self {
+            Self::Own(runtime) => (runtime, None),
+            Self::Node(node) => (&node.runtime, Some(&node.relay.mempool)),
+        }
+    }
+
+    /// The chain plus the mempool templates draw from: the node's live
+    /// mempool, or the pool's own mempool DB.
+    fn chain_and_mempool(
+        &self,
+        cfg: &ChainConfig,
+        mempool_db_path: &Path,
+    ) -> Result<(&ChainRuntime, std::borrow::Cow<'_, Mempool>), NodeError> {
+        match self {
+            Self::Node(node) => Ok((
+                &node.runtime,
+                std::borrow::Cow::Borrowed(&node.relay.mempool),
+            )),
+            Self::Own(runtime) => Ok((
+                runtime,
+                std::borrow::Cow::Owned(load_mempool_from_db_or_empty_with_retry(
+                    cfg,
+                    mempool_db_path,
+                    10,
+                    25,
+                )?),
+            )),
+        }
+    }
+
+    /// After the pool connected a block: drop its txs from the mempool and,
+    /// on a node, announce it to peers like any other new block.
+    fn after_local_block(
+        &mut self,
+        chain_before: &[Hash256],
+        cfg: &ChainConfig,
+        mempool_db_path: &Path,
+        included_txids: &[Hash256],
+        now_unix_sec: u64,
+    ) -> Result<(), NodeError> {
+        match self {
+            Self::Own(_) => {
+                remove_confirmed_txids_from_mempool_db(cfg, mempool_db_path, included_txids)?;
+            }
+            Self::Node(node) => {
+                let chain_after = node.runtime.block_hashes().to_vec();
+                relay_apply_main_chain_transition(node, chain_before, &chain_after, now_unix_sec);
+                persist_mempool_db(cfg, &mut node.relay.mempool, mempool_db_path)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 fn lock_runtime<'a>(
@@ -13838,7 +14132,7 @@ async fn issue_new_stratum_job_async<S: AsyncRead + AsyncWrite + Unpin>(
     coinbase_label: &str,
 ) -> Result<Hash256, NodeError> {
     let (tip_hash, template_work) = {
-        let runtime = lock_runtime(&ctx.runtime)?;
+        let runtime = ctx.runtime.lock()?;
         let tip_hash = runtime.tip_hash();
         let template_work = if let Some(addr) = &ctx.template_provider_addr {
             let target = runtime.expected_target_for_next_block()?;
@@ -13857,10 +14151,11 @@ async fn issue_new_stratum_job_async<S: AsyncRead + AsyncWrite + Unpin>(
             };
             request_template_from_provider(addr, &request)?
         } else {
+            let (chain, mempool) = runtime.chain_and_mempool(&ctx.cfg, &ctx.mempool_db_path)?;
             ctx.template_provider.build_template(
-                &runtime,
+                chain,
                 &ctx.cfg,
-                &ctx.mempool_db_path,
+                &mempool,
                 ctx.max_template_txs,
                 reward_key_hash20,
                 coinbase_label,
@@ -13944,23 +14239,7 @@ async fn issue_new_stratum_job_async<S: AsyncRead + AsyncWrite + Unpin>(
 }
 
 fn load_runtime_tip_hash(ctx: &StratumServerContext) -> Result<Hash256, NodeError> {
-    let mut runtime = lock_runtime(&ctx.runtime)?;
-    stratum_refresh_runtime_locked(ctx, &mut runtime);
-    Ok(runtime.tip_hash())
-}
-
-/// Merge blocks other processes wrote to the runtime DB (cheap `stat` when
-/// nothing changed). Failures are logged and retried on the next poll: the
-/// pool keeps serving its current view rather than dropping miners.
-fn stratum_refresh_runtime_locked(ctx: &StratumServerContext, runtime: &mut ChainRuntime) {
-    let Ok(mut seen) = ctx.runtime_db_seen_mtime.lock() else {
-        return;
-    };
-    if let Err(err) =
-        refresh_runtime_from_db_if_changed(&ctx.cfg, runtime, &ctx.runtime_db_path, &mut seen)
-    {
-        eprintln!("warning: stratum runtime refresh failed: {err}");
-    }
+    Ok(ctx.runtime.lock()?.tip_hash())
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -13976,6 +14255,22 @@ fn stratum_should_defer_job_issuance(
 ) -> Result<StratumStaleGuardDecision, NodeError> {
     if ctx.stale_guard_max_lag_blocks == 0 {
         return Ok(StratumStaleGuardDecision::default());
+    }
+    // On a node the sync lag is read live from the relay state.
+    if let ChainHandle::Node(node) = &ctx.runtime {
+        let guard = node
+            .lock()
+            .map_err(|_| NodeError::Runtime("node state mutex poisoned".to_owned()))?;
+        let lag_blocks = relay_max_known_tip_height(&guard, now_unix_sec)
+            .saturating_sub(guard.runtime.tip_height());
+        return Ok(StratumStaleGuardDecision {
+            blocked: stratum_stale_guard_lag_blocks_exceed_limit(
+                lag_blocks,
+                ctx.stale_guard_max_lag_blocks,
+            ),
+            lag_blocks,
+            snapshot_age_sec: 0,
+        });
     }
     let Some(path) = ctx.relay_telemetry_path.as_ref() else {
         return Ok(StratumStaleGuardDecision::default());
@@ -14315,7 +14610,7 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
                                 ctx.pool_payout_cfg.mode,
                                 PoolPayoutModeArg::Pps | PoolPayoutModeArg::Hybrid
                             ) {
-                                lock_runtime(&ctx.runtime).ok().map(|runtime| {
+                                ctx.runtime.lock().ok().map(|runtime| {
                                     runtime_spendable_balance_for_key_hash(
                                         &runtime,
                                         ctx.pool_coinbase_key_hash20,
@@ -14367,10 +14662,8 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
                                 let mut submit_failed = false;
 
                                 {
-                                    let mut runtime = lock_runtime(&ctx.runtime)?;
-                                    // Validate against the latest shared chain, not a
-                                    // stale in-memory view.
-                                    stratum_refresh_runtime_locked(&ctx, &mut runtime);
+                                    let mut runtime = ctx.runtime.lock()?;
+                                    let chain_before = runtime.block_hashes().to_vec();
                                     if !stratum_share_prev_hash_matches_tip(
                                         work.job.prev_hash,
                                         runtime.tip_hash(),
@@ -14447,12 +14740,13 @@ async fn run_stratum_client_async<S: AsyncRead + AsyncWrite + Unpin>(
                                                     } => {}
                                                 }
                                                 if tip_advanced
-                                                    && let Err(err) =
-                                                        remove_confirmed_txids_from_mempool_db(
-                                                            &ctx.cfg,
-                                                            &ctx.mempool_db_path,
-                                                            &included_txids,
-                                                        )
+                                                    && let Err(err) = runtime.after_local_block(
+                                                        &chain_before,
+                                                        &ctx.cfg,
+                                                        &ctx.mempool_db_path,
+                                                        &included_txids,
+                                                        ntime,
+                                                    )
                                                 {
                                                     eprintln!(
                                                         "warning: failed to trim confirmed txids from mempool db: {err}"
@@ -14672,25 +14966,6 @@ fn relay_inbound_accept_rate_limited(
     }
     events.push_back(now_unix_sec);
     false
-}
-
-fn rpc_accept_error_should_retry(shutdown_enabled: bool, err_kind: std::io::ErrorKind) -> bool {
-    shutdown_enabled
-        && matches!(
-            err_kind,
-            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
-        )
-}
-
-fn map_rpc_accept_result(
-    accept_result: std::io::Result<(TcpStream, SocketAddr)>,
-    shutdown_enabled: bool,
-) -> Result<Option<(TcpStream, SocketAddr)>, NodeError> {
-    match accept_result {
-        Ok(accepted) => Ok(Some(accepted)),
-        Err(err) if rpc_accept_error_should_retry(shutdown_enabled, err.kind()) => Ok(None),
-        Err(err) => Err(NodeError::Runtime(format!("rpc accept failed: {err}"))),
-    }
 }
 
 fn map_sv2_read_result(
@@ -15190,7 +15465,7 @@ fn record_pool_round_closed(
 
 fn reconcile_pool_ledger_with_runtime(ctx: &StratumServerContext, fallback_unix_sec: u64) {
     let now_unix_sec = current_unix_sec().unwrap_or(fallback_unix_sec);
-    let runtime = match lock_runtime(&ctx.runtime) {
+    let runtime = match ctx.runtime.lock() {
         Ok(runtime) => runtime,
         Err(err) => {
             eprintln!("warning: failed to lock runtime for pool reconcile: {err}");
@@ -15436,27 +15711,13 @@ fn record_payout_version(payout: &mut PoolPayoutRecord, tx: &Transaction, tip: P
     }
 }
 
-/// Validate against the pool's chain view without holding the runtime lock
-/// across the mempool DB I/O.
 fn submit_pool_payout_tx(
     ctx: &StratumServerContext,
     tx: &Transaction,
 ) -> Result<String, NodeError> {
-    submit_tx_with_retry(80, 25, || {
-        let mut mempool = load_mempool_from_db_or_empty_strict_with_retry(
-            &ctx.cfg,
-            &ctx.mempool_db_path,
-            10,
-            25,
-        )?;
-        let fee = {
-            let runtime = lock_runtime(&ctx.runtime)?;
-            validate_tx_for_local_admission(&ctx.cfg, &runtime, &mempool, tx)?
-        };
-        let outcome = mempool.insert_with_fee(tx.clone(), fee)?;
-        persist_mempool_db_with_retry(&ctx.cfg, &mut mempool, &ctx.mempool_db_path, 10, 25)?;
-        Ok(mempool_outcome_label(&outcome).to_owned())
-    })
+    ctx.runtime
+        .submit_tx(&ctx.cfg, &ctx.mempool_db_path, tx, 0)
+        .map(|(_txid, outcome, _fee)| outcome)
 }
 
 fn maybe_process_pool_payouts(ctx: &StratumServerContext) -> Result<(), NodeError> {
@@ -15481,7 +15742,9 @@ fn maybe_process_pool_payouts(ctx: &StratumServerContext) -> Result<(), NodeErro
     let Some(pool_key) = ctx.pool_payout_key.as_ref() else {
         return persist_pool_ledger(ctx);
     };
-    let mempool = if awaiting_mempool {
+    // A node's live mempool is read under the chain lock below; a
+    // standalone pool reads its own mempool DB.
+    let db_mempool = if awaiting_mempool && !ctx.runtime.is_node() {
         Some(load_mempool_from_db_or_empty_with_retry(
             &ctx.cfg,
             &ctx.mempool_db_path,
@@ -15496,10 +15759,16 @@ fn maybe_process_pool_payouts(ctx: &StratumServerContext) -> Result<(), NodeErro
     {
         // Tracking, planning and signing see one chain state: a version
         // confirmed in between could otherwise go unnoticed.
-        let runtime = lock_runtime(&ctx.runtime)?;
+        let guard = ctx.runtime.lock()?;
+        let (runtime, node_mempool) = guard.chain_and_node_mempool();
         let mut ledger = ctx.pool_ledger_state.lock().map_err(|_| poisoned())?;
-        ledger.track_payouts_on_chain(&runtime);
-        if let Some(mempool) = mempool.as_ref() {
+        ledger.track_payouts_on_chain(runtime);
+        let mempool = if awaiting_mempool {
+            node_mempool.or(db_mempool.as_ref())
+        } else {
+            None
+        };
+        if let Some(mempool) = mempool {
             let settle_confirmations = ledger.payout_settle_confirmations();
             let tip = PoolChainPoint {
                 height: runtime.tip_height(),
@@ -15519,7 +15788,7 @@ fn maybe_process_pool_payouts(ctx: &StratumServerContext) -> Result<(), NodeErro
                 .filter(|payout| payout.confirmed_in.is_none())
             {
                 let required_input = match plan_payout_step(
-                    &runtime,
+                    runtime,
                     mempool,
                     &mempool_spent,
                     payout,
@@ -15543,7 +15812,7 @@ fn maybe_process_pool_payouts(ctx: &StratumServerContext) -> Result<(), NodeErro
                     excluded.remove(required);
                 }
                 match build_signed_payout_tx(
-                    &runtime,
+                    runtime,
                     &ctx.cfg.network_id,
                     pool_key,
                     decoded.key_hash20,
@@ -16347,6 +16616,12 @@ fn validate_pool_payout_config(payout_cfg: &PoolPayoutConfig) -> Result<(), Node
 }
 
 fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
+    run_stratum_service(args, None)
+}
+
+/// `stratum-serve` (own data directory), or the pool service of `serve`
+/// working on the node's chain and mempool.
+fn run_stratum_service(args: StratumServeArgs, node: Option<SharedNode>) -> Result<(), NodeError> {
     let config_path = args
         .config
         .unwrap_or_else(|| PathBuf::from(format!("config/{}.toml", args.network.as_str())));
@@ -16362,7 +16637,23 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
     let relay_telemetry_path = Some(default_relay_telemetry_path(&runtime_db_path));
     let stale_guard_max_lag_blocks = stratum_stale_guard_max_lag_blocks();
     let stale_guard_max_snapshot_age_sec = stratum_stale_guard_max_snapshot_age_sec();
-    let (runtime, source) = load_runtime_from_db_or_genesis(&cfg, &runtime_db_path)?;
+    let (chain, source, _stores) = match node {
+        Some(node) => (
+            ChainHandle::Node(node),
+            "node",
+            OwnedStores::claim(&[&pool_ledger_db_path])?,
+        ),
+        None => {
+            let stores =
+                OwnedStores::claim(&[&runtime_db_path, &mempool_db_path, &pool_ledger_db_path])?;
+            let (runtime, source) = load_runtime_from_db_or_genesis(&cfg, &runtime_db_path)?;
+            (
+                ChainHandle::Own(Arc::new(Mutex::new(runtime))),
+                source,
+                stores,
+            )
+        }
+    };
     let payout_cfg = PoolPayoutConfig {
         mode: args.pool_payout_mode,
         pool_fee_bps: args.pool_fee_bps,
@@ -16410,14 +16701,18 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
             .ok_or_else(|| NodeError::Runtime("pool payout key is missing".to_owned()))?;
         scam_core::hash160_blake3(&key.pubkey_compressed())
     };
-    let pool_ledger_state = load_pool_ledger_from_db_or_new(
-        &cfg,
-        &runtime,
-        &pool_ledger_db_path,
-        args.pool_share_retention,
-        args.pool_round_retention,
-        payout_cfg.clone(),
-    )?;
+    let (pool_ledger_state, tip_height, tip_hash) = {
+        let runtime = chain.lock()?;
+        let ledger = load_pool_ledger_from_db_or_new(
+            &cfg,
+            &runtime,
+            &pool_ledger_db_path,
+            args.pool_share_retention,
+            args.pool_round_retention,
+            payout_cfg.clone(),
+        )?;
+        (ledger, runtime.tip_height(), runtime.tip_hash())
+    };
     let share_target_hex = args
         .share_target_hex
         .as_deref()
@@ -16545,11 +16840,7 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
 
     println!(
         "Stratum (SV2 framed) listening on {} network={} source={} tip_h={} tip_hash={}",
-        args.bind,
-        cfg.network_id,
-        source,
-        runtime.tip_height(),
-        runtime.tip_hash()
+        args.bind, cfg.network_id, source, tip_height, tip_hash
     );
     println!("Mempool DB: {}", mempool_db_path.display());
     println!("Pool ledger DB: {}", pool_ledger_db_path.display());
@@ -16641,9 +16932,8 @@ fn run_stratum_serve(args: StratumServeArgs) -> Result<(), NodeError> {
 
     let ctx = StratumServerContext {
         cfg,
-        runtime: Arc::new(Mutex::new(runtime)),
+        runtime: chain,
         runtime_db_path,
-        runtime_db_seen_mtime: Arc::new(Mutex::new(None)),
         mempool_db_path,
         max_template_txs,
         share_target,
@@ -18099,13 +18389,6 @@ fn json_error_body(message: &str) -> String {
     serde_json::json!({ "error": message }).to_string()
 }
 
-#[derive(Debug)]
-struct HttpRequest {
-    method: String,
-    path: String,
-    body: Vec<u8>,
-}
-
 // No `Debug`: the request carries wallet secrets that must not reach logs.
 #[derive(Deserialize)]
 #[serde(default)]
@@ -18612,33 +18895,14 @@ fn wallet_tx_history_for_key_hash(
     history
 }
 
-fn mempool_tx_count_from_db(mempool_db_path: &Path) -> Result<(bool, usize), NodeError> {
-    if !mempool_db_path.exists() {
-        return Ok((false, 0));
-    }
-    let snapshot = load_with_retry(10, 15, is_mempool_db_lock_conflict, || {
-        load_mempool_db(mempool_db_path).map_err(NodeError::from)
-    })?;
-    match snapshot {
-        Some(value) => Ok((true, value.entries.len())),
-        None => {
-            eprintln!(
-                "warning: mempool db {} is lock-contended; snapshot temporarily unavailable",
-                mempool_db_path.display()
-            );
-            Ok((false, 0))
-        }
-    }
-}
-
 fn build_rpc_event_snapshot(
     cfg: &ChainConfig,
     runtime: &ChainRuntime,
-    mempool_db_path: &Path,
+    mempool_tx_count: usize,
     relay_telemetry_path: Option<&Path>,
     stratum_telemetry_path: Option<&Path>,
 ) -> Result<RpcEventSnapshot, NodeError> {
-    let (mempool_available, mempool_tx_count) = mempool_tx_count_from_db(mempool_db_path)?;
+    let mempool_available = true;
     let now_unix_sec = current_unix_sec()?;
     let (
         relay_active_peers,
@@ -18786,231 +19050,12 @@ fn pool_worker_status_from_snapshot(
         })
 }
 
-fn write_http_response<W: Write>(
-    stream: &mut W,
-    status_line: &str,
-    content_type: &str,
-    body: &[u8],
-) -> Result<(), NodeError> {
-    let headers = format!(
-        "HTTP/1.1 {status_line}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    stream
-        .write_all(headers.as_bytes())
-        .map_err(|e| NodeError::Runtime(format!("http write failed: {e}")))?;
-    stream
-        .write_all(body)
-        .map_err(|e| NodeError::Runtime(format!("http write failed: {e}")))?;
-    stream
-        .flush()
-        .map_err(|e| NodeError::Runtime(format!("http flush failed: {e}")))?;
-    Ok(())
-}
-
-fn write_http_json_response<W: Write>(
-    stream: &mut W,
-    status_line: &str,
-    body: &str,
-) -> Result<(), NodeError> {
-    write_http_response(
-        stream,
-        status_line,
-        "application/json; charset=utf-8",
-        body.as_bytes(),
-    )
-}
-
-fn write_http_sse_headers<W: Write>(stream: &mut W) -> Result<(), NodeError> {
-    let headers = concat!(
-        "HTTP/1.1 200 OK\r\n",
-        "Content-Type: text/event-stream; charset=utf-8\r\n",
-        "Cache-Control: no-cache\r\n",
-        "Connection: keep-alive\r\n",
-        "\r\n"
-    );
-    stream
-        .write_all(headers.as_bytes())
-        .map_err(|e| NodeError::Runtime(format!("http write failed: {e}")))?;
-    stream
-        .flush()
-        .map_err(|e| NodeError::Runtime(format!("http flush failed: {e}")))?;
-    Ok(())
-}
-
-fn write_http_sse_event<W: Write>(
-    stream: &mut W,
-    event_name: &str,
-    payload_json: &str,
-) -> Result<(), NodeError> {
-    let frame = format!("event: {event_name}\ndata: {payload_json}\n\n");
-    stream
-        .write_all(frame.as_bytes())
-        .map_err(|e| NodeError::Runtime(format!("http write failed: {e}")))?;
-    stream
-        .flush()
-        .map_err(|e| NodeError::Runtime(format!("http flush failed: {e}")))?;
-    Ok(())
-}
-
-fn write_http_sse_comment<W: Write>(stream: &mut W, comment: &str) -> Result<(), NodeError> {
-    let frame = format!(": {comment}\n\n");
-    stream
-        .write_all(frame.as_bytes())
-        .map_err(|e| NodeError::Runtime(format!("http write failed: {e}")))?;
-    stream
-        .flush()
-        .map_err(|e| NodeError::Runtime(format!("http flush failed: {e}")))?;
-    Ok(())
-}
-
-fn find_http_header_terminator(buffer: &[u8]) -> Option<usize> {
-    buffer.windows(4).position(|window| window == b"\r\n\r\n")
-}
-
-fn parse_content_length(headers: &str) -> Result<usize, NodeError> {
-    for line in headers.lines().skip(1) {
-        let mut parts = line.splitn(2, ':');
-        let Some(name) = parts.next() else {
-            continue;
-        };
-        let Some(value) = parts.next() else {
-            continue;
-        };
-        if name.trim().eq_ignore_ascii_case("content-length") {
-            return value.trim().parse::<usize>().map_err(|e| {
-                NodeError::Runtime(format!(
-                    "invalid Content-Length header '{}': {e}",
-                    value.trim()
-                ))
-            });
-        }
-    }
-    Ok(0)
-}
-
-fn http_io_error_is_timeout_like(err: &std::io::Error) -> bool {
-    matches!(
-        err.kind(),
-        std::io::ErrorKind::TimedOut
-            | std::io::ErrorKind::WouldBlock
-            | std::io::ErrorKind::Interrupted
-    )
-}
-
-fn http_io_error_is_closed_like(err: &std::io::Error) -> bool {
-    matches!(
-        err.kind(),
-        std::io::ErrorKind::UnexpectedEof
-            | std::io::ErrorKind::ConnectionReset
-            | std::io::ErrorKind::ConnectionAborted
-            | std::io::ErrorKind::BrokenPipe
-            | std::io::ErrorKind::NotConnected
-    )
-}
-
-fn read_http_request<R: Read>(stream: &mut R) -> Result<Option<HttpRequest>, NodeError> {
-    let mut buffer = Vec::<u8>::with_capacity(4096);
-    let mut chunk = [0u8; 4096];
-    let mut header_end = None::<usize>;
-    let mut content_length = 0usize;
-
-    loop {
-        let read = match stream.read(&mut chunk) {
-            Ok(read) => read,
-            Err(err) if http_io_error_is_timeout_like(&err) => {
-                if buffer.is_empty() {
-                    return Ok(None);
-                }
-                return Err(NodeError::Runtime(format!(
-                    "http read timeout while waiting for full request: {err}"
-                )));
-            }
-            Err(err) if http_io_error_is_closed_like(&err) => {
-                if buffer.is_empty() {
-                    return Ok(None);
-                }
-                return Err(NodeError::Runtime(format!(
-                    "http connection closed while reading request: {err}"
-                )));
-            }
-            Err(err) => {
-                return Err(NodeError::Runtime(format!("http read failed: {err}")));
-            }
-        };
-        if read == 0 {
-            if buffer.is_empty() {
-                return Ok(None);
-            }
-            break;
-        }
-        buffer.extend_from_slice(&chunk[..read]);
-
-        if buffer.len() > 2 * 1024 * 1024 {
-            return Err(NodeError::Runtime(
-                "http request too large (max 2 MiB)".to_owned(),
-            ));
-        }
-
-        if header_end.is_none()
-            && let Some(pos) = find_http_header_terminator(&buffer)
-        {
-            let end = pos + 4;
-            let headers = std::str::from_utf8(&buffer[..end])
-                .map_err(|e| NodeError::Runtime(format!("invalid utf8 in request headers: {e}")))?;
-            content_length = parse_content_length(headers)?;
-            header_end = Some(end);
-        }
-
-        if let Some(end) = header_end
-            && buffer.len() >= end.saturating_add(content_length)
-        {
-            break;
-        }
-    }
-
-    let Some(end) = header_end else {
-        return Err(NodeError::Runtime(
-            "malformed http request: missing header terminator".to_owned(),
-        ));
-    };
-
-    let headers = std::str::from_utf8(&buffer[..end])
-        .map_err(|e| NodeError::Runtime(format!("invalid utf8 in request: {e}")))?;
-    let Some(line) = headers.lines().next() else {
-        return Ok(None);
-    };
-    let mut parts = line.split_whitespace();
-    let method = parts.next().unwrap_or_default().to_owned();
-    let raw_target = parts.next().unwrap_or("/");
-    let path = raw_target.split('?').next().unwrap_or("/");
-
-    let available_body = buffer.len().saturating_sub(end);
-    if available_body < content_length {
-        return Err(NodeError::Runtime(format!(
-            "malformed http request: expected body length {}, got {}",
-            content_length, available_body
-        )));
-    }
-    let body = if content_length == 0 {
-        Vec::new()
-    } else {
-        buffer[end..end + content_length].to_vec()
-    };
-
-    Ok(Some(HttpRequest {
-        method,
-        path: path.to_owned(),
-        body,
-    }))
-}
-
-fn parse_json_body<T: DeserializeOwned>(request: &HttpRequest) -> Result<T, NodeError> {
-    if request.body.is_empty() {
+fn parse_json_body<T: DeserializeOwned>(body: &[u8]) -> Result<T, NodeError> {
+    if body.is_empty() {
         return serde_json::from_str("{}")
             .map_err(|e| NodeError::Runtime(format!("invalid json body: {e}")));
     }
-    serde_json::from_slice::<T>(&request.body)
+    serde_json::from_slice::<T>(body)
         .map_err(|e| NodeError::Runtime(format!("invalid json body: {e}")))
 }
 
@@ -19127,210 +19172,8 @@ fn ui_dir_is_servable(ui_dir: &Path) -> bool {
     ui_dir.exists() && ui_dir.is_dir()
 }
 
-fn file_mtime(path: &Path) -> Option<SystemTime> {
-    fs::metadata(path).ok()?.modified().ok()
-}
-
-fn runtime_db_mtime(path: &Path) -> Option<SystemTime> {
-    file_mtime(path)
-}
-
-fn mempool_db_mtime(path: &Path) -> Option<SystemTime> {
-    file_mtime(path)
-}
-
-fn refresh_runtime_from_db_if_changed(
-    cfg: &ChainConfig,
-    runtime: &mut ChainRuntime,
-    runtime_db_path: &Path,
-    last_seen_mtime: &mut Option<SystemTime>,
-) -> Result<(), NodeError> {
-    let current_mtime = runtime_db_mtime(runtime_db_path);
-    if current_mtime == *last_seen_mtime {
-        return Ok(());
-    }
-    if !runtime_db_path.exists() {
-        *last_seen_mtime = current_mtime;
-        return Ok(());
-    }
-    let disk_tip = load_with_retry(10, 25, is_runtime_db_lock_conflict, || {
-        load_chain_archive_tip_db(runtime_db_path).map_err(NodeError::from)
-    })?;
-    // Lock-contended: keep the old mtime so the next poll retries.
-    let Some(disk_tip) = disk_tip else {
-        return Ok(());
-    };
-    let Some(disk_tip) = disk_tip else {
-        *last_seen_mtime = current_mtime;
-        return Ok(());
-    };
-    ensure_network_id_match(
-        &cfg.network_id,
-        &disk_tip.network_id,
-        "runtime db network mismatch",
-    )?;
-    let known_on_main_chain = runtime
-        .height_of(&disk_tip.hash)
-        .is_some_and(|height| runtime.block_hash_at_height(height) == Some(disk_tip.hash));
-    if !known_on_main_chain {
-        // Merge instead of replace: feed the archive's recent blocks through
-        // normal fork choice. Blocks we already have are no-ops, and blocks
-        // this process holds that are not on disk yet are kept (the old
-        // wholesale replacement dropped them and replayed the whole chain).
-        let from_height = runtime
-            .tip_height()
-            .min(disk_tip.height)
-            .saturating_sub(scam_chain::MAX_REORG_DEPTH);
-        let loaded = load_with_retry(10, 25, is_runtime_db_lock_conflict, || {
-            load_chain_archive_range_db(runtime_db_path, from_height).map_err(NodeError::from)
-        })?;
-        let Some((network_id, blocks)) = loaded else {
-            return Ok(());
-        };
-        ensure_network_id_match(&cfg.network_id, &network_id, "runtime db network mismatch")?;
-        for (height, block) in blocks {
-            match runtime.submit_block(block) {
-                Ok(_) => {}
-                Err(err) => {
-                    eprintln!("warning: runtime db refresh stopped at height {height}: {err}");
-                    break;
-                }
-            }
-        }
-    }
-    *last_seen_mtime = current_mtime;
-    Ok(())
-}
-
-fn refresh_relay_runtime_from_db_if_changed(
-    cfg: &ChainConfig,
-    state: &mut RelayServerState,
-    runtime_db_path: &Path,
-    last_seen_mtime: &mut Option<SystemTime>,
-    now_unix_sec: u64,
-) -> Result<bool, NodeError> {
-    let chain_before = state.runtime.block_hashes().to_vec();
-    refresh_runtime_from_db_if_changed(cfg, &mut state.runtime, runtime_db_path, last_seen_mtime)?;
-    let chain_after = state.runtime.block_hashes().to_vec();
-    if chain_before == chain_after {
-        return Ok(false);
-    }
-    relay_apply_main_chain_transition(state, &chain_before, &chain_after, now_unix_sec);
-    Ok(true)
-}
-
-fn refresh_mempool_from_db_if_changed(
-    cfg: &ChainConfig,
-    relay: &mut RelayAdmissionState,
-    mempool_db_path: &Path,
-    last_seen_mtime: &mut Option<SystemTime>,
-) -> Result<(), NodeError> {
-    let current_mtime = mempool_db_mtime(mempool_db_path);
-    if current_mtime == *last_seen_mtime {
-        return Ok(());
-    }
-    let fresh = load_with_retry(10, 25, is_mempool_db_lock_conflict, || {
-        load_mempool_from_db_or_empty(cfg, mempool_db_path)
-    })?;
-    if let Some(disk) = fresh {
-        // Merge, don't replace: replacing dropped transactions the relay had
-        // admitted but not yet written. The DB is written only by this node's
-        // own validated admission paths; templates and block connection
-        // re-validate anyway.
-        for txid in disk.txids_by_feerate_desc() {
-            if relay.mempool.contains(&txid) {
-                continue;
-            }
-            if let Some((tx, fee)) = disk.get_with_fee(&txid) {
-                let _ = relay.mempool.insert_with_fee(tx.clone(), fee);
-            }
-        }
-        *last_seen_mtime = current_mtime;
-    }
-    Ok(())
-}
-
-fn try_serve_ui_asset<W: Write>(
-    stream: &mut W,
-    ui_dir: &Path,
-    request_path: &str,
-) -> Result<bool, NodeError> {
-    if ui_dir_is_servable(ui_dir) {
-        let Some(relative) = sanitize_ui_path(request_path) else {
-            write_http_json_response(
-                stream,
-                "400 Bad Request",
-                &json_error_body("invalid asset path"),
-            )?;
-            return Ok(true);
-        };
-        let candidate = ui_dir.join(relative);
-        let asset_path = if candidate.exists() && candidate.is_file() {
-            candidate
-        } else {
-            let index = ui_dir.join("index.html");
-            if index.exists() && index.is_file() {
-                index
-            } else {
-                return Ok(false);
-            }
-        };
-        let body = fs::read(&asset_path).map_err(|e| {
-            NodeError::Runtime(format!(
-                "cannot read ui asset {}: {e}",
-                asset_path.display()
-            ))
-        })?;
-        write_http_response(stream, "200 OK", guess_content_type(&asset_path), &body)?;
-        Ok(true)
-    } else {
-        Ok(false)
-    }
-}
-
-fn rpc_exact_route_matches(
-    method: &str,
-    path: &str,
-    expected_method: &str,
-    expected_path: &str,
-) -> bool {
-    method == expected_method && path == expected_path
-}
-
 fn is_get_method(method: &str) -> bool {
     method == "GET"
-}
-
-fn is_pool_worker_route(method: &str, path: &str) -> bool {
-    is_get_method(method) && path.starts_with("/pool/worker/")
-}
-
-fn rpc_block_height_path<'a>(method: &str, path: &'a str) -> Option<&'a str> {
-    if is_get_method(method) {
-        path.strip_prefix("/block/")
-    } else {
-        None
-    }
-}
-
-fn rpc_tx_path_parts<'a>(method: &str, path: &'a str) -> Option<(&'a str, &'a str, bool)> {
-    if !is_get_method(method) {
-        return None;
-    }
-    let rest = path.strip_prefix("/tx/")?;
-    let mut segments = rest.split('/');
-    let height_raw = segments.next().unwrap_or_default();
-    let index_raw = segments.next().unwrap_or_default();
-    let has_extra = segments.next().is_some();
-    Some((height_raw, index_raw, has_extra))
-}
-
-fn rpc_txid_path<'a>(method: &str, path: &'a str) -> Option<&'a str> {
-    if is_get_method(method) {
-        path.strip_prefix("/txid/")
-    } else {
-        None
-    }
 }
 
 fn rpc_txid_path_is_invalid(txid_raw: &str) -> bool {
@@ -19348,17 +19191,6 @@ fn parse_tx_height_and_index(height_raw: &str, index_raw: &str) -> Option<(u64, 
     }
 }
 
-fn find_tx_by_txid(
-    block: &scam_core::Block,
-    needle_txid: Hash256,
-) -> Option<(usize, &Transaction)> {
-    block
-        .transactions
-        .iter()
-        .enumerate()
-        .find(|(_, tx)| tx.txid() == needle_txid)
-}
-
 fn address_hrp_is_accepted(accepted_hrps: &[String], hrp: &str) -> bool {
     accepted_hrps.iter().any(|candidate| candidate == hrp)
 }
@@ -19371,135 +19203,11 @@ fn should_attempt_ui_asset_serve(method: &str) -> bool {
     is_get_method(method)
 }
 
-fn should_serve_ui_asset_for_route(method: &str, ui_served: bool) -> bool {
-    should_attempt_ui_asset_serve(method) && ui_served
-}
-
-fn should_reply_bad_http_request(err: &NodeError) -> bool {
-    match err {
-        NodeError::Runtime(msg) => {
-            !(msg.contains("http read timeout while waiting for full request")
-                || msg.contains("http connection closed while reading request"))
-        }
-        _ => true,
-    }
-}
-
-fn rpc_sse_write_error_is_closed_like(err: &NodeError) -> bool {
-    match err {
-        NodeError::Runtime(msg) => {
-            let lowered = msg.to_ascii_lowercase();
-            lowered.contains("broken pipe")
-                || lowered.contains("connection reset")
-                || lowered.contains("connection aborted")
-                || lowered.contains("not connected")
-        }
-        _ => false,
-    }
-}
-
-fn rpc_events_worker_should_continue(stop_flag: &AtomicBool) -> bool {
-    !stop_flag.load(Ordering::Relaxed)
-}
-
-fn reap_finished_rpc_event_workers(handles: &mut Vec<thread::JoinHandle<()>>) {
-    let mut pending = Vec::<thread::JoinHandle<()>>::with_capacity(handles.len());
-    while let Some(handle) = handles.pop() {
-        if handle.is_finished() {
-            let _ = handle.join();
-        } else {
-            pending.push(handle);
-        }
-    }
-    pending.reverse();
-    *handles = pending;
-}
-
-#[allow(clippy::too_many_arguments)]
-fn run_rpc_events_worker(
-    stream: &mut impl Write,
-    cfg: ChainConfig,
-    runtime_db_path: PathBuf,
-    mempool_db_path: PathBuf,
-    relay_telemetry_path: Option<PathBuf>,
-    stratum_telemetry_path: Option<PathBuf>,
-    stop_flag: Arc<AtomicBool>,
-    interval: Duration,
-) -> Result<(), NodeError> {
-    let (mut runtime, _) = load_runtime_from_db_or_genesis(&cfg, &runtime_db_path)?;
-    let mut runtime_db_seen_mtime = runtime_db_mtime(&runtime_db_path);
-    if let Err(err) = write_http_sse_headers(stream) {
-        if rpc_sse_write_error_is_closed_like(&err) {
-            return Ok(());
-        }
-        return Err(err);
-    }
-
-    if stop_flag.load(Ordering::Relaxed) {
-        return Ok(());
-    }
-
-    while rpc_events_worker_should_continue(&stop_flag) {
-        if stop_flag.load(Ordering::Relaxed) {
-            break;
-        }
-        refresh_runtime_from_db_if_changed(
-            &cfg,
-            &mut runtime,
-            &runtime_db_path,
-            &mut runtime_db_seen_mtime,
-        )?;
-        if let Err(err) = write_http_sse_comment(stream, "heartbeat") {
-            if rpc_sse_write_error_is_closed_like(&err) {
-                return Ok(());
-            }
-            return Err(err);
-        }
-        let snapshot = build_rpc_event_snapshot(
-            &cfg,
-            &runtime,
-            &mempool_db_path,
-            relay_telemetry_path.as_deref(),
-            stratum_telemetry_path.as_deref(),
-        )?;
-        let payload = serde_json::to_string(&snapshot)
-            .map_err(|e| NodeError::Runtime(format!("events serialization failed: {e}")))?;
-        if let Err(err) = write_http_sse_event(stream, "snapshot", &payload) {
-            if rpc_sse_write_error_is_closed_like(&err) {
-                return Ok(());
-            }
-            return Err(err);
-        }
-        thread::sleep(interval);
-    }
-    Ok(())
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RpcHttpBackend {
-    Legacy,
-    Axum,
-}
-
-fn rpc_http_backend_from_env() -> RpcHttpBackend {
-    match env_opt("SCAM_RPC_HTTP_BACKEND")
-        .unwrap_or_else(|| "axum".to_owned())
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        // Legacy is opt-in by name only; a typo must not silently select
-        // the server without request protections.
-        "legacy" => RpcHttpBackend::Legacy,
-        _ => RpcHttpBackend::Axum,
-    }
-}
-
 #[derive(Clone)]
 struct AxumRpcState {
     network: Network,
     cfg: ChainConfig,
-    runtime_db_path: PathBuf,
-    runtime_cache: Arc<Mutex<AxumRuntimeCache>>,
+    chain: ChainHandle,
     mempool_db_path: PathBuf,
     relay_telemetry: Option<PathBuf>,
     stratum_telemetry: Option<PathBuf>,
@@ -19572,18 +19280,13 @@ impl TxidIndex {
 
 /// Run blocking request work without stalling the async runtime: on a
 /// multi-thread runtime the current worker hands its other tasks off first.
-fn rpc_blocking_section<T>(work: impl FnOnce() -> T) -> T {
+fn blocking_section<T>(work: impl FnOnce() -> T) -> T {
     match tokio::runtime::Handle::try_current() {
         Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
             tokio::task::block_in_place(work)
         }
         _ => work(),
     }
-}
-
-struct AxumRuntimeCache {
-    runtime: ChainRuntime,
-    last_seen_mtime: Option<SystemTime>,
 }
 
 fn axum_json_response(status: StatusCode, body: String) -> AxumResponse {
@@ -19622,93 +19325,28 @@ fn axum_internal_error(err: impl ToString) -> AxumResponse {
 }
 
 fn axum_parse_json_body<T: DeserializeOwned>(body: AxumBytes) -> Result<T, NodeError> {
-    let request = HttpRequest {
-        method: "POST".to_owned(),
-        path: "/".to_owned(),
-        body: body.to_vec(),
-    };
-    parse_json_body::<T>(&request)
-}
-
-fn axum_runtime_for_query_with_refresh<T, F, R>(
-    state: &AxumRpcState,
-    mut refresh: R,
-    query: F,
-) -> Result<T, NodeError>
-where
-    F: FnOnce(&ChainRuntime) -> Result<T, NodeError>,
-    R: FnMut(
-        &ChainConfig,
-        &mut ChainRuntime,
-        &Path,
-        &mut Option<SystemTime>,
-    ) -> Result<(), NodeError>,
-{
-    let mut cache = state
-        .runtime_cache
-        .lock()
-        .map_err(|_| NodeError::Runtime("axum runtime cache mutex poisoned".to_owned()))?;
-    let AxumRuntimeCache {
-        runtime,
-        last_seen_mtime,
-    } = &mut *cache;
-    match refresh(&state.cfg, runtime, &state.runtime_db_path, last_seen_mtime) {
-        Ok(()) => {}
-        Err(err) if is_runtime_db_lock_conflict(&err) => {}
-        Err(err) => return Err(err),
-    }
-    query(&cache.runtime)
+    parse_json_body::<T>(&body)
 }
 
 fn axum_runtime_for_query<T, F>(state: &AxumRpcState, query: F) -> Result<T, NodeError>
 where
     F: FnOnce(&ChainRuntime) -> Result<T, NodeError>,
 {
-    axum_runtime_for_query_with_refresh(state, refresh_runtime_from_db_if_changed, query)
+    let runtime = state.chain.lock()?;
+    query(&runtime)
 }
 
 fn axum_status_payload(state: &AxumRpcState) -> Result<StatusResponse, NodeError> {
-    let mut runtime_cache = state
-        .runtime_cache
-        .lock()
-        .map_err(|_| NodeError::Runtime("axum runtime cache mutex poisoned".to_owned()))?;
-    let AxumRuntimeCache {
-        runtime,
-        last_seen_mtime,
-    } = &mut *runtime_cache;
-    let current_mtime = runtime_db_mtime(&state.runtime_db_path);
-    let seen_before_refresh = *last_seen_mtime;
-    refresh_runtime_from_db_if_changed(
-        &state.cfg,
-        runtime,
-        &state.runtime_db_path,
-        last_seen_mtime,
-    )?;
-    let refresh_used_cached_runtime = current_mtime.is_some()
-        && current_mtime != seen_before_refresh
-        && *last_seen_mtime != current_mtime;
-
-    let mut tip_height = runtime.tip_height();
-    let mut tip_hash = runtime.tip_hash().to_hex();
-    let mut utxo_count = runtime.utxo_len();
-    let mut cumulative_work = runtime.cumulative_work().to_str_radix(10);
-    let mut network_hashrate_hps = estimate_network_hashrate_hps(runtime);
-    drop(runtime_cache);
-
-    if refresh_used_cached_runtime
-        && let Some(path) = state.relay_telemetry.as_ref()
-        && let Some(snapshot) = load_latest_jsonl_record::<RelayServerTelemetrySnapshot>(path)?
-    {
-        tip_height = snapshot.tip_height;
-        tip_hash = snapshot.tip_hash;
-        utxo_count = snapshot.utxo_count.max(utxo_count);
-        if !snapshot.cumulative_work.trim().is_empty() {
-            cumulative_work = snapshot.cumulative_work;
-        }
-        if snapshot.network_hashrate_hps > 0.0 {
-            network_hashrate_hps = snapshot.network_hashrate_hps;
-        }
-    }
+    let (tip_height, tip_hash, utxo_count, cumulative_work, network_hashrate_hps) =
+        axum_runtime_for_query(state, |runtime| {
+            Ok((
+                runtime.tip_height(),
+                runtime.tip_hash().to_hex(),
+                runtime.utxo_len(),
+                runtime.cumulative_work().to_str_radix(10),
+                estimate_network_hashrate_hps(runtime),
+            ))
+        })?;
     let (stratum_active_clients, stratum_workers_active, stratum_pool_hashrate_hps) =
         match state.stratum_telemetry.as_ref() {
             Some(path) => match load_latest_jsonl_record::<StratumServerTelemetrySnapshot>(path)? {
@@ -19965,7 +19603,12 @@ fn axum_wallet_send_preview_payload(
     let seed = wallet_seed_from_mnemonic(&req.mnemonic, &req.passphrase, seed_mode)?;
     let (key, _account, _index) =
         derive_wallet_key_from_request(&seed, req.path.as_deref(), req.account, req.index)?;
-    let reserved_outpoints = load_wallet_reserved_outpoints(&state.cfg, &state.mempool_db_path)?;
+    let reserved_outpoints =
+        state
+            .chain
+            .with_mempool(&state.cfg, &state.mempool_db_path, |_, mempool| {
+                Ok(mempool_spent_outpoints(mempool))
+            })?;
     let signed = axum_runtime_for_query(state, |runtime| {
         build_signed_transfer_tx_auto_fee(
             runtime,
@@ -20020,15 +19663,18 @@ fn axum_events_snapshot_cached(state: &AxumRpcState) -> Result<String, NodeError
 }
 
 fn axum_events_snapshot_payload(state: &AxumRpcState) -> Result<String, NodeError> {
-    let snapshot = axum_runtime_for_query(state, |runtime| {
-        build_rpc_event_snapshot(
-            &state.cfg,
-            runtime,
-            &state.mempool_db_path,
-            state.relay_telemetry.as_deref(),
-            state.stratum_telemetry.as_deref(),
-        )
-    })?;
+    let snapshot =
+        state
+            .chain
+            .with_mempool(&state.cfg, &state.mempool_db_path, |runtime, mempool| {
+                build_rpc_event_snapshot(
+                    &state.cfg,
+                    runtime,
+                    mempool.len(),
+                    state.relay_telemetry.as_deref(),
+                    state.stratum_telemetry.as_deref(),
+                )
+            })?;
     serde_json::to_string(&snapshot)
         .map_err(|e| NodeError::Runtime(format!("events serialization failed: {e}")))
 }
@@ -20090,67 +19736,22 @@ connect-src 'self' http://127.0.0.1:* http://localhost:* http://[::1]:*; \
 frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
 
 async fn axum_mempool_handler(AxumState(state): AxumState<AxumRpcState>) -> AxumResponse {
-    let mut txids = Vec::<String>::new();
-    let mut tx_count = None::<usize>;
-    if state.mempool_db_path.exists() {
-        match load_mempool_from_db_or_empty_with_retry(
-            &state.cfg,
-            &state.mempool_db_path,
-            rpc_db_retry_attempts(),
-            rpc_db_retry_backoff_ms(),
-        ) {
-            Ok(mut mempool) => {
-                let removed_confirmed = match axum_runtime_for_query(&state, |runtime| {
-                    Ok(cleanup_mempool_against_chain(runtime, &mut mempool))
-                }) {
-                    Ok(removed) => removed,
-                    Err(err) => return axum_internal_error(err),
-                };
-                if should_persist_startup_mempool_cleanup(removed_confirmed)
-                    && let Err(err) = persist_mempool_db_with_retry(
-                        &state.cfg,
-                        &mut mempool,
-                        &state.mempool_db_path,
-                        rpc_db_retry_attempts(),
-                        rpc_db_retry_backoff_ms(),
-                    )
-                {
-                    if mempool_cleanup_persist_is_fatal(&err) {
-                        return axum_internal_error(format!(
-                            "mempool db persist after confirmed-prune failed ({}): {err}",
-                            state.mempool_db_path.display()
-                        ));
-                    }
-                    eprintln!(
-                        "warning: mempool db cleanup persist lock contention ({}): {err}",
-                        state.mempool_db_path.display()
-                    );
-                }
-                tx_count = Some(mempool.len());
-                txids = mempool
+    let listed = blocking_section(|| {
+        state
+            .chain
+            .with_mempool(&state.cfg, &state.mempool_db_path, |_, mempool| {
+                Ok(mempool
                     .txids_by_feerate_desc()
                     .into_iter()
                     .map(|txid| txid.to_hex())
-                    .collect();
-            }
-            Err(err) => {
-                if mempool_summary_should_fallback_on_error(&err) {
-                    eprintln!(
-                        "warning: mempool db lock contention while serving /mempool ({}): {err}",
-                        state.mempool_db_path.display()
-                    );
-                } else {
-                    return axum_json_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        json_error_body(&format!(
-                            "mempool db load failed ({}): {err}",
-                            state.mempool_db_path.display()
-                        )),
-                    );
-                }
-            }
-        }
-    }
+                    .collect::<Vec<_>>())
+            })
+    });
+    let txids = match listed {
+        Ok(txids) => txids,
+        Err(err) => return axum_internal_error(err),
+    };
+    let tx_count = Some(txids.len());
     let summary = if let Some(telemetry_path) = state.relay_telemetry.as_ref() {
         match load_latest_jsonl_record::<RelayServerTelemetrySnapshot>(telemetry_path) {
             Ok(Some(snapshot)) => MempoolSummaryRpcResponse {
@@ -20236,7 +19837,7 @@ async fn axum_events_handler(AxumState(state): AxumState<AxumRpcState>) -> AxumR
         IntervalStream::new(tokio::time::interval(Duration::from_secs(1))).map(move |_| {
             // The subscriber slot is held for as long as the stream lives.
             let _subscriber = &permit;
-            let data = match rpc_blocking_section(|| axum_events_snapshot_cached(&stream_state)) {
+            let data = match blocking_section(|| axum_events_snapshot_cached(&stream_state)) {
                 Ok(payload) => payload,
                 Err(err) => json_error_body(&err.to_string()),
             };
@@ -20569,20 +20170,14 @@ async fn axum_wallet_send_handler(
         Ok(tx) => tx,
         Err(err) => return axum_internal_error(format!("tx decode failed: {err}")),
     };
-    let (txid, outcome, effective_fee) = match axum_runtime_for_query(&state, |runtime| {
-        submit_tx_via_mempool_db_for_runtime_with_retry(
-            &state.cfg,
-            runtime,
-            &state.mempool_db_path,
-            tx.clone(),
-            preview_payload.fee,
-            rpc_db_retry_attempts(),
-            rpc_db_retry_backoff_ms(),
-        )
-    }) {
-        Ok(value) => value,
-        Err(err) => return axum_bad_request(err),
-    };
+    let (txid, outcome, effective_fee) =
+        match state
+            .chain
+            .submit_tx(&state.cfg, &state.mempool_db_path, &tx, preview_payload.fee)
+        {
+            Ok(value) => value,
+            Err(err) => return axum_bad_request(err),
+        };
     let payload = WalletSendRpcResponse {
         network_id: state.cfg.network_id.clone(),
         txid: txid.to_hex(),
@@ -20612,20 +20207,14 @@ async fn axum_tx_submit_handler(
         Ok(value) => value,
         Err(err) => return axum_bad_request(err),
     };
-    let (txid, outcome, effective_fee) = match axum_runtime_for_query(&state, |runtime| {
-        submit_tx_via_mempool_db_for_runtime_with_retry(
-            &state.cfg,
-            runtime,
-            &state.mempool_db_path,
-            tx.clone(),
-            requested_fee,
-            rpc_db_retry_attempts(),
-            rpc_db_retry_backoff_ms(),
-        )
-    }) {
-        Ok(value) => value,
-        Err(err) => return axum_bad_request(err),
-    };
+    let (txid, outcome, effective_fee) =
+        match state
+            .chain
+            .submit_tx(&state.cfg, &state.mempool_db_path, &tx, requested_fee)
+        {
+            Ok(value) => value,
+            Err(err) => return axum_bad_request(err),
+        };
     let payload = TxSubmitRpcResponse {
         network_id: state.cfg.network_id.clone(),
         txid: txid.to_hex(),
@@ -20899,6 +20488,7 @@ fn axum_request_is_get(method: &Method) -> bool {
 fn run_rpc_serve_inner_axum(
     args: RpcServeArgs,
     shutdown_flag: Option<Arc<AtomicBool>>,
+    node: Option<SharedNode>,
 ) -> Result<(), NodeError> {
     let RpcServeArgs {
         network,
@@ -20929,22 +20519,47 @@ fn run_rpc_serve_inner_axum(
     let pool_ledger_db_path = pool_ledger
         .clone()
         .unwrap_or_else(|| default_pool_ledger_db_path(&runtime_db_path));
-    let (cfg, runtime) = build_runtime_for_query(
-        network,
-        config,
-        Some(runtime_db_path.clone()),
-        mine_blocks,
-        interval_sec,
-        max_nonce,
-        "rpc-serve-axum",
-    )?;
-    println!(
-        "RPC(axum) listening on {} (network={} tip_h={} tip_hash={})",
-        bind,
-        cfg.network_id,
-        runtime.tip_height(),
-        runtime.tip_hash()
-    );
+    let (cfg, chain, _stores) = match node {
+        Some(node) => {
+            if should_mine_query_blocks(mine_blocks) {
+                return Err(NodeError::Runtime(
+                    "--mine-blocks is for a standalone rpc-serve; a node mines through stratum"
+                        .to_owned(),
+                ));
+            }
+            let config_path = config
+                .unwrap_or_else(|| PathBuf::from(format!("config/{}.toml", network.as_str())));
+            (
+                load_chain_config(&config_path)?,
+                ChainHandle::Node(node),
+                OwnedStores::claim(&[&pool_ledger_db_path])?,
+            )
+        }
+        None => {
+            let stores =
+                OwnedStores::claim(&[&runtime_db_path, &mempool_db_path, &pool_ledger_db_path])?;
+            let (cfg, runtime) = build_runtime_for_query(
+                network,
+                config,
+                Some(runtime_db_path.clone()),
+                mine_blocks,
+                interval_sec,
+                max_nonce,
+                "rpc-serve-axum",
+            )?;
+            (cfg, ChainHandle::Own(Arc::new(Mutex::new(runtime))), stores)
+        }
+    };
+    {
+        let runtime = chain.lock()?;
+        println!(
+            "RPC(axum) listening on {} (network={} tip_h={} tip_hash={})",
+            bind,
+            cfg.network_id,
+            runtime.tip_height(),
+            runtime.tip_hash()
+        );
+    }
     println!(
         "Endpoints (axum): GET /health, /status, /block/<height>, /tx/<height>/<index>, /txid/<txid>, /mempool, /events, /pool/status, /pool/worker/<label>, /pool/payouts/pending, /pool/payouts/completed; POST /wallet/new, /wallet/address, /wallet/decode, /wallet/balance, /wallet/balance-by-address, /wallet/balance-history-by-address, /wallet/send-preview, /wallet/send, /tx/submit, /wallet/qr"
     );
@@ -20960,16 +20575,10 @@ fn run_rpc_serve_inner_axum(
     if max_requests_limit_configured(max_requests) {
         println!("Max requests before exit: {}", max_requests);
     }
-    let runtime_last_seen_mtime = runtime_db_mtime(&runtime_db_path);
-
     let shared = AxumRpcState {
         network,
         cfg,
-        runtime_db_path,
-        runtime_cache: Arc::new(Mutex::new(AxumRuntimeCache {
-            runtime,
-            last_seen_mtime: runtime_last_seen_mtime,
-        })),
+        chain,
         mempool_db_path,
         relay_telemetry,
         stratum_telemetry,
@@ -20979,7 +20588,7 @@ fn run_rpc_serve_inner_axum(
     };
     let listener_bind = bind.clone();
 
-    // Multi-thread so a slow handler (it runs in `rpc_blocking_section`)
+    // Multi-thread so a slow handler (it runs in `blocking_section`)
     // cannot stall the accept loop or other clients.
     TokioRuntimeBuilder::new_multi_thread()
         .worker_threads(4)
@@ -21054,1196 +20663,11 @@ fn run_rpc_serve_inner_axum(
         })
 }
 
-fn run_rpc_serve_inner_legacy(
-    args: RpcServeArgs,
-    shutdown_flag: Option<Arc<AtomicBool>>,
-) -> Result<(), NodeError> {
-    let RpcServeArgs {
-        network,
-        config,
-        runtime_db,
-        bind,
-        ui_dir,
-        relay_telemetry,
-        stratum_telemetry,
-        pool_ledger,
-        mine_blocks,
-        interval_sec,
-        max_nonce,
-        max_requests,
-        auth_token_file,
-        disable_wallet_rpc,
-    } = args;
-    // The legacy server has no Host/Origin/Content-Type/token checks; only
-    // allow it for loopback binds without any requested protection.
-    if auth_token_file.is_some() || disable_wallet_rpc || !rpc_bind_is_loopback(&bind) {
-        return Err(NodeError::Runtime(
-            "the legacy RPC backend cannot enforce auth/wallet/bind policy; use the default axum backend".to_owned(),
-        ));
-    }
-    eprintln!(
-        "warning: legacy RPC backend selected (SCAM_RPC_HTTP_BACKEND=legacy): no DNS-rebinding or CSRF protection"
-    );
-    let runtime_db_path = runtime_db
-        .clone()
-        .unwrap_or_else(|| default_runtime_db_path(network));
-    let mempool_db_path = default_mempool_db_path(&runtime_db_path);
-    let pool_ledger_db_path = pool_ledger
-        .clone()
-        .unwrap_or_else(|| default_pool_ledger_db_path(&runtime_db_path));
-    let (cfg, mut runtime) = build_runtime_for_query(
-        network,
-        config,
-        Some(runtime_db_path.clone()),
-        mine_blocks,
-        interval_sec,
-        max_nonce,
-        "rpc-serve",
-    )?;
-    let mut runtime_db_seen_mtime = runtime_db_mtime(&runtime_db_path);
-
-    let listener = TcpListener::bind(&bind)
-        .map_err(|e| NodeError::Runtime(format!("rpc bind failed on {}: {e}", bind)))?;
-    if shutdown_flag.is_some() {
-        listener
-            .set_nonblocking(true)
-            .map_err(|e| NodeError::Runtime(format!("rpc set_nonblocking failed: {e}")))?;
-    }
-    println!(
-        "RPC listening on {} (network={} tip_h={} tip_hash={})",
-        bind,
-        cfg.network_id,
-        runtime.tip_height(),
-        runtime.tip_hash()
-    );
-    println!(
-        "Endpoints: GET /health, /status, /block/<height>, /tx/<height>/<index>, /txid/<txid>, /mempool, /events, /pool/status, /pool/worker/<label>, /pool/payouts/pending, /pool/payouts/completed; POST /wallet/new, /wallet/address, /wallet/decode, /wallet/balance, /wallet/balance-by-address, /wallet/balance-history-by-address, /wallet/send-preview, /wallet/send, /tx/submit, /wallet/qr"
-    );
-    println!("UI assets directory: {}", ui_dir.display());
-    println!("Mempool DB source: {}", mempool_db_path.display());
-    if let Some(path) = relay_telemetry.as_ref() {
-        println!("Relay telemetry source: {}", path.display());
-    }
-    if let Some(path) = stratum_telemetry.as_ref() {
-        println!("Stratum telemetry source: {}", path.display());
-    }
-    println!("Pool ledger source: {}", pool_ledger_db_path.display());
-    if max_requests_limit_configured(max_requests) {
-        println!("Max requests before exit: {}", max_requests);
-    }
-
-    let events_stop_flag = Arc::new(AtomicBool::new(false));
-    let mut events_workers = Vec::<thread::JoinHandle<()>>::new();
-    let events_interval = Duration::from_secs(1);
-
-    let mut served = 0u32;
-    loop {
-        if let Some(flag) = shutdown_flag.as_ref()
-            && flag.load(Ordering::Relaxed)
-        {
-            break;
-        }
-        reap_finished_rpc_event_workers(&mut events_workers);
-        let Some((mut stream, _)) =
-            map_rpc_accept_result(listener.accept(), shutdown_flag.is_some())?
-        else {
-            if shutdown_flag.is_some() {
-                thread::sleep(Duration::from_millis(10));
-            }
-            continue;
-        };
-        configure_stream_timeouts_with_ops(
-            |duration| stream.set_read_timeout(duration),
-            |duration| stream.set_write_timeout(duration),
-            DEFAULT_STREAM_TIMEOUT,
-            DEFAULT_STREAM_TIMEOUT,
-        )?;
-
-        let request = match read_http_request(&mut stream) {
-            Ok(Some(request)) => request,
-            Ok(None) => continue,
-            Err(err) => {
-                if should_reply_bad_http_request(&err) {
-                    let body = json_error_body(&err.to_string());
-                    let _ = write_http_json_response(&mut stream, "400 Bad Request", &body);
-                }
-                continue;
-            }
-        };
-
-        let method = request.method.as_str();
-        let path = request.path.as_str();
-        if rpc_exact_route_matches(method, path, "GET", "/events") {
-            let cfg_clone = cfg.clone();
-            let runtime_db_path_clone = runtime_db_path.clone();
-            let mempool_db_path_clone = mempool_db_path.clone();
-            let relay_telemetry_clone = relay_telemetry.clone();
-            let stratum_telemetry_clone = stratum_telemetry.clone();
-            let stop_clone = events_stop_flag.clone();
-            events_workers.push(thread::spawn(move || {
-                let mut stream = stream;
-                if let Err(err) = run_rpc_events_worker(
-                    &mut stream,
-                    cfg_clone,
-                    runtime_db_path_clone,
-                    mempool_db_path_clone,
-                    relay_telemetry_clone,
-                    stratum_telemetry_clone,
-                    stop_clone,
-                    events_interval,
-                ) {
-                    eprintln!("warning: rpc events stream failed: {err}");
-                }
-            }));
-            served = served.saturating_add(1);
-            if max_requests_limit_hit(max_requests, served) {
-                break;
-            }
-            continue;
-        }
-        refresh_runtime_from_db_if_changed(
-            &cfg,
-            &mut runtime,
-            &runtime_db_path,
-            &mut runtime_db_seen_mtime,
-        )?;
-        let (status, body) = if rpc_exact_route_matches(method, path, "GET", "/health") {
-            ("200 OK", "{\"ok\":true}".to_owned())
-        } else if rpc_exact_route_matches(method, path, "GET", "/status") {
-            let (stratum_active_clients, stratum_workers_active, stratum_pool_hashrate_hps) =
-                match stratum_telemetry.as_ref() {
-                    Some(path) => {
-                        match load_latest_jsonl_record::<StratumServerTelemetrySnapshot>(path)? {
-                            Some(snapshot) => (
-                                Some(snapshot.active_clients),
-                                Some(snapshot.workers_active),
-                                Some(snapshot.pool_hashrate_hps),
-                            ),
-                            None => (None, None, None),
-                        }
-                    }
-                    None => (None, None, None),
-                };
-            let payload = StatusResponse {
-                network_id: cfg.network_id.clone(),
-                tip_height: runtime.tip_height(),
-                tip_hash: runtime.tip_hash().to_hex(),
-                utxo_count: runtime.utxo_len(),
-                cumulative_work: runtime.cumulative_work().to_str_radix(10),
-                network_hashrate_hps: estimate_network_hashrate_hps(&runtime),
-                stratum_active_clients,
-                stratum_workers_active,
-                stratum_pool_hashrate_hps,
-            };
-            match to_pretty_json(&payload) {
-                Ok(body) => ("200 OK", body),
-                Err(e) => (
-                    "500 Internal Server Error",
-                    json_error_body(&format!("status serialization failed: {e}")),
-                ),
-            }
-        } else if rpc_exact_route_matches(method, path, "GET", "/pool/status") {
-            let telemetry = match stratum_telemetry.as_ref() {
-                Some(path) => load_latest_jsonl_record::<StratumServerTelemetrySnapshot>(path)?,
-                None => None,
-            };
-            let ledger_snapshot = load_pool_ledger_snapshot_with_retry(&pool_ledger_db_path)?;
-            let now_unix_sec = current_unix_sec().unwrap_or(0);
-            let ledger = ledger_snapshot
-                .as_ref()
-                .and_then(|snapshot| pool_ledger_status_from_snapshot(snapshot, now_unix_sec));
-            if pool_status_sources_missing(telemetry.is_some(), ledger.is_some()) {
-                (
-                    "404 Not Found",
-                    json_error_body("pool telemetry and ledger snapshots are not available"),
-                )
-            } else {
-                let payload = PoolStatusRpcResponse { telemetry, ledger };
-                match to_pretty_json(&payload) {
-                    Ok(body) => ("200 OK", body),
-                    Err(e) => (
-                        "500 Internal Server Error",
-                        json_error_body(&format!("pool status serialization failed: {e}")),
-                    ),
-                }
-            }
-        } else if is_pool_worker_route(method, path) {
-            let worker_label = path
-                .strip_prefix("/pool/worker/")
-                .unwrap_or_default()
-                .trim();
-            if worker_label.is_empty() {
-                (
-                    "400 Bad Request",
-                    json_error_body("worker label must not be empty"),
-                )
-            } else {
-                let normalized = StratumPoolTelemetryState::sanitize_worker_label(worker_label);
-                let telemetry = match stratum_telemetry.as_ref() {
-                    Some(path) => load_latest_jsonl_record::<StratumServerTelemetrySnapshot>(path)?,
-                    None => None,
-                };
-                let telemetry_worker = telemetry.as_ref().and_then(|snapshot| {
-                    snapshot
-                        .top_workers
-                        .iter()
-                        .find(|entry| pool_worker_name_matches(&entry.worker, &normalized))
-                        .cloned()
-                });
-                let ledger = load_pool_ledger_snapshot_with_retry(&pool_ledger_db_path)?;
-                let ledger_worker = ledger
-                    .as_ref()
-                    .and_then(|snapshot| pool_worker_status_from_snapshot(snapshot, &normalized));
-                if pool_worker_sources_missing(telemetry_worker.is_some(), ledger_worker.is_some())
-                {
-                    (
-                        "404 Not Found",
-                        json_error_body(&format!(
-                            "worker {normalized} not found in telemetry or pool ledger"
-                        )),
-                    )
-                } else {
-                    let payload = PoolWorkerRpcResponse {
-                        worker: normalized,
-                        telemetry: telemetry_worker,
-                        ledger: ledger_worker,
-                    };
-                    match to_pretty_json(&payload) {
-                        Ok(body) => ("200 OK", body),
-                        Err(e) => (
-                            "500 Internal Server Error",
-                            json_error_body(&format!("worker status serialization failed: {e}")),
-                        ),
-                    }
-                }
-            }
-        } else if rpc_exact_route_matches(method, path, "GET", "/pool/payouts/pending") {
-            match load_pool_ledger_snapshot_with_retry(&pool_ledger_db_path)? {
-                Some(snapshot) => {
-                    let payload = PoolPayoutsRpcResponse {
-                        network_id: snapshot.network_id.clone(),
-                        source: pool_ledger_db_path.display().to_string(),
-                        count: snapshot.pending_payouts.len(),
-                        payouts: snapshot.pending_payouts,
-                    };
-                    match to_pretty_json(&payload) {
-                        Ok(body) => ("200 OK", body),
-                        Err(e) => (
-                            "500 Internal Server Error",
-                            json_error_body(&format!("pool payout serialization failed: {e}")),
-                        ),
-                    }
-                }
-                None => (
-                    "404 Not Found",
-                    json_error_body("pool ledger snapshot not available"),
-                ),
-            }
-        } else if rpc_exact_route_matches(method, path, "GET", "/pool/payouts/completed") {
-            match load_pool_ledger_snapshot_with_retry(&pool_ledger_db_path)? {
-                Some(snapshot) => {
-                    let payload = PoolPayoutsRpcResponse {
-                        network_id: snapshot.network_id.clone(),
-                        source: pool_ledger_db_path.display().to_string(),
-                        count: snapshot.completed_payouts.len(),
-                        payouts: snapshot.completed_payouts,
-                    };
-                    match to_pretty_json(&payload) {
-                        Ok(body) => ("200 OK", body),
-                        Err(e) => (
-                            "500 Internal Server Error",
-                            json_error_body(&format!("pool payout serialization failed: {e}")),
-                        ),
-                    }
-                }
-                None => (
-                    "404 Not Found",
-                    json_error_body("pool ledger snapshot not available"),
-                ),
-            }
-        } else if rpc_exact_route_matches(method, path, "GET", "/mempool") {
-            let (mempool_tx_count, mempool_txids) = if mempool_db_path.exists() {
-                match load_mempool_from_db_or_empty_with_retry(
-                    &cfg,
-                    &mempool_db_path,
-                    rpc_db_retry_attempts(),
-                    rpc_db_retry_backoff_ms(),
-                ) {
-                    Ok(mut mempool) => {
-                        let removed_confirmed =
-                            cleanup_mempool_against_chain(&runtime, &mut mempool);
-                        if should_persist_startup_mempool_cleanup(removed_confirmed)
-                            && let Err(err) = persist_mempool_db_with_retry(
-                                &cfg,
-                                &mut mempool,
-                                &mempool_db_path,
-                                rpc_db_retry_attempts(),
-                                rpc_db_retry_backoff_ms(),
-                            )
-                        {
-                            if mempool_cleanup_persist_is_fatal(&err) {
-                                let body = json_error_body(&format!(
-                                    "mempool db persist after confirmed-prune failed ({}): {err}",
-                                    mempool_db_path.display()
-                                ));
-                                write_http_json_response(
-                                    &mut stream,
-                                    "500 Internal Server Error",
-                                    &body,
-                                )?;
-                                continue;
-                            }
-                            eprintln!(
-                                "warning: mempool db cleanup persist lock contention ({}): {err}",
-                                mempool_db_path.display()
-                            );
-                        }
-                        (
-                            Some(mempool.len()),
-                            mempool
-                                .txids_by_feerate_desc()
-                                .into_iter()
-                                .map(|txid| txid.to_hex())
-                                .collect::<Vec<_>>(),
-                        )
-                    }
-                    Err(err) => {
-                        if mempool_summary_should_fallback_on_error(&err) {
-                            eprintln!(
-                                "warning: mempool db lock contention while serving /mempool ({}): {err}",
-                                mempool_db_path.display()
-                            );
-                            (None, Vec::new())
-                        } else {
-                            let body = json_error_body(&format!(
-                                "mempool db load failed ({}): {err}",
-                                mempool_db_path.display()
-                            ));
-                            write_http_json_response(
-                                &mut stream,
-                                "500 Internal Server Error",
-                                &body,
-                            )?;
-                            continue;
-                        }
-                    }
-                }
-            } else {
-                (None, Vec::new())
-            };
-            let summary = if let Some(telemetry_path) = relay_telemetry.as_ref() {
-                match load_latest_jsonl_record::<RelayServerTelemetrySnapshot>(telemetry_path) {
-                    Ok(Some(snapshot)) => MempoolSummaryRpcResponse {
-                        available: true,
-                        source: telemetry_path.display().to_string(),
-                        snapshot: Some(snapshot),
-                        tx_count: mempool_tx_count,
-                        txids: mempool_txids.clone(),
-                    },
-                    Ok(None) => MempoolSummaryRpcResponse {
-                        available: mempool_tx_count.is_some(),
-                        source: telemetry_path.display().to_string(),
-                        snapshot: None,
-                        tx_count: mempool_tx_count,
-                        txids: mempool_txids.clone(),
-                    },
-                    Err(err) => {
-                        let body = json_error_body(&err.to_string());
-                        write_http_json_response(&mut stream, "500 Internal Server Error", &body)?;
-                        continue;
-                    }
-                }
-            } else {
-                MempoolSummaryRpcResponse {
-                    available: mempool_tx_count.is_some(),
-                    source: format!("mempool db: {}", mempool_db_path.display()),
-                    snapshot: None,
-                    tx_count: mempool_tx_count,
-                    txids: mempool_txids,
-                }
-            };
-            match to_pretty_json(&summary) {
-                Ok(body) => ("200 OK", body),
-                Err(e) => (
-                    "500 Internal Server Error",
-                    json_error_body(&format!("mempool summary serialization failed: {e}")),
-                ),
-            }
-        } else if let Some(height_raw) = rpc_block_height_path(method, path) {
-            match height_raw.parse::<u64>() {
-                Ok(height) => match runtime.block_hash_at_height(height) {
-                    Some(hash) => match runtime.block_by_hash(&hash) {
-                        Some(block) => {
-                            let payload = block_lookup_response(height, block);
-                            match to_pretty_json(&payload) {
-                                Ok(body) => ("200 OK", body),
-                                Err(e) => (
-                                    "500 Internal Server Error",
-                                    json_error_body(&format!("block serialization failed: {e}")),
-                                ),
-                            }
-                        }
-                        None => (
-                            "500 Internal Server Error",
-                            json_error_body(&format!("block for height {height} missing")),
-                        ),
-                    },
-                    None => (
-                        "404 Not Found",
-                        json_error_body(&format!("height {height} not found")),
-                    ),
-                },
-                Err(_) => (
-                    "400 Bad Request",
-                    json_error_body("invalid block height, expected unsigned integer"),
-                ),
-            }
-        } else if let Some((height_raw, index_raw, has_extra)) = rpc_tx_path_parts(method, path) {
-            if rpc_tx_path_is_invalid(height_raw, index_raw, has_extra) {
-                (
-                    "400 Bad Request",
-                    json_error_body("tx path must be /tx/<height>/<index>"),
-                )
-            } else {
-                match parse_tx_height_and_index(height_raw, index_raw) {
-                    Some((height, index)) => match runtime.block_hash_at_height(height) {
-                        Some(hash) => match runtime.block_by_hash(&hash) {
-                            Some(block) => match block.transactions.get(index) {
-                                Some(tx) => {
-                                    let payload = tx_lookup_response(height, index, tx);
-                                    match to_pretty_json(&payload) {
-                                        Ok(body) => ("200 OK", body),
-                                        Err(e) => (
-                                            "500 Internal Server Error",
-                                            json_error_body(&format!(
-                                                "tx serialization failed: {e}"
-                                            )),
-                                        ),
-                                    }
-                                }
-                                None => (
-                                    "404 Not Found",
-                                    json_error_body(&format!(
-                                        "tx index {index} not found in block at height {height}"
-                                    )),
-                                ),
-                            },
-                            None => (
-                                "500 Internal Server Error",
-                                json_error_body(&format!("block for height {height} missing")),
-                            ),
-                        },
-                        None => (
-                            "404 Not Found",
-                            json_error_body(&format!("height {height} not found")),
-                        ),
-                    },
-                    None => (
-                        "400 Bad Request",
-                        json_error_body("invalid tx path numbers, expected /tx/<height>/<index>"),
-                    ),
-                }
-            }
-        } else if let Some(txid_raw) = rpc_txid_path(method, path) {
-            if rpc_txid_path_is_invalid(txid_raw) {
-                (
-                    "400 Bad Request",
-                    json_error_body("txid path must be /txid/<hex-txid>"),
-                )
-            } else {
-                match Hash256::from_hex(txid_raw) {
-                    Ok(needle_txid) => {
-                        let mut located = None;
-                        for height in (0..=runtime.tip_height()).rev() {
-                            let Some(block_hash) = runtime.block_hash_at_height(height) else {
-                                continue;
-                            };
-                            let Some(block) = runtime.block_by_hash(&block_hash) else {
-                                continue;
-                            };
-                            if let Some((index, tx)) = find_tx_by_txid(block, needle_txid) {
-                                located =
-                                    Some((height, index, tx_lookup_response(height, index, tx)));
-                                break;
-                            }
-                        }
-                        match located {
-                            Some((_height, _index, payload)) => match to_pretty_json(&payload) {
-                                Ok(body) => ("200 OK", body),
-                                Err(e) => (
-                                    "500 Internal Server Error",
-                                    json_error_body(&format!("tx serialization failed: {e}")),
-                                ),
-                            },
-                            None => (
-                                "404 Not Found",
-                                json_error_body(&format!("txid {txid_raw} not found")),
-                            ),
-                        }
-                    }
-                    Err(_) => (
-                        "400 Bad Request",
-                        json_error_body("invalid txid hex, expected 32-byte hash"),
-                    ),
-                }
-            }
-        } else if rpc_exact_route_matches(method, path, "POST", "/wallet/new") {
-            let req = match parse_json_body::<WalletNewRpcRequest>(&request) {
-                Ok(value) => value,
-                Err(err) => {
-                    let body = json_error_body(&err.to_string());
-                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
-                    continue;
-                }
-            };
-            let mnemonic = match new_mnemonic(req.words) {
-                Ok(value) => value,
-                Err(err) => {
-                    let body = json_error_body(&err.to_string());
-                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
-                    continue;
-                }
-            };
-            let seed_mode = match wallet_seed_mode_from_request(req.seed_mode.as_deref()) {
-                Ok(mode) => mode,
-                Err(err) => {
-                    let body = json_error_body(&err.to_string());
-                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
-                    continue;
-                }
-            };
-            let seed = mnemonic.to_seed_with_mode(&req.passphrase, seed_mode);
-            let key = match derive_wallet_key(&seed, req.account, req.index) {
-                Ok(value) => value,
-                Err(err) => {
-                    let body = json_error_body(&err.to_string());
-                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
-                    continue;
-                }
-            };
-            let hrp = req.hrp.unwrap_or_else(|| cfg.hrp.clone());
-            let payload = match wallet_address_response(&cfg, req.account, req.index, &hrp, &key) {
-                Ok(value) => value,
-                Err(err) => {
-                    let body = json_error_body(&err.to_string());
-                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
-                    continue;
-                }
-            };
-            let body = serde_json::json!({
-                "mnemonic": mnemonic.phrase(),
-                "network_id": payload.network_id,
-                "hrp": payload.hrp,
-                "account": payload.account,
-                "index": payload.index,
-                "address": payload.address,
-                "pubkey_compressed_hex": payload.pubkey_compressed_hex,
-                "key_hash20_hex": payload.key_hash20_hex
-            });
-            match serde_json::to_string_pretty(&body) {
-                Ok(rendered) => ("200 OK", rendered),
-                Err(e) => (
-                    "500 Internal Server Error",
-                    json_error_body(&format!("wallet new serialization failed: {e}")),
-                ),
-            }
-        } else if rpc_exact_route_matches(method, path, "POST", "/wallet/address") {
-            let req = match parse_json_body::<WalletAddressRpcRequest>(&request) {
-                Ok(value) => value,
-                Err(err) => {
-                    let body = json_error_body(&err.to_string());
-                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
-                    continue;
-                }
-            };
-            let seed_mode = match wallet_seed_mode_from_request(req.seed_mode.as_deref()) {
-                Ok(mode) => mode,
-                Err(err) => {
-                    let body = json_error_body(&err.to_string());
-                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
-                    continue;
-                }
-            };
-            let seed = match wallet_seed_from_mnemonic(&req.mnemonic, &req.passphrase, seed_mode) {
-                Ok(seed) => seed,
-                Err(err) => {
-                    let body = json_error_body(&err.to_string());
-                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
-                    continue;
-                }
-            };
-            let (key, account, index) = match derive_wallet_key_from_request(
-                &seed,
-                req.path.as_deref(),
-                req.account,
-                req.index,
-            ) {
-                Ok(value) => value,
-                Err(err) => {
-                    let body = json_error_body(&err.to_string());
-                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
-                    continue;
-                }
-            };
-            let hrp = req.hrp.unwrap_or_else(|| cfg.hrp.clone());
-            let payload = match wallet_address_response(&cfg, account, index, &hrp, &key) {
-                Ok(value) => value,
-                Err(err) => {
-                    let body = json_error_body(&err.to_string());
-                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
-                    continue;
-                }
-            };
-            match to_pretty_json(&payload) {
-                Ok(body) => ("200 OK", body),
-                Err(e) => (
-                    "500 Internal Server Error",
-                    json_error_body(&format!("wallet address serialization failed: {e}")),
-                ),
-            }
-        } else if rpc_exact_route_matches(method, path, "POST", "/wallet/decode") {
-            let req = match parse_json_body::<WalletDecodeRpcRequest>(&request) {
-                Ok(value) => value,
-                Err(err) => {
-                    let body = json_error_body(&err.to_string());
-                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
-                    continue;
-                }
-            };
-            let decoded = match parse_address(&req.address) {
-                Ok(value) => value,
-                Err(err) => {
-                    let body = json_error_body(&err.to_string());
-                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
-                    continue;
-                }
-            };
-            let payload = WalletDecodeRpcResponse {
-                hrp: decoded.hrp,
-                key_hash20_hex: hex::encode(decoded.key_hash20),
-            };
-            match to_pretty_json(&payload) {
-                Ok(body) => ("200 OK", body),
-                Err(e) => (
-                    "500 Internal Server Error",
-                    json_error_body(&format!("wallet decode serialization failed: {e}")),
-                ),
-            }
-        } else if rpc_exact_route_matches(method, path, "POST", "/wallet/balance") {
-            let req = match parse_json_body::<WalletBalanceRpcRequest>(&request) {
-                Ok(value) => value,
-                Err(err) => {
-                    let body = json_error_body(&err.to_string());
-                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
-                    continue;
-                }
-            };
-            let seed_mode = match wallet_seed_mode_from_request(req.seed_mode.as_deref()) {
-                Ok(mode) => mode,
-                Err(err) => {
-                    let body = json_error_body(&err.to_string());
-                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
-                    continue;
-                }
-            };
-            let seed = match wallet_seed_from_mnemonic(&req.mnemonic, &req.passphrase, seed_mode) {
-                Ok(seed) => seed,
-                Err(err) => {
-                    let body = json_error_body(&err.to_string());
-                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
-                    continue;
-                }
-            };
-            let (key, account, index) = match derive_wallet_key_from_request(
-                &seed,
-                req.path.as_deref(),
-                req.account,
-                req.index,
-            ) {
-                Ok(value) => value,
-                Err(err) => {
-                    let body = json_error_body(&err.to_string());
-                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
-                    continue;
-                }
-            };
-            let address_payload =
-                match wallet_address_response(&cfg, account, index, &cfg.hrp, &key) {
-                    Ok(value) => value,
-                    Err(err) => {
-                        let body = json_error_body(&err.to_string());
-                        write_http_json_response(&mut stream, "400 Bad Request", &body)?;
-                        continue;
-                    }
-                };
-            let key_hash20 = scam_core::hash160_blake3(&key.pubkey_compressed());
-            let payload = wallet_balance_response(
-                &runtime,
-                &cfg,
-                account,
-                index,
-                address_payload.address,
-                key_hash20,
-            );
-            match to_pretty_json(&payload) {
-                Ok(body) => ("200 OK", body),
-                Err(e) => (
-                    "500 Internal Server Error",
-                    json_error_body(&format!("wallet balance serialization failed: {e}")),
-                ),
-            }
-        } else if rpc_exact_route_matches(method, path, "POST", "/wallet/balance-by-address") {
-            let req = match parse_json_body::<WalletBalanceByAddressRpcRequest>(&request) {
-                Ok(value) => value,
-                Err(err) => {
-                    let body = json_error_body(&err.to_string());
-                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
-                    continue;
-                }
-            };
-            let decoded = match parse_address(&req.address) {
-                Ok(value) => value,
-                Err(err) => {
-                    let body = json_error_body(&err.to_string());
-                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
-                    continue;
-                }
-            };
-            let accepted_hrps = accepted_hrps_for_network(network, &cfg.hrp);
-            if should_reject_send_preview_hrp(&accepted_hrps, &decoded.hrp) {
-                let body = json_error_body(&format!(
-                    "address hrp '{}' is not valid for network '{}' (accepted: {})",
-                    decoded.hrp,
-                    cfg.network_id,
-                    accepted_hrps.join(", ")
-                ));
-                write_http_json_response(&mut stream, "400 Bad Request", &body)?;
-                continue;
-            }
-            let payload =
-                wallet_balance_response(&runtime, &cfg, 0, 0, req.address, decoded.key_hash20);
-            match to_pretty_json(&payload) {
-                Ok(body) => ("200 OK", body),
-                Err(e) => (
-                    "500 Internal Server Error",
-                    json_error_body(&format!(
-                        "wallet balance-by-address serialization failed: {e}"
-                    )),
-                ),
-            }
-        } else if rpc_exact_route_matches(
-            method,
-            path,
-            "POST",
-            "/wallet/balance-history-by-address",
-        ) {
-            let req = match parse_json_body::<WalletBalanceHistoryByAddressRpcRequest>(&request) {
-                Ok(value) => value,
-                Err(err) => {
-                    let body = json_error_body(&err.to_string());
-                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
-                    continue;
-                }
-            };
-            let decoded = match parse_address(&req.address) {
-                Ok(value) => value,
-                Err(err) => {
-                    let body = json_error_body(&err.to_string());
-                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
-                    continue;
-                }
-            };
-            let accepted_hrps = accepted_hrps_for_network(network, &cfg.hrp);
-            if should_reject_send_preview_hrp(&accepted_hrps, &decoded.hrp) {
-                let body = json_error_body(&format!(
-                    "address hrp '{}' is not valid for network '{}' (accepted: {})",
-                    decoded.hrp,
-                    cfg.network_id,
-                    accepted_hrps.join(", ")
-                ));
-                write_http_json_response(&mut stream, "400 Bad Request", &body)?;
-                continue;
-            }
-            let balance =
-                wallet_balance_response(&runtime, &cfg, 0, 0, req.address, decoded.key_hash20);
-            let tx_history =
-                wallet_tx_history_for_key_hash(&runtime, decoded.key_hash20, req.max_entries);
-            let payload = WalletBalanceHistoryRpcResponse {
-                balance,
-                tx_history,
-            };
-            match to_pretty_json(&payload) {
-                Ok(body) => ("200 OK", body),
-                Err(e) => (
-                    "500 Internal Server Error",
-                    json_error_body(&format!(
-                        "wallet balance-history-by-address serialization failed: {e}"
-                    )),
-                ),
-            }
-        } else if rpc_exact_route_matches(method, path, "POST", "/wallet/send-preview") {
-            let req = match parse_json_body::<WalletSendPreviewRpcRequest>(&request) {
-                Ok(value) => value,
-                Err(err) => {
-                    let body = json_error_body(&err.to_string());
-                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
-                    continue;
-                }
-            };
-            if wallet_send_preview_has_invalid_amount(req.amount) {
-                let body = json_error_body("amount must be > 0");
-                write_http_json_response(&mut stream, "400 Bad Request", &body)?;
-                continue;
-            }
-            let recipient = match parse_address(&req.to) {
-                Ok(value) => value,
-                Err(err) => {
-                    let body = json_error_body(&err.to_string());
-                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
-                    continue;
-                }
-            };
-            let accepted_hrps = accepted_hrps_for_network(network, &cfg.hrp);
-            if should_reject_send_preview_hrp(&accepted_hrps, &recipient.hrp) {
-                let body = json_error_body(&format!(
-                    "address hrp '{}' is not valid for network '{}' (accepted: {})",
-                    recipient.hrp,
-                    cfg.network_id,
-                    accepted_hrps.join(", ")
-                ));
-                write_http_json_response(&mut stream, "400 Bad Request", &body)?;
-                continue;
-            }
-            let seed_mode = match wallet_seed_mode_from_request(req.seed_mode.as_deref()) {
-                Ok(mode) => mode,
-                Err(err) => {
-                    let body = json_error_body(&err.to_string());
-                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
-                    continue;
-                }
-            };
-            let seed = match wallet_seed_from_mnemonic(&req.mnemonic, &req.passphrase, seed_mode) {
-                Ok(seed) => seed,
-                Err(err) => {
-                    let body = json_error_body(&err.to_string());
-                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
-                    continue;
-                }
-            };
-            let (key, _account, _index) = match derive_wallet_key_from_request(
-                &seed,
-                req.path.as_deref(),
-                req.account,
-                req.index,
-            ) {
-                Ok(value) => value,
-                Err(err) => {
-                    let body = json_error_body(&err.to_string());
-                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
-                    continue;
-                }
-            };
-            let reserved_outpoints = match load_wallet_reserved_outpoints(&cfg, &mempool_db_path) {
-                Ok(value) => value,
-                Err(err) => {
-                    let body = json_error_body(&format!(
-                        "wallet send-preview failed to load mempool state: {err}"
-                    ));
-                    write_http_json_response(&mut stream, "500 Internal Server Error", &body)?;
-                    continue;
-                }
-            };
-            let signed = match build_signed_transfer_tx_auto_fee(
-                &runtime,
-                &cfg.network_id,
-                &key,
-                recipient.key_hash20,
-                req.amount,
-                req.fee,
-                &reserved_outpoints,
-            ) {
-                Ok(value) => value,
-                Err(err) => {
-                    let body = json_error_body(&err.to_string());
-                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
-                    continue;
-                }
-            };
-            let payload = WalletSendPreviewRpcResponse {
-                network_id: cfg.network_id.clone(),
-                txid: signed.tx.txid().to_hex(),
-                raw_tx_hex: hex::encode(signed.tx.encode_for_hash()),
-                tx_bincode_hex: hex::encode(
-                    bincode::serialize(&signed.tx)
-                        .map_err(|e| NodeError::Runtime(format!("tx encode failed: {e}")))?,
-                ),
-                amount: req.amount,
-                fee: signed.fee(),
-                input_total: signed.input_total,
-                change: signed.change_value,
-                is_self_transfer: signed.is_self_transfer,
-                selected_inputs: signed
-                    .selected_inputs
-                    .into_iter()
-                    .map(|item| WalletSendPreviewInput {
-                        txid: item.outpoint.txid.to_hex(),
-                        vout: item.outpoint.vout,
-                        value: item.value,
-                    })
-                    .collect(),
-            };
-            match to_pretty_json(&payload) {
-                Ok(body) => ("200 OK", body),
-                Err(e) => (
-                    "500 Internal Server Error",
-                    json_error_body(&format!("wallet send serialization failed: {e}")),
-                ),
-            }
-        } else if rpc_exact_route_matches(method, path, "POST", "/wallet/send") {
-            let req = match parse_json_body::<WalletSendPreviewRpcRequest>(&request) {
-                Ok(value) => value,
-                Err(err) => {
-                    let body = json_error_body(&err.to_string());
-                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
-                    continue;
-                }
-            };
-            if wallet_send_preview_has_invalid_amount(req.amount) {
-                let body = json_error_body("amount must be > 0");
-                write_http_json_response(&mut stream, "400 Bad Request", &body)?;
-                continue;
-            }
-            let recipient = match parse_address(&req.to) {
-                Ok(value) => value,
-                Err(err) => {
-                    let body = json_error_body(&err.to_string());
-                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
-                    continue;
-                }
-            };
-            let accepted_hrps = accepted_hrps_for_network(network, &cfg.hrp);
-            if should_reject_send_preview_hrp(&accepted_hrps, &recipient.hrp) {
-                let body = json_error_body(&format!(
-                    "address hrp '{}' is not valid for network '{}' (accepted: {})",
-                    recipient.hrp,
-                    cfg.network_id,
-                    accepted_hrps.join(", ")
-                ));
-                write_http_json_response(&mut stream, "400 Bad Request", &body)?;
-                continue;
-            }
-            let seed_mode = match wallet_seed_mode_from_request(req.seed_mode.as_deref()) {
-                Ok(mode) => mode,
-                Err(err) => {
-                    let body = json_error_body(&err.to_string());
-                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
-                    continue;
-                }
-            };
-            let seed = match wallet_seed_from_mnemonic(&req.mnemonic, &req.passphrase, seed_mode) {
-                Ok(seed) => seed,
-                Err(err) => {
-                    let body = json_error_body(&err.to_string());
-                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
-                    continue;
-                }
-            };
-            let (key, _account, _index) = match derive_wallet_key_from_request(
-                &seed,
-                req.path.as_deref(),
-                req.account,
-                req.index,
-            ) {
-                Ok(value) => value,
-                Err(err) => {
-                    let body = json_error_body(&err.to_string());
-                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
-                    continue;
-                }
-            };
-            let reserved_outpoints = match load_wallet_reserved_outpoints(&cfg, &mempool_db_path) {
-                Ok(value) => value,
-                Err(err) => {
-                    let body = json_error_body(&format!(
-                        "wallet send failed to load mempool state: {err}"
-                    ));
-                    write_http_json_response(&mut stream, "500 Internal Server Error", &body)?;
-                    continue;
-                }
-            };
-            let signed = match build_signed_transfer_tx_auto_fee(
-                &runtime,
-                &cfg.network_id,
-                &key,
-                recipient.key_hash20,
-                req.amount,
-                req.fee,
-                &reserved_outpoints,
-            ) {
-                Ok(value) => value,
-                Err(err) => {
-                    let body = json_error_body(&err.to_string());
-                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
-                    continue;
-                }
-            };
-            let (txid, outcome, effective_fee) =
-                match submit_tx_via_mempool_db_for_runtime_with_retry(
-                    &cfg,
-                    &runtime,
-                    &mempool_db_path,
-                    signed.tx.clone(),
-                    0,
-                    rpc_db_retry_attempts(),
-                    rpc_db_retry_backoff_ms(),
-                ) {
-                    Ok(value) => value,
-                    Err(err) => {
-                        let body = json_error_body(&err.to_string());
-                        write_http_json_response(&mut stream, "400 Bad Request", &body)?;
-                        continue;
-                    }
-                };
-            let payload = WalletSendRpcResponse {
-                network_id: cfg.network_id.clone(),
-                txid: txid.to_hex(),
-                fee: effective_fee,
-                amount: req.amount,
-                input_total: signed.input_total,
-                change: signed.change_value,
-                is_self_transfer: signed.is_self_transfer,
-                mempool_outcome: outcome,
-                selected_inputs: signed
-                    .selected_inputs
-                    .into_iter()
-                    .map(|item| WalletSendPreviewInput {
-                        txid: item.outpoint.txid.to_hex(),
-                        vout: item.outpoint.vout,
-                        value: item.value,
-                    })
-                    .collect(),
-            };
-            match to_pretty_json(&payload) {
-                Ok(body) => ("200 OK", body),
-                Err(e) => (
-                    "500 Internal Server Error",
-                    json_error_body(&format!("wallet send serialization failed: {e}")),
-                ),
-            }
-        } else if rpc_exact_route_matches(method, path, "POST", "/tx/submit") {
-            let req = match parse_json_body::<TxSubmitRpcRequest>(&request) {
-                Ok(value) => value,
-                Err(err) => {
-                    let body = json_error_body(&err.to_string());
-                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
-                    continue;
-                }
-            };
-            let (tx, requested_fee) = match decode_tx_submit_request(&req) {
-                Ok(value) => value,
-                Err(err) => {
-                    let body = json_error_body(&err.to_string());
-                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
-                    continue;
-                }
-            };
-            let (txid, outcome, effective_fee) =
-                match submit_tx_via_mempool_db_for_runtime_with_retry(
-                    &cfg,
-                    &runtime,
-                    &mempool_db_path,
-                    tx,
-                    requested_fee,
-                    rpc_db_retry_attempts(),
-                    rpc_db_retry_backoff_ms(),
-                ) {
-                    Ok(value) => value,
-                    Err(err) => {
-                        let body = json_error_body(&err.to_string());
-                        write_http_json_response(&mut stream, "400 Bad Request", &body)?;
-                        continue;
-                    }
-                };
-            let payload = TxSubmitRpcResponse {
-                network_id: cfg.network_id.clone(),
-                txid: txid.to_hex(),
-                fee: effective_fee,
-                mempool_outcome: outcome,
-            };
-            match to_pretty_json(&payload) {
-                Ok(body) => ("200 OK", body),
-                Err(e) => (
-                    "500 Internal Server Error",
-                    json_error_body(&format!("tx submit serialization failed: {e}")),
-                ),
-            }
-        } else if rpc_exact_route_matches(method, path, "POST", "/wallet/qr") {
-            let req = match parse_json_body::<WalletQrRpcRequest>(&request) {
-                Ok(value) => value,
-                Err(err) => {
-                    let body = json_error_body(&err.to_string());
-                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
-                    continue;
-                }
-            };
-            if req.address.trim().is_empty() {
-                let body = json_error_body("address must not be empty");
-                write_http_json_response(&mut stream, "400 Bad Request", &body)?;
-                continue;
-            }
-            let ascii = match qr_for_payment_uri(&req.address, req.amount, req.label.as_deref()) {
-                Ok(value) => value,
-                Err(err) => {
-                    let body = json_error_body(&err.to_string());
-                    write_http_json_response(&mut stream, "400 Bad Request", &body)?;
-                    continue;
-                }
-            };
-            let payload = WalletQrRpcResponse { ascii };
-            match to_pretty_json(&payload) {
-                Ok(body) => ("200 OK", body),
-                Err(e) => (
-                    "500 Internal Server Error",
-                    json_error_body(&format!("wallet qr serialization failed: {e}")),
-                ),
-            }
-        } else {
-            let ui_served = if should_attempt_ui_asset_serve(method) {
-                try_serve_ui_asset(&mut stream, &ui_dir, path)?
-            } else {
-                false
-            };
-            if should_serve_ui_asset_for_route(method, ui_served) {
-                served = served.saturating_add(1);
-                if max_requests_limit_hit(max_requests, served) {
-                    break;
-                }
-                continue;
-            }
-            ("404 Not Found", json_error_body("unknown endpoint"))
-        };
-
-        write_http_json_response(&mut stream, status, &body)?;
-        served = served.saturating_add(1);
-        if max_requests_limit_hit(max_requests, served) {
-            break;
-        }
-    }
-    events_stop_flag.store(true, Ordering::Relaxed);
-    for handle in events_workers {
-        let _ = handle.join();
-    }
-    Ok(())
-}
-
 fn run_rpc_serve_inner(
     args: RpcServeArgs,
     shutdown_flag: Option<Arc<AtomicBool>>,
 ) -> Result<(), NodeError> {
-    match rpc_http_backend_from_env() {
-        RpcHttpBackend::Legacy => run_rpc_serve_inner_legacy(args, shutdown_flag),
-        RpcHttpBackend::Axum => run_rpc_serve_inner_axum(args, shutdown_flag),
-    }
+    run_rpc_serve_inner_axum(args, shutdown_flag, None)
 }
 
 fn run_rpc_serve(args: RpcServeArgs) -> Result<(), NodeError> {
@@ -22320,6 +20744,7 @@ fn run_command(cli: Cli) -> Result<(), NodeError> {
         Some(Command::NetDemo(args)) => run_net_demo(args),
         Some(Command::SyncPeer(args)) => run_sync_peer(args),
         Some(Command::SyncBook(args)) => run_sync_book(args),
+        Some(Command::Serve(args)) => run_serve(args),
         Some(Command::RelayServe(args)) => run_relay_serve(args),
         Some(Command::ReindexRuntime(args)) => run_reindex_runtime(args),
         Some(Command::Soak(args)) => run_soak(args),
@@ -22371,7 +20796,6 @@ mod tests {
     use std::net::{Shutdown, TcpListener, TcpStream};
     use std::path::PathBuf;
     use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
     use std::sync::mpsc;
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -22712,11 +21136,9 @@ mod tests {
         let state = super::AxumRpcState {
             network: Network::Devnet,
             cfg: cfg.clone(),
-            runtime_db_path: work_dir.join("runtime.redb"),
-            runtime_cache: Arc::new(std::sync::Mutex::new(super::AxumRuntimeCache {
-                runtime: ChainRuntime::from_config(cfg.clone()).expect("runtime"),
-                last_seen_mtime: None,
-            })),
+            chain: super::ChainHandle::Own(Arc::new(std::sync::Mutex::new(
+                ChainRuntime::from_config(cfg.clone()).expect("runtime"),
+            ))),
             mempool_db_path: work_dir.join("mempool.redb"),
             relay_telemetry: None,
             stratum_telemetry: None,
@@ -23112,31 +21534,12 @@ mod tests {
         super::consensus_fingerprint(&cfg)
     }
 
-    fn assert_rpc_route_match_contract_precondition() {
-        assert!(super::rpc_exact_route_matches(
-            "GET", "/health", "GET", "/health"
-        ));
-        assert!(!super::rpc_exact_route_matches(
-            "POST", "/health", "GET", "/health"
-        ));
-        assert!(!super::rpc_exact_route_matches(
-            "GET", "/status", "GET", "/health"
-        ));
-    }
-
     fn allocate_local_addr() -> Option<String> {
         match TcpListener::bind("127.0.0.1:0") {
             Ok(listener) => listener.local_addr().ok().map(|addr| addr.to_string()),
             Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => None,
             Err(err) => panic!("bind failed: {err}"),
         }
-    }
-
-    fn read_http_request_from_raw(
-        raw: &[u8],
-    ) -> Result<Option<super::HttpRequest>, super::NodeError> {
-        let mut cursor = std::io::Cursor::new(raw.to_vec());
-        super::read_http_request(&mut cursor)
     }
 
     async fn axum_response_body_text(response: axum::response::Response) -> String {
@@ -23178,9 +21581,8 @@ mod tests {
     ) -> super::StratumServerContext {
         super::StratumServerContext {
             cfg: cfg.clone(),
-            runtime: std::sync::Arc::new(std::sync::Mutex::new(runtime)),
+            runtime: super::ChainHandle::Own(std::sync::Arc::new(std::sync::Mutex::new(runtime))),
             runtime_db_path,
-            runtime_db_seen_mtime: Arc::new(std::sync::Mutex::new(None)),
             mempool_db_path,
             max_template_txs: cfg.max_mempool_txs as usize,
             share_target: Target::MAX,
@@ -23227,6 +21629,16 @@ mod tests {
         }
     }
 
+    fn test_io_error_is_closed_like(err: &std::io::Error) -> bool {
+        matches!(
+            err.kind(),
+            std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::UnexpectedEof
+        )
+    }
+
     fn send_http_request(addr: &str, request: &str) -> String {
         fn header_end_offset(bytes: &[u8]) -> Option<usize> {
             bytes
@@ -23261,7 +21673,7 @@ mod tests {
                 request.replacen("\r\n\r\n", "\r\nConnection: close\r\n\r\n", 1)
             };
             if let Err(err) = stream.write_all(request_with_close.as_bytes()) {
-                if super::http_io_error_is_closed_like(&err) {
+                if test_io_error_is_closed_like(&err) {
                     last_closed_like_err = Some(err.to_string());
                     continue;
                 }
@@ -23295,7 +21707,7 @@ mod tests {
                             return String::from_utf8_lossy(&response).into_owned();
                         }
                     }
-                    Err(err) if super::http_io_error_is_closed_like(&err) => {
+                    Err(err) if test_io_error_is_closed_like(&err) => {
                         if !response.is_empty() {
                             return String::from_utf8_lossy(&response).into_owned();
                         }
@@ -23444,7 +21856,7 @@ mod tests {
                 {
                     continue;
                 }
-                Err(err) if super::http_io_error_is_closed_like(&err) => break,
+                Err(err) if test_io_error_is_closed_like(&err) => break,
                 Err(err) => panic!("read response: {err}"),
             }
         }
@@ -23937,12 +22349,6 @@ mod tests {
                 std::env::remove_var(STRATUM_STALE_GUARD_LOG_KEY);
             }
         }
-        let lock_err = super::NodeError::Runtime("Database already open".to_owned());
-        let other_err = super::NodeError::Runtime("other error".to_owned());
-        assert!(super::mempool_summary_should_fallback_on_error(&lock_err));
-        assert!(!super::mempool_summary_should_fallback_on_error(&other_err));
-        assert!(!super::mempool_cleanup_persist_is_fatal(&lock_err));
-        assert!(super::mempool_cleanup_persist_is_fatal(&other_err));
 
         assert!(!super::should_emit_periodic_round(1, 2));
         assert!(super::should_emit_periodic_round(2, 2));
@@ -23953,15 +22359,6 @@ mod tests {
 
         assert!(!super::is_tx_flow_enabled(0));
         assert!(super::is_tx_flow_enabled(1));
-        assert!(super::is_pool_worker_route(
-            "GET",
-            "/pool/worker/miner.alpha"
-        ));
-        assert!(!super::is_pool_worker_route(
-            "POST",
-            "/pool/worker/miner.alpha"
-        ));
-        assert!(!super::is_pool_worker_route("GET", "/pool/worker"));
         let recipient = [0x11u8; 20];
         let miner = [0x22u8; 20];
         assert_eq!(
@@ -24057,10 +22454,9 @@ mod tests {
         assert!(!super::relay_io_error_is_closed_like(&io_denied));
         assert!(super::sv2_io_error_is_timeout_like(&io_timeout));
         assert!(!super::sv2_io_error_is_timeout_like(&io_reset));
-        assert!(!super::http_io_error_is_timeout_like(&io_broken_pipe));
-        assert!(super::http_io_error_is_closed_like(&io_reset));
-        assert!(super::http_io_error_is_closed_like(&io_broken_pipe));
-        assert!(!super::http_io_error_is_closed_like(&io_denied));
+        assert!(test_io_error_is_closed_like(&io_reset));
+        assert!(test_io_error_is_closed_like(&io_broken_pipe));
+        assert!(!test_io_error_is_closed_like(&io_denied));
         assert!(super::relay_gossip_error_is_non_fatal(
             &super::GossipError::Recon("received sketch for unknown round salt=7".to_owned())
         ));
@@ -24075,22 +22471,6 @@ mod tests {
         ));
         assert!(!super::relay_gossip_error_is_non_fatal(
             &super::GossipError::UnknownPeer { peer_id: 1 }
-        ));
-        assert!(super::rpc_accept_error_should_retry(
-            true,
-            std::io::ErrorKind::WouldBlock
-        ));
-        assert!(super::rpc_accept_error_should_retry(
-            true,
-            std::io::ErrorKind::Interrupted
-        ));
-        assert!(!super::rpc_accept_error_should_retry(
-            false,
-            std::io::ErrorKind::WouldBlock
-        ));
-        assert!(!super::rpc_accept_error_should_retry(
-            true,
-            std::io::ErrorKind::PermissionDenied
         ));
 
         assert!(!super::should_require_noise_static_key(
@@ -24163,38 +22543,6 @@ mod tests {
         })
         .expect_err("empty tx submit payload must fail");
         assert!(tx_submit_empty.to_string().contains("must not be empty"));
-        assert!(!super::should_reply_bad_http_request(
-            &super::NodeError::Runtime(
-                "http read timeout while waiting for full request: timed out".to_owned()
-            )
-        ));
-        assert!(!super::should_reply_bad_http_request(
-            &super::NodeError::Runtime(
-                "http connection closed while reading request: broken pipe".to_owned()
-            )
-        ));
-        assert!(super::should_reply_bad_http_request(
-            &super::NodeError::Runtime("malformed http request".to_owned())
-        ));
-        assert!(super::rpc_sse_write_error_is_closed_like(
-            &super::NodeError::Runtime("http write failed: Broken pipe".to_owned())
-        ));
-        assert!(super::rpc_sse_write_error_is_closed_like(
-            &super::NodeError::Runtime("http flush failed: Connection reset by peer".to_owned())
-        ));
-        assert!(super::rpc_sse_write_error_is_closed_like(
-            &super::NodeError::Runtime("http flush failed: connection aborted".to_owned())
-        ));
-        assert!(super::rpc_sse_write_error_is_closed_like(
-            &super::NodeError::Runtime("http flush failed: not connected".to_owned())
-        ));
-        assert!(!super::rpc_sse_write_error_is_closed_like(
-            &super::NodeError::Runtime("http write failed: permission denied".to_owned())
-        ));
-        let events_stop = std::sync::atomic::AtomicBool::new(false);
-        assert!(super::rpc_events_worker_should_continue(&events_stop));
-        events_stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        assert!(!super::rpc_events_worker_should_continue(&events_stop));
 
         assert!(super::share_target_in_bounds(
             Target::MAX,
@@ -25575,37 +23923,6 @@ mod tests {
     }
 
     #[test]
-    fn map_rpc_accept_result_retries_only_for_shutdown_nonblocking_errors() {
-        let mapped = super::map_rpc_accept_result(
-            Err(std::io::Error::from(std::io::ErrorKind::Interrupted)),
-            true,
-        )
-        .expect("shutdown mode should treat interrupted accept as retry");
-        assert!(mapped.is_none());
-
-        let retry = super::map_rpc_accept_result(
-            Err(std::io::Error::from(std::io::ErrorKind::WouldBlock)),
-            true,
-        )
-        .expect("shutdown mode should treat would-block as retry");
-        assert!(retry.is_none());
-
-        let no_shutdown = super::map_rpc_accept_result(
-            Err(std::io::Error::from(std::io::ErrorKind::WouldBlock)),
-            false,
-        )
-        .expect_err("without shutdown flag, would-block must be fatal");
-        assert!(no_shutdown.to_string().contains("rpc accept failed"));
-
-        let fatal = super::map_rpc_accept_result(
-            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
-            true,
-        )
-        .expect_err("non-retry io errors must stay fatal");
-        assert!(fatal.to_string().contains("rpc accept failed"));
-    }
-
-    #[test]
     fn handle_runtime_persist_result_only_ignores_lock_conflicts() {
         let tip_hash = Hash256([0xAB; 32]);
         super::handle_runtime_persist_result(Ok(()), tip_hash).expect("ok path");
@@ -25690,84 +24007,6 @@ mod tests {
         .expect_err("error path must bubble up");
         assert!(errored);
         assert!(err.to_string().contains("boom"));
-    }
-
-    #[test]
-    fn rpc_route_helpers_are_strict_for_method_path_and_prefixes() {
-        assert!(super::rpc_exact_route_matches(
-            "GET", "/health", "GET", "/health"
-        ));
-        assert!(!super::rpc_exact_route_matches(
-            "POST", "/health", "GET", "/health"
-        ));
-        assert!(!super::rpc_exact_route_matches(
-            "GET", "/status", "GET", "/health"
-        ));
-        assert!(super::is_get_method("GET"));
-        assert!(!super::is_get_method("POST"));
-
-        assert_eq!(
-            super::rpc_block_height_path("GET", "/block/123"),
-            Some("123")
-        );
-        assert_eq!(super::rpc_block_height_path("POST", "/block/123"), None);
-        assert_eq!(super::rpc_block_height_path("GET", "/status"), None);
-
-        assert_eq!(
-            super::rpc_tx_path_parts("GET", "/tx/10/2"),
-            Some(("10", "2", false))
-        );
-        assert_eq!(
-            super::rpc_tx_path_parts("GET", "/tx/10/2/extra"),
-            Some(("10", "2", true))
-        );
-        assert_eq!(
-            super::rpc_tx_path_parts("GET", "/tx/10"),
-            Some(("10", "", false))
-        );
-        assert_eq!(super::rpc_tx_path_parts("POST", "/tx/10/2"), None);
-        assert_eq!(super::rpc_txid_path("GET", "/txid/abcd"), Some("abcd"));
-        assert_eq!(super::rpc_txid_path("POST", "/txid/abcd"), None);
-        assert_eq!(super::rpc_txid_path("GET", "/tx/10/2"), None);
-        assert!(super::rpc_txid_path_is_invalid(""));
-        assert!(super::rpc_txid_path_is_invalid("aa/bb"));
-        assert!(!super::rpc_txid_path_is_invalid("abcd"));
-
-        assert!(super::rpc_tx_path_is_invalid("10", "2", true));
-        assert!(super::rpc_tx_path_is_invalid("", "2", false));
-        assert!(super::rpc_tx_path_is_invalid("10", "", false));
-        assert!(!super::rpc_tx_path_is_invalid("10", "2", false));
-        assert_eq!(super::parse_tx_height_and_index("10", "2"), Some((10, 2)));
-        assert_eq!(super::parse_tx_height_and_index("ten", "2"), None);
-        assert_eq!(super::parse_tx_height_and_index("10", "two"), None);
-
-        let accepted = vec!["sd".to_owned(), "td".to_owned()];
-        assert!(super::address_hrp_is_accepted(&accepted, "sd"));
-        assert!(!super::address_hrp_is_accepted(&accepted, "s"));
-        assert!(!super::should_reject_send_preview_hrp(&accepted, "sd"));
-        assert!(super::should_reject_send_preview_hrp(&accepted, "s"));
-        assert!(super::should_attempt_ui_asset_serve("GET"));
-        assert!(!super::should_attempt_ui_asset_serve("POST"));
-        assert!(super::should_serve_ui_asset_for_route("GET", true));
-        assert!(!super::should_serve_ui_asset_for_route("GET", false));
-        assert!(!super::should_serve_ui_asset_for_route("POST", true));
-
-        assert!(super::role_service_response_is_empty(0));
-        assert!(!super::role_service_response_is_empty(1));
-    }
-
-    #[test]
-    fn find_tx_by_txid_matches_only_exact_hash() {
-        let cfg: ChainConfig =
-            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
-        let block = cfg.build_genesis_block().expect("genesis block");
-        let txid = block.transactions[0].txid();
-        let found = super::find_tx_by_txid(&block, txid).expect("txid should be found");
-        assert_eq!(found.0, 0);
-        assert_eq!(found.1.txid(), txid);
-
-        let missing = super::find_tx_by_txid(&block, Hash256([0x55; 32]));
-        assert!(missing.is_none(), "non-matching txid must not be returned");
     }
 
     #[test]
@@ -27559,6 +25798,130 @@ mod tests {
         tx
     }
 
+    #[test]
+    fn serve_service_options_split_like_a_shell_and_parse_as_their_commands() {
+        assert_eq!(
+            super::split_service_args(
+                r#"--bind 127.0.0.1:1 --ui-dir 'my web' --x "a \"b\"" --p C:\web\ui"#
+            )
+            .expect("split"),
+            vec![
+                "--bind",
+                "127.0.0.1:1",
+                "--ui-dir",
+                "my web",
+                "--x",
+                "a \"b\"",
+                "--p",
+                "C:\\web\\ui"
+            ]
+        );
+        assert!(super::split_service_args("--bind 'open").is_err());
+        let rpc = super::parse_service_args::<super::RpcServiceCli>(
+            "rpc",
+            "--bind 127.0.0.1:19080 --disable-wallet-rpc",
+        )
+        .expect("rpc options");
+        assert_eq!(rpc.args.bind, "127.0.0.1:19080");
+        assert!(rpc.args.disable_wallet_rpc);
+        let err = super::parse_service_args::<super::StratumServiceCli>("stratum", "--no-such")
+            .err()
+            .expect("unknown option");
+        assert!(err.to_string().contains("--stratum"));
+    }
+
+    /// S1/S2/S6: in `serve` the RPC and the pool work on the node's own
+    /// chain and mempool: a tx submitted over RPC is in the mempool the pool
+    /// builds templates from, a block the pool finds is the RPC's tip at once
+    /// (no DB round trip) and its txs leave the mempool.
+    #[test]
+    fn serve_services_share_the_nodes_chain_and_mempool() {
+        let (cfg, runtime, key, outpoint) = relay_funded_runtime_for_pool();
+        let value = runtime.utxo_set().get(&outpoint).expect("utxo").value;
+        let tx = signed_pool_test_tx(&cfg, &key, outpoint, value - 100_000);
+        let txid = tx.txid();
+        let work_dir = temp_dir("test-serve-shared-node");
+        fs::create_dir_all(&work_dir).expect("mkdir");
+        let mempool_db = work_dir.join("mempool.redb");
+        let relay = RelayAdmissionState {
+            mempool: build_mempool_from_cfg(&cfg).expect("mempool"),
+            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
+                .expect("orphan"),
+            gossip: GossipEngine::new(64).expect("gossip"),
+        };
+        let node: super::SharedNode =
+            Arc::new(std::sync::Mutex::new(RelayServerState::new(runtime, relay)));
+        let rpc_chain = super::ChainHandle::Node(node.clone());
+        let pool_chain = super::ChainHandle::Node(node.clone());
+
+        // RPC submit lands in the node's mempool (and its DB).
+        let (submitted, outcome, _fee) = rpc_chain
+            .submit_tx(&cfg, &mempool_db, &tx, 0)
+            .expect("rpc submit");
+        assert_eq!(submitted, txid);
+        assert_eq!(outcome, "accepted");
+        assert!(node.lock().expect("node").relay.mempool.contains(&txid));
+        assert!(
+            super::load_mempool_from_db_or_empty(&cfg, &mempool_db)
+                .expect("mempool db")
+                .contains(&txid)
+        );
+
+        // The pool's template draws from that same mempool.
+        let block = {
+            let guard = pool_chain.lock().expect("pool lock");
+            let (chain, mempool) = guard
+                .chain_and_mempool(&cfg, &mempool_db)
+                .expect("chain and mempool");
+            let work = super::StratumTemplateProvider::build_template(
+                &super::RuntimeTemplateProvider,
+                chain,
+                &cfg,
+                &mempool,
+                16,
+                [7u8; 20],
+                "serve-test",
+            )
+            .expect("template");
+            assert!(work.block_txs.iter().any(|t| t.txid() == txid));
+            mine_block(
+                &BlockTemplate {
+                    version: work.template.version,
+                    prev_block: work.template.prev_hash,
+                    timestamp: work.template.ntime,
+                    target: work.template.network_target,
+                    transactions: work.block_txs,
+                },
+                2_000_000,
+            )
+            .expect("mine")
+        };
+        {
+            let mut guard = pool_chain.lock().expect("pool lock");
+            let chain_before = guard.block_hashes().to_vec();
+            guard.submit_block(block).expect("submit");
+            guard
+                .after_local_block(&chain_before, &cfg, &mempool_db, &[txid], 1)
+                .expect("after block");
+        }
+        let rpc_tip = match &rpc_chain {
+            super::ChainHandle::Node(node) => node.lock().expect("node").runtime.tip_height(),
+            super::ChainHandle::Own(_) => unreachable!(),
+        };
+        assert_eq!(rpc_tip, 1, "the RPC sees the pool's block immediately");
+        assert!(
+            !node.lock().expect("node").relay.mempool.contains(&txid),
+            "confirmed tx left the node mempool"
+        );
+        assert!(
+            !super::load_mempool_from_db_or_empty(&cfg, &mempool_db)
+                .expect("mempool db")
+                .contains(&txid),
+            "and its DB"
+        );
+        let _ = fs::remove_dir_all(work_dir);
+    }
+
     /// ST4: a version is replaced only when it can no longer confirm, and
     /// then by a version spending the same lineage coin; with the lineage
     /// coin gone a relayed version is replaced only after the conflict is
@@ -28424,9 +26787,8 @@ mod tests {
         );
         let ctx = super::StratumServerContext {
             cfg: cfg.clone(),
-            runtime: std::sync::Arc::new(std::sync::Mutex::new(runtime)),
+            runtime: super::ChainHandle::Own(std::sync::Arc::new(std::sync::Mutex::new(runtime))),
             runtime_db_path,
-            runtime_db_seen_mtime: Arc::new(std::sync::Mutex::new(None)),
             mempool_db_path,
             max_template_txs: cfg.max_mempool_txs as usize,
             share_target: Target::MAX,
@@ -30547,42 +28909,6 @@ mod tests {
     }
 
     #[test]
-    fn rpc_http_backend_from_env_defaults_to_axum_and_accepts_overrides() {
-        const KEY: &str = "SCAM_RPC_HTTP_BACKEND";
-        unsafe {
-            std::env::remove_var(KEY);
-        }
-        assert_eq!(
-            super::rpc_http_backend_from_env(),
-            super::RpcHttpBackend::Axum
-        );
-        unsafe {
-            std::env::set_var(KEY, "axum");
-        }
-        assert_eq!(
-            super::rpc_http_backend_from_env(),
-            super::RpcHttpBackend::Axum
-        );
-        unsafe {
-            std::env::set_var(KEY, "unknown");
-        }
-        assert_eq!(
-            super::rpc_http_backend_from_env(),
-            super::RpcHttpBackend::Axum
-        );
-        unsafe {
-            std::env::set_var(KEY, "legacy");
-        }
-        assert_eq!(
-            super::rpc_http_backend_from_env(),
-            super::RpcHttpBackend::Legacy
-        );
-        unsafe {
-            std::env::remove_var(KEY);
-        }
-    }
-
-    #[test]
     fn relay_policy_requires_socks5_for_onion_and_i2p_even_when_flag_enabled() {
         let endpoint_onion =
             super::parse_relay_target_endpoint("exampleabcdefghijklmnop.onion:9735").unwrap();
@@ -30746,129 +29072,6 @@ mod tests {
 
         let json = super::json_error_body("line1\nquote\"slash\\");
         assert_eq!(json, "{\"error\":\"line1\\nquote\\\"slash\\\\\"}");
-
-        let input = b"GET / HTTP/1.1\r\nHost: local\r\n\r\nbody";
-        let pos = super::find_http_header_terminator(input).expect("terminator");
-        assert_eq!(&input[pos..pos + 4], b"\r\n\r\n");
-        assert!(super::find_http_header_terminator(b"GET / HTTP/1.1\r\n").is_none());
-    }
-
-    #[test]
-    fn write_http_json_response_propagates_writer_errors() {
-        struct FailWriter;
-        impl Write for FailWriter {
-            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
-                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
-            }
-        }
-
-        let mut writer = FailWriter;
-        let err = super::write_http_json_response(&mut writer, "200 OK", "{\"ok\":true}")
-            .expect_err("writer error must propagate");
-        assert!(err.to_string().contains("http write failed"));
-    }
-
-    #[test]
-    fn write_http_sse_helpers_emit_expected_frames_and_propagate_flush_errors() {
-        let mut buf = Vec::<u8>::new();
-        super::write_http_sse_headers(&mut buf).expect("write headers");
-        super::write_http_sse_comment(&mut buf, "heartbeat").expect("write comment");
-        super::write_http_sse_event(&mut buf, "snapshot", "{\"ok\":true}").expect("write event");
-        let text = String::from_utf8(buf).expect("utf8");
-        assert!(text.starts_with("HTTP/1.1 200 OK\r\n"));
-        assert!(text.contains("text/event-stream"));
-        assert!(text.contains(": heartbeat\n\n"));
-        assert!(text.contains("event: snapshot\ndata: {\"ok\":true}\n\n"));
-
-        struct FlushFailWriter;
-        impl Write for FlushFailWriter {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
-            }
-        }
-
-        let mut fail = FlushFailWriter;
-        let err = super::write_http_sse_headers(&mut fail).expect_err("headers flush must fail");
-        assert!(err.to_string().contains("http flush failed"));
-
-        let mut fail = FlushFailWriter;
-        let err =
-            super::write_http_sse_comment(&mut fail, "hb").expect_err("comment flush must fail");
-        assert!(err.to_string().contains("http flush failed"));
-
-        let mut fail = FlushFailWriter;
-        let err =
-            super::write_http_sse_event(&mut fail, "evt", "{}").expect_err("event flush must fail");
-        assert!(err.to_string().contains("http flush failed"));
-    }
-
-    #[test]
-    fn run_rpc_events_worker_writes_headers_before_main_loop() {
-        let cfg: ChainConfig =
-            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
-        let work_dir = temp_dir("test-rpc-events-worker");
-        fs::create_dir_all(&work_dir).expect("mkdir");
-        let runtime_db = work_dir.join("runtime.redb");
-        let mempool_db = work_dir.join("mempool.redb");
-
-        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
-        persist_runtime_db(&runtime, &runtime_db).expect("persist runtime");
-
-        let stop = Arc::new(AtomicBool::new(true));
-        let mut stream = Vec::<u8>::new();
-        super::run_rpc_events_worker(
-            &mut stream,
-            cfg,
-            runtime_db,
-            mempool_db,
-            None,
-            None,
-            stop,
-            Duration::from_millis(1),
-        )
-        .expect("rpc events worker should complete cleanly");
-        let text = String::from_utf8(stream).expect("utf8");
-        assert!(text.starts_with("HTTP/1.1 200 OK\r\n"));
-        assert!(text.contains("text/event-stream"));
-
-        let _ = fs::remove_dir_all(work_dir);
-    }
-
-    #[test]
-    fn reap_finished_rpc_event_workers_removes_only_completed_threads() {
-        let (tx, rx) = mpsc::channel::<()>();
-        let finished = thread::spawn(|| {});
-        let blocked = thread::spawn(move || {
-            let _ = rx.recv();
-        });
-        let mut handles = vec![finished, blocked];
-        let reap_deadline = Instant::now() + Duration::from_secs(1);
-        while handles.len() > 1 && Instant::now() < reap_deadline {
-            super::reap_finished_rpc_event_workers(&mut handles);
-            if handles.len() > 1 {
-                thread::sleep(Duration::from_millis(5));
-            }
-        }
-        assert_eq!(handles.len(), 1, "finished worker should be reaped");
-
-        let _ = tx.send(());
-        let final_reap_deadline = Instant::now() + Duration::from_secs(1);
-        while !handles.is_empty() && Instant::now() < final_reap_deadline {
-            super::reap_finished_rpc_event_workers(&mut handles);
-            if !handles.is_empty() {
-                thread::sleep(Duration::from_millis(5));
-            }
-        }
-        assert!(
-            handles.is_empty(),
-            "remaining worker should be reaped after completion"
-        );
     }
 
     #[test]
@@ -31867,243 +30070,6 @@ mod tests {
     }
 
     #[test]
-    fn read_http_request_rejects_invalid_content_length_header() {
-        let raw = b"POST /wallet/new HTTP/1.1\r\nHost: localhost\r\nContent-Length: nope\r\n\r\n";
-        let result = read_http_request_from_raw(raw);
-        if let Err(err) = &result
-            && err.to_string().contains("permission denied")
-        {
-            return;
-        }
-        let err = result.expect_err("must reject invalid content-length");
-        assert!(err.to_string().contains("invalid Content-Length"));
-    }
-
-    #[test]
-    fn read_http_request_rejects_missing_header_terminator() {
-        let raw = b"GET /health HTTP/1.1\r\nHost: localhost\r\n";
-        let result = read_http_request_from_raw(raw);
-        if let Err(err) = &result
-            && err.to_string().contains("permission denied")
-        {
-            return;
-        }
-        let err = result.expect_err("must reject malformed headers");
-        assert!(err.to_string().contains("missing header terminator"));
-    }
-
-    #[test]
-    fn read_http_request_parses_body_and_strips_query_string() {
-        let body = r#"{"hello":"world"}"#;
-        let raw = format!(
-            "POST /wallet/new?foo=bar HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        let parsed = read_http_request_from_raw(raw.as_bytes()).expect("parse request");
-        let request = parsed.expect("request present");
-        assert_eq!(request.method, "POST");
-        assert_eq!(request.path, "/wallet/new");
-        assert_eq!(request.body, body.as_bytes());
-    }
-
-    #[test]
-    fn read_http_request_accepts_payload_larger_than_one_mebibyte() {
-        let body = vec![b'a'; 1_200_000];
-        let mut raw = format!(
-            "POST /wallet/new HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
-            body.len()
-        )
-        .into_bytes();
-        raw.extend_from_slice(&body);
-        let parsed = read_http_request_from_raw(&raw).expect("parse request");
-        let request = parsed.expect("request");
-        assert_eq!(request.path, "/wallet/new");
-        assert_eq!(request.body.len(), body.len());
-    }
-
-    #[test]
-    fn read_http_request_accepts_exact_two_mebibyte_total_request_size() {
-        let max_total = 2 * 1024 * 1024usize;
-        let mut body_len = max_total;
-        let mut header = String::new();
-        for _ in 0..8 {
-            header = format!(
-                "POST /wallet/new HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
-                body_len
-            );
-            let total = header.len().saturating_add(body_len);
-            if total == max_total {
-                break;
-            }
-            if total > max_total {
-                body_len = body_len.saturating_sub(total - max_total);
-            } else {
-                body_len = body_len.saturating_add(max_total - total);
-            }
-        }
-        assert_eq!(
-            header.len().saturating_add(body_len),
-            max_total,
-            "header/body adjustment must converge to exact 2 MiB total"
-        );
-        let mut raw = header.into_bytes();
-        raw.extend_from_slice(&vec![b'a'; body_len]);
-        let parsed = read_http_request_from_raw(&raw).expect("parse exact 2 MiB request");
-        let request = parsed.expect("request");
-        assert_eq!(request.path, "/wallet/new");
-        assert_eq!(request.body.len(), body_len);
-    }
-
-    #[test]
-    fn read_http_request_waits_for_full_body_across_multiple_reads() {
-        #[derive(Default)]
-        struct ChunkReader {
-            chunks: Vec<Vec<u8>>,
-            next: usize,
-        }
-
-        impl Read for ChunkReader {
-            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-                if self.next >= self.chunks.len() {
-                    return Ok(0);
-                }
-                let chunk = &self.chunks[self.next];
-                let len = chunk.len().min(buf.len());
-                buf[..len].copy_from_slice(&chunk[..len]);
-                self.next = self.next.saturating_add(1);
-                Ok(len)
-            }
-        }
-
-        let body = b"{\"k\":1234}".to_vec();
-        let header = format!(
-            "POST /wallet/new HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
-            body.len()
-        )
-        .into_bytes();
-        let split = body.len() / 2;
-        let mut reader = ChunkReader {
-            chunks: vec![header, body[..split].to_vec(), body[split..].to_vec()],
-            next: 0,
-        };
-        let parsed = super::read_http_request(&mut reader).expect("parse");
-        let request = parsed.expect("request");
-        assert_eq!(request.method, "POST");
-        assert_eq!(request.path, "/wallet/new");
-        assert_eq!(request.body, body);
-    }
-
-    #[test]
-    fn read_http_request_rejects_truncated_body_at_eof() {
-        let raw = b"POST /wallet/new HTTP/1.1\r\nHost: localhost\r\nContent-Length: 10\r\n\r\nabc";
-        let err = read_http_request_from_raw(raw).expect_err("truncated body must fail");
-        assert!(err.to_string().contains("expected body length"));
-    }
-
-    #[test]
-    fn read_http_request_timeout_without_bytes_is_treated_as_no_request() {
-        struct TimeoutReader;
-
-        impl Read for TimeoutReader {
-            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
-                Err(std::io::Error::from(std::io::ErrorKind::TimedOut))
-            }
-        }
-
-        let mut reader = TimeoutReader;
-        let parsed = super::read_http_request(&mut reader).expect("timeout without bytes");
-        assert!(
-            parsed.is_none(),
-            "idle timeout should be treated as empty request"
-        );
-    }
-
-    #[test]
-    fn read_http_request_timeout_after_partial_payload_is_rejected() {
-        #[derive(Default)]
-        struct PartialThenTimeout {
-            calls: usize,
-        }
-
-        impl Read for PartialThenTimeout {
-            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-                if self.calls == 0 {
-                    let part = b"POST /wallet/new HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nab";
-                    let len = part.len().min(buf.len());
-                    buf[..len].copy_from_slice(&part[..len]);
-                    self.calls = 1;
-                    return Ok(len);
-                }
-                Err(std::io::Error::from(std::io::ErrorKind::TimedOut))
-            }
-        }
-
-        let mut reader = PartialThenTimeout::default();
-        let err = super::read_http_request(&mut reader).expect_err("partial timeout must fail");
-        assert!(err.to_string().contains("timeout"));
-    }
-
-    #[test]
-    fn read_http_request_connection_closed_without_bytes_is_treated_as_no_request() {
-        struct ClosedReader;
-
-        impl Read for ClosedReader {
-            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
-                Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset))
-            }
-        }
-
-        let mut reader = ClosedReader;
-        let parsed = super::read_http_request(&mut reader).expect("closed without bytes");
-        assert!(
-            parsed.is_none(),
-            "closed idle socket should produce no request"
-        );
-    }
-
-    #[test]
-    fn read_http_request_connection_closed_after_partial_payload_is_rejected() {
-        #[derive(Default)]
-        struct PartialThenClosed {
-            calls: usize,
-        }
-
-        impl Read for PartialThenClosed {
-            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-                if self.calls == 0 {
-                    let part = b"POST /wallet/new HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nab";
-                    let len = part.len().min(buf.len());
-                    buf[..len].copy_from_slice(&part[..len]);
-                    self.calls = 1;
-                    return Ok(len);
-                }
-                Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset))
-            }
-        }
-
-        let mut reader = PartialThenClosed::default();
-        let err = super::read_http_request(&mut reader).expect_err("partial close must fail");
-        assert!(err.to_string().contains("connection closed"));
-    }
-
-    #[test]
-    fn read_http_request_non_timeout_non_close_io_error_is_reported() {
-        struct PermissionDeniedReader;
-
-        impl Read for PermissionDeniedReader {
-            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
-                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
-            }
-        }
-
-        let mut reader = PermissionDeniedReader;
-        let err =
-            super::read_http_request(&mut reader).expect_err("permission denied must bubble up");
-        assert!(err.to_string().contains("http read failed"));
-    }
-
-    #[test]
     fn read_role_request_handles_empty_invalid_and_valid_payloads() {
         let mut empty = std::io::Cursor::new(Vec::<u8>::new());
         let err = super::read_role_request::<serde_json::Value, _>(&mut empty)
@@ -32326,34 +30292,17 @@ mod tests {
         let cfg: ChainConfig =
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
         let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
-        let work_dir = temp_dir("test-rpc-event-snapshot");
-        fs::create_dir_all(&work_dir).expect("mkdir");
-
-        let missing_mempool = work_dir.join("missing-mempool.redb");
-        let missing = super::build_rpc_event_snapshot(&cfg, &runtime, &missing_mempool, None, None)
-            .expect("snapshot without mempool db");
-        assert_eq!(missing.network_id, cfg.network_id);
-        assert_eq!(missing.tip_height, runtime.tip_height());
-        assert_eq!(missing.tip_hash, runtime.tip_hash().to_hex());
-        assert!(!missing.mempool_available);
-        assert_eq!(missing.mempool_tx_count, 0);
-        assert!(missing.last_block_age_sec <= missing.unix_sec);
-        assert!(missing.relay_active_peers.is_none());
-        assert!(missing.sync_lag_blocks.is_none());
-        assert!(missing.unix_sec > 0);
-
-        let mempool_db = work_dir.join("mempool.redb");
-        let snapshot = MempoolSnapshot {
-            network_id: cfg.network_id.clone(),
-            entries: Vec::new(),
-        };
-        save_mempool_db(&mempool_db, &snapshot).expect("persist empty mempool");
-        let present = super::build_rpc_event_snapshot(&cfg, &runtime, &mempool_db, None, None)
-            .expect("snapshot with mempool db");
-        assert!(present.mempool_available);
-        assert_eq!(present.mempool_tx_count, 0);
-
-        let _ = fs::remove_dir_all(work_dir);
+        let snapshot =
+            super::build_rpc_event_snapshot(&cfg, &runtime, 3, None, None).expect("snapshot");
+        assert_eq!(snapshot.network_id, cfg.network_id);
+        assert_eq!(snapshot.tip_height, runtime.tip_height());
+        assert_eq!(snapshot.tip_hash, runtime.tip_hash().to_hex());
+        assert!(snapshot.mempool_available);
+        assert_eq!(snapshot.mempool_tx_count, 3);
+        assert!(snapshot.last_block_age_sec <= snapshot.unix_sec);
+        assert!(snapshot.relay_active_peers.is_none());
+        assert!(snapshot.sync_lag_blocks.is_none());
+        assert!(snapshot.unix_sec > 0);
     }
 
     #[test]
@@ -32398,54 +30347,6 @@ mod tests {
             super::guess_content_type(std::path::Path::new("photo.jpeg")),
             "image/jpeg"
         );
-
-        let ui_dir = temp_dir("test-ui-assets");
-        fs::create_dir_all(&ui_dir).expect("mkdir");
-        fs::write(ui_dir.join("index.html"), "<html>ok</html>").expect("write index");
-        fs::create_dir_all(ui_dir.join("folder")).expect("mkdir folder");
-        let mut invalid_path_response = Vec::<u8>::new();
-        let served =
-            super::try_serve_ui_asset(&mut invalid_path_response, &ui_dir, "/../secrets.txt")
-                .expect("serve invalid path");
-        assert!(served);
-        let invalid_path_response =
-            String::from_utf8(invalid_path_response).expect("utf8 invalid-path response");
-        assert!(invalid_path_response.starts_with("HTTP/1.1 400 Bad Request"));
-
-        let mut fallback_response = Vec::<u8>::new();
-        let served = super::try_serve_ui_asset(&mut fallback_response, &ui_dir, "/does-not-exist")
-            .expect("serve fallback");
-        assert!(served);
-        let fallback_response =
-            String::from_utf8(fallback_response).expect("utf8 fallback response");
-        assert!(fallback_response.starts_with("HTTP/1.1 200 OK"));
-        assert!(fallback_response.contains("<html>ok</html>"));
-
-        let mut directory_response = Vec::<u8>::new();
-        let served = super::try_serve_ui_asset(&mut directory_response, &ui_dir, "/folder")
-            .expect("serve directory path fallback");
-        assert!(served);
-        let directory_response =
-            String::from_utf8(directory_response).expect("utf8 directory fallback response");
-        assert!(directory_response.starts_with("HTTP/1.1 200 OK"));
-        assert!(directory_response.contains("<html>ok</html>"));
-
-        let missing_ui = ui_dir.join("missing-ui");
-        let mut missing_response = Vec::<u8>::new();
-        let served = super::try_serve_ui_asset(&mut missing_response, &missing_ui, "/index.html")
-            .expect("serve missing ui");
-        assert!(!served);
-        assert!(missing_response.is_empty());
-
-        let broken_ui = ui_dir.join("broken-ui");
-        fs::create_dir_all(broken_ui.join("index.html")).expect("mkdir broken index");
-        let mut broken_response = Vec::<u8>::new();
-        let served = super::try_serve_ui_asset(&mut broken_response, &broken_ui, "/missing")
-            .expect("serve broken ui");
-        assert!(!served);
-        assert!(broken_response.is_empty());
-
-        let _ = fs::remove_dir_all(ui_dir);
     }
 
     #[test]
@@ -32457,11 +30358,9 @@ mod tests {
         let state = super::AxumRpcState {
             network: Network::Devnet,
             cfg: cfg.clone(),
-            runtime_db_path: work_dir.join("runtime.redb"),
-            runtime_cache: Arc::new(std::sync::Mutex::new(super::AxumRuntimeCache {
-                runtime: ChainRuntime::from_config(cfg.clone()).expect("runtime"),
-                last_seen_mtime: None,
-            })),
+            chain: super::ChainHandle::Own(Arc::new(std::sync::Mutex::new(
+                ChainRuntime::from_config(cfg.clone()).expect("runtime"),
+            ))),
             mempool_db_path: work_dir.join("mempool.redb"),
             relay_telemetry: None,
             stratum_telemetry: None,
@@ -32533,11 +30432,9 @@ mod tests {
         let state = super::AxumRpcState {
             network: Network::Devnet,
             cfg: cfg.clone(),
-            runtime_db_path: work_dir.join("runtime.redb"),
-            runtime_cache: Arc::new(std::sync::Mutex::new(super::AxumRuntimeCache {
-                runtime: ChainRuntime::from_config(cfg.clone()).expect("runtime"),
-                last_seen_mtime: None,
-            })),
+            chain: super::ChainHandle::Own(Arc::new(std::sync::Mutex::new(
+                ChainRuntime::from_config(cfg.clone()).expect("runtime"),
+            ))),
             mempool_db_path: work_dir.join("mempool.redb"),
             relay_telemetry: None,
             stratum_telemetry: None,
@@ -32579,11 +30476,9 @@ mod tests {
         let state = super::AxumRpcState {
             network: Network::Devnet,
             cfg: cfg.clone(),
-            runtime_db_path: work_dir.join("runtime.redb"),
-            runtime_cache: Arc::new(std::sync::Mutex::new(super::AxumRuntimeCache {
-                runtime: ChainRuntime::from_config(cfg.clone()).expect("runtime"),
-                last_seen_mtime: None,
-            })),
+            chain: super::ChainHandle::Own(Arc::new(std::sync::Mutex::new(
+                ChainRuntime::from_config(cfg.clone()).expect("runtime"),
+            ))),
             mempool_db_path: work_dir.join("mempool.redb"),
             relay_telemetry: None,
             stratum_telemetry: None,
@@ -32650,11 +30545,9 @@ mod tests {
         let state = super::AxumRpcState {
             network: Network::Devnet,
             cfg: cfg.clone(),
-            runtime_db_path: work_dir.join("runtime.redb"),
-            runtime_cache: Arc::new(std::sync::Mutex::new(super::AxumRuntimeCache {
-                runtime: ChainRuntime::from_config(cfg).expect("runtime"),
-                last_seen_mtime: None,
-            })),
+            chain: super::ChainHandle::Own(Arc::new(std::sync::Mutex::new(
+                ChainRuntime::from_config(cfg).expect("runtime"),
+            ))),
             mempool_db_path: work_dir.join("mempool.redb"),
             relay_telemetry: None,
             stratum_telemetry: None,
@@ -32733,7 +30626,6 @@ mod tests {
 
     #[test]
     fn mutation_guard_stage2_regressions() {
-        assert_rpc_route_match_contract_precondition();
         let cfg: ChainConfig =
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
 
@@ -32760,11 +30652,9 @@ mod tests {
         let state = super::AxumRpcState {
             network: Network::Devnet,
             cfg: cfg.clone(),
-            runtime_db_path: work_dir.join("runtime.redb"),
-            runtime_cache: Arc::new(std::sync::Mutex::new(super::AxumRuntimeCache {
-                runtime: ChainRuntime::from_config(cfg.clone()).expect("runtime"),
-                last_seen_mtime: None,
-            })),
+            chain: super::ChainHandle::Own(Arc::new(std::sync::Mutex::new(
+                ChainRuntime::from_config(cfg.clone()).expect("runtime"),
+            ))),
             mempool_db_path: work_dir.join("mempool.redb"),
             relay_telemetry: None,
             stratum_telemetry: None,
@@ -32934,54 +30824,6 @@ mod tests {
                 .contains("requires --secure-static-secret-key-hex")
         );
 
-        const KEY: &str = "SCAM_RPC_HTTP_BACKEND";
-        let _net_guard = network_test_guard();
-        if let Some(addr) = allocate_local_addr() {
-            let rpc_dir = temp_dir("test-mutation-guard-rpc-legacy");
-            fs::create_dir_all(&rpc_dir).expect("mkdir rpc");
-            let rpc_cfg = rpc_dir.join("devnet.toml");
-            fs::write(&rpc_cfg, include_str!("../../../config/devnet.toml"))
-                .expect("write rpc cfg");
-            let rpc_runtime = rpc_dir.join("runtime.redb");
-            let ui_dir = rpc_dir.join("ui");
-            fs::create_dir_all(&ui_dir).expect("mkdir rpc ui");
-            fs::write(ui_dir.join("index.html"), "<html>ui</html>").expect("write rpc ui");
-            unsafe {
-                std::env::set_var(KEY, "legacy");
-            }
-            let (shutdown, handle) = spawn_rpc_server_for_test(RpcServeArgs {
-                network: Network::Devnet,
-                config: Some(rpc_cfg),
-                runtime_db: Some(rpc_runtime),
-                bind: addr.clone(),
-                ui_dir,
-                relay_telemetry: None,
-                stratum_telemetry: None,
-                pool_ledger: None,
-                mine_blocks: 0,
-                interval_sec: 120,
-                max_nonce: 500_000,
-                max_requests: 0,
-                auth_token_file: None,
-                disable_wallet_rpc: false,
-            });
-            let assertions = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let post_events = send_http_request(
-                    &addr,
-                    "POST /events HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
-                );
-                assert!(post_events.starts_with("HTTP/1.1 404 Not Found"));
-            }));
-            stop_rpc_server_for_test(shutdown, handle, "mutation guard legacy rpc");
-            unsafe {
-                std::env::remove_var(KEY);
-            }
-            let _ = fs::remove_dir_all(rpc_dir);
-            if let Err(payload) = assertions {
-                std::panic::resume_unwind(payload);
-            }
-        }
-
         let _ = fs::remove_dir_all(work_dir);
     }
 
@@ -33005,7 +30847,6 @@ mod tests {
 
     #[test]
     fn run_rpc_serve_dispatches_health_and_unknown_routes() {
-        assert_rpc_route_match_contract_precondition();
         let _net_guard = network_test_guard();
         let Some(addr) = allocate_local_addr() else {
             return;
@@ -33053,115 +30894,7 @@ mod tests {
     }
 
     #[test]
-    fn run_rpc_serve_legacy_backend_routes_are_strict_when_selected() {
-        assert_rpc_route_match_contract_precondition();
-        const KEY: &str = "SCAM_RPC_HTTP_BACKEND";
-        let _net_guard = network_test_guard();
-        let Some(addr) = allocate_local_addr() else {
-            return;
-        };
-        let work_dir = temp_dir("test-rpc-serve-legacy-routes");
-        fs::create_dir_all(&work_dir).expect("mkdir");
-        let config_path = work_dir.join("devnet.toml");
-        fs::write(&config_path, include_str!("../../../config/devnet.toml")).expect("write cfg");
-        let runtime_db = work_dir.join("runtime.redb");
-        let ui_dir = work_dir.join("ui");
-        fs::create_dir_all(&ui_dir).expect("mkdir ui");
-        fs::write(ui_dir.join("index.html"), "<html>ui</html>").expect("write ui");
-
-        unsafe {
-            std::env::set_var(KEY, "legacy");
-        }
-        let (server_shutdown, server) = spawn_rpc_server_for_test(RpcServeArgs {
-            network: Network::Devnet,
-            config: Some(config_path),
-            runtime_db: Some(runtime_db),
-            bind: addr.clone(),
-            ui_dir,
-            relay_telemetry: None,
-            stratum_telemetry: None,
-            pool_ledger: None,
-            mine_blocks: 0,
-            interval_sec: 120,
-            max_nonce: 500_000,
-            max_requests: 0,
-            auth_token_file: None,
-            disable_wallet_rpc: false,
-        });
-
-        with_rpc_server_shutdown(server_shutdown, server, "rpc legacy routes server", || {
-            let health =
-                send_http_request(&addr, "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n");
-            assert!(health.starts_with("HTTP/1.1 200 OK"));
-
-            let post_events = send_http_request(
-                &addr,
-                "POST /events HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
-            );
-            assert!(post_events.starts_with("HTTP/1.1 404 Not Found"));
-            assert!(post_events.contains("\"unknown endpoint\""));
-        });
-        unsafe {
-            std::env::remove_var(KEY);
-        }
-        let _ = fs::remove_dir_all(work_dir);
-    }
-
-    #[test]
-    fn run_rpc_serve_inner_legacy_serves_health_and_stops_on_max_requests() {
-        assert_rpc_route_match_contract_precondition();
-        let _net_guard = network_test_guard();
-        let Some(addr) = allocate_local_addr() else {
-            return;
-        };
-        let work_dir = temp_dir("test-rpc-inner-legacy-health");
-        fs::create_dir_all(&work_dir).expect("mkdir");
-        let config_path = work_dir.join("devnet.toml");
-        fs::write(&config_path, include_str!("../../../config/devnet.toml")).expect("write cfg");
-        let runtime_db = work_dir.join("runtime.redb");
-        let ui_dir = work_dir.join("ui");
-        fs::create_dir_all(&ui_dir).expect("mkdir ui");
-        fs::write(ui_dir.join("index.html"), "<html>ui</html>").expect("write ui");
-
-        let shutdown_flag = Arc::new(AtomicBool::new(false));
-        let shutdown_clone = Arc::clone(&shutdown_flag);
-        let bind_addr = addr.clone();
-        let handle = thread::spawn(move || {
-            super::run_rpc_serve_inner_legacy(
-                RpcServeArgs {
-                    network: Network::Devnet,
-                    config: Some(config_path),
-                    runtime_db: Some(runtime_db),
-                    bind: bind_addr,
-                    ui_dir,
-                    relay_telemetry: None,
-                    stratum_telemetry: None,
-                    pool_ledger: None,
-                    mine_blocks: 0,
-                    interval_sec: 120,
-                    max_nonce: 500_000,
-                    max_requests: 1,
-                    auth_token_file: None,
-                    disable_wallet_rpc: false,
-                },
-                Some(shutdown_clone),
-            )
-        });
-
-        let health = send_http_request(&addr, "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n");
-        assert!(health.starts_with("HTTP/1.1 200 OK"));
-        assert!(health.contains("{\"ok\":true}"));
-
-        let server_result =
-            join_with_timeout(handle, Duration::from_secs(10), "rpc legacy inner server");
-        server_result.expect("legacy inner server should exit without errors");
-
-        let _ = fs::remove_dir_all(work_dir);
-    }
-
-    #[test]
     fn run_rpc_serve_dispatches_core_and_wallet_routes() {
-        assert_rpc_route_match_contract_precondition();
         let _net_guard = network_test_guard();
         let Some(addr) = allocate_local_addr() else {
             return;
@@ -33259,7 +30992,6 @@ mod tests {
 
     #[test]
     fn run_rpc_serve_pool_status_and_worker_routes_use_stratum_telemetry_snapshot() {
-        assert_rpc_route_match_contract_precondition();
         let _net_guard = network_test_guard();
         let Some(addr) = allocate_local_addr() else {
             return;
@@ -33366,7 +31098,6 @@ mod tests {
 
     #[test]
     fn run_rpc_serve_streams_event_snapshots() {
-        assert_rpc_route_match_contract_precondition();
         let _net_guard = network_test_guard();
         let Some(addr) = allocate_local_addr() else {
             return;
@@ -33454,7 +31185,6 @@ mod tests {
 
     #[test]
     fn run_rpc_serve_wallet_send_rejects_invalid_and_double_spend_paths() {
-        assert_rpc_route_match_contract_precondition();
         let _net_guard = network_test_guard();
         let Some(addr) = allocate_local_addr() else {
             return;
@@ -33639,7 +31369,6 @@ mod tests {
 
     #[test]
     fn run_rpc_serve_route_matching_and_hrp_validation_are_strict() {
-        assert_rpc_route_match_contract_precondition();
         let _net_guard = network_test_guard();
         let Some(addr) = allocate_local_addr() else {
             return;
@@ -34366,147 +32095,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn refresh_runtime_from_db_skips_reload_when_mtime_unchanged() {
-        let cfg_devnet: ChainConfig =
-            toml::from_str(include_str!("../../../config/devnet.toml")).expect("devnet config");
-        let cfg_testnet: ChainConfig =
-            toml::from_str(include_str!("../../../config/testnet.toml")).expect("testnet config");
-        let work_dir = temp_dir("test-refresh-runtime-mtime");
-        fs::create_dir_all(&work_dir).expect("mkdir");
-        let runtime_db_path = work_dir.join("runtime.redb");
-
-        let runtime_testnet = ChainRuntime::from_config(cfg_testnet.clone()).expect("runtime");
-        persist_runtime_db(&runtime_testnet, &runtime_db_path).expect("persist runtime");
-        let mut local_runtime = ChainRuntime::from_config(cfg_devnet.clone()).expect("runtime");
-        let mut last_seen = super::runtime_db_mtime(&runtime_db_path);
-        let before_tip = local_runtime.tip_hash();
-
-        super::refresh_runtime_from_db_if_changed(
-            &cfg_devnet,
-            &mut local_runtime,
-            &runtime_db_path,
-            &mut last_seen,
-        )
-        .expect("mtime unchanged should skip mismatched reload");
-        assert_eq!(local_runtime.tip_hash(), before_tip);
-        let _ = fs::remove_dir_all(work_dir);
-    }
-
-    #[test]
-    fn refresh_runtime_from_db_if_changed_reloads_tip_when_mtime_changes() {
-        let mut cfg: ChainConfig =
-            toml::from_str(include_str!("../../../config/devnet.toml")).expect("devnet config");
-        cfg.coinbase_maturity = 1;
-        cfg.validate().expect("config validate");
-
-        let work_dir = temp_dir("test-refresh-runtime-reload");
-        fs::create_dir_all(&work_dir).expect("mkdir");
-        let runtime_db_path = work_dir.join("runtime.redb");
-
-        let mut producer = ChainRuntime::from_config(cfg.clone()).expect("producer runtime");
-        let reward_key_hash = cfg.genesis_reward_key_hash20().expect("reward key");
-        mine_blocks_on_runtime(
-            &mut producer,
-            &super::MiningLoopParams {
-                count: 1,
-                interval_sec: cfg.target_block_time_sec,
-                max_nonce: 500_000,
-                miner_key_hash: reward_key_hash,
-                label_prefix: "refresh-runtime",
-                print_each: false,
-            },
-        )
-        .expect("mine producer");
-        persist_runtime_db(&producer, &runtime_db_path).expect("persist runtime");
-
-        let mut local_runtime = ChainRuntime::from_config(cfg.clone()).expect("local runtime");
-        let mut seen = None;
-        super::refresh_runtime_from_db_if_changed(
-            &cfg,
-            &mut local_runtime,
-            &runtime_db_path,
-            &mut seen,
-        )
-        .expect("refresh runtime");
-        assert_eq!(local_runtime.tip_hash(), producer.tip_hash());
-        assert_eq!(local_runtime.tip_height(), producer.tip_height());
-        assert!(super::runtime_db_mtime(&runtime_db_path).is_some());
-        assert!(super::file_mtime(&runtime_db_path).is_some());
-
-        let _ = fs::remove_dir_all(work_dir);
-    }
-
-    #[test]
-    fn refresh_relay_runtime_from_db_if_changed_announces_connected_blocks() {
-        let mut cfg: ChainConfig =
-            toml::from_str(include_str!("../../../config/devnet.toml")).expect("devnet config");
-        cfg.coinbase_maturity = 1;
-        cfg.validate().expect("config validate");
-
-        let work_dir = temp_dir("test-refresh-relay-runtime-announces");
-        fs::create_dir_all(&work_dir).expect("mkdir");
-        let runtime_db_path = work_dir.join("runtime.redb");
-
-        let mut producer = ChainRuntime::from_config(cfg.clone()).expect("producer runtime");
-        mine_blocks_on_runtime(
-            &mut producer,
-            &super::MiningLoopParams {
-                count: 1,
-                interval_sec: cfg.target_block_time_sec,
-                max_nonce: 500_000,
-                miner_key_hash: cfg.genesis_reward_key_hash20().expect("reward key"),
-                label_prefix: "refresh-relay-runtime",
-                print_each: false,
-            },
-        )
-        .expect("mine producer");
-        persist_runtime_db(&producer, &runtime_db_path).expect("persist runtime");
-
-        let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(&cfg).expect("mempool"),
-            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
-                .expect("orphan"),
-            gossip: GossipEngine::new(cfg.p2p_max_inv_items as usize).expect("gossip"),
-        };
-        let mut state = RelayServerState::new(
-            ChainRuntime::from_config(cfg.clone()).expect("local runtime"),
-            relay,
-        );
-        let mut seen = None;
-
-        let changed = super::refresh_relay_runtime_from_db_if_changed(
-            &cfg,
-            &mut state,
-            &runtime_db_path,
-            &mut seen,
-            super::current_unix_sec().expect("now"),
-        )
-        .expect("refresh relay runtime");
-        assert!(changed, "runtime update should be detected");
-        assert_eq!(state.runtime.tip_hash(), producer.tip_hash());
-        assert_eq!(state.runtime.tip_height(), producer.tip_height());
-        assert!(
-            state
-                .relay
-                .gossip
-                .has_inventory(&InventoryItem::Block(producer.tip_hash())),
-            "connected block must be announced into local gossip inventory"
-        );
-
-        let unchanged = super::refresh_relay_runtime_from_db_if_changed(
-            &cfg,
-            &mut state,
-            &runtime_db_path,
-            &mut seen,
-            super::current_unix_sec().expect("now"),
-        )
-        .expect("refresh unchanged runtime");
-        assert!(!unchanged, "same mtime must not force redundant transition");
-
-        let _ = fs::remove_dir_all(work_dir);
-    }
-
     /// Audit F-5/F-11. Verify the Host allow-list logic that the middleware
     /// uses to drop DNS-rebound requests. We test the pure predicate so the
     /// rule is locked down even without spinning up axum.
@@ -34578,11 +32166,7 @@ mod tests {
         let state = super::AxumRpcState {
             network: Network::Devnet,
             cfg: cfg.clone(),
-            runtime_db_path: runtime_db_path.clone(),
-            runtime_cache: Arc::new(std::sync::Mutex::new(super::AxumRuntimeCache {
-                runtime: cached_runtime,
-                last_seen_mtime: None,
-            })),
+            chain: super::ChainHandle::Own(Arc::new(std::sync::Mutex::new(cached_runtime))),
             mempool_db_path: work_dir.join("mempool.redb"),
             relay_telemetry: None,
             stratum_telemetry: None,
@@ -34597,382 +32181,6 @@ mod tests {
             "db lock conflict should keep serving cached runtime snapshot"
         );
         assert_eq!(payload.tip_height, expected_cached_tip_height);
-
-        let _ = fs::remove_dir_all(work_dir);
-    }
-
-    #[test]
-    fn axum_status_payload_uses_relay_telemetry_when_runtime_db_is_locked() {
-        let cfg: ChainConfig =
-            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
-        let work_dir = temp_dir("test-axum-status-telemetry-fallback");
-        fs::create_dir_all(&work_dir).expect("mkdir");
-        let runtime_db_path = work_dir.join("runtime.redb");
-        let telemetry_path = work_dir.join("relay.telemetry.jsonl");
-
-        let mut persisted_runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
-        mine_blocks_on_runtime(
-            &mut persisted_runtime,
-            &super::MiningLoopParams {
-                count: 1,
-                interval_sec: cfg.target_block_time_sec,
-                max_nonce: 500_000,
-                miner_key_hash: cfg.genesis_reward_key_hash20().expect("reward key"),
-                label_prefix: "axum-status-telemetry-lock",
-                print_each: false,
-            },
-        )
-        .expect("mine persisted runtime");
-        persist_runtime_db(&persisted_runtime, &runtime_db_path).expect("persist runtime");
-        let cached_runtime = ChainRuntime::from_config(cfg.clone()).expect("cached runtime");
-
-        let telemetry_snapshot = super::RelayServerTelemetrySnapshot {
-            timestamp_unix_sec: 77,
-            active_peers: 5,
-            tip_height: 42,
-            utxo_count: 128,
-            cumulative_work: "4096".to_owned(),
-            network_hashrate_hps: 12.5,
-            max_known_tip_height: 43,
-            global_sync_lag_blocks: 1,
-            tip_hash: "11".repeat(32),
-            mempool_len: 0,
-            orphan_pool_len: 0,
-            mempool_inserted_total: 0,
-            mempool_replaced_total: 0,
-            mempool_removed_by_replacement_total: 0,
-            mempool_rejected_conflict_total: 0,
-            orphan_accepted_total: 0,
-            orphan_evicted_total: 0,
-            orphan_expired_total: 0,
-            orphan_promoted_total: 0,
-            gossip_replacement_rate_limited_total: 0,
-        };
-        super::append_relay_telemetry_snapshot(&telemetry_path, &telemetry_snapshot)
-            .expect("append telemetry");
-
-        let _runtime_db_lock = redb::Database::open(&runtime_db_path).expect("open db lock");
-        let state = super::AxumRpcState {
-            network: Network::Devnet,
-            cfg: cfg.clone(),
-            runtime_db_path: runtime_db_path.clone(),
-            runtime_cache: Arc::new(std::sync::Mutex::new(super::AxumRuntimeCache {
-                runtime: cached_runtime,
-                last_seen_mtime: None,
-            })),
-            mempool_db_path: work_dir.join("mempool.redb"),
-            relay_telemetry: Some(telemetry_path.clone()),
-            stratum_telemetry: None,
-            pool_ledger_db_path: work_dir.join("pool-ledger.redb"),
-            ui_dir: work_dir.join("ui"),
-            extras: Arc::default(),
-        };
-
-        let payload = super::axum_status_payload(&state).expect("status payload");
-        assert_eq!(payload.tip_height, telemetry_snapshot.tip_height);
-        assert_eq!(payload.tip_hash, telemetry_snapshot.tip_hash);
-        assert_eq!(payload.utxo_count, telemetry_snapshot.utxo_count);
-        assert_eq!(payload.cumulative_work, telemetry_snapshot.cumulative_work);
-        assert_eq!(
-            payload.network_hashrate_hps, telemetry_snapshot.network_hashrate_hps,
-            "telemetry fallback should override stale cached hashrate when DB is locked"
-        );
-
-        let _ = fs::remove_dir_all(work_dir);
-    }
-
-    #[test]
-    fn axum_status_payload_keeps_cached_hashrate_when_telemetry_hashrate_is_zero() {
-        let cfg: ChainConfig =
-            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
-        let work_dir = temp_dir("test-axum-status-telemetry-zero-hashrate");
-        fs::create_dir_all(&work_dir).expect("mkdir");
-        let runtime_db_path = work_dir.join("runtime.redb");
-        let telemetry_path = work_dir.join("relay.telemetry.jsonl");
-
-        let mut persisted_runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
-        mine_blocks_on_runtime(
-            &mut persisted_runtime,
-            &super::MiningLoopParams {
-                count: 1,
-                interval_sec: cfg.target_block_time_sec,
-                max_nonce: 500_000,
-                miner_key_hash: cfg.genesis_reward_key_hash20().expect("reward key"),
-                label_prefix: "axum-status-zero-hashrate-lock",
-                print_each: false,
-            },
-        )
-        .expect("mine persisted runtime");
-        persist_runtime_db(&persisted_runtime, &runtime_db_path).expect("persist runtime");
-        let cached_runtime = ChainRuntime::from_config(cfg.clone()).expect("cached runtime");
-        let cached_hashrate = super::estimate_network_hashrate_hps(&cached_runtime);
-
-        let telemetry_snapshot = super::RelayServerTelemetrySnapshot {
-            timestamp_unix_sec: 88,
-            active_peers: 7,
-            tip_height: 64,
-            utxo_count: 256,
-            cumulative_work: "8192".to_owned(),
-            network_hashrate_hps: 0.0,
-            max_known_tip_height: 65,
-            global_sync_lag_blocks: 1,
-            tip_hash: "22".repeat(32),
-            mempool_len: 0,
-            orphan_pool_len: 0,
-            mempool_inserted_total: 0,
-            mempool_replaced_total: 0,
-            mempool_removed_by_replacement_total: 0,
-            mempool_rejected_conflict_total: 0,
-            orphan_accepted_total: 0,
-            orphan_evicted_total: 0,
-            orphan_expired_total: 0,
-            orphan_promoted_total: 0,
-            gossip_replacement_rate_limited_total: 0,
-        };
-        super::append_relay_telemetry_snapshot(&telemetry_path, &telemetry_snapshot)
-            .expect("append telemetry");
-
-        let _runtime_db_lock = redb::Database::open(&runtime_db_path).expect("open db lock");
-        let state = super::AxumRpcState {
-            network: Network::Devnet,
-            cfg: cfg.clone(),
-            runtime_db_path: runtime_db_path.clone(),
-            runtime_cache: Arc::new(std::sync::Mutex::new(super::AxumRuntimeCache {
-                runtime: cached_runtime,
-                last_seen_mtime: None,
-            })),
-            mempool_db_path: work_dir.join("mempool.redb"),
-            relay_telemetry: Some(telemetry_path.clone()),
-            stratum_telemetry: None,
-            pool_ledger_db_path: work_dir.join("pool-ledger.redb"),
-            ui_dir: work_dir.join("ui"),
-            extras: Arc::default(),
-        };
-
-        let payload = super::axum_status_payload(&state).expect("status payload");
-        assert_eq!(payload.tip_height, telemetry_snapshot.tip_height);
-        assert_eq!(payload.tip_hash, telemetry_snapshot.tip_hash);
-        assert_eq!(
-            payload.network_hashrate_hps, cached_hashrate,
-            "zero telemetry hashrate must not erase cached runtime estimate"
-        );
-
-        let _ = fs::remove_dir_all(work_dir);
-    }
-
-    #[test]
-    fn axum_status_payload_prefers_fresh_runtime_over_telemetry_when_db_refresh_succeeds() {
-        let cfg: ChainConfig =
-            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
-        let work_dir = temp_dir("test-axum-status-prefers-runtime-on-refresh");
-        fs::create_dir_all(&work_dir).expect("mkdir");
-        let runtime_db_path = work_dir.join("runtime.redb");
-        let telemetry_path = work_dir.join("relay.telemetry.jsonl");
-
-        let mut persisted_runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
-        mine_blocks_on_runtime(
-            &mut persisted_runtime,
-            &super::MiningLoopParams {
-                count: 1,
-                interval_sec: cfg.target_block_time_sec,
-                max_nonce: 500_000,
-                miner_key_hash: cfg.genesis_reward_key_hash20().expect("reward key"),
-                label_prefix: "axum-status-runtime-preferred",
-                print_each: false,
-            },
-        )
-        .expect("mine persisted runtime");
-        persist_runtime_db(&persisted_runtime, &runtime_db_path).expect("persist runtime");
-        let cached_runtime = ChainRuntime::from_config(cfg.clone()).expect("cached runtime");
-        assert_ne!(
-            cached_runtime.tip_height(),
-            persisted_runtime.tip_height(),
-            "test requires cached runtime to be stale"
-        );
-
-        let telemetry_snapshot = super::RelayServerTelemetrySnapshot {
-            timestamp_unix_sec: 99,
-            active_peers: 9,
-            tip_height: 777,
-            utxo_count: 777,
-            cumulative_work: "999999".to_owned(),
-            network_hashrate_hps: 999.0,
-            max_known_tip_height: 777,
-            global_sync_lag_blocks: 0,
-            tip_hash: "33".repeat(32),
-            mempool_len: 0,
-            orphan_pool_len: 0,
-            mempool_inserted_total: 0,
-            mempool_replaced_total: 0,
-            mempool_removed_by_replacement_total: 0,
-            mempool_rejected_conflict_total: 0,
-            orphan_accepted_total: 0,
-            orphan_evicted_total: 0,
-            orphan_expired_total: 0,
-            orphan_promoted_total: 0,
-            gossip_replacement_rate_limited_total: 0,
-        };
-        super::append_relay_telemetry_snapshot(&telemetry_path, &telemetry_snapshot)
-            .expect("append telemetry");
-
-        let state = super::AxumRpcState {
-            network: Network::Devnet,
-            cfg: cfg.clone(),
-            runtime_db_path: runtime_db_path.clone(),
-            runtime_cache: Arc::new(std::sync::Mutex::new(super::AxumRuntimeCache {
-                runtime: cached_runtime,
-                last_seen_mtime: None,
-            })),
-            mempool_db_path: work_dir.join("mempool.redb"),
-            relay_telemetry: Some(telemetry_path.clone()),
-            stratum_telemetry: None,
-            pool_ledger_db_path: work_dir.join("pool-ledger.redb"),
-            ui_dir: work_dir.join("ui"),
-            extras: Arc::default(),
-        };
-
-        let payload = super::axum_status_payload(&state).expect("status payload");
-        assert_eq!(payload.tip_height, persisted_runtime.tip_height());
-        assert_eq!(payload.tip_hash, persisted_runtime.tip_hash().to_hex());
-        assert_ne!(
-            payload.tip_height, telemetry_snapshot.tip_height,
-            "telemetry override must not apply after successful runtime DB refresh"
-        );
-
-        let _ = fs::remove_dir_all(work_dir);
-    }
-
-    #[test]
-    fn axum_runtime_for_query_refresh_guard_handles_lock_and_non_lock_errors_strictly() {
-        let cfg: ChainConfig =
-            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
-        let work_dir = temp_dir("test-axum-runtime-refresh-guard");
-        fs::create_dir_all(&work_dir).expect("mkdir");
-        let runtime_db_path = work_dir.join("runtime.redb");
-
-        let state = super::AxumRpcState {
-            network: Network::Devnet,
-            cfg: cfg.clone(),
-            runtime_db_path: runtime_db_path.clone(),
-            runtime_cache: Arc::new(std::sync::Mutex::new(super::AxumRuntimeCache {
-                runtime: ChainRuntime::from_config(cfg.clone()).expect("cached runtime"),
-                last_seen_mtime: None,
-            })),
-            mempool_db_path: work_dir.join("mempool.redb"),
-            relay_telemetry: None,
-            stratum_telemetry: None,
-            pool_ledger_db_path: work_dir.join("pool-ledger.redb"),
-            ui_dir: work_dir.join("ui"),
-            extras: Arc::default(),
-        };
-
-        let lock_value = super::axum_runtime_for_query_with_refresh(
-            &state,
-            |_cfg, _runtime, _path, _last_seen| {
-                Err(super::NodeError::Runtime(
-                    "Database already open".to_owned(),
-                ))
-            },
-            |runtime| Ok::<u64, super::NodeError>(runtime.tip_height()),
-        )
-        .expect("lock conflict must keep serving cached runtime");
-        assert_eq!(lock_value, 0);
-
-        let non_lock_err = super::axum_runtime_for_query_with_refresh(
-            &state,
-            |_cfg, _runtime, _path, _last_seen| {
-                Err(super::NodeError::Runtime("permission denied".to_owned()))
-            },
-            |runtime| Ok::<u64, super::NodeError>(runtime.tip_height()),
-        )
-        .expect_err("non-lock refresh errors must propagate");
-        assert!(non_lock_err.to_string().contains("permission denied"));
-
-        let _ = fs::remove_dir_all(work_dir);
-    }
-
-    #[test]
-    fn axum_runtime_for_query_propagates_non_lock_refresh_errors() {
-        let cfg: ChainConfig =
-            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
-        let work_dir = temp_dir("test-axum-runtime-cache-non-lock-error");
-        fs::create_dir_all(&work_dir).expect("mkdir");
-        let runtime_db_path = work_dir.join("runtime.redb");
-
-        let runtime = ChainRuntime::from_config(cfg.clone()).expect("runtime");
-        let mut archive = super::runtime_to_archive(&runtime).expect("archive");
-        archive.network_id = "wrongnet".to_owned();
-        scam_storage::save_chain_archive_db(&runtime_db_path, &archive)
-            .expect("save mismatched archive");
-
-        let state = super::AxumRpcState {
-            network: Network::Devnet,
-            cfg: cfg.clone(),
-            runtime_db_path: runtime_db_path.clone(),
-            runtime_cache: Arc::new(std::sync::Mutex::new(super::AxumRuntimeCache {
-                runtime: ChainRuntime::from_config(cfg.clone()).expect("cached runtime"),
-                last_seen_mtime: None,
-            })),
-            mempool_db_path: work_dir.join("mempool.redb"),
-            relay_telemetry: None,
-            stratum_telemetry: None,
-            pool_ledger_db_path: work_dir.join("pool-ledger.redb"),
-            ui_dir: work_dir.join("ui"),
-            extras: Arc::default(),
-        };
-
-        let err = super::axum_runtime_for_query(&state, |_runtime| Ok::<u64, super::NodeError>(1))
-            .expect_err("non-lock refresh errors must propagate to caller");
-        assert!(err.to_string().contains("network mismatch"));
-
-        let _ = fs::remove_dir_all(work_dir);
-    }
-
-    #[test]
-    fn refresh_mempool_from_db_if_changed_reloads_snapshot_when_mtime_changes() {
-        let cfg: ChainConfig =
-            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
-        let work_dir = temp_dir("test-refresh-mempool-reload");
-        fs::create_dir_all(&work_dir).expect("mkdir");
-        let mempool_db_path = work_dir.join("mempool.redb");
-
-        let tx = Transaction {
-            version: 1,
-            inputs: vec![TxIn {
-                prev_out: OutPoint {
-                    txid: Hash256([0x11; 32]),
-                    vout: 0,
-                },
-                signature: vec![0x44; 64],
-                pubkey_compressed: vec![0x02; 33],
-                sequence: 0,
-            }],
-            outputs: vec![TxOut {
-                value: 1_000,
-                key_hash20: [0x22; 20],
-            }],
-            lock_time: 0,
-        };
-
-        let mut disk_mempool = build_mempool_from_cfg(&cfg).expect("disk mempool");
-        disk_mempool
-            .insert_with_fee(tx.clone(), 2_000)
-            .expect("insert tx");
-        let snapshot = super::mempool_snapshot_from_pool(&cfg, &disk_mempool);
-        save_mempool_db(&mempool_db_path, &snapshot).expect("save mempool");
-
-        let mut relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(&cfg).expect("relay mempool"),
-            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
-                .expect("orphan"),
-            gossip: GossipEngine::new(32).expect("gossip"),
-        };
-        let mut seen = None;
-        assert!(!relay.mempool.contains(&tx.txid()));
-        super::refresh_mempool_from_db_if_changed(&cfg, &mut relay, &mempool_db_path, &mut seen)
-            .expect("refresh mempool");
-        assert!(relay.mempool.contains(&tx.txid()));
-        assert!(super::mempool_db_mtime(&mempool_db_path).is_some());
 
         let _ = fs::remove_dir_all(work_dir);
     }
@@ -38483,50 +35691,6 @@ mod tests {
             .expect("tx remains in sanitized mempool");
         assert_eq!(sanitized_tx.txid(), tx.txid());
         assert_eq!(sanitized_fee, expected_fee);
-    }
-
-    #[test]
-    fn load_wallet_reserved_outpoints_roundtrip_from_mempool_db() {
-        let mut cfg: ChainConfig =
-            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
-        cfg.coinbase_maturity = 1;
-        cfg.validate().expect("config validate");
-
-        let work_dir = temp_dir("test-wallet-reserved-outpoints");
-        fs::create_dir_all(&work_dir).expect("mkdir");
-        let mempool_db = work_dir.join("mempool.redb");
-
-        let reserved = OutPoint {
-            txid: Hash256([0x42; 32]),
-            vout: 7,
-        };
-        let tx = Transaction {
-            version: 1,
-            inputs: vec![TxIn {
-                prev_out: reserved.clone(),
-                signature: vec![1u8; 64],
-                pubkey_compressed: vec![0x02; 33],
-                sequence: 0,
-            }],
-            outputs: vec![TxOut {
-                value: 1_000,
-                key_hash20: [8u8; 20],
-            }],
-            lock_time: 0,
-        };
-
-        let mut mempool = build_mempool_from_cfg(&cfg).expect("mempool");
-        let _ = mempool.insert_with_fee(tx, 1_000).expect("insert");
-        super::persist_mempool_db(&cfg, &mut mempool, &mempool_db).expect("persist");
-
-        let loaded =
-            super::load_wallet_reserved_outpoints(&cfg, &mempool_db).expect("load reserved");
-        assert_eq!(loaded.len(), 1);
-        assert!(loaded.contains(&reserved));
-
-        let empty = super::load_wallet_reserved_outpoints(&cfg, &work_dir.join("missing.redb"))
-            .expect("missing file should map to empty set");
-        assert!(empty.is_empty());
     }
 
     #[test]
@@ -43195,7 +40359,6 @@ mod tests {
         const BLOCKS_AGGR_INTERVAL_KEY: &str = "SCAM_RELAY_BLOCKS_AGGRESSIVE_INTERVAL_SEC";
         const DISCOVERY_REFRESH_KEY: &str = "SCAM_RELAY_DISCOVERY_REFRESH_SEC";
         const DISCOVERY_REFRESH_JITTER_KEY: &str = "SCAM_RELAY_DISCOVERY_REFRESH_JITTER_SEC";
-        const SESSION_DB_REFRESH_KEY: &str = "SCAM_RELAY_SESSION_DB_REFRESH_INTERVAL_SEC";
         const INBOUND_WINDOW_KEY: &str = "SCAM_RELAY_INBOUND_ACCEPT_WINDOW_SEC";
         const INBOUND_MAX_PER_IP_KEY: &str = "SCAM_RELAY_INBOUND_ACCEPT_MAX_PER_IP";
         const INBOUND_LOOPBACK_MULT_KEY: &str = "SCAM_RELAY_INBOUND_ACCEPT_LOOPBACK_MULTIPLIER";
@@ -43220,7 +40383,6 @@ mod tests {
             BLOCKS_AGGR_INTERVAL_KEY,
             DISCOVERY_REFRESH_KEY,
             DISCOVERY_REFRESH_JITTER_KEY,
-            SESSION_DB_REFRESH_KEY,
             INBOUND_WINDOW_KEY,
             INBOUND_MAX_PER_IP_KEY,
             INBOUND_LOOPBACK_MULT_KEY,
@@ -43314,10 +40476,6 @@ mod tests {
             super::RELAY_DISCOVERY_REFRESH_JITTER_SEC
         );
         assert_eq!(
-            super::relay_session_db_refresh_interval_sec(),
-            super::RELAY_SESSION_DB_REFRESH_INTERVAL_SEC
-        );
-        assert_eq!(
             super::relay_inbound_accept_window_sec(),
             super::RELAY_INBOUND_ACCEPT_WINDOW_SEC
         );
@@ -43350,7 +40508,6 @@ mod tests {
             std::env::set_var(BLOCKS_AGGR_INTERVAL_KEY, "0");
             std::env::set_var(DISCOVERY_REFRESH_KEY, "0");
             std::env::set_var(DISCOVERY_REFRESH_JITTER_KEY, "999999");
-            std::env::set_var(SESSION_DB_REFRESH_KEY, "0");
             std::env::set_var(INBOUND_WINDOW_KEY, "0");
             std::env::set_var(INBOUND_MAX_PER_IP_KEY, "0");
             std::env::set_var(INBOUND_LOOPBACK_MULT_KEY, "0");
@@ -43415,10 +40572,6 @@ mod tests {
         );
         assert_eq!(super::relay_discovery_refresh_jitter_sec(), 300);
         assert_eq!(
-            super::relay_session_db_refresh_interval_sec(),
-            super::RELAY_SESSION_DB_REFRESH_INTERVAL_SEC
-        );
-        assert_eq!(
             super::relay_inbound_accept_window_sec(),
             super::RELAY_INBOUND_ACCEPT_WINDOW_SEC
         );
@@ -43455,7 +40608,6 @@ mod tests {
             std::env::set_var(BLOCKS_AGGR_INTERVAL_KEY, "3");
             std::env::set_var(DISCOVERY_REFRESH_KEY, "11");
             std::env::set_var(DISCOVERY_REFRESH_JITTER_KEY, "3");
-            std::env::set_var(SESSION_DB_REFRESH_KEY, "2");
             std::env::set_var(INBOUND_WINDOW_KEY, "7");
             std::env::set_var(INBOUND_MAX_PER_IP_KEY, "13");
             std::env::set_var(INBOUND_LOOPBACK_MULT_KEY, "5");
@@ -43480,7 +40632,6 @@ mod tests {
         assert_eq!(super::relay_blocks_aggressive_interval_sec(), 3);
         assert_eq!(super::relay_discovery_refresh_sec(), 11);
         assert_eq!(super::relay_discovery_refresh_jitter_sec(), 3);
-        assert_eq!(super::relay_session_db_refresh_interval_sec(), 2);
         assert_eq!(super::relay_inbound_accept_window_sec(), 7);
         assert_eq!(super::relay_inbound_accept_base_max_per_ip(8), 13);
         assert_eq!(super::relay_inbound_accept_loopback_multiplier(), 5);
@@ -43992,90 +41143,6 @@ mod tests {
     }
 
     #[test]
-    fn run_relay_state_sync_task_async_reloads_runtime_after_db_change() {
-        const REFRESH_KEY: &str = "SCAM_RELAY_SESSION_DB_REFRESH_INTERVAL_SEC";
-        let saved_refresh = std::env::var(REFRESH_KEY).ok();
-        unsafe {
-            std::env::set_var(REFRESH_KEY, "1");
-        }
-
-        let cfg: ChainConfig =
-            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
-        let runtime_base = ChainRuntime::from_config(cfg.clone()).expect("runtime");
-        let mut runtime_next = ChainRuntime::from_config(cfg.clone()).expect("runtime next");
-        super::mine_blocks_on_runtime(
-            &mut runtime_next,
-            &super::MiningLoopParams {
-                count: 1,
-                interval_sec: cfg.target_block_time_sec,
-                max_nonce: 500_000,
-                miner_key_hash: cfg.genesis_reward_key_hash20().expect("key"),
-                label_prefix: "state-sync-bg",
-                print_each: false,
-            },
-        )
-        .expect("mine next runtime");
-        assert!(
-            runtime_next.tip_height() > runtime_base.tip_height(),
-            "test precondition: advanced runtime must be ahead"
-        );
-
-        let relay = RelayAdmissionState {
-            mempool: build_mempool_from_cfg(&cfg).expect("mempool"),
-            orphan_pool: OrphanPool::new(cfg.max_orphan_txs as usize, cfg.orphan_ttl_sec)
-                .expect("orphan"),
-            gossip: GossipEngine::new(64).expect("gossip"),
-        };
-        let state = Arc::new(std::sync::Mutex::new(RelayServerState::new(
-            ChainRuntime::from_config(cfg.clone()).expect("runtime state"),
-            relay,
-        )));
-
-        let work_dir = temp_dir("test-relay-sync-bg-task");
-        fs::create_dir_all(&work_dir).expect("mkdir");
-        let runtime_db_path = work_dir.join("runtime.redb");
-        let mempool_db_path = work_dir.join("mempool.redb");
-        persist_runtime_db(&runtime_base, &runtime_db_path).expect("persist base runtime");
-        fs::write(&mempool_db_path, b"").expect("touch mempool db file");
-
-        let stop = Arc::new(AtomicBool::new(false));
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-        rt.block_on(async {
-            let task = tokio::spawn(super::run_relay_state_sync_task_async(
-                stop.clone(),
-                state.clone(),
-                cfg.clone(),
-                runtime_db_path.clone(),
-                mempool_db_path.clone(),
-            ));
-            tokio::time::sleep(Duration::from_millis(250)).await;
-            persist_runtime_db(&runtime_next, &runtime_db_path).expect("persist advanced runtime");
-            tokio::time::sleep(Duration::from_millis(1_500)).await;
-            stop.store(true, std::sync::atomic::Ordering::Relaxed);
-            let _ = tokio::time::timeout(Duration::from_secs(5), task)
-                .await
-                .expect("sync task join timeout");
-        });
-
-        let reloaded_tip = state.lock().expect("state lock").runtime.tip_height();
-        assert_eq!(reloaded_tip, runtime_next.tip_height());
-
-        if let Some(value) = saved_refresh {
-            unsafe {
-                std::env::set_var(REFRESH_KEY, value);
-            }
-        } else {
-            unsafe {
-                std::env::remove_var(REFRESH_KEY);
-            }
-        }
-        let _ = fs::remove_dir_all(work_dir);
-    }
-
-    #[test]
     fn axum_handlers_return_structured_payloads_and_never_default_responses() {
         let cfg: ChainConfig =
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
@@ -44085,11 +41152,7 @@ mod tests {
         let state = super::AxumRpcState {
             network: Network::Devnet,
             cfg: cfg.clone(),
-            runtime_db_path: work_dir.join("runtime.redb"),
-            runtime_cache: Arc::new(std::sync::Mutex::new(super::AxumRuntimeCache {
-                runtime,
-                last_seen_mtime: None,
-            })),
+            chain: super::ChainHandle::Own(Arc::new(std::sync::Mutex::new(runtime))),
             mempool_db_path: work_dir.join("mempool.redb"),
             relay_telemetry: None,
             stratum_telemetry: None,
@@ -44316,42 +41379,6 @@ mod tests {
             assert!(!super::axum_request_is_get(&axum::http::Method::POST));
         });
 
-        let _ = fs::remove_dir_all(work_dir);
-    }
-
-    #[test]
-    fn run_rpc_serve_inner_legacy_rejects_invalid_bind_address() {
-        let work_dir = temp_dir("test-rpc-legacy-invalid-bind");
-        fs::create_dir_all(&work_dir).expect("mkdir");
-        let config_path = work_dir.join("devnet.toml");
-        fs::write(&config_path, include_str!("../../../config/devnet.toml")).expect("write cfg");
-        let err = super::run_rpc_serve_inner_legacy(
-            RpcServeArgs {
-                network: Network::Devnet,
-                config: Some(config_path),
-                runtime_db: Some(work_dir.join("runtime.redb")),
-                bind: "not-an-addr".to_owned(),
-                ui_dir: work_dir.join("ui"),
-                relay_telemetry: None,
-                stratum_telemetry: None,
-                pool_ledger: None,
-                mine_blocks: 0,
-                interval_sec: 120,
-                max_nonce: 1000,
-                max_requests: 1,
-                auth_token_file: None,
-                disable_wallet_rpc: false,
-            },
-            Some(Arc::new(AtomicBool::new(true))),
-        )
-        .expect_err("invalid bind must fail");
-        let err_text = err.to_string();
-        assert!(
-            err_text.contains("not-an-addr")
-                || err_text.contains("bind")
-                || err_text.contains("address"),
-            "unexpected error text: {err_text}"
-        );
         let _ = fs::remove_dir_all(work_dir);
     }
 

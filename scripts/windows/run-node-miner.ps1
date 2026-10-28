@@ -96,8 +96,13 @@ switch ($Command) {
         Stop-PidFileProcess -PidFile $RpcPid | Out-Null
         Stop-PidFileProcess -PidFile $RelayPid | Out-Null
 
+        # One node process: P2P relay plus, in-process, RPC/web console and
+        # the stratum pool on the same chain and mempool (it owns the data
+        # directory). Service options go as one quoted string each.
+        $rpcOptions = "--bind $RpcBind --ui-dir '$UiDir' --relay-telemetry '$RelayTelemetry' --stratum-telemetry '$StratumTelemetry'"
+        $stratumOptions = "--bind $StratumBind --read-timeout-sec $StratumReadTimeoutSec --telemetry-out '$StratumTelemetry' --telemetry-every-sec 5"
         $relayArgs = @(
-            'relay-serve',
+            'serve',
             '--network', $Network,
             '--config', $Config,
             '--runtime-db', $RuntimeDb,
@@ -106,36 +111,14 @@ switch ($Command) {
             '--read-timeout-sec', $P2pReadTimeoutSec,
             '--write-timeout-sec', $P2pWriteTimeoutSec,
             '--telemetry-out', $RelayTelemetry,
-            '--telemetry-every-sec', '5'
+            '--telemetry-every-sec', '5',
+            '--rpc', ('"{0}"' -f $rpcOptions),
+            '--stratum', ('"{0}"' -f $stratumOptions)
         )
         if ($OutboundConnect.ToLowerInvariant() -eq 'true' -or $OutboundConnect -eq '1') {
             $relayArgs += @('--outbound-connect', '--outbound-redial-sec', $OutboundRedialSec)
         }
-        $relayPidValue = Start-BackgroundProcess -Bin $ScamNodeBin -Args $relayArgs -StdOut $RelayLog -StdErr $RelayErr -PidFile $RelayPid -Name 'relay'
-
-        $rpcArgs = @(
-            'rpc-serve',
-            '--network', $Network,
-            '--config', $Config,
-            '--runtime-db', $RuntimeDb,
-            '--bind', $RpcBind,
-            '--ui-dir', $UiDir,
-            '--relay-telemetry', $RelayTelemetry,
-            '--stratum-telemetry', $StratumTelemetry
-        )
-        $rpcPidValue = Start-BackgroundProcess -Bin $ScamNodeBin -Args $rpcArgs -StdOut $RpcLog -StdErr $RpcErr -PidFile $RpcPid -Name 'rpc'
-
-        $stratumArgs = @(
-            'stratum-serve',
-            '--network', $Network,
-            '--config', $Config,
-            '--runtime-db', $RuntimeDb,
-            '--bind', $StratumBind,
-            '--read-timeout-sec', $StratumReadTimeoutSec,
-            '--telemetry-out', $StratumTelemetry,
-            '--telemetry-every-sec', '5'
-        )
-        $stratumPidValue = Start-BackgroundProcess -Bin $ScamNodeBin -Args $stratumArgs -StdOut $StratumLog -StdErr $StratumErr -PidFile $StratumPid -Name 'stratum'
+        $relayPidValue = Start-BackgroundProcess -Bin $ScamNodeBin -Args $relayArgs -StdOut $RelayLog -StdErr $RelayErr -PidFile $RelayPid -Name 'node'
 
         $minerArgs = @(
             'stratum-mine',
@@ -149,9 +132,7 @@ switch ($Command) {
         $minerPidValue = Start-BackgroundProcess -Bin $ScamNodeBin -Args $minerArgs -StdOut $MinerLog -StdErr $MinerErr -PidFile $MinerPid -Name 'miner'
 
         Write-Host '[node-miner] up'
-        Write-Host "[node-miner] relay pid: $relayPidValue"
-        Write-Host "[node-miner] rpc pid: $rpcPidValue"
-        Write-Host "[node-miner] stratum pid: $stratumPidValue"
+        Write-Host "[node-miner] node pid (relay + rpc + stratum): $relayPidValue"
         Write-Host "[node-miner] miner pid: $minerPidValue"
         Write-Host "[node-miner] relay: $RelayBind"
         Write-Host "[node-miner] rpc/ui: http://$RpcBind/"
@@ -175,8 +156,9 @@ switch ($Command) {
     }
     'status' {
         $relayPidValue = Get-RunningPidFromFile -PidFile $RelayPid
-        $rpcPidValue = Get-RunningPidFromFile -PidFile $RpcPid
-        $stratumPidValue = Get-RunningPidFromFile -PidFile $StratumPid
+        # RPC and stratum run inside the node process.
+        $rpcPidValue = $relayPidValue
+        $stratumPidValue = $relayPidValue
         $minerPidValue = Get-RunningPidFromFile -PidFile $MinerPid
         $relayState = if ($null -eq $relayPidValue) { 'stopped' } else { "running (pid=$relayPidValue)" }
         $rpcState = if ($null -eq $rpcPidValue) { 'stopped' } else { "running (pid=$rpcPidValue)" }

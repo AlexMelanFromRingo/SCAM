@@ -110,8 +110,10 @@ start() {
   stop_pid_file "${RELAY_PID}"
   stop_pid_file "${RPC_PID}"
 
+  # One node process: P2P relay plus the in-process RPC/web console (it
+  # owns the data directory).
   local relay_args=(
-    relay-serve
+    serve
     --network "${NETWORK}"
     --config "${CONFIG}"
     --runtime-db "${RUNTIME_DB}"
@@ -121,24 +123,14 @@ start() {
     --write-timeout-sec "${P2P_WRITE_TIMEOUT_SEC}"
     --telemetry-out "${RELAY_TELEMETRY}"
     --telemetry-every-sec 5
+    --rpc "--bind ${RPC_BIND} --ui-dir '${UI_DIR}' --relay-telemetry '${RELAY_TELEMETRY}'"
   )
   if [[ "${OUTBOUND_CONNECT,,}" == "true" || "${OUTBOUND_CONNECT}" == "1" ]]; then
     relay_args+=(--outbound-connect --outbound-redial-sec "${OUTBOUND_REDIAL_SEC}")
   fi
   "${SCAM_NODE_BIN}" "${relay_args[@]}" > "${RELAY_LOG}" 2>&1 &
   echo "$!" > "${RELAY_PID}"
-  ensure_started "${RELAY_PID}" "${RELAY_LOG}" "relay"
-
-  "${SCAM_NODE_BIN}" rpc-serve \
-    --network "${NETWORK}" \
-    --config "${CONFIG}" \
-    --runtime-db "${RUNTIME_DB}" \
-    --bind "${RPC_BIND}" \
-    --ui-dir "${UI_DIR}" \
-    --relay-telemetry "${RELAY_TELEMETRY}" \
-    > "${RPC_LOG}" 2>&1 &
-  echo "$!" > "${RPC_PID}"
-  ensure_started "${RPC_PID}" "${RPC_LOG}" "rpc"
+  ensure_started "${RELAY_PID}" "${RELAY_LOG}" "node"
 
   echo "[node-only] up"
   echo "[node-only] relay: ${RELAY_BIND}"
@@ -161,8 +153,9 @@ status() {
   if [[ -f "${RELAY_PID}" ]] && pid_is_alive "$(cat "${RELAY_PID}")"; then
     relay_state="running (pid=$(cat "${RELAY_PID}"))"
   fi
-  if [[ -f "${RPC_PID}" ]] && pid_is_alive "$(cat "${RPC_PID}")"; then
-    rpc_state="running (pid=$(cat "${RPC_PID}"))"
+  # The RPC runs inside the node process.
+  if [[ -f "${RELAY_PID}" ]] && pid_is_alive "$(cat "${RELAY_PID}")"; then
+    rpc_state="running (in node pid=$(cat "${RELAY_PID}"))"
   fi
   echo "[node-only] relay=${relay_state} rpc=${rpc_state}"
   echo "[node-only] relay bind: ${RELAY_BIND}"

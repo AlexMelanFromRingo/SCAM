@@ -76,8 +76,11 @@ switch ($Command) {
         Stop-PidFileProcess -PidFile $RelayPid | Out-Null
         Stop-PidFileProcess -PidFile $RpcPid | Out-Null
 
+        # One node process: P2P relay plus the in-process RPC/web console
+        # (it owns the data directory).
+        $rpcOptions = "--bind $RpcBind --ui-dir '$UiDir' --relay-telemetry '$RelayTelemetry'"
         $relayArgs = @(
-            'relay-serve',
+            'serve',
             '--network', $Network,
             '--config', $Config,
             '--runtime-db', $RuntimeDb,
@@ -86,23 +89,14 @@ switch ($Command) {
             '--read-timeout-sec', $P2pReadTimeoutSec,
             '--write-timeout-sec', $P2pWriteTimeoutSec,
             '--telemetry-out', $RelayTelemetry,
-            '--telemetry-every-sec', '5'
+            '--telemetry-every-sec', '5',
+            '--rpc', ('"{0}"' -f $rpcOptions)
         )
         if ($OutboundConnect.ToLowerInvariant() -eq 'true' -or $OutboundConnect -eq '1') {
             $relayArgs += @('--outbound-connect', '--outbound-redial-sec', $OutboundRedialSec)
         }
-        $relayPidValue = Start-BackgroundProcess -Bin $ScamNodeBin -Args $relayArgs -StdOut $RelayLog -StdErr $RelayErr -PidFile $RelayPid -Name 'relay'
-
-        $rpcArgs = @(
-            'rpc-serve',
-            '--network', $Network,
-            '--config', $Config,
-            '--runtime-db', $RuntimeDb,
-            '--bind', $RpcBind,
-            '--ui-dir', $UiDir,
-            '--relay-telemetry', $RelayTelemetry
-        )
-        $rpcPidValue = Start-BackgroundProcess -Bin $ScamNodeBin -Args $rpcArgs -StdOut $RpcLog -StdErr $RpcErr -PidFile $RpcPid -Name 'rpc'
+        $relayPidValue = Start-BackgroundProcess -Bin $ScamNodeBin -Args $relayArgs -StdOut $RelayLog -StdErr $RelayErr -PidFile $RelayPid -Name 'node'
+        $rpcPidValue = $relayPidValue
 
         Write-Host '[node-only] up'
         Write-Host "[node-only] relay pid: $relayPidValue"
@@ -126,7 +120,8 @@ switch ($Command) {
     }
     'status' {
         $relayPidValue = Get-RunningPidFromFile -PidFile $RelayPid
-        $rpcPidValue = Get-RunningPidFromFile -PidFile $RpcPid
+        # The RPC runs inside the node process.
+        $rpcPidValue = $relayPidValue
         $relayState = if ($null -eq $relayPidValue) { 'stopped' } else { "running (pid=$relayPidValue)" }
         $rpcState = if ($null -eq $rpcPidValue) { 'stopped' } else { "running (pid=$rpcPidValue)" }
         Write-Host "[node-only] relay=$relayState rpc=$rpcState"

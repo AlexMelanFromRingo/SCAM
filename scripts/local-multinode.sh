@@ -446,100 +446,20 @@ start_cluster() {
 
   echo "[cluster] starting ${NODE_COUNT} nodes (network=${NETWORK}, config=${CONFIG})"
   for ((idx = 0; idx < NODE_COUNT; idx++)); do
-    local nodedir logsdir peersdir runtime_db p2p_port rpc_port stratum_port
-    nodedir="$(node_dir "${idx}")"
+    local logsdir peersdir runtime_db
     logsdir="$(logs_dir_path "${idx}")"
     peersdir="$(peers_dir_path "${idx}")"
     runtime_db="$(runtime_db_path "${idx}")"
-    p2p_port="$(p2p_port_for "${idx}")"
-    rpc_port="$(rpc_port_for "${idx}")"
-    stratum_port="$(stratum_port_for "${idx}")"
-
     mkdir -p "${logsdir}" "${peersdir}"
-    local relay_extra_args=()
-    if is_true "${RELAY_OUTBOUND_CONNECT}"; then
-      relay_extra_args+=(--outbound-connect --outbound-redial-sec "${RELAY_OUTBOUND_REDIAL_SEC}")
-    fi
-
     "${bin}" node \
       --network "${NETWORK}" \
       --config "${CONFIG}" \
       --runtime-db "${runtime_db}" \
       > "${logsdir}/bootstrap.log" 2>&1
-
-    spawn_detached \
-      "${nodedir}/relay.pid" \
-      "node-${idx} relay-serve" \
-      "${logsdir}/relay.log" \
-      env \
-      SCAM_RELAY_HANDSHAKE_TIMEOUT_SEC="${RELAY_HANDSHAKE_TIMEOUT_SEC}" \
-      SCAM_RELAY_TOKIO_WORKER_THREADS="${RELAY_TOKIO_WORKER_THREADS}" \
-      SCAM_RELAY_OUTBOUND_MAX_PEERS="${RELAY_OUTBOUND_MAX_PEERS}" \
-      SCAM_RELAY_OUTBOUND_SPAWN_BURST="${RELAY_OUTBOUND_SPAWN_BURST}" \
-      SCAM_RELAY_OUTBOUND_SPAWN_LAG_THRESHOLD="${RELAY_OUTBOUND_SPAWN_LAG_THRESHOLD}" \
-      SCAM_RELAY_OUTBOUND_SPAWN_LAG_MIN_BURST="${RELAY_OUTBOUND_SPAWN_LAG_MIN_BURST}" \
-      SCAM_RELAY_OUTBOUND_LAG_MAX_PEERS="${RELAY_OUTBOUND_LAG_MAX_PEERS}" \
-      SCAM_RELAY_OUTBOUND_LAG_ROTATE_AFTER_SEC="${RELAY_OUTBOUND_LAG_ROTATE_AFTER_SEC}" \
-      SCAM_RELAY_OUTBOUND_BUCKET_CAP="${RELAY_OUTBOUND_BUCKET_CAP}" \
-      SCAM_RELAY_OUTBOUND_INITIAL_JITTER_MS="${RELAY_OUTBOUND_INITIAL_JITTER_MS}" \
-      "${bin}" relay-serve \
-      --network "${NETWORK}" \
-      --config "${CONFIG}" \
-      --runtime-db "${runtime_db}" \
-      --peers-dir "${peersdir}" \
-      --bind "127.0.0.1:${p2p_port}" \
-      --max-clients "${RELAY_MAX_CLIENTS}" \
-      --read-timeout-sec "${P2P_READ_TIMEOUT_SEC}" \
-      --write-timeout-sec "${P2P_WRITE_TIMEOUT_SEC}" \
-      "${relay_extra_args[@]}" \
-      --telemetry-out "${nodedir}/relay.telemetry.jsonl" \
-      --telemetry-every-sec 5
-
-    local rpc_value="-"
-    if is_true "${RUN_RPC}"; then
-      spawn_detached \
-        "${nodedir}/rpc.pid" \
-        "node-${idx} rpc-serve" \
-        "${logsdir}/rpc.log" \
-        "${bin}" rpc-serve \
-        --network "${NETWORK}" \
-        --config "${CONFIG}" \
-        --runtime-db "${runtime_db}" \
-        --bind "127.0.0.1:${rpc_port}" \
-        --ui-dir "${UI_DIR}" \
-        --relay-telemetry "${nodedir}/relay.telemetry.jsonl" \
-        --stratum-telemetry "${nodedir}/stratum.telemetry.jsonl"
-      rpc_value="${rpc_port}"
-    fi
-
-    local stratum_value="-"
-    if should_run_stratum_for_idx "${idx}"; then
-      spawn_detached \
-        "${nodedir}/stratum.pid" \
-        "node-${idx} stratum-serve" \
-        "${logsdir}/stratum.log" \
-        env \
-        SCAM_STRATUM_TOKIO_WORKER_THREADS="${STRATUM_TOKIO_WORKER_THREADS}" \
-        "${bin}" stratum-serve \
-        --network "${NETWORK}" \
-        --config "${CONFIG}" \
-        --runtime-db "${runtime_db}" \
-        --bind "127.0.0.1:${stratum_port}" \
-        --read-timeout-sec "${STRATUM_READ_TIMEOUT_SEC}" \
-        --telemetry-out "${nodedir}/stratum.telemetry.jsonl" \
-        --telemetry-every-sec "${STRATUM_TELEMETRY_EVERY_SEC}"
-      stratum_value="${stratum_port}"
-    fi
-
-    echo -e "${idx}\t${p2p_port}\t${rpc_value}\t${stratum_value}\t${nodedir}" >> "${ENDPOINTS_FILE}"
   done
 
-  sleep 1
-
-  if is_true "${WAIT_FOR_RELAY_READY}"; then
-    wait_for_relays_ready "${RELAY_READY_TIMEOUT_SEC}" "${RELAY_READY_POLL_MS}"
-  fi
-
+  # Peer books are written before the nodes start: a running node owns its
+  # data directory (stores are opened once and locked).
   if is_true "${WIRE_PEERS}"; then
     echo "[cluster] wiring peer books"
     local peers_per_node="${WIRE_PEERS_PER_NODE}"
@@ -600,60 +520,73 @@ start_cluster() {
     echo "[cluster] skipping peer-book wiring (WIRE_PEERS=false)"
   fi
 
-  if is_true "${SYNC_BOOK}"; then
-    if ! is_true "${FORCE_INITIAL_SYNC_BOOK_WITH_RELAY}"; then
-      echo "[cluster] skip initial sync-book pass: relay runtime holds runtime DB locks and handles realtime propagation"
-      echo "[cluster] set FORCE_INITIAL_SYNC_BOOK_WITH_RELAY=true to force one-shot sync-book (not recommended)"
-    else
-      echo "[cluster] running initial sync-book pass (FORCE_INITIAL_SYNC_BOOK_WITH_RELAY=true)"
-      for ((idx = 1; idx < NODE_COUNT; idx++)); do
-        local logsdir runtime_db peersdir
-        logsdir="$(logs_dir_path "${idx}")"
-        runtime_db="$(runtime_db_path "${idx}")"
-        peersdir="$(peers_dir_path "${idx}")"
-        if ! "${bin}" sync-book \
-          --network "${NETWORK}" \
-          --config "${CONFIG}" \
-          --runtime-db "${runtime_db}" \
-          --peers-dir "${peersdir}" \
-          --max-peers "${NODE_COUNT}" \
-          --max-batches-per-peer "${SYNC_MAX_BATCHES_PER_PEER}" \
-          > "${logsdir}/sync-book.log" 2>&1; then
-          echo "[cluster] node-${idx} sync-book returned non-zero (see ${logsdir}/sync-book.log)"
-        fi
-      done
+  for ((idx = 0; idx < NODE_COUNT; idx++)); do
+    local nodedir logsdir peersdir runtime_db p2p_port rpc_port stratum_port
+    nodedir="$(node_dir "${idx}")"
+    logsdir="$(logs_dir_path "${idx}")"
+    peersdir="$(peers_dir_path "${idx}")"
+    runtime_db="$(runtime_db_path "${idx}")"
+    p2p_port="$(p2p_port_for "${idx}")"
+    rpc_port="$(rpc_port_for "${idx}")"
+    stratum_port="$(stratum_port_for "${idx}")"
+
+    local relay_extra_args=()
+    if is_true "${RELAY_OUTBOUND_CONNECT}"; then
+      relay_extra_args+=(--outbound-connect --outbound-redial-sec "${RELAY_OUTBOUND_REDIAL_SEC}")
     fi
+    # One process per node: P2P relay plus, in-process, RPC and stratum on
+    # the same chain and mempool.
+    local rpc_value="-"
+    if is_true "${RUN_RPC}"; then
+      relay_extra_args+=(--rpc "--bind 127.0.0.1:${rpc_port} --ui-dir '${UI_DIR}' --relay-telemetry '${nodedir}/relay.telemetry.jsonl' --stratum-telemetry '${nodedir}/stratum.telemetry.jsonl'")
+      rpc_value="${rpc_port}"
+    fi
+    local stratum_value="-"
+    if should_run_stratum_for_idx "${idx}"; then
+      relay_extra_args+=(--stratum "--bind 127.0.0.1:${stratum_port} --read-timeout-sec ${STRATUM_READ_TIMEOUT_SEC} --telemetry-out '${nodedir}/stratum.telemetry.jsonl' --telemetry-every-sec ${STRATUM_TELEMETRY_EVERY_SEC}")
+      stratum_value="${stratum_port}"
+    fi
+
+    spawn_detached \
+      "${nodedir}/relay.pid" \
+      "node-${idx} serve" \
+      "${logsdir}/relay.log" \
+      env \
+      SCAM_RELAY_HANDSHAKE_TIMEOUT_SEC="${RELAY_HANDSHAKE_TIMEOUT_SEC}" \
+      SCAM_RELAY_TOKIO_WORKER_THREADS="${RELAY_TOKIO_WORKER_THREADS}" \
+      SCAM_STRATUM_TOKIO_WORKER_THREADS="${STRATUM_TOKIO_WORKER_THREADS}" \
+      SCAM_RELAY_OUTBOUND_MAX_PEERS="${RELAY_OUTBOUND_MAX_PEERS}" \
+      SCAM_RELAY_OUTBOUND_SPAWN_BURST="${RELAY_OUTBOUND_SPAWN_BURST}" \
+      SCAM_RELAY_OUTBOUND_SPAWN_LAG_THRESHOLD="${RELAY_OUTBOUND_SPAWN_LAG_THRESHOLD}" \
+      SCAM_RELAY_OUTBOUND_SPAWN_LAG_MIN_BURST="${RELAY_OUTBOUND_SPAWN_LAG_MIN_BURST}" \
+      SCAM_RELAY_OUTBOUND_LAG_MAX_PEERS="${RELAY_OUTBOUND_LAG_MAX_PEERS}" \
+      SCAM_RELAY_OUTBOUND_LAG_ROTATE_AFTER_SEC="${RELAY_OUTBOUND_LAG_ROTATE_AFTER_SEC}" \
+      SCAM_RELAY_OUTBOUND_BUCKET_CAP="${RELAY_OUTBOUND_BUCKET_CAP}" \
+      SCAM_RELAY_OUTBOUND_INITIAL_JITTER_MS="${RELAY_OUTBOUND_INITIAL_JITTER_MS}" \
+      "${bin}" serve \
+      --network "${NETWORK}" \
+      --config "${CONFIG}" \
+      --runtime-db "${runtime_db}" \
+      --peers-dir "${peersdir}" \
+      --bind "127.0.0.1:${p2p_port}" \
+      --max-clients "${RELAY_MAX_CLIENTS}" \
+      --read-timeout-sec "${P2P_READ_TIMEOUT_SEC}" \
+      --write-timeout-sec "${P2P_WRITE_TIMEOUT_SEC}" \
+      "${relay_extra_args[@]}" \
+      --telemetry-out "${nodedir}/relay.telemetry.jsonl" \
+      --telemetry-every-sec 5
+
+    echo -e "${idx}\t${p2p_port}\t${rpc_value}\t${stratum_value}\t${nodedir}" >> "${ENDPOINTS_FILE}"
+  done
+
+  sleep 1
+
+  if is_true "${WAIT_FOR_RELAY_READY}"; then
+    wait_for_relays_ready "${RELAY_READY_TIMEOUT_SEC}" "${RELAY_READY_POLL_MS}"
   fi
 
-  if is_true "${RUN_SYNC_LOOP}"; then
-    if ! is_true "${FORCE_SYNC_LOOP_WITH_RELAY}"; then
-      echo "[cluster] skip periodic sync-book loops: relay already handles realtime propagation; external sync-loop can cause runtime DB lock contention"
-      echo "[cluster] set FORCE_SYNC_LOOP_WITH_RELAY=true to override (not recommended)"
-    else
-      echo "[cluster] starting periodic sync-book loops (interval=${SYNC_LOOP_INTERVAL_SEC}s)"
-      for ((idx = 1; idx < NODE_COUNT; idx++)); do
-        local logsdir runtime_db peersdir nodedir
-        logsdir="$(logs_dir_path "${idx}")"
-        runtime_db="$(runtime_db_path "${idx}")"
-        peersdir="$(peers_dir_path "${idx}")"
-        nodedir="$(node_dir "${idx}")"
-        (
-          while true; do
-            "${bin}" sync-book \
-              --network "${NETWORK}" \
-              --config "${CONFIG}" \
-              --runtime-db "${runtime_db}" \
-              --peers-dir "${peersdir}" \
-              --max-peers "${NODE_COUNT}" \
-              --max-batches-per-peer "${SYNC_MAX_BATCHES_PER_PEER}" \
-              >> "${logsdir}/sync-loop.log" 2>&1 || true
-            sleep "${SYNC_LOOP_INTERVAL_SEC}"
-          done
-        ) &
-        write_pid "${nodedir}/sync-loop.pid" "$!"
-        ensure_pid_started "${nodedir}/sync-loop.pid" "node-${idx} sync-loop" "${logsdir}/sync-loop.log"
-      done
-    fi
+  if is_true "${SYNC_BOOK}" || is_true "${RUN_SYNC_LOOP}"; then
+    echo "[cluster] SYNC_BOOK/RUN_SYNC_LOOP ignored: each node owns its data directory and syncs over P2P"
   fi
 
   echo "[cluster] up"
@@ -704,17 +637,12 @@ status_cluster() {
     if [[ -f "${dir}/relay.pid" ]] && pid_is_alive "$(cat "${dir}/relay.pid")"; then
       relay_state="running"
     fi
+    # RPC and stratum run inside the node process.
     if [[ "${rpc}" != "-" ]]; then
-      rpc_state="stopped"
-      if [[ -f "${dir}/rpc.pid" ]] && pid_is_alive "$(cat "${dir}/rpc.pid")"; then
-        rpc_state="running"
-      fi
+      rpc_state="${relay_state}"
     fi
     if [[ "${stratum}" != "-" ]]; then
-      stratum_state="stopped"
-      if [[ -f "${dir}/stratum.pid" ]] && pid_is_alive "$(cat "${dir}/stratum.pid")"; then
-        stratum_state="running"
-      fi
+      stratum_state="${relay_state}"
     fi
     if [[ -f "${dir}/sync-loop.pid" ]] && pid_is_alive "$(cat "${dir}/sync-loop.pid")"; then
       sync_state="running"

@@ -69,17 +69,18 @@ Baseline at start: `fmt`/`clippy -D warnings`/`cargo test --workspace
 | P11 | medium | `--max-clients N` is a lifetime connection limit; relay exits after N connections. | `main.rs` accept loop | fixed (`relay-serve --max-active-sessions` caps concurrency; `--max-clients` documented as the test-only "exit after N") |
 | P12 | medium | Compact short ids unsalted (8-byte txid prefix); no fallback to full block; BlockTxn accepted from any peer. | `main.rs` | fixed (SipHash-2-4 keyed by block hash; merkle mismatch → GetData full block, no penalty; BlockTxn only from the asked peer) |
 | P13 | low | Unpruned maps: `banned_peers`, `inbound_accept_history`, `peer_tip_by_address`. | `main.rs`, `gossip.rs` | fixed (accept history pruned inside the shared limiter for relay and stratum; `banned_ips` expire; per-connection gossip bans dropped on disconnect; address-keyed tip hints capped at 4096 with a 6 h TTL, connected peers kept) |
+| P14 | medium | Peer reputation/anchor JSON stores are updated read-modify-write by concurrent outbound workers through one fixed temp file ⇒ lost updates, torn renames; blocking file I/O in async tasks. | `main.rs` peer stores | fixed (updates serialized in-process, run outside the async executor) |
 
 ## Storage / process model
 
 | ID | Sev | Finding | Where | Status |
 |---|---|---|---|---|
-| S1 | critical | `stratum-serve` loads the chain once, never reloads, and persists its stale chain over the shared archive (temp+rename, no ancestry check); relay refresh adopts disk state without fork choice ⇒ chain rollback. | `main.rs` stratum persist / relay refresh | fixed (guarded write refuses stale writers via recorded tip work; refresh merges disk blocks through `submit_block`) — single-writer redesign still recommended; owner decision (2026-10-28): single node process owning every store — in progress |
-| S2 | high | Relay drops the mutex between `submit_block` and persist; background refresh can reload in between and the session then persists the older chain. | `main.rs` relay session | mitigated (refresh now merges instead of replacing, so the new block survives); owner decision (2026-10-28): single node process owning every store — in progress |
+| S1 | critical | `stratum-serve` loads the chain once, never reloads, and persists its stale chain over the shared archive (temp+rename, no ancestry check); relay refresh adopts disk state without fork choice ⇒ chain rollback. | `main.rs` stratum persist / relay refresh | fixed (one node process — `serve` — owns the data directory: relay, RPC and pool share one in-memory chain and mempool; stores are opened once and locked (`pin_database`), so no other process can write them and nothing is merged back from disk; the guarded incremental archive writer remains as a second line) |
+| S2 | high | Relay drops the mutex between `submit_block` and persist; background refresh can reload in between and the session then persists the older chain. | `main.rs` relay session | fixed (relay sessions persist chain and mempool changes inside the same critical section that made them; pool blocks are connected to the node's chain and announced through the relay; no background reload exists anymore) |
 | S3 | high | Every tip change rewrites the entire archive (O(H²) bytes during sync). | `storage::save_chain_archive_db` callers | fixed (`persist_chain_archive_incremental_db`: one redb txn, only new blocks) |
 | S4 | high | Every start/refresh replays all blocks with full signature checks (relay ~1 s after any write, RPC cache, each SSE conn, each payout). | `main.rs::load_runtime_from_db_or_genesis` | partially fixed (refresh reads tip meta, then only the tail, validating only unknown blocks); cold start still replays — persisted UTXO set needed |
 | S5 | medium | Mempool DB: load-modify-rewrite from RPC, relay and stratum ⇒ lost updates; `GET /mempool` writes. | `main.rs` | fixed (mempool tracks its own delta; `apply_mempool_delta_db` writes only inserts/removals in one txn; relay refresh merges instead of replacing) |
-| S6 | medium | redb exclusive open per access; nested retry sleeps while holding locks / in async tasks. | `main.rs` | open; owner decision (2026-10-28): single node process owning every store — in progress |
+| S6 | medium | redb exclusive open per access; nested retry sleeps while holding locks / in async tasks. | `main.rs` | fixed (stores pinned per process: opened once, shared by every call, no lock-conflict retries or sleeps in-process; another process is refused fast with `OwnedByOtherProcess`; DB and JSON-store I/O from async relay tasks runs in `block_in_place`/`spawn_blocking`; ledger/peer-book writes happen outside service locks) |
 | S7 | low | No on-disk schema version; `#[serde(default)]` useless under bincode. | `storage` | fixed (`schema_version` in every store; unknown versions refused; pool ledger requires v2) |
 | S8 | low | Temp files leaked on error; rename while temp DB still open. | `storage` | fixed (every whole-store rewrite happens in place inside one redb transaction — no temp DB, no rename; the bincode snapshot file is written temp+fsync+rename with the temp removed on error) |
 
@@ -112,6 +113,7 @@ Baseline at start: `fmt`/`clippy -D warnings`/`cargo test --workspace
 | R11 | low | Web console: mnemonic fields autocomplete/spellcheck on; no CSP / X-Frame-Options; `apiBase` override from localStorage. | `web/` | fixed (no autocomplete/spellcheck on secrets, passphrases masked, CSP + X-Frame-Options + nosniff; CSP limits `connect-src` to loopback) |
 | R12 | low | QR payment URI label not percent-encoded ⇒ parameter injection. | `wallet/src/qr.rs` | fixed |
 | R13 | low | No zeroization of secrets; `json_error_body` does not escape control chars. | wallet, `main.rs` | fixed (JSON via serde; keys, mnemonics, passphrases, vault key and plaintext wiped on drop) |
+| R14 | medium | A second RPC server (`SCAM_RPC_HTTP_BACKEND=legacy`) duplicated every route without the request policy and with its own per-request DB reads. | `main.rs` | fixed (removed; the axum server is the only RPC) |
 
 ## Tooling / CI
 
@@ -157,6 +159,13 @@ but **existing devnet/testnet chains and nodes must be upgraded together**:
 - Every store carries `schema_version`. Pool ledgers written before the
   current format (v3) are refused — move the file aside to start a fresh
   ledger.
+- A node is one process: `scam-node serve` (relay + `--rpc "..."` +
+  `--stratum "..."`). It owns its data directory: stores are opened once and
+  locked, so `relay-serve`, `rpc-serve`, `stratum-serve` or store-writing
+  CLI tools on the same files are refused ("held by another running
+  process") — use the node's RPC. The standalone commands remain for a
+  process alone on its data. Lab scripts and `run-mode` use the single
+  process; the legacy RPC backend (`SCAM_RPC_HTTP_BACKEND=legacy`) is gone.
 - Peer books are format v2 (addrman fields). A v1 `peers/<network>.redb` is
   refused — move it aside (re-add pinned peers with `add-peer`). Addresses
   added with `add-peer(s)` are operator-pinned and never evicted.

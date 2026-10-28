@@ -1,6 +1,6 @@
 # Web Console (Explorer + Wallet)
 
-SCAM includes a browser UI served directly by `scam-node rpc-serve`.
+SCAM includes a browser UI served by the node (`scam-node serve --rpc "..."`).
 
 The UI is in `web/` and provides:
 - explorer view (status, latest blocks, block lookup, tx lookup),
@@ -19,27 +19,20 @@ cargo run -p scam-node -- node \
   --runtime-db data/devnet.runtime.redb
 ```
 
-Optional: run relay for live telemetry snapshots:
+## 2) Start the node with the RPC + UI server
+
+The console runs inside the node process, on the node's own chain and
+mempool (a running node owns its data directory; a separate `rpc-serve` on
+the same files is refused):
 
 ```bash
-cargo run -p scam-node -- relay-serve \
+cargo run -p scam-node -- serve \
   --network devnet \
   --config config/devnet.toml \
   --runtime-db data/devnet.runtime.redb \
   --bind 0.0.0.0:18444 \
-  --telemetry-out data/relay.telemetry.jsonl
-```
-
-## 2) Start RPC + UI Server
-
-```bash
-cargo run -p scam-node -- rpc-serve \
-  --network devnet \
-  --config config/devnet.toml \
-  --runtime-db data/devnet.runtime.redb \
-  --bind 127.0.0.1:18080 \
-  --ui-dir web \
-  --relay-telemetry data/relay.telemetry.jsonl
+  --telemetry-out data/relay.telemetry.jsonl \
+  --rpc "--bind 127.0.0.1:18080 --ui-dir web --relay-telemetry data/relay.telemetry.jsonl"
 ```
 
 Open:
@@ -78,4 +71,4 @@ POST:
 ## 5) Stratum vs RPC
 
 - RPC/UI is for operator tooling, explorer, and wallet operations.
-- Mining jobs and share submission should use Stratum/SV2 commands (`stratum-serve`, `stratum-mine`, role services).
+- Mining jobs and share submission should use Stratum/SV2 commands (`serve --stratum`, `stratum-mine`, role services).
