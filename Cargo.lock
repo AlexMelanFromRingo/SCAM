@@ -1724,7 +1724,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "scam-chain"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "num-bigint",
  "scam-consensus",
@@ -1738,7 +1738,7 @@ dependencies = [
 
 [[package]]
 name = "scam-consensus"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "bincode",
  "num-bigint",
@@ -1752,7 +1752,7 @@ dependencies = [
 
 [[package]]
 name = "scam-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "blake3",
  "hex",
@@ -1765,7 +1765,7 @@ dependencies = [
 
 [[package]]
 name = "scam-mempool"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "scam-core",
  "thiserror 2.0.18",
@@ -1773,7 +1773,7 @@ dependencies = [
 
 [[package]]
 name = "scam-miner"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "scam-core",
  "scam-mempool",
@@ -1782,7 +1782,7 @@ dependencies = [
 
 [[package]]
 name = "scam-node"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "axum",
  "bincode",
@@ -1814,7 +1814,7 @@ dependencies = [
 
 [[package]]
 name = "scam-p2p"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "bincode",
  "bytes",
@@ -1829,7 +1829,7 @@ dependencies = [
 
 [[package]]
 name = "scam-rpc"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "bincode",
  "hex",
@@ -1841,7 +1841,7 @@ dependencies = [
 
 [[package]]
 name = "scam-storage"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "bincode",
  "redb",
@@ -1853,7 +1853,7 @@ dependencies = [
 
 [[package]]
 name = "scam-stratum"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "bincode",
  "blake3",
@@ -1871,7 +1871,7 @@ dependencies = [
 
 [[package]]
 name = "scam-tui"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "crossterm",
  "ratatui",
@@ -1882,7 +1882,7 @@ dependencies = [
 
 [[package]]
 name = "scam-wallet"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "argon2",
  "bech32 0.9.1",

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-SCAM ("Smart Computing Alternative Money") is a Rust 2024 implementation of a PoW L1 blockchain (BLAKE3-256 PoW, Schnorr/secp256k1 signatures, Bech32m addresses, UTXO model, SV2 stratum subset). The workspace is currently at `0.3.0` (`Cargo.toml`); the operator-facing README is the canonical end-user reference.
+SCAM ("Smart Computing Alternative Money") is a Rust 2024 implementation of a PoW L1 blockchain (BLAKE3-256 PoW, Schnorr/secp256k1 signatures, Bech32m addresses, UTXO model, SV2 stratum subset). The workspace is currently at `0.3.1` (`Cargo.toml`); the operator-facing README is the canonical end-user reference.
 
 ## Quality gates (must all pass before considering work done)
 
@@ -108,7 +108,7 @@ cargo run -p scam-node -- config-scaffold --network-id <id> --hrp <hrp> --out co
 
 - `ci.yml` — fmt/check/test (with the split for `scam-node`)/clippy, then `sv2-conformance-matrix.sh`.
 - `mutation.yml` — manual dispatch with stage/timeout/shard/iterate knobs.
-- `release-build.yml` — triggered by workspace version bumps on `master`; uploads `scam-node-linux-x86_64`, `scam-node-windows-x86_64.exe`, `scam-node-macos-aarch64` (macOS x86_64 is cross-compiled from the ARM64 runner — see recent commits).
+- `release-build.yml` — triggered by workspace version bumps on `master`; uploads `scam-node-linux-x86_64`, `scam-node-windows-x86_64.exe`, `scam-node-macos-x86_64` (cross-compiled on the ARM64 runner with the toolchain pinned in `rust-toolchain.toml`; a manual run on a non-`master` branch builds without publishing).
 - `sv2-release-gate.yml`, `sv2-external-interop.yml` — SV2 gate checks.
 
 ## Conventions worth following
