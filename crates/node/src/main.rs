@@ -91,7 +91,7 @@ use tokio_socks::tcp::Socks5Stream;
 use tokio_stream::{StreamExt, wrappers::IntervalStream};
 
 #[derive(Debug, Parser)]
-#[command(name = "scam-node")]
+#[command(name = "scam-node", version)]
 #[command(about = "SCAM full node bootstrap", long_about = None)]
 struct Cli {
     #[command(subcommand)]
@@ -1771,6 +1771,10 @@ enum NodeError {
         "insufficient spendable funds for amount+fee={needed} (spendable total: {spendable_total})"
     )]
     InsufficientFunds { needed: u64, spendable_total: u128 },
+    /// Command line rejected, or help/version requested. `main` lets clap
+    /// print it: help and version go to stdout with status 0.
+    #[error("{0}")]
+    Cli(#[from] clap::Error),
     #[error("{0}")]
     Runtime(String),
 }
@@ -12545,8 +12549,9 @@ fn split_service_args(raw: &str) -> Result<Vec<String>, NodeError> {
 
 fn parse_service_args<T: Parser>(service: &str, raw: &str) -> Result<T, NodeError> {
     let words = split_service_args(raw)?;
-    T::try_parse_from(std::iter::once(format!("serve --{service}")).chain(words))
-        .map_err(|e| NodeError::Runtime(format!("--{service}: {e}")))
+    Ok(T::try_parse_from(
+        std::iter::once(format!("serve --{service}")).chain(words),
+    )?)
 }
 
 /// `serve`: the relay owns the node; the RPC and the stratum pool run as
@@ -21056,14 +21061,18 @@ where
     I: IntoIterator<Item = T>,
     T: Into<std::ffi::OsString> + Clone,
 {
-    let cli = Cli::try_parse_from(args).map_err(|e| NodeError::Runtime(e.to_string()))?;
+    let cli = Cli::try_parse_from(args)?;
     run_command(cli)
 }
 
 fn main() {
-    if let Err(err) = run_from_args(std::env::args_os()) {
-        eprintln!("error: {err}");
-        std::process::exit(1);
+    match run_from_args(std::env::args_os()) {
+        Ok(()) => {}
+        Err(NodeError::Cli(err)) => err.exit(),
+        Err(err) => {
+            eprintln!("error: {err}");
+            std::process::exit(1);
+        }
     }
 }
 
@@ -41847,6 +41856,48 @@ mod tests {
         ])
         .expect_err("run_from_args must execute command dispatch");
         assert!(err.to_string().contains("config"));
+        assert!(matches!(err, super::NodeError::ConfigRead { .. }));
+    }
+
+    /// Help and version requests (also for the options nested in `serve
+    /// --rpc/--stratum`) and usage errors reach `main` as `NodeError::Cli`,
+    /// which clap prints itself: help/version to stdout with status 0.
+    #[test]
+    fn cli_requests_and_usage_errors_are_cli_errors() {
+        use clap::error::ErrorKind;
+        let cli_kind = |err: super::NodeError| match err {
+            super::NodeError::Cli(err) => err.kind(),
+            other => panic!("expected NodeError::Cli, got {other}"),
+        };
+        for (args, kind) in [
+            (&["scam-node", "--help"][..], ErrorKind::DisplayHelp),
+            (
+                &["scam-node", "serve", "--help"][..],
+                ErrorKind::DisplayHelp,
+            ),
+            (&["scam-node", "--version"][..], ErrorKind::DisplayVersion),
+            (&["scam-node", "-V"][..], ErrorKind::DisplayVersion),
+            (&["scam-node", "--no-such"][..], ErrorKind::UnknownArgument),
+        ] {
+            let err = super::run_from_args(args.iter().copied()).expect_err("no command runs");
+            assert_eq!(cli_kind(err), kind, "{args:?}");
+        }
+        let version = super::run_from_args(["scam-node", "--version"]).expect_err("version");
+        assert_eq!(
+            version.to_string(),
+            format!("scam-node {}\n", env!("CARGO_PKG_VERSION"))
+        );
+
+        let help = super::parse_service_args::<super::RpcServiceCli>("rpc", "--help")
+            .err()
+            .expect("help");
+        let rendered = help.to_string();
+        assert!(rendered.contains("Usage: serve --rpc") && rendered.contains("--ui-dir"));
+        assert_eq!(cli_kind(help), ErrorKind::DisplayHelp);
+        let err = super::parse_service_args::<super::StratumServiceCli>("stratum", "--no-such")
+            .err()
+            .expect("unknown option");
+        assert_eq!(cli_kind(err), ErrorKind::UnknownArgument);
     }
 
     #[test]

@@ -151,7 +151,7 @@ Config controls algorithm and parameters.
 
 ### 4.1 Prerequisites
 - Linux/macOS with `bash`.
-- Rust stable toolchain (workspace currently validated on Rust 1.93.x stable).
+- Rust 1.95.0, pinned in `rust-toolchain.toml` (rustup installs it on the first `cargo` call).
 - For fuzzing: nightly toolchain.
 
 ### 4.2 Build (debug)
@@ -167,7 +167,7 @@ cargo build --workspace --release
 ```
 
 Main binary:
-- `target/release/scam-node`
+- `target/release/scam-node` (`scam-node --version` prints its version, `scam-node --help` / `scam-node <command> --help` the options)
 
 ### 4.4 Full quality gate
 
@@ -183,13 +183,16 @@ cargo clippy --workspace --all-targets -- -D warnings
 - Workflow: `.github/workflows/release-build.yml`
 - Trigger:
   - push to `master` when `Cargo.toml` workspace version changes,
-  - manual `workflow_dispatch`.
+  - manual `workflow_dispatch` (on a branch other than `master` it only builds
+    the binaries, without publishing).
+- Builds with the toolchain pinned in `rust-toolchain.toml`.
 - Output:
-  - creates/updates GitHub Release tag `v<workspace-version>`,
+  - creates/updates GitHub Release tag `v<workspace-version>` (a version with
+    a `-` suffix is a pre-release),
   - uploads raw binaries (no archive):
     - `scam-node-linux-x86_64`
     - `scam-node-windows-x86_64.exe`
-    - `scam-node-macos-aarch64`
+    - `scam-node-macos-x86_64` (cross-compiled on an Apple Silicon runner)
 
 ---
 

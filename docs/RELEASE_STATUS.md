@@ -1,5 +1,20 @@
 # SCAM Release Status
 
+## 0.3.1 (`2026-10-28`)
+
+State:
+- CLI fixes found checking the 0.3.0 binaries (`docs/PRODUCTION_AUDIT.md`
+  T3): `scam-node --version`/`-V`; help (also `serve --rpc/--stratum
+  "--help"`) on stdout with status 0; usage errors exit 2.
+- Release build installs the toolchain pinned in `rust-toolchain.toml` with
+  the macOS cross target (T2, shipped in the 0.3.0 release run).
+- No consensus, protocol or storage changes: 0.3.1 and 0.3.0 nodes
+  interoperate and share data directories.
+- Gates on the release commit: fmt, clippy `-D warnings`, workspace and
+  `scam-node` tests, `cli_main` (help/version/exit codes), e2e, SV2 matrix (CI).
+
+Not run for this release: same list as 0.3.0.
+
 ## 0.3.0 (`2026-10-28`)
 
 State:

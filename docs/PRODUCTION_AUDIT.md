@@ -120,6 +120,8 @@ Baseline at start: `fmt`/`clippy -D warnings`/`cargo test --workspace
 | ID | Sev | Finding | Where | Status |
 |---|---|---|---|---|
 | T1 | high | SV2 conformance gate could never fail on local stacks: `rc=$?` in the `else` branch read the preceding assignment's status (always 0); per-stack reports from earlier runs were counted as this run's results; the shared `data/` runtime DB let leftover state decide the outcome. | `scripts/sv2-conformance-matrix.sh` (CI) | fixed (`\|\| rc=$?`, stale reports deleted, private fresh `DATA_DIR` per run) |
+| T2 | high | Release build could not produce the macOS binary: `dtolnay/rust-toolchain@stable` added `x86_64-apple-darwin` to `stable`, but cargo builds with the toolchain pinned in `rust-toolchain.toml` (1.95.0), installed without that target ⇒ "can't find crate for `core`", nothing published (found releasing v0.3.0). | `.github/workflows/release-build.yml` | fixed (pinned toolchain installed and the target added to it; publish only from `master`, a manual run elsewhere is a build-only dry run) |
+| T3 | medium | CLI: no `--version` (an operator cannot tell which binary runs); every clap outcome was mapped to `NodeError::Runtime`, so `--help` (also `serve --rpc/--stratum "--help"`) printed to stderr as `error: …` with status 1, and usage errors exited 1 (found checking the v0.3.0 binary). | `main.rs::main`, `run_from_args`, `parse_service_args` | fixed (`scam-node --version`/`-V`; clap outcomes travel as `NodeError::Cli` and clap prints them: help/version on stdout with status 0, usage errors on stderr with status 2; other errors keep `error:` and status 1) |
 
 ## Behaviour changes operators must know
 
@@ -188,6 +190,9 @@ but **existing devnet/testnet chains and nodes must be upgraded together**:
 - The runtime archive is written incrementally with recorded tip work; a
   process whose chain is behind the archive gets `StaleArchiveWriter` instead
   of overwriting it. Archives written by older versions are accepted.
+- CLI (0.3.1): `scam-node --version`; `--help` prints to stdout with status
+  0; command-line usage errors exit with status 2 (were 1). Runtime errors
+  still print `error: …` and exit 1.
 
 ## Verification of this pass (2026-10-28)
 
