@@ -748,15 +748,21 @@ async function loadStatus() {
 }
 
 function renderLatestBlocks(blocks, tipHeight) {
+  // Audit F-10: escape every field from the RPC payload before inlining
+  // into HTML attributes/text. Even though the RPC binds to localhost,
+  // the page can be reached via DNS rebinding or a proxy on the same
+  // host; assume the JSON is attacker-controlled.
   latestBlocksBody.innerHTML = "";
   for (const block of blocks) {
     const row = document.createElement("tr");
+    const hash = String(block.hash ?? "");
+    const target = String(block.target ?? "");
     row.innerHTML = `
-      <td>${block.height}</td>
-      <td class="mono" title="${block.hash}">${shortHash(block.hash)}</td>
-      <td>${block.tx_count}</td>
-      <td>${block.timestamp}</td>
-      <td class="mono" title="${block.target}">${shortHash(block.target, 10, 8)}</td>
+      <td>${escapeHtml(block.height ?? "")}</td>
+      <td class="mono" title="${escapeHtml(hash)}">${escapeHtml(shortHash(hash))}</td>
+      <td>${escapeHtml(block.tx_count ?? "")}</td>
+      <td>${escapeHtml(block.timestamp ?? "")}</td>
+      <td class="mono" title="${escapeHtml(target)}">${escapeHtml(shortHash(target, 10, 8))}</td>
     `;
     latestBlocksBody.appendChild(row);
   }
@@ -764,6 +770,7 @@ function renderLatestBlocks(blocks, tipHeight) {
   latestRange.textContent = `${first}..${tipHeight}`;
   if (blocks.length && blocks[0].target) {
     state.latestTarget = blocks[0].target;
+    // textContent (not innerHTML) — safe even unescaped.
     statDifficulty.textContent = blocks[0].target;
   }
 }
@@ -1197,10 +1204,13 @@ function initWalletActions() {
       seed_mode: raw.seed_mode || "bip39",
       to: raw.to,
       amount: parseNumber(raw.amount, 0),
-      fee: parseNumber(raw.fee, 1),
       account: parseNumber(raw.account, 0),
       index: parseNumber(raw.index, 0),
     };
+    // Empty fee = let the node pick the minimum relay fee for the tx size.
+    if (String(raw.fee ?? "").trim() !== "") {
+      payload.fee = parseNumber(raw.fee, 0);
+    }
     try {
       const data = await request("/wallet/send", { method: "POST", body: payload });
       setWalletResult(data);

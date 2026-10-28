@@ -1,24 +1,46 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use redb::{Database, ReadableTable, TableDefinition};
-use scam_consensus::{UtxoEntry, UtxoSet};
+use scam_consensus::{BlockUndoData, UtxoEntry, UtxoSet};
 use scam_core::{Block, BlockHeader, Hash256, OutPoint, Transaction};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("chain_meta");
+/// Metadata key holding a store's on-disk format version (u32 LE).
+const SCHEMA_VERSION_KEY: &str = "schema_version";
+/// Format of the chain archive, chain snapshot, mempool and peer-book
+/// stores. An absent key means 1 (the layout is unchanged).
+pub const STORE_SCHEMA_VERSION: u32 = 1;
+/// Pool ledger format. v2 added frozen per-round PPLNS credits and settled
+/// worker credits; v3 orders shares by an arrival sequence number and
+/// records signed payout transactions before they are broadcast. Older
+/// ledgers cannot be decoded and are refused.
+pub const POOL_LEDGER_SCHEMA_VERSION: u32 = 3;
+/// Peer book format. v2 records the announcing peer's group, services, last
+/// successful connection and tried state (addrman layout); v1 is refused.
+pub const PEER_BOOK_SCHEMA_VERSION: u32 = 2;
 const UTXO_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("utxos");
 const BLOCK_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("blocks_by_hash");
 const HEADER_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("headers_by_hash");
 const BLOCK_INDEX_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("block_index");
+/// UTXO set of the archive tip, written in the same transaction as the tip.
+const CHAINSTATE_UTXO_TABLE: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("chainstate_utxos");
+/// Undo data of the newest blocks (the reorg window), by block hash.
+const CHAINSTATE_UNDO_TABLE: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("chainstate_undo");
+/// Archive meta key: the block whose UTXO set `chainstate_utxos` holds.
+const CHAINSTATE_TIP_KEY: &str = "chainstate_tip";
 const PEER_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("peers");
 const MEMPOOL_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("mempool_by_txid");
 const POOL_META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("pool_meta");
 const POOL_WORKER_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("pool_workers");
-const POOL_SHARE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("pool_shares");
+const POOL_SHARE_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("pool_shares_by_seq");
 const POOL_ROUND_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("pool_rounds");
 const POOL_PAYOUT_PENDING_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("pool_payout_pending");
@@ -52,11 +74,17 @@ pub struct PeerAddressBook {
     pub peers: Vec<PeerAddressRecord>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
 pub struct PeerAddressRecord {
     pub address: String,
     pub last_seen_unix_sec: u64,
+    /// Failed connection attempts since the last success.
     pub ban_score: u32,
+    /// Network group of the peer that announced it, or `manual`.
+    pub source_group: String,
+    pub services: u64,
+    pub last_success_unix_sec: u64,
+    pub tried: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -80,6 +108,8 @@ struct MempoolStoredValue {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct PoolShareRecord {
+    /// Arrival order: the PPLNS window is the newest shares by `seq`.
+    pub seq: u64,
     pub share_key: String,
     pub worker: String,
     pub timestamp_unix_sec: u64,
@@ -103,10 +133,18 @@ pub struct PoolRoundRecord {
     pub end_unix_sec: Option<u64>,
     pub closed_by_worker: Option<String>,
     pub found_block_hash: Option<Hash256>,
-    #[serde(default)]
     pub found_block_reward_atomic: u128,
-    #[serde(default)]
     pub orphaned: bool,
+    /// PPLNS split frozen when the round closed. Recomputing it later from
+    /// the (capped) share history shrank old rounds' rewards and stopped
+    /// payouts to workers already paid.
+    pub pplns_credits: Vec<PoolRoundCredit>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct PoolRoundCredit {
+    pub worker: String,
+    pub amount_atomic: u128,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -117,6 +155,8 @@ pub struct PoolWorkerAccrualRecord {
     pub blocks_found_total: u64,
     pub expected_hashes_accumulated: f64,
     pub pplns_accrual_atomic: u128,
+    /// PPLNS credits of rounds that have left the round-retention window.
+    pub pplns_settled_atomic: u128,
     pub pps_accrual_atomic: u128,
     pub paid_total_atomic: u128,
     pub last_share_unix_sec: u64,
@@ -128,8 +168,65 @@ pub struct PoolPayoutRecord {
     pub worker: String,
     pub amount_atomic: u128,
     pub created_unix_sec: u64,
+    /// Signed payout transaction, recorded before its first broadcast: after
+    /// a crash the same transaction is re-broadcast, never a second one.
+    pub signed_tx_hex: Option<String>,
+    /// Txid of `signed_tx_hex`, or of the version that confirmed.
     pub submitted_txid_hex: Option<String>,
+    /// Earlier versions of this payout, replaced after an input was spent
+    /// elsewhere; any of them confirming completes the payout.
+    pub superseded_txids: Vec<String>,
+    /// Coin every version spends while it is unspent, so at most one
+    /// version can ever confirm.
+    pub lineage_input: Option<OutPoint>,
+    /// Some mempool accepted the signed tx, so it may have been relayed.
+    pub broadcast_accepted: bool,
+    /// The tx is known absent from the active chain up to this block.
+    pub searched_through: Option<PoolChainPoint>,
+    /// Active-chain block that includes the tx.
+    pub confirmed_in: Option<PoolChainPoint>,
+    /// Tip height when the tx was first seen unable to confirm.
+    pub dead_since_height: Option<u64>,
     pub confirmed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct PoolChainPoint {
+    pub height: u64,
+    pub hash: Hash256,
+}
+
+/// Changes since the last write of a pool ledger; see
+/// [`apply_pool_ledger_delta_db`].
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PoolLedgerDelta {
+    pub current_round_id: u64,
+    pub shares_appended: Vec<PoolShareRecord>,
+    /// Shares with a lower `seq` are dropped.
+    pub shares_retained_from_seq: Option<u64>,
+    pub rounds_upserted: Vec<PoolRoundRecord>,
+    pub rounds_removed: Vec<u64>,
+    pub workers_upserted: Vec<PoolWorkerAccrualRecord>,
+    pub workers_removed: Vec<String>,
+    pub pending_upserted: Vec<PoolPayoutRecord>,
+    pub pending_removed: Vec<String>,
+    pub completed_upserted: Vec<PoolPayoutRecord>,
+    pub completed_removed: Vec<String>,
+}
+
+impl PoolLedgerDelta {
+    pub fn is_empty_besides_round_id(&self) -> bool {
+        self.shares_appended.is_empty()
+            && self.shares_retained_from_seq.is_none()
+            && self.rounds_upserted.is_empty()
+            && self.rounds_removed.is_empty()
+            && self.workers_upserted.is_empty()
+            && self.workers_removed.is_empty()
+            && self.pending_upserted.is_empty()
+            && self.pending_removed.is_empty()
+            && self.completed_upserted.is_empty()
+            && self.completed_removed.is_empty()
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -191,11 +288,7 @@ pub fn save_snapshot(path: &Path, snapshot: &ChainStateSnapshot) -> Result<(), S
         })?;
     }
     let bytes = bincode::serialize(snapshot).map_err(StorageError::Encode)?;
-    fs::write(path, bytes).map_err(|source| StorageError::Write {
-        path: path.display().to_string(),
-        source,
-    })?;
-    Ok(())
+    write_file_atomically(path, &bytes)
 }
 
 pub fn load_snapshot(path: &Path) -> Result<ChainStateSnapshot, StorageError> {
@@ -213,18 +306,13 @@ pub fn save_snapshot_db(path: &Path, snapshot: &ChainStateSnapshot) -> Result<()
             source,
         })?;
     }
-    let tmp_path = temp_db_path(path);
-    if tmp_path.exists() {
-        fs::remove_file(&tmp_path).map_err(|source| StorageError::Write {
-            path: tmp_path.display().to_string(),
-            source,
-        })?;
-    }
 
-    let db = Database::create(&tmp_path).map_err(|e| StorageError::Db(e.to_string()))?;
+    let db = open_or_create_db(path)?;
     let write_txn = db
         .begin_write()
         .map_err(|e| StorageError::Db(e.to_string()))?;
+    delete_table(&write_txn, META_TABLE)?;
+    delete_table(&write_txn, UTXO_TABLE)?;
     {
         let mut meta = write_txn
             .open_table(META_TABLE)
@@ -234,6 +322,7 @@ pub fn save_snapshot_db(path: &Path, snapshot: &ChainStateSnapshot) -> Result<()
             bincode::serialize(&snapshot.block_hashes_by_height).map_err(StorageError::Encode)?;
         meta.insert("network_id", snapshot.network_id.as_bytes())
             .map_err(|e| StorageError::Db(e.to_string()))?;
+        write_schema_version(&mut meta, STORE_SCHEMA_VERSION)?;
         meta.insert("tip_height", tip_height_bytes.as_slice())
             .map_err(|e| StorageError::Db(e.to_string()))?;
         meta.insert("tip_hash", snapshot.tip_hash.0.as_slice())
@@ -256,12 +345,11 @@ pub fn save_snapshot_db(path: &Path, snapshot: &ChainStateSnapshot) -> Result<()
     write_txn
         .commit()
         .map_err(|e| StorageError::Db(e.to_string()))?;
-    atomic_replace_file(&tmp_path, path)?;
     Ok(())
 }
 
 pub fn load_snapshot_db(path: &Path) -> Result<ChainStateSnapshot, StorageError> {
-    let db = Database::open(path).map_err(|e| StorageError::Db(e.to_string()))?;
+    let db = open_existing_db(path)?;
     let read_txn = db
         .begin_read()
         .map_err(|e| StorageError::Db(e.to_string()))?;
@@ -270,6 +358,7 @@ pub fn load_snapshot_db(path: &Path) -> Result<ChainStateSnapshot, StorageError>
         let meta = read_txn
             .open_table(META_TABLE)
             .map_err(|e| StorageError::Db(e.to_string()))?;
+        check_schema_version(&meta, "chain snapshot", STORE_SCHEMA_VERSION, Some(1))?;
 
         let network_id_raw = meta
             .get("network_id")
@@ -360,18 +449,17 @@ pub fn save_chain_archive_db(path: &Path, archive: &ChainArchive) -> Result<(), 
             source,
         })?;
     }
-    let tmp_path = temp_db_path(path);
-    if tmp_path.exists() {
-        fs::remove_file(&tmp_path).map_err(|source| StorageError::Write {
-            path: tmp_path.display().to_string(),
-            source,
-        })?;
-    }
 
-    let db = Database::create(&tmp_path).map_err(|e| StorageError::Db(e.to_string()))?;
+    let db = open_or_create_db(path)?;
     let write_txn = db
         .begin_write()
         .map_err(|e| StorageError::Db(e.to_string()))?;
+    delete_table(&write_txn, META_TABLE)?;
+    delete_table(&write_txn, BLOCK_TABLE)?;
+    delete_table(&write_txn, HEADER_TABLE)?;
+    delete_table(&write_txn, BLOCK_INDEX_TABLE)?;
+    delete_table(&write_txn, CHAINSTATE_UTXO_TABLE)?;
+    delete_table(&write_txn, CHAINSTATE_UNDO_TABLE)?;
     {
         let mut meta = write_txn
             .open_table(META_TABLE)
@@ -379,6 +467,7 @@ pub fn save_chain_archive_db(path: &Path, archive: &ChainArchive) -> Result<(), 
         let tip_height = (archive.blocks_by_height.len() as u64).saturating_sub(1);
         meta.insert("network_id", archive.network_id.as_bytes())
             .map_err(|e| StorageError::Db(e.to_string()))?;
+        write_schema_version(&mut meta, STORE_SCHEMA_VERSION)?;
         meta.insert("tip_height", tip_height.to_le_bytes().as_slice())
             .map_err(|e| StorageError::Db(e.to_string()))?;
         let tip_hash = archive
@@ -420,12 +509,174 @@ pub fn save_chain_archive_db(path: &Path, archive: &ChainArchive) -> Result<(), 
     write_txn
         .commit()
         .map_err(|e| StorageError::Db(e.to_string()))?;
-    atomic_replace_file(&tmp_path, path)?;
     Ok(())
 }
 
-pub fn load_chain_archive_db(path: &Path) -> Result<ChainArchive, StorageError> {
-    let db = Database::open(path).map_err(|e| StorageError::Db(e.to_string()))?;
+fn write_schema_version(
+    meta: &mut redb::Table<&str, &[u8]>,
+    version: u32,
+) -> Result<(), StorageError> {
+    meta.insert(SCHEMA_VERSION_KEY, version.to_le_bytes().as_slice())
+        .map_err(|e| StorageError::Db(e.to_string()))?;
+    Ok(())
+}
+
+/// Check a store's format version. `legacy_version` is what an absent key
+/// means (`None`: the key is mandatory).
+fn check_schema_version<T: redb::ReadableTable<&'static str, &'static [u8]>>(
+    meta: &T,
+    store: &'static str,
+    expected: u32,
+    legacy_version: Option<u32>,
+) -> Result<(), StorageError> {
+    let found = match meta
+        .get(SCHEMA_VERSION_KEY)
+        .map_err(|e| StorageError::Db(e.to_string()))?
+    {
+        Some(raw) => {
+            let bytes: [u8; 4] =
+                raw.value()
+                    .try_into()
+                    .map_err(|_| StorageError::InvalidMetaFormat {
+                        key: SCHEMA_VERSION_KEY.to_owned(),
+                        details: "expected 4 bytes".to_owned(),
+                    })?;
+            Some(u32::from_le_bytes(bytes))
+        }
+        None => legacy_version,
+    };
+    if found != Some(expected) {
+        return Err(StorageError::UnsupportedSchema {
+            store,
+            found,
+            expected,
+        });
+    }
+    Ok(())
+}
+
+/// Tip recorded in a chain archive's metadata.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArchiveTip {
+    pub network_id: String,
+    pub height: u64,
+    pub hash: Hash256,
+    /// Big-endian cumulative chain work of the tip; `None` for archives
+    /// written before work was recorded.
+    pub work_be: Option<Vec<u8>>,
+}
+
+/// Result of [`persist_chain_archive_incremental_db`].
+/// What the archive writer needs from the in-memory chain to keep the
+/// persisted chainstate (UTXO set and recent undo data) equal to it, so a
+/// restart loads the state instead of replaying every block.
+pub struct ChainstateSource<'a> {
+    /// The current entry of an outpoint (`None`: not in the UTXO set).
+    pub utxo: &'a dyn Fn(&OutPoint) -> Option<UtxoEntry>,
+    /// Every UTXO: the first write of an archive without a chainstate.
+    pub all_utxos: &'a dyn Fn() -> Vec<(OutPoint, UtxoEntry)>,
+    /// Undo data of a main-chain block, if the chain still keeps it.
+    pub undo: &'a dyn Fn(&Hash256) -> Option<BlockUndoData>,
+    /// Undo is kept for this many newest blocks (the reorg window).
+    pub undo_window: u64,
+}
+
+/// A persisted chain plus the state needed to resume it without replay.
+pub struct PersistedChainstate {
+    pub network_id: String,
+    pub blocks_by_height: Vec<Block>,
+    pub utxos: UtxoSet,
+    pub undo: std::collections::HashMap<Hash256, BlockUndoData>,
+}
+
+/// Outpoints a block reads or creates: their final state is all that a
+/// connect or disconnect of the block can change.
+fn block_touched_outpoints(block: &Block, touched: &mut std::collections::HashSet<OutPoint>) {
+    for tx in &block.transactions {
+        if !tx.is_coinbase() {
+            touched.extend(tx.inputs.iter().map(|input| input.prev_out.clone()));
+        }
+        let txid = tx.txid();
+        touched.extend((0..tx.outputs.len()).map(|vout| OutPoint {
+            txid,
+            vout: vout as u32,
+        }));
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArchivePersistOutcome {
+    /// First height whose index entry was (re)written; `None` if the archive
+    /// already matched.
+    pub first_written_height: Option<u64>,
+    pub blocks_written: usize,
+}
+
+/// Compare two big-endian unsigned integers given as bytes.
+fn cmp_be_uint(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+    let a = &a[a.iter().position(|byte| *byte != 0).unwrap_or(a.len())..];
+    let b = &b[b.iter().position(|byte| *byte != 0).unwrap_or(b.len())..];
+    a.len().cmp(&b.len()).then_with(|| a.cmp(b))
+}
+
+fn read_archive_tip<T: redb::ReadableTable<&'static str, &'static [u8]>>(
+    meta: &T,
+) -> Result<Option<ArchiveTip>, StorageError> {
+    let (Some(height_raw), Some(hash_raw)) = (
+        meta.get("tip_height")
+            .map_err(|e| StorageError::Db(e.to_string()))?,
+        meta.get("tip_hash")
+            .map_err(|e| StorageError::Db(e.to_string()))?,
+    ) else {
+        return Ok(None);
+    };
+    let height_bytes: [u8; 8] =
+        height_raw
+            .value()
+            .try_into()
+            .map_err(|_| StorageError::InvalidMetaFormat {
+                key: "tip_height".to_owned(),
+                details: "expected 8 bytes".to_owned(),
+            })?;
+    let hash = bytes_to_hash(hash_raw.value(), "tip_hash")?;
+    let network_id = meta
+        .get("network_id")
+        .map_err(|e| StorageError::Db(e.to_string()))?
+        .map(|raw| std::str::from_utf8(raw.value()).map(str::to_owned))
+        .transpose()
+        .map_err(StorageError::InvalidUtf8)?
+        .unwrap_or_default();
+    let work_be = meta
+        .get("tip_work")
+        .map_err(|e| StorageError::Db(e.to_string()))?
+        .map(|raw| raw.value().to_vec());
+    Ok(Some(ArchiveTip {
+        network_id,
+        height: u64::from_le_bytes(height_bytes),
+        hash,
+        work_be,
+    }))
+}
+
+/// Read only the tip metadata of a chain archive.
+pub fn load_chain_archive_tip_db(path: &Path) -> Result<Option<ArchiveTip>, StorageError> {
+    let db = open_existing_db(path)?;
+    let read_txn = db
+        .begin_read()
+        .map_err(|e| StorageError::Db(e.to_string()))?;
+    let meta = read_txn
+        .open_table(META_TABLE)
+        .map_err(|e| StorageError::Db(e.to_string()))?;
+    check_schema_version(&meta, "chain archive", STORE_SCHEMA_VERSION, Some(1))?;
+    read_archive_tip(&meta)
+}
+
+/// Load the main-chain blocks at heights `>= from_height`, in order.
+pub fn load_chain_archive_range_db(
+    path: &Path,
+    from_height: u64,
+) -> Result<(String, Vec<(u64, Block)>), StorageError> {
+    let db = open_existing_db(path)?;
     let read_txn = db
         .begin_read()
         .map_err(|e| StorageError::Db(e.to_string()))?;
@@ -433,6 +684,439 @@ pub fn load_chain_archive_db(path: &Path) -> Result<ChainArchive, StorageError> 
         let meta = read_txn
             .open_table(META_TABLE)
             .map_err(|e| StorageError::Db(e.to_string()))?;
+        check_schema_version(&meta, "chain archive", STORE_SCHEMA_VERSION, Some(1))?;
+        let raw = meta
+            .get("network_id")
+            .map_err(|e| StorageError::Db(e.to_string()))?
+            .ok_or_else(|| StorageError::MissingMeta("network_id".to_owned()))?;
+        std::str::from_utf8(raw.value())
+            .map_err(StorageError::InvalidUtf8)?
+            .to_owned()
+    };
+    let index_table = read_txn
+        .open_table(BLOCK_INDEX_TABLE)
+        .map_err(|e| StorageError::Db(e.to_string()))?;
+    let blocks_table = read_txn
+        .open_table(BLOCK_TABLE)
+        .map_err(|e| StorageError::Db(e.to_string()))?;
+    let mut out = Vec::new();
+    for row in index_table
+        .range(from_height..)
+        .map_err(|e| StorageError::Db(e.to_string()))?
+    {
+        let (height, hash_raw) = row.map_err(|e| StorageError::Db(e.to_string()))?;
+        let hash = bytes_to_hash(hash_raw.value(), "block_index hash")?;
+        let block_raw = blocks_table
+            .get(hash.0.as_slice())
+            .map_err(|e| StorageError::Db(e.to_string()))?
+            .ok_or_else(|| StorageError::MissingArchiveRecord {
+                table: "blocks_by_hash",
+                key: hash.to_string(),
+            })?;
+        let block: Block = bincode::deserialize(block_raw.value()).map_err(StorageError::Decode)?;
+        out.push((height.value(), block));
+    }
+    Ok((network_id, out))
+}
+
+/// Persist the main chain into the archive at `path` incrementally, in one
+/// redb write transaction (crash-atomic; no full rewrite, no temp file).
+///
+/// `main_chain` is the writer's main chain by height and `tip_work_be` its
+/// cumulative work. Only blocks above the first height where the archive
+/// differs are written; stale index entries above the new tip are removed.
+///
+/// Several processes share this file. To make a lagging writer unable to
+/// roll the chain back, the write is refused with
+/// [`StorageError::StaleArchiveWriter`] when the archive's tip is not on the
+/// writer's main chain and carries at least as much work (or, for legacy
+/// archives without recorded work, is higher).
+pub fn persist_chain_archive_incremental_db(
+    path: &Path,
+    network_id: &str,
+    main_chain: &[Hash256],
+    tip_work_be: &[u8],
+    get_block: &dyn Fn(&Hash256) -> Option<Block>,
+    chainstate: &ChainstateSource<'_>,
+) -> Result<ArchivePersistOutcome, StorageError> {
+    let Some(new_tip_hash) = main_chain.last().copied() else {
+        return Err(StorageError::InvalidArchive(
+            "main chain cannot be empty".to_owned(),
+        ));
+    };
+    let new_tip_height = (main_chain.len() - 1) as u64;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|source| StorageError::CreateDir {
+            path: parent.display().to_string(),
+            source,
+        })?;
+    }
+    let db = open_or_create_db(path)?;
+    let write_txn = db
+        .begin_write()
+        .map_err(|e| StorageError::Db(e.to_string()))?;
+    let outcome = {
+        let mut meta = write_txn
+            .open_table(META_TABLE)
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+        if let Some(existing) = meta
+            .get("network_id")
+            .map_err(|e| StorageError::Db(e.to_string()))?
+        {
+            let existing = std::str::from_utf8(existing.value())
+                .map_err(StorageError::InvalidUtf8)?
+                .to_owned();
+            if existing != network_id {
+                return Err(StorageError::InvalidArchive(format!(
+                    "archive network '{existing}' does not match writer network '{network_id}'"
+                )));
+            }
+        }
+        let disk_tip = read_archive_tip(&meta)?;
+
+        let mut index_table = write_txn
+            .open_table(BLOCK_INDEX_TABLE)
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+        let index_hash_at = |table: &redb::Table<u64, &[u8]>, height: u64| {
+            table
+                .get(height)
+                .map_err(|e| StorageError::Db(e.to_string()))?
+                .map(|raw| bytes_to_hash(raw.value(), "block_index hash"))
+                .transpose()
+        };
+
+        // First height at which the archive's index differs from ours.
+        let first_diff = match &disk_tip {
+            None => 0,
+            Some(tip) => {
+                let tip_on_our_chain = main_chain.get(tip.height as usize) == Some(&tip.hash);
+                if !tip_on_our_chain {
+                    let disk_wins = match &tip.work_be {
+                        Some(work) => cmp_be_uint(work, tip_work_be).is_ge(),
+                        None => tip.height >= new_tip_height,
+                    };
+                    if disk_wins {
+                        return Err(StorageError::StaleArchiveWriter {
+                            disk_tip: tip.hash,
+                            disk_height: tip.height,
+                        });
+                    }
+                }
+                let mut height = tip.height.min(new_tip_height);
+                loop {
+                    let ours = main_chain.get(height as usize);
+                    if index_hash_at(&index_table, height)?.as_ref() == ours {
+                        break height + 1;
+                    }
+                    if height == 0 {
+                        break 0;
+                    }
+                    height -= 1;
+                }
+            }
+        };
+
+        // Blocks leaving the main chain (their index entries are replaced).
+        let mut disconnected = Vec::<Hash256>::new();
+        if let Some(tip) = &disk_tip {
+            for height in first_diff..=tip.height {
+                if let Some(hash) = index_hash_at(&index_table, height)? {
+                    disconnected.push(hash);
+                }
+            }
+        }
+        let chainstate_tip = meta
+            .get(CHAINSTATE_TIP_KEY)
+            .map_err(|e| StorageError::Db(e.to_string()))?
+            .map(|raw| bytes_to_hash(raw.value(), CHAINSTATE_TIP_KEY))
+            .transpose()?;
+
+        let mut blocks_table = write_txn
+            .open_table(BLOCK_TABLE)
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+        let mut headers_table = write_txn
+            .open_table(HEADER_TABLE)
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+        let mut blocks_written = 0usize;
+        let mut touched = std::collections::HashSet::<OutPoint>::new();
+        for hash in &disconnected {
+            if let Some(raw) = blocks_table
+                .get(hash.0.as_slice())
+                .map_err(|e| StorageError::Db(e.to_string()))?
+            {
+                let block: Block =
+                    bincode::deserialize(raw.value()).map_err(StorageError::Decode)?;
+                block_touched_outpoints(&block, &mut touched);
+            }
+        }
+        for height in first_diff..=new_tip_height {
+            let hash = main_chain[height as usize];
+            let already_stored = blocks_table
+                .get(hash.0.as_slice())
+                .map_err(|e| StorageError::Db(e.to_string()))?
+                .is_some();
+            let block = if already_stored {
+                None
+            } else {
+                Some(
+                    get_block(&hash).ok_or_else(|| StorageError::MissingArchiveRecord {
+                        table: "writer main chain",
+                        key: hash.to_string(),
+                    })?,
+                )
+            };
+            match &block {
+                Some(block) => block_touched_outpoints(block, &mut touched),
+                None => {
+                    if let Some(raw) = blocks_table
+                        .get(hash.0.as_slice())
+                        .map_err(|e| StorageError::Db(e.to_string()))?
+                    {
+                        let stored: Block =
+                            bincode::deserialize(raw.value()).map_err(StorageError::Decode)?;
+                        block_touched_outpoints(&stored, &mut touched);
+                    }
+                }
+            }
+            if let Some(block) = block {
+                let block_bytes = bincode::serialize(&block).map_err(StorageError::Encode)?;
+                let header_bytes =
+                    bincode::serialize(&block.header).map_err(StorageError::Encode)?;
+                blocks_table
+                    .insert(hash.0.as_slice(), block_bytes.as_slice())
+                    .map_err(|e| StorageError::Db(e.to_string()))?;
+                headers_table
+                    .insert(hash.0.as_slice(), header_bytes.as_slice())
+                    .map_err(|e| StorageError::Db(e.to_string()))?;
+                blocks_written += 1;
+            }
+            index_table
+                .insert(height, hash.0.as_slice())
+                .map_err(|e| StorageError::Db(e.to_string()))?;
+        }
+        if let Some(tip) = &disk_tip {
+            for height in (new_tip_height + 1)..=tip.height.max(new_tip_height) {
+                index_table
+                    .remove(height)
+                    .map_err(|e| StorageError::Db(e.to_string()))?;
+            }
+        }
+
+        // Chainstate: the UTXO set and recent undo of the new tip.
+        let mut utxo_table = write_txn
+            .open_table(CHAINSTATE_UTXO_TABLE)
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+        let mut undo_table = write_txn
+            .open_table(CHAINSTATE_UNDO_TABLE)
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+        let incremental =
+            chainstate_tip.is_some() && chainstate_tip == disk_tip.as_ref().map(|t| t.hash);
+        if incremental {
+            for outpoint in &touched {
+                let key = bincode::serialize(outpoint).map_err(StorageError::Encode)?;
+                match (chainstate.utxo)(outpoint) {
+                    Some(entry) => {
+                        let value = bincode::serialize(&entry).map_err(StorageError::Encode)?;
+                        utxo_table
+                            .insert(key.as_slice(), value.as_slice())
+                            .map_err(|e| StorageError::Db(e.to_string()))?;
+                    }
+                    None => {
+                        utxo_table
+                            .remove(key.as_slice())
+                            .map_err(|e| StorageError::Db(e.to_string()))?;
+                    }
+                }
+            }
+            for hash in &disconnected {
+                undo_table
+                    .remove(hash.0.as_slice())
+                    .map_err(|e| StorageError::Db(e.to_string()))?;
+            }
+        } else {
+            // No (or a stale) chainstate yet: write the whole set once.
+            utxo_table
+                .retain(|_, _| false)
+                .map_err(|e| StorageError::Db(e.to_string()))?;
+            undo_table
+                .retain(|_, _| false)
+                .map_err(|e| StorageError::Db(e.to_string()))?;
+            for (outpoint, entry) in (chainstate.all_utxos)() {
+                let key = bincode::serialize(&outpoint).map_err(StorageError::Encode)?;
+                let value = bincode::serialize(&entry).map_err(StorageError::Encode)?;
+                utxo_table
+                    .insert(key.as_slice(), value.as_slice())
+                    .map_err(|e| StorageError::Db(e.to_string()))?;
+            }
+        }
+        // Undo for the window's blocks (new ones, or all of them on a full
+        // write); blocks that left the window lose theirs.
+        let window_start = new_tip_height.saturating_sub(chainstate.undo_window.saturating_sub(1));
+        let undo_from = if incremental {
+            first_diff.max(window_start)
+        } else {
+            window_start
+        };
+        for height in undo_from..=new_tip_height {
+            let hash = main_chain[height as usize];
+            if let Some(undo) = (chainstate.undo)(&hash) {
+                let value = bincode::serialize(&undo).map_err(StorageError::Encode)?;
+                undo_table
+                    .insert(hash.0.as_slice(), value.as_slice())
+                    .map_err(|e| StorageError::Db(e.to_string()))?;
+            }
+        }
+        let old_window_start = disk_tip.as_ref().map_or(0, |tip| {
+            tip.height
+                .saturating_sub(chainstate.undo_window.saturating_sub(1))
+        });
+        for height in old_window_start..window_start {
+            if let Some(hash) = main_chain.get(height as usize) {
+                undo_table
+                    .remove(hash.0.as_slice())
+                    .map_err(|e| StorageError::Db(e.to_string()))?;
+            }
+        }
+        meta.insert(CHAINSTATE_TIP_KEY, new_tip_hash.0.as_slice())
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+
+        meta.insert("network_id", network_id.as_bytes())
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+        write_schema_version(&mut meta, STORE_SCHEMA_VERSION)?;
+        meta.insert("tip_height", new_tip_height.to_le_bytes().as_slice())
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+        meta.insert("tip_hash", new_tip_hash.0.as_slice())
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+        meta.insert("tip_work", tip_work_be)
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+
+        ArchivePersistOutcome {
+            first_written_height: (first_diff <= new_tip_height).then_some(first_diff),
+            blocks_written,
+        }
+    };
+    write_txn
+        .commit()
+        .map_err(|e| StorageError::Db(e.to_string()))?;
+    Ok(outcome)
+}
+
+/// Drop the persisted chainstate (reindex): the next archive write stores
+/// a complete one rebuilt from the replayed chain.
+pub fn reset_chainstate_db(path: &Path) -> Result<(), StorageError> {
+    let db = open_existing_db(path)?;
+    let write_txn = db
+        .begin_write()
+        .map_err(|e| StorageError::Db(e.to_string()))?;
+    delete_table(&write_txn, CHAINSTATE_UTXO_TABLE)?;
+    delete_table(&write_txn, CHAINSTATE_UNDO_TABLE)?;
+    {
+        let mut meta = write_txn
+            .open_table(META_TABLE)
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+        meta.remove(CHAINSTATE_TIP_KEY)
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+    }
+    write_txn
+        .commit()
+        .map_err(|e| StorageError::Db(e.to_string()))?;
+    Ok(())
+}
+
+/// The archive's main chain with its persisted chainstate, or `None` when
+/// the archive has none for its tip (written before chainstates existed):
+/// the caller then replays the chain once and the next write stores one.
+pub fn load_chainstate_db(path: &Path) -> Result<Option<PersistedChainstate>, StorageError> {
+    let db = open_existing_db(path)?;
+    let read_txn = db
+        .begin_read()
+        .map_err(|e| StorageError::Db(e.to_string()))?;
+    let meta = read_txn
+        .open_table(META_TABLE)
+        .map_err(|e| StorageError::Db(e.to_string()))?;
+    check_schema_version(&meta, "chain archive", STORE_SCHEMA_VERSION, Some(1))?;
+    let Some(tip) = read_archive_tip(&meta)? else {
+        return Ok(None);
+    };
+    let chainstate_tip = meta
+        .get(CHAINSTATE_TIP_KEY)
+        .map_err(|e| StorageError::Db(e.to_string()))?
+        .map(|raw| bytes_to_hash(raw.value(), CHAINSTATE_TIP_KEY))
+        .transpose()?;
+    if chainstate_tip != Some(tip.hash) {
+        return Ok(None);
+    }
+    let index = read_txn
+        .open_table(BLOCK_INDEX_TABLE)
+        .map_err(|e| StorageError::Db(e.to_string()))?;
+    let blocks = read_txn
+        .open_table(BLOCK_TABLE)
+        .map_err(|e| StorageError::Db(e.to_string()))?;
+    let mut blocks_by_height = Vec::with_capacity(tip.height as usize + 1);
+    for height in 0..=tip.height {
+        let hash = index
+            .get(height)
+            .map_err(|e| StorageError::Db(e.to_string()))?
+            .map(|raw| bytes_to_hash(raw.value(), "block_index hash"))
+            .transpose()?
+            .ok_or_else(|| StorageError::MissingArchiveRecord {
+                table: "block_index",
+                key: height.to_string(),
+            })?;
+        let raw = blocks
+            .get(hash.0.as_slice())
+            .map_err(|e| StorageError::Db(e.to_string()))?
+            .ok_or_else(|| StorageError::MissingArchiveRecord {
+                table: "blocks_by_hash",
+                key: hash.to_string(),
+            })?;
+        let block: Block = bincode::deserialize(raw.value()).map_err(StorageError::Decode)?;
+        blocks_by_height.push(block);
+    }
+    let mut utxos = UtxoSet::new();
+    for row in read_txn
+        .open_table(CHAINSTATE_UTXO_TABLE)
+        .map_err(|e| StorageError::Db(e.to_string()))?
+        .iter()
+        .map_err(|e| StorageError::Db(e.to_string()))?
+    {
+        let (key, value) = row.map_err(|e| StorageError::Db(e.to_string()))?;
+        utxos.insert(
+            bincode::deserialize(key.value()).map_err(StorageError::Decode)?,
+            bincode::deserialize(value.value()).map_err(StorageError::Decode)?,
+        );
+    }
+    let mut undo = std::collections::HashMap::new();
+    for row in read_txn
+        .open_table(CHAINSTATE_UNDO_TABLE)
+        .map_err(|e| StorageError::Db(e.to_string()))?
+        .iter()
+        .map_err(|e| StorageError::Db(e.to_string()))?
+    {
+        let (key, value) = row.map_err(|e| StorageError::Db(e.to_string()))?;
+        undo.insert(
+            bytes_to_hash(key.value(), "chainstate_undo key")?,
+            bincode::deserialize(value.value()).map_err(StorageError::Decode)?,
+        );
+    }
+    Ok(Some(PersistedChainstate {
+        network_id: tip.network_id,
+        blocks_by_height,
+        utxos,
+        undo,
+    }))
+}
+
+pub fn load_chain_archive_db(path: &Path) -> Result<ChainArchive, StorageError> {
+    let db = open_existing_db(path)?;
+    let read_txn = db
+        .begin_read()
+        .map_err(|e| StorageError::Db(e.to_string()))?;
+    let network_id = {
+        let meta = read_txn
+            .open_table(META_TABLE)
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+        check_schema_version(&meta, "chain archive", STORE_SCHEMA_VERSION, Some(1))?;
         let network_id_raw = meta
             .get("network_id")
             .map_err(|e| StorageError::Db(e.to_string()))?
@@ -506,7 +1190,7 @@ pub fn load_chain_archive_db(path: &Path) -> Result<ChainArchive, StorageError> 
 }
 
 pub fn load_block_by_hash_db(path: &Path, hash: Hash256) -> Result<Option<Block>, StorageError> {
-    let db = Database::open(path).map_err(|e| StorageError::Db(e.to_string()))?;
+    let db = open_existing_db(path)?;
     let read_txn = db
         .begin_read()
         .map_err(|e| StorageError::Db(e.to_string()))?;
@@ -537,13 +1221,6 @@ pub fn save_peer_book_db(path: &Path, peer_book: &PeerAddressBook) -> Result<(),
             source,
         })?;
     }
-    let tmp_path = temp_db_path(path);
-    if tmp_path.exists() {
-        fs::remove_file(&tmp_path).map_err(|source| StorageError::Write {
-            path: tmp_path.display().to_string(),
-            source,
-        })?;
-    }
 
     let mut dedup = std::collections::HashMap::<String, PeerAddressRecord>::new();
     for record in &peer_book.peers {
@@ -557,16 +1234,19 @@ pub fn save_peer_book_db(path: &Path, peer_book: &PeerAddressBook) -> Result<(),
     let mut peers = dedup.into_values().collect::<Vec<_>>();
     peers.sort_by(|a, b| a.address.cmp(&b.address));
 
-    let db = Database::create(&tmp_path).map_err(|e| StorageError::Db(e.to_string()))?;
+    let db = open_or_create_db(path)?;
     let write_txn = db
         .begin_write()
         .map_err(|e| StorageError::Db(e.to_string()))?;
+    delete_table(&write_txn, META_TABLE)?;
+    delete_table(&write_txn, PEER_TABLE)?;
     {
         let mut meta = write_txn
             .open_table(META_TABLE)
             .map_err(|e| StorageError::Db(e.to_string()))?;
         meta.insert("network_id", peer_book.network_id.as_bytes())
             .map_err(|e| StorageError::Db(e.to_string()))?;
+        write_schema_version(&mut meta, PEER_BOOK_SCHEMA_VERSION)?;
     }
     {
         let mut peer_table = write_txn
@@ -582,12 +1262,84 @@ pub fn save_peer_book_db(path: &Path, peer_book: &PeerAddressBook) -> Result<(),
     write_txn
         .commit()
         .map_err(|e| StorageError::Db(e.to_string()))?;
-    atomic_replace_file(&tmp_path, path)?;
+    Ok(())
+}
+
+/// Apply peer-book changes (upserted records, removed addresses) in one
+/// write transaction; the store is created if missing. The relay keeps its
+/// address table in memory and persists only what changed.
+pub fn apply_peer_book_delta_db(
+    path: &Path,
+    network_id: &str,
+    upserted: &[PeerAddressRecord],
+    removed: &[String],
+) -> Result<(), StorageError> {
+    if upserted
+        .iter()
+        .any(|record| record.address.trim().is_empty())
+    {
+        return Err(StorageError::InvalidPeerBook(
+            "peer address cannot be empty".to_owned(),
+        ));
+    }
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent).map_err(|source| StorageError::CreateDir {
+            path: parent.display().to_string(),
+            source,
+        })?;
+    }
+    let db = open_or_create_db(path)?;
+    let write_txn = db
+        .begin_write()
+        .map_err(|e| StorageError::Db(e.to_string()))?;
+    {
+        let mut meta = write_txn
+            .open_table(META_TABLE)
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+        let existing = meta
+            .get("network_id")
+            .map_err(|e| StorageError::Db(e.to_string()))?
+            .map(|raw| String::from_utf8_lossy(raw.value()).into_owned());
+        match existing {
+            Some(existing) => {
+                if existing != network_id {
+                    return Err(StorageError::InvalidPeerBook(format!(
+                        "peer book network mismatch: db='{existing}', write='{network_id}'"
+                    )));
+                }
+                check_schema_version(&meta, "peer book", PEER_BOOK_SCHEMA_VERSION, None)?;
+            }
+            None => {
+                meta.insert("network_id", network_id.as_bytes())
+                    .map_err(|e| StorageError::Db(e.to_string()))?;
+                write_schema_version(&mut meta, PEER_BOOK_SCHEMA_VERSION)?;
+            }
+        }
+    }
+    {
+        let mut table = write_txn
+            .open_table(PEER_TABLE)
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+        for address in removed {
+            table
+                .remove(address.as_str())
+                .map_err(|e| StorageError::Db(e.to_string()))?;
+        }
+        for record in upserted {
+            let value = bincode::serialize(record).map_err(StorageError::Encode)?;
+            table
+                .insert(record.address.as_str(), value.as_slice())
+                .map_err(|e| StorageError::Db(e.to_string()))?;
+        }
+    }
+    write_txn
+        .commit()
+        .map_err(|e| StorageError::Db(e.to_string()))?;
     Ok(())
 }
 
 pub fn load_peer_book_db(path: &Path) -> Result<PeerAddressBook, StorageError> {
-    let db = Database::open(path).map_err(|e| StorageError::Db(e.to_string()))?;
+    let db = open_existing_db(path)?;
     let read_txn = db
         .begin_read()
         .map_err(|e| StorageError::Db(e.to_string()))?;
@@ -595,6 +1347,7 @@ pub fn load_peer_book_db(path: &Path) -> Result<PeerAddressBook, StorageError> {
         let meta = read_txn
             .open_table(META_TABLE)
             .map_err(|e| StorageError::Db(e.to_string()))?;
+        check_schema_version(&meta, "peer book", PEER_BOOK_SCHEMA_VERSION, None)?;
         let network_id_raw = meta
             .get("network_id")
             .map_err(|e| StorageError::Db(e.to_string()))?
@@ -636,13 +1389,6 @@ pub fn save_mempool_db(path: &Path, snapshot: &MempoolSnapshot) -> Result<(), St
             source,
         })?;
     }
-    let tmp_path = temp_db_path(path);
-    if tmp_path.exists() {
-        fs::remove_file(&tmp_path).map_err(|source| StorageError::Write {
-            path: tmp_path.display().to_string(),
-            source,
-        })?;
-    }
 
     let mut dedup = std::collections::HashMap::<Hash256, MempoolTxRecord>::new();
     for entry in &snapshot.entries {
@@ -656,18 +1402,21 @@ pub fn save_mempool_db(path: &Path, snapshot: &MempoolSnapshot) -> Result<(), St
         dedup.insert(entry.txid, entry.clone());
     }
     let mut entries = dedup.into_values().collect::<Vec<_>>();
-    entries.sort_by(|a, b| a.txid.cmp(&b.txid));
+    entries.sort_by_key(|e| e.txid);
 
-    let db = Database::create(&tmp_path).map_err(|e| StorageError::Db(e.to_string()))?;
+    let db = open_or_create_db(path)?;
     let write_txn = db
         .begin_write()
         .map_err(|e| StorageError::Db(e.to_string()))?;
+    delete_table(&write_txn, META_TABLE)?;
+    delete_table(&write_txn, MEMPOOL_TABLE)?;
     {
         let mut meta = write_txn
             .open_table(META_TABLE)
             .map_err(|e| StorageError::Db(e.to_string()))?;
         meta.insert("network_id", snapshot.network_id.as_bytes())
             .map_err(|e| StorageError::Db(e.to_string()))?;
+        write_schema_version(&mut meta, STORE_SCHEMA_VERSION)?;
         let count = entries.len() as u64;
         meta.insert("tx_count", count.to_le_bytes().as_slice())
             .map_err(|e| StorageError::Db(e.to_string()))?;
@@ -690,12 +1439,85 @@ pub fn save_mempool_db(path: &Path, snapshot: &MempoolSnapshot) -> Result<(), St
     write_txn
         .commit()
         .map_err(|e| StorageError::Db(e.to_string()))?;
-    atomic_replace_file(&tmp_path, path)?;
+    Ok(())
+}
+
+/// Apply an incremental change set to the mempool DB in one write
+/// transaction: insert/replace `upserts`, delete `removes`. Unlike
+/// [`save_mempool_db`] it never drops entries written by other processes.
+pub fn apply_mempool_delta_db(
+    path: &Path,
+    network_id: &str,
+    upserts: &[MempoolTxRecord],
+    removes: &[Hash256],
+) -> Result<(), StorageError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|source| StorageError::CreateDir {
+            path: parent.display().to_string(),
+            source,
+        })?;
+    }
+    for entry in upserts {
+        let computed = entry.tx.txid();
+        if computed != entry.txid {
+            return Err(StorageError::InvalidMempool(format!(
+                "txid mismatch in mempool delta: provided={}, computed={}",
+                entry.txid, computed
+            )));
+        }
+    }
+    let db = open_or_create_db(path)?;
+    let write_txn = db
+        .begin_write()
+        .map_err(|e| StorageError::Db(e.to_string()))?;
+    {
+        let mut table = write_txn
+            .open_table(MEMPOOL_TABLE)
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+        for txid in removes {
+            table
+                .remove(txid.0.as_slice())
+                .map_err(|e| StorageError::Db(e.to_string()))?;
+        }
+        for entry in upserts {
+            let value = MempoolStoredValue {
+                tx: entry.tx.clone(),
+                fee: entry.fee,
+            };
+            let value_bytes = bincode::serialize(&value).map_err(StorageError::Encode)?;
+            table
+                .insert(entry.txid.0.as_slice(), value_bytes.as_slice())
+                .map_err(|e| StorageError::Db(e.to_string()))?;
+        }
+        let count = redb::ReadableTableMetadata::len(&table)
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+        let mut meta = write_txn
+            .open_table(META_TABLE)
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+        if let Some(existing) = meta
+            .get("network_id")
+            .map_err(|e| StorageError::Db(e.to_string()))?
+            && existing.value() != network_id.as_bytes()
+        {
+            return Err(StorageError::InvalidMempool(format!(
+                "mempool db network '{}' does not match writer network '{network_id}'",
+                String::from_utf8_lossy(existing.value())
+            )));
+        }
+        meta.insert("network_id", network_id.as_bytes())
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+        write_schema_version(&mut meta, STORE_SCHEMA_VERSION)?;
+        meta.insert("tx_count", count.to_le_bytes().as_slice())
+            .map_err(|e| StorageError::Db(e.to_string()))?;
+    }
+    write_txn
+        .commit()
+        .map_err(|e| StorageError::Db(e.to_string()))?;
     Ok(())
 }
 
 pub fn load_mempool_db(path: &Path) -> Result<MempoolSnapshot, StorageError> {
-    let db = Database::open(path).map_err(|e| StorageError::Db(e.to_string()))?;
+    let db = open_existing_db(path)?;
     let read_txn = db
         .begin_read()
         .map_err(|e| StorageError::Db(e.to_string()))?;
@@ -704,6 +1526,7 @@ pub fn load_mempool_db(path: &Path) -> Result<MempoolSnapshot, StorageError> {
         let meta = read_txn
             .open_table(META_TABLE)
             .map_err(|e| StorageError::Db(e.to_string()))?;
+        check_schema_version(&meta, "mempool", STORE_SCHEMA_VERSION, Some(1))?;
         let network_id_raw = meta
             .get("network_id")
             .map_err(|e| StorageError::Db(e.to_string()))?
@@ -735,7 +1558,7 @@ pub fn load_mempool_db(path: &Path) -> Result<MempoolSnapshot, StorageError> {
             fee: stored.fee,
         });
     }
-    entries.sort_by(|a, b| a.txid.cmp(&b.txid));
+    entries.sort_by_key(|e| e.txid);
     Ok(MempoolSnapshot {
         network_id,
         entries,
@@ -743,163 +1566,201 @@ pub fn load_mempool_db(path: &Path) -> Result<MempoolSnapshot, StorageError> {
 }
 
 pub fn save_pool_ledger_db(path: &Path, snapshot: &PoolLedgerSnapshot) -> Result<(), StorageError> {
-    if snapshot.network_id.trim().is_empty() {
-        return Err(StorageError::InvalidPoolLedger(
-            "network_id must not be empty".to_owned(),
-        ));
+    let delta = PoolLedgerDelta {
+        current_round_id: snapshot.current_round_id,
+        shares_appended: snapshot.shares.clone(),
+        shares_retained_from_seq: None,
+        rounds_upserted: snapshot.rounds.clone(),
+        rounds_removed: Vec::new(),
+        workers_upserted: snapshot.workers.clone(),
+        workers_removed: Vec::new(),
+        pending_upserted: snapshot.pending_payouts.clone(),
+        pending_removed: Vec::new(),
+        completed_upserted: snapshot.completed_payouts.clone(),
+        completed_removed: Vec::new(),
+    };
+    write_pool_ledger(path, &snapshot.network_id, &delta, true)
+}
+
+/// Apply `delta` to the ledger at `path` (created if missing) in one write
+/// transaction, so a share or payout update costs only the changed rows.
+pub fn apply_pool_ledger_delta_db(
+    path: &Path,
+    network_id: &str,
+    delta: &PoolLedgerDelta,
+) -> Result<(), StorageError> {
+    write_pool_ledger(path, network_id, delta, false)
+}
+
+fn validate_pool_ledger_delta(
+    network_id: &str,
+    delta: &PoolLedgerDelta,
+) -> Result<(), StorageError> {
+    let invalid = |msg: &str| Err(StorageError::InvalidPoolLedger(msg.to_owned()));
+    if network_id.trim().is_empty() {
+        return invalid("network_id must not be empty");
     }
-    if let Some(parent) = path.parent() {
+    for share in &delta.shares_appended {
+        if share.share_key.trim().is_empty() {
+            return invalid("share_key must not be empty");
+        }
+        if share.worker.trim().is_empty() {
+            return invalid("share worker must not be empty");
+        }
+    }
+    if delta
+        .workers_upserted
+        .iter()
+        .any(|worker| worker.worker.trim().is_empty())
+    {
+        return invalid("worker label must not be empty");
+    }
+    if delta
+        .pending_upserted
+        .iter()
+        .any(|payout| payout.payout_id.trim().is_empty())
+    {
+        return invalid("pending payout_id must not be empty");
+    }
+    if delta
+        .completed_upserted
+        .iter()
+        .any(|payout| payout.payout_id.trim().is_empty())
+    {
+        return invalid("completed payout_id must not be empty");
+    }
+    Ok(())
+}
+
+fn write_pool_ledger(
+    path: &Path,
+    network_id: &str,
+    delta: &PoolLedgerDelta,
+    replace_all: bool,
+) -> Result<(), StorageError> {
+    validate_pool_ledger_delta(network_id, delta)?;
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent).map_err(|source| StorageError::CreateDir {
             path: parent.display().to_string(),
             source,
         })?;
     }
-    let tmp_path = temp_db_path(path);
-    if tmp_path.exists() {
-        fs::remove_file(&tmp_path).map_err(|source| StorageError::Write {
-            path: tmp_path.display().to_string(),
-            source,
-        })?;
-    }
-
-    let mut share_dedup = std::collections::HashMap::<String, PoolShareRecord>::new();
-    for share in &snapshot.shares {
-        if share.share_key.trim().is_empty() {
-            return Err(StorageError::InvalidPoolLedger(
-                "share_key must not be empty".to_owned(),
-            ));
-        }
-        if share.worker.trim().is_empty() {
-            return Err(StorageError::InvalidPoolLedger(
-                "share worker must not be empty".to_owned(),
-            ));
-        }
-        share_dedup.insert(share.share_key.clone(), share.clone());
-    }
-    let mut shares = share_dedup.into_values().collect::<Vec<_>>();
-    shares.sort_by(|a, b| a.share_key.cmp(&b.share_key));
-
-    let mut round_dedup = std::collections::HashMap::<u64, PoolRoundRecord>::new();
-    for round in &snapshot.rounds {
-        round_dedup.insert(round.round_id, round.clone());
-    }
-    let mut rounds = round_dedup.into_values().collect::<Vec<_>>();
-    rounds.sort_by_key(|round| round.round_id);
-
-    let mut worker_dedup = std::collections::HashMap::<String, PoolWorkerAccrualRecord>::new();
-    for worker in &snapshot.workers {
-        if worker.worker.trim().is_empty() {
-            return Err(StorageError::InvalidPoolLedger(
-                "worker label must not be empty".to_owned(),
-            ));
-        }
-        worker_dedup.insert(worker.worker.clone(), worker.clone());
-    }
-    let mut workers = worker_dedup.into_values().collect::<Vec<_>>();
-    workers.sort_by(|a, b| a.worker.cmp(&b.worker));
-
-    let mut pending_dedup = std::collections::HashMap::<String, PoolPayoutRecord>::new();
-    for payout in &snapshot.pending_payouts {
-        if payout.payout_id.trim().is_empty() {
-            return Err(StorageError::InvalidPoolLedger(
-                "pending payout_id must not be empty".to_owned(),
-            ));
-        }
-        pending_dedup.insert(payout.payout_id.clone(), payout.clone());
-    }
-    let mut pending_payouts = pending_dedup.into_values().collect::<Vec<_>>();
-    pending_payouts.sort_by(|a, b| a.payout_id.cmp(&b.payout_id));
-
-    let mut completed_dedup = std::collections::HashMap::<String, PoolPayoutRecord>::new();
-    for payout in &snapshot.completed_payouts {
-        if payout.payout_id.trim().is_empty() {
-            return Err(StorageError::InvalidPoolLedger(
-                "completed payout_id must not be empty".to_owned(),
-            ));
-        }
-        completed_dedup.insert(payout.payout_id.clone(), payout.clone());
-    }
-    let mut completed_payouts = completed_dedup.into_values().collect::<Vec<_>>();
-    completed_payouts.sort_by(|a, b| a.payout_id.cmp(&b.payout_id));
-
-    let db = Database::create(&tmp_path).map_err(|e| StorageError::Db(e.to_string()))?;
+    let db = open_or_create_db(path)?;
     let write_txn = db
         .begin_write()
         .map_err(|e| StorageError::Db(e.to_string()))?;
+    if replace_all {
+        delete_table(&write_txn, POOL_META_TABLE)?;
+        delete_table(&write_txn, POOL_WORKER_TABLE)?;
+        delete_table(&write_txn, POOL_SHARE_TABLE)?;
+        delete_table(&write_txn, POOL_ROUND_TABLE)?;
+        delete_table(&write_txn, POOL_PAYOUT_PENDING_TABLE)?;
+        delete_table(&write_txn, POOL_PAYOUT_COMPLETED_TABLE)?;
+    }
+    let db_err = |e: &dyn std::fmt::Display| StorageError::Db(e.to_string());
     {
         let mut meta = write_txn
             .open_table(POOL_META_TABLE)
-            .map_err(|e| StorageError::Db(e.to_string()))?;
-        let current_round_id_bytes = snapshot.current_round_id.to_le_bytes();
-        meta.insert("network_id", snapshot.network_id.as_bytes())
-            .map_err(|e| StorageError::Db(e.to_string()))?;
-        meta.insert("current_round_id", current_round_id_bytes.as_slice())
-            .map_err(|e| StorageError::Db(e.to_string()))?;
-    }
-    {
-        let mut table = write_txn
-            .open_table(POOL_WORKER_TABLE)
-            .map_err(|e| StorageError::Db(e.to_string()))?;
-        for worker in workers {
-            let value = bincode::serialize(&worker).map_err(StorageError::Encode)?;
-            table
-                .insert(worker.worker.as_str(), value.as_slice())
-                .map_err(|e| StorageError::Db(e.to_string()))?;
+            .map_err(|e| db_err(&e))?;
+        let existing_network = meta
+            .get("network_id")
+            .map_err(|e| db_err(&e))?
+            .map(|raw| String::from_utf8_lossy(raw.value()).into_owned());
+        match existing_network {
+            Some(existing) => {
+                // Never mix another network's or format's rows into a ledger.
+                if existing != network_id {
+                    return Err(StorageError::InvalidPoolLedger(format!(
+                        "pool ledger network mismatch: db='{existing}', write='{network_id}'"
+                    )));
+                }
+                check_schema_version(&meta, "pool ledger", POOL_LEDGER_SCHEMA_VERSION, None)?;
+            }
+            None => {
+                meta.insert("network_id", network_id.as_bytes())
+                    .map_err(|e| db_err(&e))?;
+                write_schema_version(&mut meta, POOL_LEDGER_SCHEMA_VERSION)?;
+            }
         }
+        meta.insert(
+            "current_round_id",
+            delta.current_round_id.to_le_bytes().as_slice(),
+        )
+        .map_err(|e| db_err(&e))?;
     }
     {
         let mut table = write_txn
             .open_table(POOL_SHARE_TABLE)
-            .map_err(|e| StorageError::Db(e.to_string()))?;
-        for share in shares {
-            let value = bincode::serialize(&share).map_err(StorageError::Encode)?;
+            .map_err(|e| db_err(&e))?;
+        if let Some(from_seq) = delta.shares_retained_from_seq {
             table
-                .insert(share.share_key.as_str(), value.as_slice())
-                .map_err(|e| StorageError::Db(e.to_string()))?;
+                .retain_in(..from_seq, |_, _| false)
+                .map_err(|e| db_err(&e))?;
+        }
+        for share in &delta.shares_appended {
+            let value = bincode::serialize(share).map_err(StorageError::Encode)?;
+            table
+                .insert(share.seq, value.as_slice())
+                .map_err(|e| db_err(&e))?;
         }
     }
     {
         let mut table = write_txn
             .open_table(POOL_ROUND_TABLE)
-            .map_err(|e| StorageError::Db(e.to_string()))?;
-        for round in rounds {
-            let value = bincode::serialize(&round).map_err(StorageError::Encode)?;
+            .map_err(|e| db_err(&e))?;
+        for round_id in &delta.rounds_removed {
+            table.remove(*round_id).map_err(|e| db_err(&e))?;
+        }
+        for round in &delta.rounds_upserted {
+            let value = bincode::serialize(round).map_err(StorageError::Encode)?;
             table
                 .insert(round.round_id, value.as_slice())
-                .map_err(|e| StorageError::Db(e.to_string()))?;
+                .map_err(|e| db_err(&e))?;
         }
     }
     {
         let mut table = write_txn
-            .open_table(POOL_PAYOUT_PENDING_TABLE)
-            .map_err(|e| StorageError::Db(e.to_string()))?;
-        for payout in pending_payouts {
-            let value = bincode::serialize(&payout).map_err(StorageError::Encode)?;
+            .open_table(POOL_WORKER_TABLE)
+            .map_err(|e| db_err(&e))?;
+        for worker in &delta.workers_removed {
+            table.remove(worker.as_str()).map_err(|e| db_err(&e))?;
+        }
+        for worker in &delta.workers_upserted {
+            let value = bincode::serialize(worker).map_err(StorageError::Encode)?;
             table
-                .insert(payout.payout_id.as_str(), value.as_slice())
-                .map_err(|e| StorageError::Db(e.to_string()))?;
+                .insert(worker.worker.as_str(), value.as_slice())
+                .map_err(|e| db_err(&e))?;
         }
     }
-    {
-        let mut table = write_txn
-            .open_table(POOL_PAYOUT_COMPLETED_TABLE)
-            .map_err(|e| StorageError::Db(e.to_string()))?;
-        for payout in completed_payouts {
-            let value = bincode::serialize(&payout).map_err(StorageError::Encode)?;
+    for (definition, removed, upserted) in [
+        (
+            POOL_PAYOUT_PENDING_TABLE,
+            &delta.pending_removed,
+            &delta.pending_upserted,
+        ),
+        (
+            POOL_PAYOUT_COMPLETED_TABLE,
+            &delta.completed_removed,
+            &delta.completed_upserted,
+        ),
+    ] {
+        let mut table = write_txn.open_table(definition).map_err(|e| db_err(&e))?;
+        for payout_id in removed {
+            table.remove(payout_id.as_str()).map_err(|e| db_err(&e))?;
+        }
+        for payout in upserted {
+            let value = bincode::serialize(payout).map_err(StorageError::Encode)?;
             table
                 .insert(payout.payout_id.as_str(), value.as_slice())
-                .map_err(|e| StorageError::Db(e.to_string()))?;
+                .map_err(|e| db_err(&e))?;
         }
     }
-    write_txn
-        .commit()
-        .map_err(|e| StorageError::Db(e.to_string()))?;
-    atomic_replace_file(&tmp_path, path)?;
+    write_txn.commit().map_err(|e| db_err(&e))?;
     Ok(())
 }
 
 pub fn load_pool_ledger_db(path: &Path) -> Result<PoolLedgerSnapshot, StorageError> {
-    let db = Database::open(path).map_err(|e| StorageError::Db(e.to_string()))?;
+    let db = open_existing_db(path)?;
     let read_txn = db
         .begin_read()
         .map_err(|e| StorageError::Db(e.to_string()))?;
@@ -908,6 +1769,7 @@ pub fn load_pool_ledger_db(path: &Path) -> Result<PoolLedgerSnapshot, StorageErr
         let meta = read_txn
             .open_table(POOL_META_TABLE)
             .map_err(|e| StorageError::Db(e.to_string()))?;
+        check_schema_version(&meta, "pool ledger", POOL_LEDGER_SCHEMA_VERSION, None)?;
         let network_id_raw = meta
             .get("network_id")
             .map_err(|e| StorageError::Db(e.to_string()))?
@@ -956,24 +1818,24 @@ pub fn load_pool_ledger_db(path: &Path) -> Result<PoolLedgerSnapshot, StorageErr
     let share_table = read_txn
         .open_table(POOL_SHARE_TABLE)
         .map_err(|e| StorageError::Db(e.to_string()))?;
+    // Table order is arrival order (keyed by `seq`).
     let mut shares = Vec::<PoolShareRecord>::new();
     for row in share_table
         .iter()
         .map_err(|e| StorageError::Db(e.to_string()))?
     {
         let (key, value) = row.map_err(|e| StorageError::Db(e.to_string()))?;
-        let key_share = key.value().to_owned();
+        let seq = key.value();
         let record: PoolShareRecord =
             bincode::deserialize(value.value()).map_err(StorageError::Decode)?;
-        if record.share_key != key_share {
+        if record.seq != seq {
             return Err(StorageError::InvalidPoolLedger(format!(
-                "share key mismatch: key={key_share}, record={}",
-                record.share_key
+                "share key mismatch: key={seq}, record={}",
+                record.seq
             )));
         }
         shares.push(record);
     }
-    shares.sort_by(|a, b| a.share_key.cmp(&b.share_key));
 
     let round_table = read_txn
         .open_table(POOL_ROUND_TABLE)
@@ -1052,33 +1914,159 @@ pub fn load_pool_ledger_db(path: &Path) -> Result<PoolLedgerSnapshot, StorageErr
     })
 }
 
-fn atomic_replace_file(tmp_path: &Path, final_path: &Path) -> Result<(), StorageError> {
-    fs::rename(tmp_path, final_path).map_err(|source| StorageError::Write {
-        path: final_path.display().to_string(),
-        source,
-    })?;
+/// Databases a long-running process owns, opened once and shared by every
+/// store call in the process. redb lets one process hold a database file:
+/// opening it per call made every access contend (and sleep-retry) with the
+/// other server processes on the same files. A server pins its stores at
+/// startup; another process opening them then fails fast with
+/// [`StorageError::OwnedByOtherProcess`].
+type PinnedRegistry = std::collections::HashMap<PathBuf, (usize, PinnedDb)>;
 
-    let file = fs::File::open(final_path).map_err(|source| StorageError::Write {
-        path: final_path.display().to_string(),
-        source,
-    })?;
-    file.sync_all().map_err(|source| StorageError::Write {
-        path: final_path.display().to_string(),
-        source,
-    })?;
+static PINNED_DATABASES: std::sync::OnceLock<std::sync::Mutex<PinnedRegistry>> =
+    std::sync::OnceLock::new();
 
-    if let Some(parent) = final_path.parent() {
-        let dir = fs::File::open(parent).map_err(|source| StorageError::Write {
-            path: parent.display().to_string(),
-            source,
-        })?;
-        dir.sync_all().map_err(|source| StorageError::Write {
-            path: parent.display().to_string(),
-            source,
-        })?;
+enum PinnedDb {
+    /// Pinned before the file existed; opened by the first write.
+    Pending,
+    Open(Arc<Database>),
+}
+
+/// Pins are counted: services of one process may each pin a shared store;
+/// it closes when the last one releases it.
+fn pinned_databases() -> std::sync::MutexGuard<'static, PinnedRegistry> {
+    PINNED_DATABASES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Canonical key for a database path that may not exist yet.
+fn database_key(path: &Path) -> PathBuf {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent = fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+    match path.file_name() {
+        Some(name) => parent.join(name),
+        None => parent,
     }
+}
 
+fn map_open_error(path: &Path, err: redb::DatabaseError) -> StorageError {
+    match err {
+        redb::DatabaseError::DatabaseAlreadyOpen => {
+            StorageError::OwnedByOtherProcess(path.display().to_string())
+        }
+        other => StorageError::Db(other.to_string()),
+    }
+}
+
+/// Keep `path` open for the life of the process (see `PINNED_DATABASES`).
+/// An existing file is opened (and locked) now; a missing one on its first
+/// write.
+pub fn pin_database(path: &Path) -> Result<(), StorageError> {
+    let key = database_key(path);
+    let mut pinned = pinned_databases();
+    if let Some((count, _)) = pinned.get_mut(&key) {
+        *count += 1;
+        return Ok(());
+    }
+    let entry = if path.exists() {
+        PinnedDb::Open(Arc::new(
+            Database::create(path).map_err(|e| map_open_error(path, e))?,
+        ))
+    } else {
+        PinnedDb::Pending
+    };
+    pinned.insert(key, (1, entry));
     Ok(())
+}
+
+/// Release one pin of `path`; the database closes with the last one.
+pub fn unpin_database(path: &Path) {
+    let key = database_key(path);
+    let mut pinned = pinned_databases();
+    if let Some((count, _)) = pinned.get_mut(&key) {
+        *count -= 1;
+        if *count == 0 {
+            pinned.remove(&key);
+        }
+    }
+}
+
+fn open_existing_db(path: &Path) -> Result<Arc<Database>, StorageError> {
+    if let Some((_, PinnedDb::Open(db))) = pinned_databases().get(&database_key(path)) {
+        return Ok(db.clone());
+    }
+    Database::open(path)
+        .map(Arc::new)
+        .map_err(|e| map_open_error(path, e))
+}
+
+fn open_or_create_db(path: &Path) -> Result<Arc<Database>, StorageError> {
+    let key = database_key(path);
+    let mut pinned = pinned_databases();
+    match pinned.get_mut(&key) {
+        Some((_, PinnedDb::Open(db))) => Ok(db.clone()),
+        Some((_, entry @ PinnedDb::Pending)) => {
+            let db = Arc::new(Database::create(path).map_err(|e| map_open_error(path, e))?);
+            *entry = PinnedDb::Open(db.clone());
+            Ok(db)
+        }
+        None => {
+            drop(pinned);
+            Database::create(path)
+                .map(Arc::new)
+                .map_err(|e| map_open_error(path, e))
+        }
+    }
+}
+
+/// Whole-store rewrites happen in place: the old rows are dropped and the
+/// new ones written inside one redb write transaction, which is atomic and
+/// crash-safe. (Building a temp database and renaming it over the live file
+/// leaked temp files on errors and replaced a file other handles had open.)
+fn delete_table<H: redb::TableHandle>(
+    write_txn: &redb::WriteTransaction,
+    table: H,
+) -> Result<(), StorageError> {
+    write_txn
+        .delete_table(table)
+        .map_err(|e| StorageError::Db(e.to_string()))?;
+    Ok(())
+}
+
+/// Plain-file counterpart: write a sibling temp file, fsync, rename over the
+/// target and fsync the directory; the temp file is removed on any error.
+fn write_file_atomically(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
+    use std::io::Write;
+    let tmp_path = temp_file_path(path);
+    let write_err = |source| StorageError::Write {
+        path: path.display().to_string(),
+        source,
+    };
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)
+            .map_err(write_err)?;
+        file.write_all(bytes).map_err(write_err)?;
+        file.sync_all().map_err(write_err)?;
+        drop(file);
+        fs::rename(&tmp_path, path).map_err(write_err)?;
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            fs::File::open(parent)
+                .and_then(|dir| dir.sync_all())
+                .map_err(write_err)?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+    result
 }
 
 fn bytes_to_hash(raw: &[u8], context: &str) -> Result<Hash256, StorageError> {
@@ -1093,21 +2081,24 @@ fn bytes_to_hash(raw: &[u8], context: &str) -> Result<Hash256, StorageError> {
     Ok(Hash256(buf))
 }
 
-static TEMP_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
+static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-fn temp_db_path(path: &Path) -> PathBuf {
+fn temp_file_path(path: &Path) -> PathBuf {
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or("chain");
-    let suffix = TEMP_DB_COUNTER.fetch_add(1, Ordering::Relaxed);
+        .unwrap_or("snapshot");
+    let suffix = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
-    let file_name = format!("{file_name}.tmp.{pid}.{suffix}");
-    path.with_file_name(file_name)
+    path.with_file_name(format!("{file_name}.tmp.{pid}.{suffix}"))
 }
 
 #[derive(Debug, Error)]
 pub enum StorageError {
+    #[error(
+        "database {0} is held by another running process (one node process owns its data directory; use its RPC)"
+    )]
+    OwnedByOtherProcess(String),
     #[error("cannot create directory {path}: {source}")]
     CreateDir {
         path: String,
@@ -1145,6 +2136,18 @@ pub enum StorageError {
     InvalidMempool(String),
     #[error("invalid pool ledger snapshot: {0}")]
     InvalidPoolLedger(String),
+    #[error(
+        "{store} has unsupported schema version {found:?} (this build expects {expected}); move the file aside to start fresh"
+    )]
+    UnsupportedSchema {
+        store: &'static str,
+        found: Option<u32>,
+        expected: u32,
+    },
+    #[error(
+        "refusing to overwrite archive: its tip {disk_tip} at height {disk_height} is not on this writer's chain and has at least as much work"
+    )]
+    StaleArchiveWriter { disk_tip: Hash256, disk_height: u64 },
 }
 
 #[cfg(test)]
@@ -1159,11 +2162,12 @@ mod tests {
 
     use crate::{
         ChainArchive, ChainStateSnapshot, MempoolSnapshot, MempoolTxRecord, PeerAddressBook,
-        PeerAddressRecord, PoolLedgerSnapshot, PoolPayoutRecord, PoolRoundRecord, PoolShareRecord,
-        PoolWorkerAccrualRecord, UtxoRecord, load_block_by_hash_db, load_chain_archive_db,
-        load_mempool_db, load_peer_book_db, load_pool_ledger_db, load_snapshot, load_snapshot_db,
-        save_chain_archive_db, save_mempool_db, save_peer_book_db, save_pool_ledger_db,
-        save_snapshot, save_snapshot_db,
+        PeerAddressRecord, PoolChainPoint, PoolLedgerDelta, PoolLedgerSnapshot, PoolPayoutRecord,
+        PoolRoundRecord, PoolShareRecord, PoolWorkerAccrualRecord, UtxoRecord,
+        apply_peer_book_delta_db, apply_pool_ledger_delta_db, load_block_by_hash_db,
+        load_chain_archive_db, load_mempool_db, load_peer_book_db, load_pool_ledger_db,
+        load_snapshot, load_snapshot_db, save_chain_archive_db, save_mempool_db, save_peer_book_db,
+        save_pool_ledger_db, save_snapshot, save_snapshot_db,
     };
 
     fn temp_test_file(stem: &str, ext: &str) -> PathBuf {
@@ -1183,10 +2187,10 @@ mod tests {
     }
 
     #[test]
-    fn temp_db_path_is_unique_per_call() {
+    fn temp_file_path_is_unique_per_call() {
         let base = PathBuf::from("target/storage-temp-path/runtime.redb");
-        let one = super::temp_db_path(&base);
-        let two = super::temp_db_path(&base);
+        let one = super::temp_file_path(&base);
+        let two = super::temp_file_path(&base);
         assert_ne!(one, two);
         assert_eq!(one.parent(), base.parent());
         assert_eq!(two.parent(), base.parent());
@@ -1207,6 +2211,7 @@ mod tests {
                 value: 50,
                 key_hash20: [1u8; 20],
                 created_height: 0,
+                created_time: 0,
                 is_coinbase: true,
             },
         );
@@ -1250,6 +2255,7 @@ mod tests {
                 value: 100,
                 key_hash20: [2u8; 20],
                 created_height: 7,
+                created_time: 0,
                 is_coinbase: false,
             },
         );
@@ -1292,6 +2298,7 @@ mod tests {
                 value: 1,
                 key_hash20: [0u8; 20],
                 created_height: 0,
+                created_time: 0,
                 is_coinbase: false,
             },
         };
@@ -1340,6 +2347,314 @@ mod tests {
         assert_eq!(loaded.blocks_by_height[0], genesis);
         assert_eq!(loaded.blocks_by_height[1], block1);
         let _ = std::fs::remove_file(path);
+    }
+
+    fn chain_of(parent: Hash256, len: usize, salt: u64) -> Vec<Block> {
+        let mut out = Vec::new();
+        let mut prev = parent;
+        for i in 0..len {
+            let block = Block {
+                header: BlockHeader {
+                    version: 1,
+                    prev_block: prev,
+                    merkle_root: Hash256::ZERO,
+                    timestamp: 1_770_763_200 + i as u64,
+                    target: Target::MAX,
+                    nonce: salt * 1_000 + i as u64,
+                },
+                transactions: vec![],
+            };
+            prev = block.header.block_hash();
+            out.push(block);
+        }
+        out
+    }
+
+    fn persist(
+        path: &std::path::Path,
+        blocks: &[Block],
+        work: u64,
+    ) -> Result<crate::ArchivePersistOutcome, crate::StorageError> {
+        let hashes = blocks
+            .iter()
+            .map(|b| b.header.block_hash())
+            .collect::<Vec<_>>();
+        let lookup = |hash: &Hash256| {
+            blocks
+                .iter()
+                .find(|b| b.header.block_hash() == *hash)
+                .cloned()
+        };
+        crate::persist_chain_archive_incremental_db(
+            path,
+            "devnet",
+            &hashes,
+            &work.to_be_bytes(),
+            &lookup,
+            &crate::ChainstateSource {
+                utxo: &|_| None,
+                all_utxos: &Vec::new,
+                undo: &|_| None,
+                undo_window: 720,
+            },
+        )
+    }
+
+    /// S4: the archive writer keeps the persisted UTXO set equal to the
+    /// chain's (connects, reorgs) and undo data for the reorg window only;
+    /// a loader resumes from it.
+    #[test]
+    fn chainstate_tracks_utxo_set_and_undo_window_across_reorgs() {
+        use scam_consensus::{BlockUndoData, UtxoEntry};
+        let path = temp_test_file("archive-chainstate", "redb");
+        let block = |prev: Hash256, tag: u8| {
+            let coinbase = Transaction {
+                version: 1,
+                inputs: vec![TxIn {
+                    prev_out: OutPoint::coinbase(),
+                    signature: vec![tag],
+                    pubkey_compressed: vec![],
+                    sequence: u32::MAX,
+                }],
+                outputs: vec![TxOut {
+                    value: u64::from(tag),
+                    key_hash20: [tag; 20],
+                }],
+                lock_time: 0,
+            };
+            let txids = vec![coinbase.txid()];
+            Block {
+                header: BlockHeader {
+                    version: 1,
+                    prev_block: prev,
+                    merkle_root: scam_core::merkle::merkle_root(&txids),
+                    timestamp: u64::from(tag),
+                    target: Target::MAX,
+                    nonce: u64::from(tag),
+                },
+                transactions: vec![coinbase],
+            }
+        };
+        let utxos_of = |blocks: &[Block]| {
+            blocks
+                .iter()
+                .map(|b| {
+                    let tx = &b.transactions[0];
+                    (
+                        OutPoint {
+                            txid: tx.txid(),
+                            vout: 0,
+                        },
+                        UtxoEntry {
+                            value: tx.outputs[0].value,
+                            key_hash20: tx.outputs[0].key_hash20,
+                            created_height: 0,
+                            created_time: 0,
+                            is_coinbase: true,
+                        },
+                    )
+                })
+                .collect::<std::collections::HashMap<_, _>>()
+        };
+        let write = |chain: &[Block], work: u64| {
+            let hashes = chain
+                .iter()
+                .map(|b| b.header.block_hash())
+                .collect::<Vec<_>>();
+            let utxos = utxos_of(chain);
+            crate::persist_chain_archive_incremental_db(
+                &path,
+                "devnet",
+                &hashes,
+                &work.to_be_bytes(),
+                &|hash: &Hash256| {
+                    chain
+                        .iter()
+                        .find(|b| b.header.block_hash() == *hash)
+                        .cloned()
+                },
+                &crate::ChainstateSource {
+                    utxo: &|op| utxos.get(op).cloned(),
+                    all_utxos: &|| utxos.clone().into_iter().collect(),
+                    undo: &|_| Some(BlockUndoData::default()),
+                    undo_window: 2,
+                },
+            )
+            .expect("persist");
+        };
+        let mut chain = vec![block(Hash256::ZERO, 1)];
+        for tag in 2..=4 {
+            let prev = chain.last().expect("tip").header.block_hash();
+            chain.push(block(prev, tag));
+        }
+        write(&chain, 10);
+        let loaded = crate::load_chainstate_db(&path)
+            .expect("load")
+            .expect("chainstate");
+        assert_eq!(loaded.blocks_by_height, chain);
+        assert_eq!(loaded.utxos, utxos_of(&chain));
+        let mut undo_keys = loaded.undo.keys().copied().collect::<Vec<_>>();
+        undo_keys.sort();
+        let mut window = chain[2..]
+            .iter()
+            .map(|b| b.header.block_hash())
+            .collect::<Vec<_>>();
+        window.sort();
+        assert_eq!(undo_keys, window, "undo only for the window");
+
+        // Reorg: blocks 3 and 4 are replaced by 3', 4', 5'.
+        let mut fork = chain[..2].to_vec();
+        for tag in 30..=32 {
+            let prev = fork.last().expect("tip").header.block_hash();
+            fork.push(block(prev, tag));
+        }
+        write(&fork, 20);
+        let loaded = crate::load_chainstate_db(&path)
+            .expect("load")
+            .expect("chainstate");
+        assert_eq!(loaded.blocks_by_height, fork);
+        assert_eq!(
+            loaded.utxos,
+            utxos_of(&fork),
+            "disconnected outputs are gone"
+        );
+        assert_eq!(loaded.undo.len(), 2);
+        assert!(
+            loaded
+                .undo
+                .keys()
+                .all(|hash| fork[3..].iter().any(|b| b.header.block_hash() == *hash))
+        );
+
+        // A full archive rewrite drops the chainstate: loaders replay.
+        crate::save_chain_archive_db(
+            &path,
+            &crate::ChainArchive {
+                network_id: "devnet".to_owned(),
+                blocks_by_height: fork.clone(),
+            },
+        )
+        .expect("full save");
+        assert!(crate::load_chainstate_db(&path).expect("load").is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// S3: persisting writes only blocks above what the archive already has.
+    #[test]
+    fn incremental_archive_persist_appends_only_new_blocks() {
+        let path = temp_test_file("archive-incremental", "redb");
+        let chain = chain_of(Hash256::ZERO, 5, 1);
+        let first = persist(&path, &chain[..3], 3).expect("first persist");
+        assert_eq!(first.blocks_written, 3);
+        let second = persist(&path, &chain, 5).expect("second persist");
+        assert_eq!(second.first_written_height, Some(3));
+        assert_eq!(second.blocks_written, 2);
+        let again = persist(&path, &chain, 5).expect("no-op persist");
+        assert_eq!(again.blocks_written, 0);
+        assert_eq!(again.first_written_height, None);
+
+        let loaded = load_chain_archive_db(&path).expect("load");
+        assert_eq!(loaded.blocks_by_height, chain);
+        let tip = crate::load_chain_archive_tip_db(&path)
+            .expect("tip")
+            .expect("some");
+        assert_eq!(tip.height, 4);
+        assert_eq!(tip.hash, chain[4].header.block_hash());
+        let (_, tail) = crate::load_chain_archive_range_db(&path, 3).expect("range");
+        assert_eq!(tail.len(), 2);
+        assert_eq!(tail[0].0, 3);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// S1: a writer whose chain is behind (or on a lighter fork) must not be
+    /// able to roll the shared archive back.
+    #[test]
+    fn incremental_archive_persist_refuses_stale_writer_but_accepts_heavier_fork() {
+        let path = temp_test_file("archive-stale-writer", "redb");
+        let main = chain_of(Hash256::ZERO, 5, 2);
+        persist(&path, &main, 5).expect("relay persists height 4");
+
+        // A process still at height 2 tries to persist its view.
+        let err = persist(&path, &main[..3], 3).expect_err("stale prefix must be refused");
+        assert!(matches!(
+            err,
+            crate::StorageError::StaleArchiveWriter { .. }
+        ));
+        // A lighter fork from height 1 is refused too.
+        let mut light = main[..2].to_vec();
+        light.extend(chain_of(main[1].header.block_hash(), 2, 3));
+        assert!(matches!(
+            persist(&path, &light, 4),
+            Err(crate::StorageError::StaleArchiveWriter { .. })
+        ));
+        assert_eq!(
+            load_chain_archive_db(&path).expect("load").blocks_by_height,
+            main
+        );
+
+        // A heavier, shorter fork is a legitimate reorg: index rewritten and
+        // entries above the new tip removed.
+        let mut heavy = main[..2].to_vec();
+        heavy.extend(chain_of(main[1].header.block_hash(), 2, 4));
+        let outcome = persist(&path, &heavy, 9).expect("heavier fork wins");
+        assert_eq!(outcome.first_written_height, Some(2));
+        assert_eq!(
+            load_chain_archive_db(&path).expect("load").blocks_by_height,
+            heavy
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// S7: stores carry a schema version; a file with an unknown version
+    /// is refused instead of being misread.
+    #[test]
+    fn stores_record_and_enforce_schema_version() {
+        let path = temp_test_file("archive-schema", "redb");
+        let chain = chain_of(Hash256::ZERO, 2, 7);
+        persist(&path, &chain, 2).expect("persist");
+        load_chain_archive_db(&path).expect("current version loads");
+        {
+            let db = redb::Database::open(&path).expect("open");
+            let txn = db.begin_write().expect("txn");
+            {
+                let mut meta = txn.open_table(crate::META_TABLE).expect("meta");
+                meta.insert(crate::SCHEMA_VERSION_KEY, 99u32.to_le_bytes().as_slice())
+                    .expect("insert");
+            }
+            txn.commit().expect("commit");
+        }
+        assert!(matches!(
+            load_chain_archive_db(&path),
+            Err(crate::StorageError::UnsupportedSchema {
+                found: Some(99),
+                ..
+            })
+        ));
+        let _ = std::fs::remove_file(path);
+
+        // A pool ledger without a version is a v1 ledger: refused.
+        let ledger_path = temp_test_file("ledger-schema", "redb");
+        {
+            let db = redb::Database::create(&ledger_path).expect("create");
+            let txn = db.begin_write().expect("txn");
+            {
+                let mut meta = txn.open_table(crate::POOL_META_TABLE).expect("meta");
+                meta.insert("network_id", b"devnet".as_slice())
+                    .expect("net");
+                meta.insert("current_round_id", 0u64.to_le_bytes().as_slice())
+                    .expect("round");
+            }
+            txn.commit().expect("commit");
+        }
+        assert!(matches!(
+            load_pool_ledger_db(&ledger_path),
+            Err(crate::StorageError::UnsupportedSchema { found: None, .. })
+        ));
+        assert!(matches!(
+            apply_pool_ledger_delta_db(&ledger_path, "devnet", &PoolLedgerDelta::default()),
+            Err(crate::StorageError::UnsupportedSchema { found: None, .. })
+        ));
+        let _ = std::fs::remove_file(ledger_path);
     }
 
     #[test]
@@ -1400,17 +2715,20 @@ mod tests {
                     address: "127.0.0.1:8333".to_owned(),
                     last_seen_unix_sec: 1_770_763_200,
                     ban_score: 0,
+                    ..Default::default()
                 },
                 PeerAddressRecord {
                     address: "192.168.1.10:8333".to_owned(),
                     last_seen_unix_sec: 1_770_763_210,
                     ban_score: 2,
+                    ..Default::default()
                 },
                 // Duplicate address should be deduplicated by save path.
                 PeerAddressRecord {
                     address: "127.0.0.1:8333".to_owned(),
                     last_seen_unix_sec: 1_770_763_300,
                     ban_score: 5,
+                    ..Default::default()
                 },
             ],
         };
@@ -1427,6 +2745,103 @@ mod tests {
     }
 
     #[test]
+    fn peer_book_delta_writes_only_changes_and_guards_network_and_version() {
+        let path = temp_test_file("peer-book-delta", "redb");
+        let record = |address: &str, tried: bool| PeerAddressRecord {
+            address: address.to_owned(),
+            last_seen_unix_sec: 10,
+            source_group: "v4:1.2".to_owned(),
+            tried,
+            ..Default::default()
+        };
+        apply_peer_book_delta_db(
+            &path,
+            "devnet",
+            &[record("1.2.3.4:1", false), record("5.6.7.8:1", true)],
+            &[],
+        )
+        .expect("create");
+        apply_peer_book_delta_db(
+            &path,
+            "devnet",
+            &[record("9.9.9.9:1", false)],
+            &["1.2.3.4:1".to_owned()],
+        )
+        .expect("delta");
+        let book = load_peer_book_db(&path).expect("load");
+        assert_eq!(
+            book.peers
+                .iter()
+                .map(|p| p.address.as_str())
+                .collect::<Vec<_>>(),
+            vec!["5.6.7.8:1", "9.9.9.9:1"]
+        );
+        assert!(book.peers[0].tried);
+        assert!(matches!(
+            apply_peer_book_delta_db(&path, "testnet", &[], &[]),
+            Err(crate::StorageError::InvalidPeerBook(_))
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        // A v1 peer book (no version key) is refused.
+        let old = temp_test_file("peer-book-v1", "redb");
+        {
+            let db = redb::Database::create(&old).expect("create");
+            let txn = db.begin_write().expect("txn");
+            {
+                let mut meta = txn.open_table(crate::META_TABLE).expect("meta");
+                meta.insert("network_id", b"devnet".as_slice())
+                    .expect("net");
+            }
+            txn.commit().expect("commit");
+        }
+        assert!(matches!(
+            load_peer_book_db(&old),
+            Err(crate::StorageError::UnsupportedSchema { found: None, .. })
+        ));
+        assert!(matches!(
+            apply_peer_book_delta_db(&old, "devnet", &[], &[]),
+            Err(crate::StorageError::UnsupportedSchema { found: None, .. })
+        ));
+        let _ = std::fs::remove_file(old);
+    }
+
+    /// S6: a pinned store is opened once and serves every call in the
+    /// process; any other opener is refused while it is pinned.
+    #[test]
+    fn pinned_database_is_shared_in_process_and_exclusive_outside() {
+        let path = temp_test_file("pinned-peer-book", "redb");
+        crate::pin_database(&path).expect("pin (file created lazily)");
+        assert!(!path.exists(), "pinning a missing store does not create it");
+        let book = PeerAddressBook {
+            network_id: "devnet".to_owned(),
+            peers: vec![PeerAddressRecord {
+                address: "1.2.3.4:1".to_owned(),
+                ..Default::default()
+            }],
+        };
+        save_peer_book_db(&path, &book).expect("save through pinned handle");
+        for _ in 0..3 {
+            assert_eq!(load_peer_book_db(&path).expect("load").peers.len(), 1);
+        }
+        apply_peer_book_delta_db(&path, "devnet", &[], &["1.2.3.4:1".to_owned()])
+            .expect("delta through pinned handle");
+        // Anyone else (here: a direct open) is locked out while pinned.
+        assert!(redb::Database::open(&path).is_err());
+        crate::unpin_database(&path);
+        assert!(load_peer_book_db(&path).expect("reopen").peers.is_empty());
+        // A store pinned while it exists is opened (locked) immediately;
+        // pins are counted and the last release closes it.
+        crate::pin_database(&path).expect("pin existing");
+        crate::pin_database(&path).expect("second pin");
+        assert!(redb::Database::create(&path).is_err());
+        crate::unpin_database(&path);
+        assert!(redb::Database::create(&path).is_err(), "still pinned once");
+        crate::unpin_database(&path);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn peer_book_rejects_empty_address() {
         let peer_book = PeerAddressBook {
             network_id: "devnet".to_owned(),
@@ -1434,6 +2849,7 @@ mod tests {
                 address: "   ".to_owned(),
                 last_seen_unix_sec: 0,
                 ban_score: 0,
+                ..Default::default()
             }],
         };
         let path = temp_test_file("peer-book-invalid", "redb");
@@ -1518,13 +2934,14 @@ mod tests {
     }
 
     #[test]
-    fn pool_ledger_db_roundtrip_and_dedup() {
+    fn pool_ledger_db_roundtrip_and_delta() {
         let snapshot = PoolLedgerSnapshot {
             network_id: "devnet".to_owned(),
             current_round_id: 7,
             shares: vec![
                 PoolShareRecord {
-                    share_key: "1:2:3:4".to_owned(),
+                    seq: 1,
+                    share_key: "1:2:3:5".to_owned(),
                     worker: "miner.a".to_owned(),
                     timestamp_unix_sec: 1_770_763_200,
                     channel_id: 1,
@@ -1535,8 +2952,9 @@ mod tests {
                     accepted: true,
                     is_block: false,
                 },
-                // duplicate key: last one should win
+                // arrival order, not key order
                 PoolShareRecord {
+                    seq: 2,
                     share_key: "1:2:3:4".to_owned(),
                     worker: "miner.a".to_owned(),
                     timestamp_unix_sec: 1_770_763_201,
@@ -1562,6 +2980,7 @@ mod tests {
                     found_block_hash: Some(Hash256([0x33; 32])),
                     found_block_reward_atomic: 5_000_000_000,
                     orphaned: false,
+                    pplns_credits: Vec::new(),
                 },
                 PoolRoundRecord {
                     round_id: 7,
@@ -1575,6 +2994,7 @@ mod tests {
                     found_block_hash: None,
                     found_block_reward_atomic: 0,
                     orphaned: false,
+                    pplns_credits: Vec::new(),
                 },
             ],
             workers: vec![
@@ -1585,6 +3005,7 @@ mod tests {
                     blocks_found_total: 1,
                     expected_hashes_accumulated: 34_000.0,
                     pplns_accrual_atomic: 10_000,
+                    pplns_settled_atomic: 0,
                     pps_accrual_atomic: 2_000,
                     paid_total_atomic: 500,
                     last_share_unix_sec: 1_770_763_201,
@@ -1596,6 +3017,7 @@ mod tests {
                     blocks_found_total: 2,
                     expected_hashes_accumulated: 44_000.0,
                     pplns_accrual_atomic: 20_000,
+                    pplns_settled_atomic: 0,
                     pps_accrual_atomic: 4_000,
                     paid_total_atomic: 1_000,
                     last_share_unix_sec: 1_770_763_202,
@@ -1606,7 +3028,14 @@ mod tests {
                 worker: "miner.a".to_owned(),
                 amount_atomic: 1_500,
                 created_unix_sec: 1_770_763_230,
+                signed_tx_hex: None,
                 submitted_txid_hex: None,
+                superseded_txids: Vec::new(),
+                lineage_input: None,
+                broadcast_accepted: false,
+                searched_through: None,
+                confirmed_in: None,
+                dead_since_height: None,
                 confirmed: false,
             }],
             completed_payouts: vec![PoolPayoutRecord {
@@ -1614,7 +3043,20 @@ mod tests {
                 worker: "miner.b".to_owned(),
                 amount_atomic: 800,
                 created_unix_sec: 1_770_763_120,
+                signed_tx_hex: Some("00".to_owned()),
                 submitted_txid_hex: Some("aa".repeat(32)),
+                superseded_txids: vec!["bb".repeat(32)],
+                lineage_input: Some(OutPoint {
+                    txid: Hash256([0x44; 32]),
+                    vout: 1,
+                }),
+                broadcast_accepted: true,
+                searched_through: None,
+                confirmed_in: Some(PoolChainPoint {
+                    height: 101,
+                    hash: Hash256([0x33; 32]),
+                }),
+                dead_since_height: None,
                 confirmed: true,
             }],
         };
@@ -1624,13 +3066,68 @@ mod tests {
         let loaded = load_pool_ledger_db(&path).expect("load pool ledger");
         assert_eq!(loaded.network_id, "devnet");
         assert_eq!(loaded.current_round_id, 7);
-        assert_eq!(loaded.shares.len(), 1);
-        assert!(loaded.shares[0].is_block);
-        assert_eq!(loaded.workers.len(), 1);
+        assert_eq!(
+            loaded.shares.iter().map(|s| s.seq).collect::<Vec<_>>(),
+            vec![1, 2],
+            "shares load in arrival order"
+        );
+        assert!(loaded.shares[1].is_block);
+        assert_eq!(loaded.workers.len(), 1, "a duplicate worker row: last wins");
         assert_eq!(loaded.workers[0].accepted_total, 3);
         assert_eq!(loaded.rounds.len(), 2);
+        assert_eq!(loaded.pending_payouts, snapshot.pending_payouts);
+        assert_eq!(loaded.completed_payouts, snapshot.completed_payouts);
+
+        // A delta touches only the changed rows.
+        let mut share3 = snapshot.shares[0].clone();
+        share3.seq = 3;
+        share3.share_key = "9:9:9:9".to_owned();
+        let mut worker = loaded.workers[0].clone();
+        worker.accepted_total = 4;
+        let mut paid = snapshot.pending_payouts[0].clone();
+        paid.confirmed = true;
+        let delta = PoolLedgerDelta {
+            current_round_id: 8,
+            shares_appended: vec![share3],
+            shares_retained_from_seq: Some(2),
+            rounds_upserted: Vec::new(),
+            rounds_removed: vec![6],
+            workers_upserted: vec![worker],
+            workers_removed: Vec::new(),
+            pending_upserted: Vec::new(),
+            pending_removed: vec!["p-1".to_owned()],
+            completed_upserted: vec![paid],
+            completed_removed: Vec::new(),
+        };
+        apply_pool_ledger_delta_db(&path, "devnet", &delta).expect("apply delta");
+        let loaded = load_pool_ledger_db(&path).expect("reload");
+        assert_eq!(loaded.current_round_id, 8);
+        assert_eq!(
+            loaded.shares.iter().map(|s| s.seq).collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        assert_eq!(
+            loaded.rounds.iter().map(|r| r.round_id).collect::<Vec<_>>(),
+            vec![7]
+        );
+        assert_eq!(loaded.workers[0].accepted_total, 4);
+        assert!(loaded.pending_payouts.is_empty());
+        assert_eq!(loaded.completed_payouts.len(), 2);
+
+        // Never mixes another network's rows into the ledger.
+        assert!(matches!(
+            apply_pool_ledger_delta_db(&path, "testnet", &PoolLedgerDelta::default()),
+            Err(crate::StorageError::InvalidPoolLedger(_))
+        ));
+        // A full save replaces every row in place.
+        let mut smaller = snapshot.clone();
+        smaller.shares.truncate(1);
+        smaller.completed_payouts.clear();
+        save_pool_ledger_db(&path, &smaller).expect("full save");
+        let loaded = load_pool_ledger_db(&path).expect("reload full");
+        assert_eq!(loaded.shares.len(), 1);
+        assert!(loaded.completed_payouts.is_empty());
         assert_eq!(loaded.pending_payouts.len(), 1);
-        assert_eq!(loaded.completed_payouts.len(), 1);
         let _ = std::fs::remove_file(path);
     }
 

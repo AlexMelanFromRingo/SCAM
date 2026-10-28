@@ -22,7 +22,7 @@ pub fn select_outbound_peers(
     }
 
     let mut dedup = candidates.to_vec();
-    dedup.sort_unstable_by(|a, b| a.addr.cmp(&b.addr));
+    dedup.sort_unstable_by_key(|c| c.addr);
     dedup.dedup_by_key(|candidate| candidate.addr);
 
     let mut tried = Vec::<PeerCandidate>::new();

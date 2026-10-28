@@ -8,6 +8,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install libclang (minisketch-rs bindgen)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang libclang-dev
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Cache Rust artifacts

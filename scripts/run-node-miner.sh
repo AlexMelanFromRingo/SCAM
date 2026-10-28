@@ -128,8 +128,10 @@ start() {
   stop_pid_file "${RPC_PID}"
   stop_pid_file "${RELAY_PID}"
 
+  # One node process: P2P relay plus, in-process, RPC/web console and the
+  # stratum pool on the same chain and mempool (it owns the data directory).
   local relay_args=(
-    relay-serve
+    serve
     --network "${NETWORK}"
     --config "${CONFIG}"
     --runtime-db "${RUNTIME_DB}"
@@ -139,37 +141,15 @@ start() {
     --write-timeout-sec "${P2P_WRITE_TIMEOUT_SEC}"
     --telemetry-out "${RELAY_TELEMETRY}"
     --telemetry-every-sec 5
+    --rpc "--bind ${RPC_BIND} --ui-dir '${UI_DIR}' --relay-telemetry '${RELAY_TELEMETRY}' --stratum-telemetry '${STRATUM_TELEMETRY}'"
+    --stratum "--bind ${STRATUM_BIND} --read-timeout-sec ${STRATUM_READ_TIMEOUT_SEC} --telemetry-out '${STRATUM_TELEMETRY}' --telemetry-every-sec 5"
   )
   if [[ "${OUTBOUND_CONNECT,,}" == "true" || "${OUTBOUND_CONNECT}" == "1" ]]; then
     relay_args+=(--outbound-connect --outbound-redial-sec "${OUTBOUND_REDIAL_SEC}")
   fi
   "${SCAM_NODE_BIN}" "${relay_args[@]}" > "${RELAY_LOG}" 2>&1 &
   echo "$!" > "${RELAY_PID}"
-  ensure_started "${RELAY_PID}" "${RELAY_LOG}" "relay"
-
-  "${SCAM_NODE_BIN}" rpc-serve \
-    --network "${NETWORK}" \
-    --config "${CONFIG}" \
-    --runtime-db "${RUNTIME_DB}" \
-    --bind "${RPC_BIND}" \
-    --ui-dir "${UI_DIR}" \
-    --relay-telemetry "${RELAY_TELEMETRY}" \
-    --stratum-telemetry "${STRATUM_TELEMETRY}" \
-    > "${RPC_LOG}" 2>&1 &
-  echo "$!" > "${RPC_PID}"
-  ensure_started "${RPC_PID}" "${RPC_LOG}" "rpc"
-
-  "${SCAM_NODE_BIN}" stratum-serve \
-    --network "${NETWORK}" \
-    --config "${CONFIG}" \
-    --runtime-db "${RUNTIME_DB}" \
-    --bind "${STRATUM_BIND}" \
-    --read-timeout-sec "${STRATUM_READ_TIMEOUT_SEC}" \
-    --telemetry-out "${STRATUM_TELEMETRY}" \
-    --telemetry-every-sec 5 \
-    > "${STRATUM_LOG}" 2>&1 &
-  echo "$!" > "${STRATUM_PID}"
-  ensure_started "${STRATUM_PID}" "${STRATUM_LOG}" "stratum"
+  ensure_started "${RELAY_PID}" "${RELAY_LOG}" "node"
 
   "${SCAM_NODE_BIN}" stratum-mine \
     --pool "${STRATUM_BIND}" \
@@ -206,8 +186,9 @@ status() {
   local stratum_state="stopped"
   local miner_state="stopped"
   [[ -f "${RELAY_PID}" ]] && pid_is_alive "$(cat "${RELAY_PID}")" && relay_state="running (pid=$(cat "${RELAY_PID}"))"
-  [[ -f "${RPC_PID}" ]] && pid_is_alive "$(cat "${RPC_PID}")" && rpc_state="running (pid=$(cat "${RPC_PID}"))"
-  [[ -f "${STRATUM_PID}" ]] && pid_is_alive "$(cat "${STRATUM_PID}")" && stratum_state="running (pid=$(cat "${STRATUM_PID}"))"
+  # RPC and stratum run inside the node process.
+  [[ -f "${RELAY_PID}" ]] && pid_is_alive "$(cat "${RELAY_PID}")" && rpc_state="running (in node pid=$(cat "${RELAY_PID}"))"
+  [[ -f "${RELAY_PID}" ]] && pid_is_alive "$(cat "${RELAY_PID}")" && stratum_state="running (in node pid=$(cat "${RELAY_PID}"))"
   [[ -f "${MINER_PID}" ]] && pid_is_alive "$(cat "${MINER_PID}")" && miner_state="running (pid=$(cat "${MINER_PID}"))"
   echo "[node-miner] relay=${relay_state} rpc=${rpc_state} stratum=${stratum_state} miner=${miner_state}"
 }

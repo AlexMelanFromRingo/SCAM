@@ -57,6 +57,28 @@ pub struct ChainConfig {
     #[serde(default = "default_wallet_min_spendable_confirmations")]
     pub wallet_min_spendable_confirmations: u32,
     pub block_subsidy: u64,
+    /// Number of blocks between subsidy halvings. `0` disables halvings
+    /// (constant subsidy forever — legacy behavior, preserved for existing
+    /// devnet/testnet configs that did not opt in). See
+    /// `docs/PROTOCOL_DESIGN.md` §1.
+    #[serde(default)]
+    pub halving_interval_blocks: u64,
+    /// Per-block subsidy floor after halvings reduce the reward to zero
+    /// (Monero-style tail emission). `0` means "no floor; reward goes to 0".
+    /// Must be `<= block_subsidy` to avoid an initial-jump invariant break.
+    #[serde(default)]
+    pub tail_emission: u64,
+    /// BIP9-style versionbits retarget window (blocks). `0` disables
+    /// versionbits evaluation entirely (no deployments can activate).
+    #[serde(default)]
+    pub versionbits_window_blocks: u64,
+    /// Minimum number of signaling headers within a retarget window to
+    /// trigger STARTED → LOCKED_IN. Typically 95% of window. `0` = unset.
+    #[serde(default)]
+    pub versionbits_threshold: u32,
+    /// Optional list of soft-fork deployments. Default empty.
+    #[serde(default)]
+    pub deployments: Vec<crate::versionbits::Deployment>,
     pub hrp: String,
     #[serde(default = "default_stratum_share_target")]
     pub stratum_share_target: String,
@@ -146,6 +168,50 @@ impl ChainConfig {
             return Err(ChainConfigError::InvalidField(
                 "max_tx_size must be <= max_block_size".to_owned(),
             ));
+        }
+        if self.tail_emission > self.block_subsidy {
+            return Err(ChainConfigError::InvalidField(
+                "tail_emission must be <= block_subsidy".to_owned(),
+            ));
+        }
+        // Versionbits config sanity. We don't require the feature to be
+        // enabled (a chain may legitimately ship without any deployments),
+        // but if any deployments are configured, the window + threshold +
+        // bit positions must all be valid or activation is impossible.
+        if !self.deployments.is_empty() {
+            if self.versionbits_window_blocks == 0 {
+                return Err(ChainConfigError::InvalidField(
+                    "deployments present but versionbits_window_blocks = 0".to_owned(),
+                ));
+            }
+            if self.versionbits_threshold == 0
+                || self.versionbits_threshold as u64 > self.versionbits_window_blocks
+            {
+                return Err(ChainConfigError::InvalidField(
+                    "versionbits_threshold must be in 1..=versionbits_window_blocks".to_owned(),
+                ));
+            }
+            let mut seen_bits = std::collections::HashSet::new();
+            for d in &self.deployments {
+                if !d.is_valid_bit() {
+                    return Err(ChainConfigError::InvalidField(format!(
+                        "deployment '{}' bit {} out of range (max 28)",
+                        d.name, d.bit
+                    )));
+                }
+                if d.timeout_unix <= d.start_unix {
+                    return Err(ChainConfigError::InvalidField(format!(
+                        "deployment '{}' timeout must be > start",
+                        d.name
+                    )));
+                }
+                if !seen_bits.insert(d.bit) {
+                    return Err(ChainConfigError::InvalidField(format!(
+                        "deployment bit {} reused (only one deployment per bit)",
+                        d.bit
+                    )));
+                }
+            }
         }
         if self.max_mempool_txs == 0 {
             return Err(ChainConfigError::InvalidField(
@@ -351,6 +417,29 @@ impl ChainConfig {
 
     pub fn stratum_max_share_target(&self) -> Result<Target, ChainConfigError> {
         Target::from_hex(&self.stratum_max_share_target).map_err(ChainConfigError::from)
+    }
+
+    /// Compute the consensus block subsidy at `height`.
+    ///
+    /// - When `halving_interval_blocks == 0` the subsidy is the constant
+    ///   `block_subsidy` (legacy SCAM behavior).
+    /// - Otherwise: classic Bitcoin-style halving every
+    ///   `halving_interval_blocks` blocks, but with a `tail_emission` floor
+    ///   so the reward never drops below it (Monero-style). When the floor
+    ///   is `0` the chain decays to a pure fee market like Bitcoin.
+    ///
+    /// The 64-halving guard avoids `u64::wrapping_shr` UB; in any sane
+    /// config halvings ≥ 64 means subsidy has long since been at the floor.
+    pub fn subsidy_at_height(&self, height: u64) -> u64 {
+        if self.halving_interval_blocks == 0 {
+            return self.block_subsidy;
+        }
+        let halvings = height / self.halving_interval_blocks;
+        if halvings >= 64 {
+            return self.tail_emission;
+        }
+        let halved = self.block_subsidy >> halvings;
+        halved.max(self.tail_emission)
     }
 
     pub fn build_genesis_block(&self) -> Result<Block, ChainConfigError> {
@@ -570,6 +659,11 @@ mod tests {
             coinbase_maturity: 100,
             wallet_min_spendable_confirmations: 1,
             block_subsidy: 5_000_000_000,
+            halving_interval_blocks: 0,
+            tail_emission: 0,
+            versionbits_window_blocks: 0,
+            versionbits_threshold: 0,
+            deployments: Vec::new(),
             hrp: "sd".to_owned(),
             stratum_share_target:
                 "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_owned(),
@@ -633,6 +727,11 @@ mod tests {
             coinbase_maturity: 100,
             wallet_min_spendable_confirmations: 1,
             block_subsidy: 5_000_000_000,
+            halving_interval_blocks: 0,
+            tail_emission: 0,
+            versionbits_window_blocks: 0,
+            versionbits_threshold: 0,
+            deployments: Vec::new(),
             hrp: "sd".to_owned(),
             stratum_share_target:
                 "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_owned(),
@@ -991,5 +1090,80 @@ genesis_reward_key_hash20 = "0000000000000000000000000000000000000000"
             min_share.to_hex(),
             "10ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
         );
+    }
+
+    /// Halvings disabled (interval = 0) — constant subsidy forever, matches
+    /// legacy devnet/testnet behavior. Test exists so a future "I'll just
+    /// default halving_interval_blocks to 210_000" change cannot silently
+    /// reduce running-chain rewards.
+    #[test]
+    fn subsidy_at_height_is_constant_when_halvings_disabled() {
+        let mut cfg = sample_config();
+        cfg.halving_interval_blocks = 0;
+        cfg.tail_emission = 0;
+        cfg.block_subsidy = 50;
+        for h in [0, 1, 999, 1_000_000, u64::MAX / 2] {
+            assert_eq!(cfg.subsidy_at_height(h), 50, "h={h}");
+        }
+    }
+
+    /// Bitcoin-style halving curve: subsidy halves every interval. With
+    /// `tail_emission = 0` it goes to zero (Bitcoin's bet).
+    #[test]
+    fn subsidy_at_height_halves_every_interval() {
+        let mut cfg = sample_config();
+        cfg.halving_interval_blocks = 10;
+        cfg.tail_emission = 0;
+        cfg.block_subsidy = 64;
+        assert_eq!(cfg.subsidy_at_height(0), 64);
+        assert_eq!(cfg.subsidy_at_height(9), 64);
+        assert_eq!(cfg.subsidy_at_height(10), 32);
+        assert_eq!(cfg.subsidy_at_height(19), 32);
+        assert_eq!(cfg.subsidy_at_height(20), 16);
+        assert_eq!(cfg.subsidy_at_height(60), 1);
+        assert_eq!(cfg.subsidy_at_height(70), 0);
+        // Many halvings past zero stay at zero.
+        assert_eq!(cfg.subsidy_at_height(1_000_000), 0);
+    }
+
+    /// Monero-style tail emission: subsidy floors at `tail_emission` instead
+    /// of decaying to zero. Validates the F-monetary policy contract.
+    #[test]
+    fn subsidy_at_height_floors_at_tail_emission() {
+        let mut cfg = sample_config();
+        cfg.halving_interval_blocks = 4;
+        cfg.tail_emission = 5;
+        cfg.block_subsidy = 40;
+        assert_eq!(cfg.subsidy_at_height(0), 40);
+        assert_eq!(cfg.subsidy_at_height(4), 20);
+        assert_eq!(cfg.subsidy_at_height(8), 10);
+        assert_eq!(cfg.subsidy_at_height(12), 5);
+        // 40 >> 4 = 2; tail floor pins to 5.
+        assert_eq!(cfg.subsidy_at_height(16), 5);
+        // Way out at u64::MAX-ish heights still floors.
+        assert_eq!(cfg.subsidy_at_height(u64::MAX - 1), 5);
+    }
+
+    /// Overflow guard: `>> 64` on u64 is UB-ish; we must short-circuit to
+    /// `tail_emission` once halvings ≥ 64.
+    #[test]
+    fn subsidy_at_height_does_not_panic_on_extreme_height() {
+        let mut cfg = sample_config();
+        cfg.halving_interval_blocks = 1;
+        cfg.tail_emission = 7;
+        cfg.block_subsidy = 100;
+        assert_eq!(cfg.subsidy_at_height(63), 7);
+        assert_eq!(cfg.subsidy_at_height(64), 7);
+        assert_eq!(cfg.subsidy_at_height(u64::MAX), 7);
+    }
+
+    /// Validation: a config that sets a tail floor *above* the initial
+    /// subsidy is nonsense (an initial-jump) and must be rejected.
+    #[test]
+    fn config_rejects_tail_emission_above_initial_subsidy() {
+        let mut cfg = sample_config();
+        cfg.tail_emission = cfg.block_subsidy.saturating_add(1);
+        let err = cfg.validate().expect_err("tail above initial must fail");
+        assert!(err.to_string().contains("tail_emission must be"));
     }
 }

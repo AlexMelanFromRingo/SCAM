@@ -107,16 +107,17 @@ Notes:
 
 ### 5.1 Web Console (Explorer + Wallet GUI)
 
-Run RPC server against runtime DB and serve UI files:
+Run the node with its RPC server and UI (one process owns the data
+directory; a separate `rpc-serve` on the same files is refused):
 
 ```bash
-scam-node rpc-serve \
+scam-node serve \
   --network devnet \
   --config config/devnet.toml \
   --runtime-db data/devnet.runtime.redb \
-  --bind 127.0.0.1:18080 \
-  --ui-dir web \
-  --relay-telemetry data/relay.telemetry.jsonl
+  --bind 0.0.0.0:18444 \
+  --telemetry-out data/relay.telemetry.jsonl \
+  --rpc "--bind 127.0.0.1:18080 --ui-dir web --relay-telemetry data/relay.telemetry.jsonl"
 ```
 
 Open:
@@ -323,14 +324,16 @@ scam-node wallet qr --address <address> --amount 1000 --label "Invoice #1"
 
 ## 8) Mining (Optional)
 
-Run local pool:
+Run the node with its pool (the pool works on the node's chain and
+mempool; found blocks go to peers at once):
 
 ```bash
-scam-node stratum-serve \
+scam-node serve \
   --network devnet \
   --config config/devnet.toml \
   --runtime-db data/devnet.runtime.redb \
-  --bind 127.0.0.1:3347
+  --bind 0.0.0.0:18444 \
+  --stratum "--bind 127.0.0.1:3347"
 ```
 
 Run worker:
@@ -351,17 +354,16 @@ scam-node stratum-keygen \
   --public-out data/stratum-keys/server.public.hex
 ```
 
-Start secure server:
+Start the node with a secure pool:
 
 ```bash
-scam-node stratum-serve \
+export SCAM_STRATUM_STATIC_SECRET_KEY_HEX=<server_secret_hex32>
+scam-node serve \
   --network devnet \
   --config config/devnet.toml \
   --runtime-db data/devnet.runtime.redb \
-  --bind 127.0.0.1:3347 \
-  --secure-transport \
-  --secure-transport-mode noise-xx \
-  --secure-static-secret-key-hex <server_secret_hex32>
+  --bind 0.0.0.0:18444 \
+  --stratum "--bind 127.0.0.1:3347 --secure-transport --secure-transport-mode noise-xx"
 ```
 
 Secure worker:

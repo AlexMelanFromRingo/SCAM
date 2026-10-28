@@ -39,12 +39,19 @@ stratum_inbound_max_accepts_per_ip = 64
 stratum_max_jobs_per_channel = 64
 stratum_max_active_clients = 256
 stratum_max_protocol_violations = 8
-stratum_secure_transport = false
+# Encrypted (noise_xx) by default: the worker name carries the payout
+# address and must not travel in plaintext. Generate the server key with
+# `scam-node stratum-keygen`.
+stratum_secure_transport = true
 stratum_secure_transport_mode = "noise_xx"
 stratum_secure_rekey_interval_messages = 10000
 
-genesis_message = "SCAM mainnet genesis block 2026-02-11"
-genesis_timestamp = 1_770_763_200
-genesis_target = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-genesis_nonce = 0
+# Genesis frozen by crates/core/examples/freeze_mainnet_genesis.rs
+# (audit/hardening-tui branch, 2026-05-16). Re-running the example with
+# the same target + message + timestamp recomputes the same nonce, so
+# this freeze is reproducible. See docs/MAINNET_BOOTSTRAP.md.
+genesis_message = "SCAM mainnet bootstrap @ audit/hardening-tui 2026-05-16"
+genesis_timestamp = 1778904904
+genesis_target = "00000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+genesis_nonce = 689878
 genesis_reward_key_hash20 = "0000000000000000000000000000000000000000"

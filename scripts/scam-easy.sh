@@ -74,9 +74,10 @@ Usage: scripts/scam-easy.sh <command>
 Commands:
   node            bootstrap runtime DB
   status          print chain status
-  relay           start P2P relay server
-  rpc             start RPC + Web UI server
-  pool            start Stratum pool server
+  serve           start the node: relay + RPC/Web UI + pool in one process
+  relay           start a P2P relay alone (owns the data directory)
+  rpc             start RPC + Web UI alone on a stopped node's data
+  pool            start a Stratum pool alone on its own data directory
   miner           start Stratum miner client
   add-peer        add peer from PEER env var (host:port)
   sync-peer       sync from PEER env var (host:port)
@@ -104,6 +105,13 @@ case "${COMMAND}" in
     ;;
   status)
     run_node_cmd status --network "${NETWORK}" --config "${CONFIG}" "$@"
+    ;;
+  serve)
+    # The node: relay + RPC/web console + pool in one process that owns the
+    # data directory (relay/rpc/pool below are standalone and cannot share it).
+    run_node_cmd serve --network "${NETWORK}" --config "${CONFIG}" --runtime-db "${RUNTIME_DB}" --bind "${RELAY_BIND}" \
+      --rpc "--bind ${RPC_BIND} --ui-dir '${RPC_UI_DIR}' --relay-telemetry '${RPC_RELAY_TELEMETRY}' --stratum-telemetry '${RPC_STRATUM_TELEMETRY}'" \
+      --stratum "--bind ${POOL_BIND} --telemetry-out '${POOL_TELEMETRY_OUT}' --telemetry-every-sec ${POOL_TELEMETRY_EVERY_SEC}" "$@"
     ;;
   relay)
     run_node_cmd relay-serve --network "${NETWORK}" --config "${CONFIG}" --runtime-db "${RUNTIME_DB}" --bind "${RELAY_BIND}" "$@"

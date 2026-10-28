@@ -99,6 +99,52 @@ pub fn select_block_hashes_for_peer(
     out
 }
 
+/// [`select_headers_for_peer`] backed by the caller's existing indexes:
+/// `main_chain_height(hash)` returns the height of a *main-chain* block and
+/// `header(hash)` its header. Avoids building a whole-chain map for every
+/// `GetHeaders` (the relay did that under its global lock).
+pub fn select_headers_with_lookup(
+    main_chain: &[Hash256],
+    main_chain_height: impl Fn(&Hash256) -> Option<usize>,
+    header: impl Fn(&Hash256) -> Option<BlockHeader>,
+    locator: &[Hash256],
+    stop: Option<Hash256>,
+    max_headers: usize,
+) -> Vec<BlockHeader> {
+    let max_headers = max_headers.min(MAX_HEADERS_PER_MESSAGE);
+    let fork_height = locator.iter().find_map(&main_chain_height).unwrap_or(0);
+    let mut out = Vec::new();
+    for hash in main_chain.iter().skip(fork_height.saturating_add(1)) {
+        if out.len() >= max_headers || Some(*hash) == stop {
+            break;
+        }
+        match header(hash) {
+            Some(header) => out.push(header),
+            None => break,
+        }
+    }
+    out
+}
+
+/// [`select_block_hashes_for_peer`] backed by a main-chain height lookup.
+pub fn select_block_hashes_with_lookup(
+    main_chain: &[Hash256],
+    main_chain_height: impl Fn(&Hash256) -> Option<usize>,
+    locator: &[Hash256],
+    stop: Option<Hash256>,
+    max_hashes: usize,
+) -> Vec<Hash256> {
+    let max_hashes = max_hashes.min(MAX_BLOCK_HASHES_PER_MESSAGE);
+    let fork_height = locator.iter().find_map(&main_chain_height).unwrap_or(0);
+    main_chain
+        .iter()
+        .skip(fork_height.saturating_add(1))
+        .take_while(|hash| Some(**hash) != stop)
+        .take(max_hashes)
+        .copied()
+        .collect()
+}
+
 fn build_height_index(main_chain: &[Hash256]) -> HashMap<Hash256, usize> {
     let mut height_by_hash = HashMap::<Hash256, usize>::with_capacity(main_chain.len());
     for (height, hash) in main_chain.iter().copied().enumerate() {
@@ -123,7 +169,39 @@ mod tests {
 
     use scam_core::{BlockHeader, Hash256, Target, hash::hash256};
 
-    use crate::sync::{build_block_locator, select_block_hashes_for_peer, select_headers_for_peer};
+    use crate::sync::{
+        build_block_locator, select_block_hashes_for_peer, select_block_hashes_with_lookup,
+        select_headers_for_peer, select_headers_with_lookup,
+    };
+
+    /// P9: the lookup-based selectors return exactly what the map-based
+    /// ones do, for every locator shape.
+    #[test]
+    fn lookup_selectors_match_map_based_selectors() {
+        let (chain, headers) = chain_headers(300);
+        let height = |hash: &Hash256| chain.iter().position(|h| h == hash);
+        let header = |hash: &Hash256| headers.get(hash).cloned();
+        let locators = [
+            build_block_locator(&chain[..120]),
+            build_block_locator(&chain),
+            vec![Hash256([0xEE; 32])],
+            Vec::new(),
+        ];
+        for locator in &locators {
+            for stop in [None, Some(chain[150]), Some(chain[0])] {
+                for max in [0, 1, 7, 2_000, 10_000] {
+                    assert_eq!(
+                        select_headers_with_lookup(&chain, height, header, locator, stop, max),
+                        select_headers_for_peer(&chain, &headers, locator, stop, max),
+                    );
+                    assert_eq!(
+                        select_block_hashes_with_lookup(&chain, height, locator, stop, max),
+                        select_block_hashes_for_peer(&chain, locator, stop, max),
+                    );
+                }
+            }
+        }
+    }
 
     fn chain_headers(count: usize) -> (Vec<Hash256>, HashMap<Hash256, BlockHeader>) {
         let mut chain = Vec::new();

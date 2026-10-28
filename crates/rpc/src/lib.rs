@@ -14,6 +14,19 @@ pub struct StatusResponse {
     pub stratum_active_clients: Option<usize>,
     pub stratum_workers_active: Option<usize>,
     pub stratum_pool_hashrate_hps: Option<f64>,
+    /// A branch forking below the reorg window that the node is proving
+    /// (by headers) or fetching to switch to (the heaviest chain wins).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deep_fork: Option<DeepForkStatusResponse>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct DeepForkStatusResponse {
+    pub fork_height: u64,
+    pub branch_tip_height: u64,
+    /// "proving-headers" or "fetching-blocks".
+    pub stage: String,
+    pub blocks_received: usize,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -35,20 +48,13 @@ pub struct TxResponse {
     pub output_count: usize,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct TxSubmitRpcRequest {
     pub tx_hex: String,
+    /// 0 (the default) = store the transaction's actual fee; any other value
+    /// must equal it (the node never trusts a claimed fee).
     pub fee: u64,
-}
-
-impl Default for TxSubmitRpcRequest {
-    fn default() -> Self {
-        Self {
-            tx_hex: String::new(),
-            fee: 1,
-        }
-    }
 }
 
 pub fn decode_tx_submit_request(

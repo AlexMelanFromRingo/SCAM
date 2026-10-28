@@ -45,9 +45,52 @@ struct ReconRound {
     extension_requests: u8,
 }
 
+/// Most inventory items remembered per peer (like Bitcoin Core's 50k
+/// rolling filter). Every `Inv` item a peer sends used to be kept until it
+/// disconnected, so random hashes grew memory without bound.
+const MAX_KNOWN_INVENTORY_PER_PEER: usize = 50_000;
+
+/// Insertion-ordered set that forgets its oldest entries past a cap.
+#[derive(Default)]
+struct BoundedInventorySet {
+    set: HashSet<InventoryItem>,
+    order: VecDeque<InventoryItem>,
+}
+
+impl BoundedInventorySet {
+    /// Returns true if the item was not present.
+    fn insert(&mut self, item: InventoryItem) -> bool {
+        if !self.set.insert(item.clone()) {
+            return false;
+        }
+        self.order.push_back(item);
+        while self.set.len() > MAX_KNOWN_INVENTORY_PER_PEER {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.set.remove(&oldest);
+        }
+        // Removed items leave stale queue entries; compact occasionally.
+        if self.order.len() > self.set.len().saturating_mul(2).max(1_024) {
+            let set = &self.set;
+            self.order.retain(|item| set.contains(item));
+        }
+        true
+    }
+
+    fn remove(&mut self, item: &InventoryItem) {
+        self.set.remove(item);
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.set.len()
+    }
+}
+
 #[derive(Default)]
 struct PeerState {
-    known_inventory: HashSet<InventoryItem>,
+    known_inventory: BoundedInventorySet,
     score: u32,
     replacement_events: VecDeque<u64>,
     recon_enabled: bool,
@@ -198,6 +241,9 @@ impl GossipEngine {
 
     pub fn disconnect_peer(&mut self, peer_id: PeerId) {
         self.peers.remove(&peer_id);
+        // Peer ids are per connection and never reused, so a ban keyed by
+        // the id has no effect after disconnect; the relay bans by IP.
+        self.banned_peers.remove(&peer_id);
     }
 
     pub fn peer_count(&self) -> usize {
@@ -385,6 +431,39 @@ impl GossipEngine {
                 .saturating_add(1);
         }
 
+        Ok(self.apply_mempool_inventory_delta_inner(announced_txs, removed_txids))
+    }
+
+    /// Charge one replacement against `from_peer`'s rate limit *before* its
+    /// transaction is inserted (the check used to run after the mempool had
+    /// already changed, so it only suppressed the announcement).
+    pub fn reserve_peer_replacement(
+        &mut self,
+        from_peer: PeerId,
+        now_unix_sec: u64,
+    ) -> Result<(), GossipError> {
+        if self.banned_peers.contains(&from_peer) {
+            return Err(GossipError::BannedPeer { peer_id: from_peer });
+        }
+        self.enforce_replacement_rate(from_peer, now_unix_sec)?;
+        self.telemetry.inbound_replacement_events_total = self
+            .telemetry
+            .inbound_replacement_events_total
+            .saturating_add(1);
+        Ok(())
+    }
+
+    /// Apply a mempool change whose replacement budget was already charged
+    /// with [`GossipEngine::reserve_peer_replacement`].
+    pub fn apply_reserved_mempool_inventory_delta(
+        &mut self,
+        from_peer: PeerId,
+        announced_txs: Vec<Transaction>,
+        removed_txids: &[Hash256],
+    ) -> Result<Vec<OutboundMessage>, GossipError> {
+        if !self.peers.contains_key(&from_peer) {
+            return Err(GossipError::UnknownPeer { peer_id: from_peer });
+        }
         Ok(self.apply_mempool_inventory_delta_inner(announced_txs, removed_txids))
     }
 
@@ -756,6 +835,17 @@ impl GossipEngine {
         let mut remote_sketch = Minisketch::try_new(RECON_BITS, implementation, capacity)
             .map_err(|err| GossipError::Recon(format!("remote minisketch create failed: {err}")))?;
         remote_sketch.set_seed(salt);
+        // `Minisketch::deserialize` hands only a raw pointer to C, which then
+        // reads `serialized_size()` bytes. A shorter buffer is an
+        // out-of-bounds read (an empty Vec segfaults the node).
+        if bytes.len() != remote_sketch.serialized_size() {
+            self.apply_penalty(from_peer, 25);
+            return Err(GossipError::Recon(format!(
+                "recon sketch is {} bytes, expected exactly {}",
+                bytes.len(),
+                remote_sketch.serialized_size()
+            )));
+        }
         remote_sketch.deserialize(&bytes);
         local_sketch
             .merge(&remote_sketch)
@@ -2583,9 +2673,10 @@ mod tests {
             WireMessage::ReqRecon { salt, set_size } => (salt, set_size as usize),
             ref other => panic!("expected reqrecon, got {other:?}"),
         };
-        let max_serialized_len =
-            (((super::RECON_BITS as usize).saturating_mul(capacity)) / 8).max(1);
-        let payload = vec![0u8; max_serialized_len.saturating_mul(2)];
+        let exact_len = Minisketch::try_new(super::RECON_BITS, 0, capacity)
+            .expect("sketch")
+            .serialized_size();
+        let payload = vec![0u8; exact_len];
         let out = engine
             .on_message(
                 96,
@@ -2605,6 +2696,77 @@ mod tests {
             )),
             "payload boundary should not trigger size rejection"
         );
+    }
+
+    /// P1: minisketch-rs `deserialize` reads `serialized_size()` bytes from
+    /// a raw pointer; any other length must be rejected before it is called
+    /// (an empty payload used to segfault the node).
+    /// P13: per-connection ban entries do not outlive the connection.
+    #[test]
+    fn disconnect_forgets_per_connection_ban() {
+        let mut engine = GossipEngine::new(8).expect("engine");
+        engine.connect_peer(5);
+        engine.banned_peers.insert(5);
+        engine.disconnect_peer(5);
+        assert!(engine.banned_peers.is_empty());
+    }
+
+    /// P8: a peer flooding random inventory cannot grow our memory beyond
+    /// the per-peer cap.
+    #[test]
+    fn known_inventory_per_peer_is_bounded() {
+        let mut set = super::BoundedInventorySet::default();
+        for i in 0..(super::MAX_KNOWN_INVENTORY_PER_PEER as u64 + 5_000) {
+            let mut hash = [0u8; 32];
+            hash[..8].copy_from_slice(&i.to_le_bytes());
+            set.insert(InventoryItem::Tx(scam_core::Hash256(hash)));
+        }
+        assert_eq!(set.len(), super::MAX_KNOWN_INVENTORY_PER_PEER);
+        assert!(set.order.len() <= super::MAX_KNOWN_INVENTORY_PER_PEER * 2);
+        let first = InventoryItem::Tx(scam_core::Hash256([0u8; 32]));
+        assert!(set.insert(first), "oldest entries were forgotten");
+    }
+
+    #[test]
+    fn handle_sketch_rejects_payload_not_matching_serialized_size() {
+        for bad_len in [0usize, 1, 3] {
+            let mut engine = GossipEngine::new(8).expect("engine");
+            engine.connect_peer(95);
+            engine
+                .on_message(
+                    95,
+                    WireMessage::SendRecon {
+                        enabled: true,
+                        version: 1,
+                        short_id_bits: super::RECON_BITS as u8,
+                        implementation: 0,
+                        salt: 95,
+                        max_sketch_items: 8,
+                        max_diff_items: 8,
+                    },
+                )
+                .expect("enable");
+            let req = engine
+                .maybe_start_reconciliation(95, 1_000)
+                .expect("start recon");
+            let salt = match req[0].message {
+                WireMessage::ReqRecon { salt, .. } => salt,
+                ref other => panic!("expected reqrecon, got {other:?}"),
+            };
+            let err = engine
+                .on_message(
+                    95,
+                    WireMessage::Sketch {
+                        salt,
+                        bits: super::RECON_BITS,
+                        capacity: 8,
+                        implementation: 0,
+                        bytes: vec![0u8; bad_len],
+                    },
+                )
+                .expect_err("short sketch must be rejected");
+            assert!(matches!(err, super::GossipError::Recon(_)), "{err:?}");
+        }
     }
 
     #[test]

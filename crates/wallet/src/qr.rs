@@ -16,11 +16,25 @@ pub fn qr_for_payment_uri(
     }
     if let Some(lbl) = label {
         uri.push(if has_query { '&' } else { '?' });
-        let escaped = lbl.replace(' ', "%20");
-        uri.push_str(&format!("label={escaped}"));
+        uri.push_str("label=");
+        uri.push_str(&percent_encode_uri_component(lbl));
     }
 
     qr_for_text(&uri)
+}
+
+/// Percent-encode everything outside RFC 3986 "unreserved", so a label like
+/// `x&amount=999` cannot inject extra URI parameters.
+fn percent_encode_uri_component(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for byte in raw.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
 }
 
 pub fn qr_for_text(text: &str) -> Result<String, QrError> {
@@ -60,6 +74,15 @@ pub enum QrError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn payment_uri_label_cannot_inject_parameters() {
+        assert_eq!(
+            super::percent_encode_uri_component("Alice Smith&amount=999#x"),
+            "Alice%20Smith%26amount%3D999%23x"
+        );
+        assert_eq!(super::percent_encode_uri_component("a-b.c_d~"), "a-b.c_d~");
+    }
+
     use qrcodegen::{QrCode, QrCodeEcc};
 
     use crate::qr::{qr_for_payment_uri, qr_for_text, render_ascii_qr};

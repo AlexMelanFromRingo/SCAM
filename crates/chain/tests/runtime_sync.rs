@@ -11,12 +11,12 @@ fn load_devnet_config() -> ChainConfig {
     toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse")
 }
 
-fn coinbase(value: u64, key_hash20: [u8; 20], tag: &[u8]) -> Transaction {
+fn coinbase(height: u64, value: u64, key_hash20: [u8; 20], tag: &[u8]) -> Transaction {
     Transaction {
         version: 1,
         inputs: vec![TxIn {
             prev_out: OutPoint::coinbase(),
-            signature: tag.to_vec(),
+            signature: scam_core::coinbase_script(height, tag),
             pubkey_compressed: vec![],
             sequence: u32::MAX,
         }],
@@ -43,6 +43,7 @@ fn mine_blocks(
             timestamp,
             target: runtime.expected_target_for_next_block().expect("target"),
             transactions: vec![coinbase(
+                runtime.tip_height() + 1,
                 config.block_subsidy,
                 miner_key_hash,
                 format!("{tag}-{i}").as_bytes(),
@@ -55,6 +56,7 @@ fn mine_blocks(
 }
 
 fn mine_branch_block(
+    height: u64,
     prev: Hash256,
     timestamp: u64,
     target: Target,
@@ -68,6 +70,7 @@ fn mine_branch_block(
         timestamp,
         target,
         transactions: vec![coinbase(
+            height,
             config.block_subsidy,
             config.genesis_reward_key_hash20().expect("miner key hash"),
             tag,
@@ -157,6 +160,7 @@ fn fork_reorg_switches_to_heavier_chain() {
 
     for i in 0..6 {
         let block = mine_branch_block(
+            2 + i,
             fork_prev,
             fork_timestamp,
             fork_target,
@@ -198,6 +202,7 @@ fn difficulty_retargets_at_20_block_boundaries() {
     );
 
     let block20 = mine_branch_block(
+        runtime.tip_height() + 1,
         runtime.tip_hash(),
         runtime.tip_header().timestamp.saturating_add(30),
         retarget_target,

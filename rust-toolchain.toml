@@ -1,0 +1,7 @@
+[toolchain]
+# Pinned so audit finding F-1 (silent clippy regression on rustc upgrade)
+# cannot recur. CI must use this exact toolchain. Bump deliberately, with
+# a clippy pass in the same PR.
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

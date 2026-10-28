@@ -1,17 +1,80 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use num_bigint::BigUint;
 use scam_consensus::{
-    BlockApplySummary, BlockValidationError, UtxoEntry, UtxoSet, asert_next, chainwork_for_target,
-    lwma_next, retarget_next, validate_and_apply_block, validate_block_basic,
+    BlockApplyContext, BlockApplySummary, BlockSizeLimits, BlockUndoData, BlockValidationError,
+    UndoError, UtxoSet, asert_next, chainwork_for_target, lwma_next, retarget_next,
+    revert_block_undo, validate_and_apply_block_with_undo, validate_block_basic,
 };
-use scam_core::{Block, BlockHeader, ChainConfig, DifficultyAlgorithm, Hash256, Target};
+use scam_core::{
+    Block, BlockHeader, ChainConfig, DifficultyAlgorithm, Hash256, Target, block_meets_pow,
+    header_meets_pow,
+};
 use thiserror::Error;
 
 const MEDIAN_TIME_PAST_WINDOW: usize = 11;
 const MAX_FUTURE_BLOCK_TIME_SEC: u64 = 2 * 60 * 60;
+/// Deepest reorganization the runtime performs automatically. Side
+/// branches forking below `tip - MAX_REORG_DEPTH` are refused and pruned,
+/// and undo data older than that is dropped. This bounds memory for
+/// side-branch storage and undo records; a deeper reorg requires an
+/// operator to resync from a trusted peer.
+pub const MAX_REORG_DEPTH: u64 = 720;
+/// A deep branch may be this many times longer than the active chain
+/// above the fork (plus `DEEP_BRANCH_LENGTH_SLACK`) before a probe gives up.
+const DEEP_BRANCH_LENGTH_FACTOR: u64 = 4;
+const DEEP_BRANCH_LENGTH_SLACK: u64 = 10_000;
+
+/// Headers of a branch that forks below the reorg window, checked and summed
+/// without storing the branch: a sliding window of headers (for difficulty
+/// and median-time-past) and one hash per header. It proves the branch
+/// carries more work than the active chain before any of its blocks is
+/// downloaded or stored, so a long cheap branch from an old, low-difficulty
+/// fork costs a node no more than its hashes.
+#[derive(Clone, Debug)]
+pub struct DeepBranchProbe {
+    fork_hash: Hash256,
+    fork_height: u64,
+    tip_hash: Hash256,
+    tip_height: u64,
+    work: BigUint,
+    hashes: Vec<Hash256>,
+    window: HashMap<Hash256, (BlockHeader, u64)>,
+    window_order: std::collections::VecDeque<Hash256>,
+    max_len: u64,
+}
+
+impl DeepBranchProbe {
+    pub fn fork_hash(&self) -> Hash256 {
+        self.fork_hash
+    }
+
+    pub fn fork_height(&self) -> u64 {
+        self.fork_height
+    }
+
+    pub fn tip_hash(&self) -> Hash256 {
+        self.tip_hash
+    }
+
+    pub fn tip_height(&self) -> u64 {
+        self.tip_height
+    }
+
+    /// Cumulative work of the branch tip (including the shared prefix).
+    pub fn work(&self) -> &BigUint {
+        &self.work
+    }
+
+    /// Branch block hashes above the fork, oldest first.
+    pub fn hashes(&self) -> &[Hash256] {
+        &self.hashes
+    }
+}
+/// Prune side branches / undo data every this many tip changes.
+const PRUNE_INTERVAL_BLOCKS: u64 = 64;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BlockSubmissionOutcome {
@@ -37,15 +100,15 @@ pub struct ChainRuntime {
     utxos: UtxoSet,
     blocks: HashMap<Hash256, Block>,
     headers: HashMap<Hash256, BlockHeader>,
+    heights: HashMap<Hash256, u64>,
     cumulative_work: HashMap<Hash256, BigUint>,
     main_chain: Vec<Hash256>,
-    undo_data: HashMap<Hash256, BlockUndo>,
-}
-
-#[derive(Clone, Debug)]
-struct BlockUndo {
-    spent_entries: Vec<(scam_core::OutPoint, UtxoEntry)>,
-    created_outpoints: Vec<scam_core::OutPoint>,
+    undo_data: HashMap<Hash256, BlockUndoData>,
+    /// Blocks that passed proof-of-work at the expected target but failed
+    /// full validation. Descendants are rejected without revalidation.
+    invalid_blocks: HashSet<Hash256>,
+    max_reorg_depth: u64,
+    tip_changes: u64,
 }
 
 impl ChainRuntime {
@@ -55,6 +118,11 @@ impl ChainRuntime {
         Self::new(config, genesis)
     }
 
+    /// Rebuild a runtime from a locally stored, height-ordered main chain.
+    ///
+    /// Every block is fully revalidated, except for the wall-clock
+    /// "too far in the future" rule: these blocks were accepted earlier,
+    /// and a host whose clock is behind must still be able to restart.
     pub fn from_ordered_blocks(
         config: ChainConfig,
         blocks_by_height: Vec<Block>,
@@ -77,21 +145,307 @@ impl ChainRuntime {
 
         let mut runtime = Self::new(config, first.clone())?;
         for block in blocks_by_height.into_iter().skip(1) {
-            runtime.apply_next_block(block)?;
+            runtime.apply_next_block_inner(block, false)?;
         }
         Ok(runtime)
     }
 
+    /// Resume a chain from state this node persisted itself: the main chain
+    /// plus the UTXO set of its tip and the undo data of its newest blocks,
+    /// all written in one transaction. Blocks are not re-validated (the
+    /// full replay of `from_ordered_blocks` made every start re-check every
+    /// signature); headers are checked to link up from the genesis block,
+    /// meet their own proof of work, and commit to their transactions.
+    pub fn from_trusted_state(
+        config: ChainConfig,
+        blocks_by_height: Vec<Block>,
+        utxos: UtxoSet,
+        undo_data: HashMap<Hash256, BlockUndoData>,
+    ) -> Result<Self, ChainError> {
+        config.validate()?;
+        let expected_genesis = config.build_genesis_block()?.header.block_hash();
+        let mut blocks = HashMap::with_capacity(blocks_by_height.len());
+        let mut headers = HashMap::with_capacity(blocks_by_height.len());
+        let mut heights = HashMap::with_capacity(blocks_by_height.len());
+        let mut cumulative_work = HashMap::with_capacity(blocks_by_height.len());
+        let mut main_chain = Vec::with_capacity(blocks_by_height.len());
+        let mut work = BigUint::default();
+        for (height, block) in blocks_by_height.into_iter().enumerate() {
+            let hash = block.header.block_hash();
+            match main_chain.last() {
+                None if hash != expected_genesis => {
+                    return Err(ChainError::UnexpectedGenesis {
+                        expected: expected_genesis,
+                        got: hash,
+                    });
+                }
+                Some(parent) if block.header.prev_block != *parent => {
+                    return Err(ChainError::InvalidRuntime(format!(
+                        "persisted chain does not link at height {height}"
+                    )));
+                }
+                _ => {}
+            }
+            if !block_meets_pow(&block) || !block.has_valid_merkle_root() {
+                return Err(ChainError::InvalidRuntime(format!(
+                    "persisted block {hash} at height {height} fails proof of work or merkle check"
+                )));
+            }
+            work += chainwork_for_target(block.header.target);
+            headers.insert(hash, block.header.clone());
+            heights.insert(hash, height as u64);
+            cumulative_work.insert(hash, work.clone());
+            main_chain.push(hash);
+            blocks.insert(hash, block);
+        }
+        if main_chain.is_empty() {
+            return Err(ChainError::InvalidRuntime(
+                "persisted chain cannot be empty".to_owned(),
+            ));
+        }
+        let main_set = main_chain.iter().copied().collect::<HashSet<_>>();
+        let undo_data = undo_data
+            .into_iter()
+            .filter(|(hash, _)| main_set.contains(hash))
+            .collect();
+        Ok(Self {
+            config,
+            utxos,
+            blocks,
+            headers,
+            heights,
+            cumulative_work,
+            main_chain,
+            undo_data,
+            invalid_blocks: HashSet::new(),
+            max_reorg_depth: MAX_REORG_DEPTH,
+            tip_changes: 0,
+        })
+    }
+
+    /// Reorgs up to `depth` blocks use undo data; deeper branches are
+    /// adopted through a `DeepBranchProbe` (default `MAX_REORG_DEPTH`).
+    pub fn with_max_reorg_depth(mut self, depth: u64) -> Self {
+        self.max_reorg_depth = depth.max(1);
+        self
+    }
+
+    /// Whether `parent` is a main-chain block too deep for an undo reorg: a
+    /// branch from it is adopted only through a `DeepBranchProbe`.
+    pub fn is_deep_fork_point(&self, parent: &Hash256) -> bool {
+        self.height_of(parent).is_some_and(|height| {
+            self.is_on_main_chain(parent, height)
+                && height
+                    .saturating_add(1)
+                    .saturating_add(self.max_reorg_depth)
+                    <= self.tip_height()
+        })
+    }
+
+    pub fn begin_deep_branch_probe(
+        &self,
+        fork_hash: Hash256,
+    ) -> Result<DeepBranchProbe, ChainError> {
+        if !self.is_deep_fork_point(&fork_hash) {
+            return Err(ChainError::DeepBranch {
+                reason: format!("{fork_hash} is not a main-chain block below the reorg window"),
+            });
+        }
+        let fork_height = self
+            .height_of(&fork_hash)
+            .ok_or(ChainError::MissingHeader {
+                block_hash: fork_hash,
+            })?;
+        let work = self
+            .cumulative_work
+            .get(&fork_hash)
+            .ok_or(ChainError::MissingHeader {
+                block_hash: fork_hash,
+            })?
+            .clone();
+        let active_len = self.tip_height() - fork_height;
+        Ok(DeepBranchProbe {
+            fork_hash,
+            fork_height,
+            tip_hash: fork_hash,
+            tip_height: fork_height,
+            work,
+            hashes: Vec::new(),
+            window: HashMap::new(),
+            window_order: std::collections::VecDeque::new(),
+            max_len: active_len
+                .saturating_mul(DEEP_BRANCH_LENGTH_FACTOR)
+                .saturating_add(DEEP_BRANCH_LENGTH_SLACK),
+        })
+    }
+
+    /// Check the next contiguous headers of the probed branch with the
+    /// consensus header rules (link, proof of work, the branch's expected
+    /// target, median-time-past, future limit) and add their work.
+    pub fn extend_deep_branch_probe(
+        &self,
+        probe: &mut DeepBranchProbe,
+        headers: &[BlockHeader],
+        now_unix_sec: u64,
+    ) -> Result<(), ChainError> {
+        let keep = (self.config.difficulty_adjustment_window as usize + 2)
+            .max(MEDIAN_TIME_PAST_WINDOW + 1);
+        for header in headers {
+            if header.prev_block != probe.tip_hash {
+                return Err(ChainError::DeepBranch {
+                    reason: "headers do not extend the probed branch".to_owned(),
+                });
+            }
+            if probe.hashes.len() as u64 >= probe.max_len {
+                return Err(ChainError::DeepBranch {
+                    reason: format!("branch longer than {} blocks", probe.max_len),
+                });
+            }
+            let hash = header.block_hash();
+            if self.invalid_blocks.contains(&hash) {
+                return Err(ChainError::KnownInvalid { block_hash: hash });
+            }
+            if !header_meets_pow(header) {
+                return Err(ChainError::DeepBranch {
+                    reason: format!("header {hash} fails proof of work"),
+                });
+            }
+            let lookup = self.lookup(Some(&probe.window));
+            let expected = self.expected_target_in(&lookup, probe.tip_hash)?;
+            if header.target != expected {
+                return Err(ChainError::UnexpectedTarget {
+                    expected,
+                    got: header.target,
+                });
+            }
+            let median_time_past = median_time_past_in(&lookup, probe.tip_hash)?;
+            if header.timestamp <= median_time_past {
+                return Err(ChainError::TimestampTooOld {
+                    block_hash: hash,
+                    median_time_past,
+                    got: header.timestamp,
+                });
+            }
+            let max_allowed = now_unix_sec.saturating_add(MAX_FUTURE_BLOCK_TIME_SEC);
+            if header.timestamp > max_allowed {
+                return Err(ChainError::TimestampTooFarInFuture {
+                    block_hash: hash,
+                    got: header.timestamp,
+                    max_allowed,
+                });
+            }
+            let height = probe.tip_height + 1;
+            probe.window.insert(hash, (header.clone(), height));
+            probe.window_order.push_back(hash);
+            while probe.window_order.len() > keep {
+                if let Some(old) = probe.window_order.pop_front() {
+                    probe.window.remove(&old);
+                }
+            }
+            probe.work += chainwork_for_target(header.target);
+            probe.tip_hash = hash;
+            probe.tip_height = height;
+            probe.hashes.push(hash);
+        }
+        Ok(())
+    }
+
+    /// The heaviest valid chain wins at any depth: true once the probed
+    /// branch carries more work than the active chain.
+    pub fn deep_branch_outworks(&self, probe: &DeepBranchProbe) -> bool {
+        probe.work > *self.cumulative_work()
+    }
+
+    /// Switch to a probed branch that out-works the active chain: rebuild
+    /// the chain state from genesis along it, validating every block (the
+    /// undo data to disconnect this deep does not exist). On failure nothing
+    /// changes, and the branch from the first invalid block on is remembered
+    /// as invalid.
+    pub fn adopt_deep_branch(
+        &mut self,
+        probe: &DeepBranchProbe,
+        branch_blocks: Vec<Block>,
+    ) -> Result<BlockSubmissionOutcome, ChainError> {
+        if !self.deep_branch_outworks(probe) {
+            return Err(ChainError::DeepBranch {
+                reason: "branch does not carry more work than the active chain".to_owned(),
+            });
+        }
+        if !self.is_on_main_chain(&probe.fork_hash, probe.fork_height) {
+            return Err(ChainError::DeepBranch {
+                reason: "fork point left the active chain".to_owned(),
+            });
+        }
+        if branch_blocks.len() != probe.hashes.len()
+            || branch_blocks
+                .iter()
+                .zip(&probe.hashes)
+                .any(|(block, hash)| block.header.block_hash() != *hash)
+        {
+            return Err(ChainError::DeepBranch {
+                reason: "blocks do not match the probed headers".to_owned(),
+            });
+        }
+        let genesis_hash = self.main_chain[0];
+        let genesis = self
+            .blocks
+            .get(&genesis_hash)
+            .cloned()
+            .ok_or(ChainError::MissingBlock {
+                block_hash: genesis_hash,
+            })?;
+        let mut rebuilt = Self::new(self.config.clone(), genesis)?;
+        rebuilt.max_reorg_depth = self.max_reorg_depth;
+        for height in 1..=probe.fork_height as usize {
+            let hash = self.main_chain[height];
+            let block = self
+                .blocks
+                .get(&hash)
+                .cloned()
+                .ok_or(ChainError::MissingBlock { block_hash: hash })?;
+            rebuilt.apply_next_block_inner(block, false)?;
+        }
+        for (index, block) in branch_blocks.into_iter().enumerate() {
+            if let Err(err) = rebuilt.apply_next_block_inner(block, false) {
+                self.invalid_blocks
+                    .extend(probe.hashes[index..].iter().copied());
+                return Err(err);
+            }
+        }
+        rebuilt.invalid_blocks = std::mem::take(&mut self.invalid_blocks);
+        let old_tip = self.tip_hash();
+        *self = rebuilt;
+        Ok(BlockSubmissionOutcome::Reorged {
+            old_tip,
+            new_tip: self.tip_hash(),
+            new_height: self.tip_height(),
+        })
+    }
+
+    /// Undo data of a block (kept for the reorg window).
+    pub fn undo_for(&self, hash: &Hash256) -> Option<&BlockUndoData> {
+        self.undo_data.get(hash)
+    }
+
     pub fn new(config: ChainConfig, genesis: Block) -> Result<Self, ChainError> {
         let mut utxos = UtxoSet::new();
-        let applied = validate_and_apply_block(
-            &genesis,
-            0,
-            config.block_subsidy,
-            config.coinbase_maturity as u64,
-            config.network_id.as_bytes(),
-            &mut utxos,
-        )?;
+        let limits = BlockSizeLimits::from_chain_config(&config);
+        // Subsidy at height 0 — `subsidy_at_height(0)` is by definition
+        // `block_subsidy` for any valid config, but routing through the
+        // helper keeps the rule in one place.
+        // Genesis MTP: no predecessors, so the only available clock is
+        // the genesis header timestamp itself. Any CSV time-lock against
+        // genesis would be unsatisfiable in the height-since-genesis<11
+        // window regardless of MTP semantics, so this fallback is safe.
+        let ctx = BlockApplyContext {
+            current_height: 0,
+            block_subsidy: config.subsidy_at_height(0),
+            coinbase_maturity: config.coinbase_maturity as u64,
+            chain_domain: config.network_id.as_bytes(),
+            limits,
+            median_time_past: Some(genesis.header.timestamp),
+        };
+        let (applied, _) = validate_and_apply_block_with_undo(&genesis, ctx, &mut utxos)?;
 
         let genesis_hash = applied.block_hash;
         let genesis_header = genesis.header.clone();
@@ -99,6 +453,8 @@ impl ChainRuntime {
         blocks.insert(genesis_hash, genesis);
         let mut headers = HashMap::new();
         headers.insert(genesis_hash, genesis_header.clone());
+        let mut heights = HashMap::new();
+        heights.insert(genesis_hash, 0);
         let mut cumulative_work = HashMap::new();
         cumulative_work.insert(genesis_hash, chainwork_for_target(genesis_header.target));
 
@@ -107,9 +463,13 @@ impl ChainRuntime {
             utxos,
             blocks,
             headers,
+            heights,
             cumulative_work,
             main_chain: vec![genesis_hash],
             undo_data: HashMap::new(),
+            invalid_blocks: HashSet::new(),
+            max_reorg_depth: MAX_REORG_DEPTH,
+            tip_changes: 0,
         })
     }
 
@@ -173,40 +533,96 @@ impl ChainRuntime {
         self.headers.get(hash)
     }
 
+    /// Height of any stored block (main chain or side branch).
+    pub fn height_of(&self, hash: &Hash256) -> Option<u64> {
+        self.heights.get(hash).copied()
+    }
+
+    pub fn is_known_invalid(&self, hash: &Hash256) -> bool {
+        self.invalid_blocks.contains(hash)
+    }
+
     pub fn median_time_past_for_tip(&self) -> Result<u64, ChainError> {
         self.median_time_past(self.tip_hash())
     }
+    /// Evaluate a single BIP9-style deployment against the current main
+    /// chain. Walks retarget windows from genesis forward, tallying
+    /// signaling bit-count per window and stepping the state machine.
+    /// Returns the state observable at the tip.
+    ///
+    /// O(tip_height) and recomputed every call. For production hot
+    /// paths cache the result keyed by (deployment.bit, window_index of
+    /// tip). For audit / RPC / TUI display this is fine.
+    pub fn versionbits_state(
+        &self,
+        deployment: &scam_core::Deployment,
+    ) -> Result<scam_core::DeploymentState, ChainError> {
+        let window = self.config.versionbits_window_blocks;
+        let threshold = self.config.versionbits_threshold;
+        if window == 0 || threshold == 0 {
+            return Ok(scam_core::DeploymentState::Defined);
+        }
 
-    fn median_time_past(&self, parent_hash: Hash256) -> Result<u64, ChainError> {
-        let mut timestamps = Vec::with_capacity(MEDIAN_TIME_PAST_WINDOW);
-        let mut cursor = Some(parent_hash);
-
-        for _ in 0..MEDIAN_TIME_PAST_WINDOW {
-            let Some(hash) = cursor else {
-                break;
-            };
-            let header = self
-                .headers
-                .get(&hash)
-                .ok_or(ChainError::MissingHeader { block_hash: hash })?;
-            timestamps.push(header.timestamp);
-
-            if header.prev_block == Hash256::ZERO {
-                break;
+        let tip_h = self.tip_height();
+        let mut state = scam_core::DeploymentState::Defined;
+        let mut window_start: u64 = 0;
+        while window_start + window <= tip_h.saturating_add(1) {
+            // Count signaling headers in the just-completed window
+            // [window_start, window_start + window).
+            let mut signal_count: u32 = 0;
+            for h in window_start..(window_start + window) {
+                let Some(hash) = self.block_hash_at_height(h) else {
+                    return Err(ChainError::MissingHeader {
+                        block_hash: scam_core::Hash256::ZERO,
+                    });
+                };
+                let header = self
+                    .headers
+                    .get(&hash)
+                    .ok_or(ChainError::MissingHeader { block_hash: hash })?;
+                if scam_core::deployment_bit_signaled(header.version, deployment.bit) {
+                    signal_count = signal_count.saturating_add(1);
+                }
             }
-            cursor = Some(header.prev_block);
+            // MTP at the boundary block (last block of the window).
+            let boundary_hash = self.block_hash_at_height(window_start + window - 1).ok_or(
+                ChainError::MissingHeader {
+                    block_hash: scam_core::Hash256::ZERO,
+                },
+            )?;
+            let boundary_mtp = self.median_time_past(boundary_hash)?;
+            state = scam_core::next_state(
+                state,
+                signal_count,
+                boundary_mtp,
+                deployment,
+                threshold,
+                window,
+            );
+            window_start += window;
         }
-
-        if timestamps.is_empty() {
-            return Err(ChainError::InvalidRuntime(
-                "cannot compute median-time-past without headers".to_owned(),
-            ));
-        }
-        timestamps.sort_unstable();
-        Ok(timestamps[timestamps.len() / 2])
+        Ok(state)
     }
 
-    fn validate_contextual_timestamps(&self, block: &Block) -> Result<(), ChainError> {
+    fn median_time_past(&self, parent_hash: Hash256) -> Result<u64, ChainError> {
+        median_time_past_in(&self.lookup(None), parent_hash)
+    }
+
+    fn lookup<'a>(
+        &'a self,
+        extra: Option<&'a HashMap<Hash256, (BlockHeader, u64)>>,
+    ) -> HeaderLookup<'a> {
+        HeaderLookup {
+            runtime: self,
+            extra,
+        }
+    }
+
+    fn validate_contextual_timestamps(
+        &self,
+        block: &Block,
+        check_future: bool,
+    ) -> Result<(), ChainError> {
         let block_hash = block.header.block_hash();
         let median_time_past = self.median_time_past(block.header.prev_block)?;
         if block.header.timestamp <= median_time_past {
@@ -217,50 +633,82 @@ impl ChainRuntime {
             });
         }
 
-        let now = current_unix_timestamp()?;
-        let max_allowed = now.saturating_add(MAX_FUTURE_BLOCK_TIME_SEC);
-        if block.header.timestamp > max_allowed {
-            return Err(ChainError::TimestampTooFarInFuture {
-                block_hash,
-                got: block.header.timestamp,
-                max_allowed,
-            });
+        if check_future {
+            let now = current_unix_timestamp()?;
+            let max_allowed = now.saturating_add(MAX_FUTURE_BLOCK_TIME_SEC);
+            if block.header.timestamp > max_allowed {
+                return Err(ChainError::TimestampTooFarInFuture {
+                    block_hash,
+                    got: block.header.timestamp,
+                    max_allowed,
+                });
+            }
         }
 
         Ok(())
     }
 
     pub fn expected_target_for_next_block(&self) -> Result<Target, ChainError> {
-        let next_height = self.tip_height() + 1;
+        self.expected_target_for_child_of(self.tip_hash())
+    }
+
+    /// Difficulty a child of `parent_hash` must carry, evaluated on the
+    /// parent's own branch (main chain or side branch).
+    pub fn expected_target_for_child_of(&self, parent_hash: Hash256) -> Result<Target, ChainError> {
+        self.expected_target_in(&self.lookup(None), parent_hash)
+    }
+
+    fn expected_target_in(
+        &self,
+        lookup: &HeaderLookup<'_>,
+        parent_hash: Hash256,
+    ) -> Result<Target, ChainError> {
         let window = self.config.difficulty_adjustment_window as u64;
         if window == 0 {
             return Err(ChainError::InvalidRuntime(
                 "difficulty_adjustment_window must be > 0".to_owned(),
             ));
         }
-
-        let tip_header = self.tip_header();
+        let parent_height = lookup
+            .height(&parent_hash)
+            .ok_or(ChainError::MissingHeader {
+                block_hash: parent_hash,
+            })?;
+        let parent = lookup
+            .header(&parent_hash)
+            .ok_or(ChainError::MissingHeader {
+                block_hash: parent_hash,
+            })?;
+        let next_height = parent_height + 1;
         let max_target = self.config.genesis_target()?;
+
         match self.config.difficulty_algorithm {
             DifficultyAlgorithm::Windowed => {
                 if !next_height.is_multiple_of(window) {
-                    return Ok(tip_header.target);
+                    return Ok(parent.target);
                 }
 
-                let start_height = next_height - window;
-                let start_hash = self.main_chain[start_height as usize];
-                let start_header = self
-                    .headers
-                    .get(&start_hash)
-                    .expect("header for start height must exist");
-                let actual_timespan = tip_header
+                // Windows overlap by one block: the timespan is measured
+                // from the *last* block of the previous window. With
+                // disjoint windows the gap between a window's last block
+                // and the next window's first block is never measured,
+                // which is the classic timewarp hole.
+                let start_height = next_height.saturating_sub(window + 1);
+                let start_hash = lookup.ancestor(parent_hash, parent_height, start_height)?;
+                let start_header = lookup
+                    .header(&start_hash)
+                    .ok_or(ChainError::MissingHeader {
+                        block_hash: start_hash,
+                    })?;
+                let intervals = (parent_height - start_height).max(1);
+                let actual_timespan = parent
                     .timestamp
                     .saturating_sub(start_header.timestamp)
                     .max(1);
-                let expected_timespan = window * self.config.target_block_time_sec;
+                let expected_timespan = intervals * self.config.target_block_time_sec;
 
                 retarget_next(
-                    tip_header.target,
+                    parent.target,
                     actual_timespan,
                     expected_timespan,
                     self.config.difficulty_clamp_down,
@@ -270,23 +718,23 @@ impl ChainRuntime {
                 .map_err(ChainError::Difficulty)
             }
             DifficultyAlgorithm::Lwma => {
-                let history = self.main_chain.len();
-                let window = self.config.difficulty_adjustment_window as usize;
+                let history = parent_height + 1;
                 if history < window + 1 {
-                    return Ok(tip_header.target);
+                    return Ok(parent.target);
                 }
-                let start = history - (window + 1);
-                let mut targets = Vec::with_capacity(window + 1);
-                let mut timestamps = Vec::with_capacity(window + 1);
-                for height in start..history {
-                    let hash = self.main_chain[height];
-                    let header = self
-                        .headers
-                        .get(&hash)
-                        .expect("header at chain height must exist");
+                let mut targets = Vec::with_capacity(window as usize + 1);
+                let mut timestamps = Vec::with_capacity(window as usize + 1);
+                let mut cursor = parent_hash;
+                for _ in 0..=window {
+                    let header = lookup
+                        .header(&cursor)
+                        .ok_or(ChainError::MissingHeader { block_hash: cursor })?;
                     targets.push(header.target);
                     timestamps.push(header.timestamp);
+                    cursor = header.prev_block;
                 }
+                targets.reverse();
+                timestamps.reverse();
 
                 lwma_next(
                     &targets,
@@ -297,19 +745,21 @@ impl ChainRuntime {
                 .map_err(ChainError::Difficulty)
             }
             DifficultyAlgorithm::Asert => {
-                if self.main_chain.len() < 2 {
-                    return Ok(tip_header.target);
+                if parent_height == 0 {
+                    return Ok(parent.target);
                 }
-                let parent_header = self
-                    .headers
-                    .get(&tip_header.prev_block)
-                    .expect("parent header for tip must exist");
-                let observed = tip_header
+                let grandparent =
+                    lookup
+                        .header(&parent.prev_block)
+                        .ok_or(ChainError::MissingHeader {
+                            block_hash: parent.prev_block,
+                        })?;
+                let observed = parent
                     .timestamp
-                    .saturating_sub(parent_header.timestamp)
+                    .saturating_sub(grandparent.timestamp)
                     .max(1);
                 asert_next(
-                    tip_header.target,
+                    parent.target,
                     observed,
                     self.config.target_block_time_sec,
                     self.config.asert_half_life_sec,
@@ -320,15 +770,53 @@ impl ChainRuntime {
         }
     }
 
+    fn is_on_main_chain(&self, hash: &Hash256, height: u64) -> bool {
+        self.main_chain.get(height as usize) == Some(hash)
+    }
+
+    /// Append a block on top of the current tip. The block must extend the
+    /// tip; it is fully validated before anything is stored.
     pub fn apply_next_block(&mut self, block: Block) -> Result<BlockApplySummary, ChainError> {
+        self.apply_next_block_inner(block, true)
+    }
+
+    fn apply_next_block_inner(
+        &mut self,
+        block: Block,
+        check_future: bool,
+    ) -> Result<BlockApplySummary, ChainError> {
         if block.header.prev_block != self.tip_hash() {
             return Err(ChainError::PrevBlockMustBeTip {
                 expected_tip: self.tip_hash(),
                 got_prev: block.header.prev_block,
             });
         }
-        self.validate_contextual_timestamps(&block)?;
+        let (summary, undo) = self.validate_and_connect(&block, check_future)?;
+        let block_hash = summary.block_hash;
+        let prev_work = self
+            .cumulative_work
+            .get(&block.header.prev_block)
+            .expect("tip work must exist")
+            .clone();
+        let work = prev_work + chainwork_for_target(block.header.target);
+        self.cumulative_work.insert(block_hash, work);
+        self.heights.insert(block_hash, self.tip_height() + 1);
+        self.headers.insert(block_hash, block.header.clone());
+        self.blocks.insert(block_hash, block);
+        self.main_chain.push(block_hash);
+        self.undo_data.insert(block_hash, undo);
+        self.on_tip_changed();
+        Ok(summary)
+    }
 
+    /// Contextual checks + UTXO application for a block whose parent is the
+    /// current tip. Mutates only the UTXO set, and only on success.
+    fn validate_and_connect(
+        &mut self,
+        block: &Block,
+        check_future: bool,
+    ) -> Result<(BlockApplySummary, BlockUndoData), ChainError> {
+        self.validate_contextual_timestamps(block, check_future)?;
         let expected_target = self.expected_target_for_next_block()?;
         if block.header.target != expected_target {
             return Err(ChainError::UnexpectedTarget {
@@ -338,194 +826,64 @@ impl ChainRuntime {
         }
 
         let height = self.tip_height() + 1;
-        let undo = self.collect_block_undo(&block)?;
-        let summary = validate_and_apply_block(
-            &block,
-            height,
-            self.config.block_subsidy,
-            self.config.coinbase_maturity as u64,
-            self.config.network_id.as_bytes(),
+        // BIP68: time-locked sequences compare against MTP of the
+        // prior-11-headers. The new block isn't applied yet, so MTP
+        // is computed from the parent (current tip).
+        let mtp = self.median_time_past(self.tip_hash())?;
+        let ctx = BlockApplyContext {
+            current_height: height,
+            block_subsidy: self.config.subsidy_at_height(height),
+            coinbase_maturity: self.config.coinbase_maturity as u64,
+            chain_domain: self.config.network_id.as_bytes(),
+            limits: BlockSizeLimits::from_chain_config(&self.config),
+            median_time_past: Some(mtp),
+        };
+        Ok(validate_and_apply_block_with_undo(
+            block,
+            ctx,
             &mut self.utxos,
-        )?;
-        let block_hash = summary.block_hash;
-        self.headers.insert(block_hash, block.header.clone());
-        self.blocks.insert(block_hash, block.clone());
-        self.main_chain.push(block_hash);
-
-        let prev_work = self
-            .cumulative_work
-            .get(&block.header.prev_block)
-            .expect("tip work must exist")
-            .clone();
-        let work = prev_work + chainwork_for_target(block.header.target);
-        self.cumulative_work.insert(block_hash, work);
-        self.undo_data.insert(block_hash, undo);
-        Ok(summary)
+        )?)
     }
 
     pub fn submit_block(&mut self, block: Block) -> Result<BlockSubmissionOutcome, ChainError> {
-        validate_block_basic(&block).map_err(ChainError::InvalidBlockStructure)?;
+        validate_block_basic(&block, BlockSizeLimits::from_chain_config(&self.config))
+            .map_err(ChainError::InvalidBlockStructure)?;
 
         let block_hash = block.header.block_hash();
         if self.headers.contains_key(&block_hash) {
             return Ok(BlockSubmissionOutcome::AlreadyKnown { block_hash });
         }
-        if !self.headers.contains_key(&block.header.prev_block) {
+        if self.invalid_blocks.contains(&block_hash) {
+            return Err(ChainError::KnownInvalid { block_hash });
+        }
+        let parent_hash = block.header.prev_block;
+        if self.invalid_blocks.contains(&parent_hash) {
+            self.invalid_blocks.insert(block_hash);
+            return Err(ChainError::InvalidAncestor {
+                block_hash,
+                ancestor: parent_hash,
+            });
+        }
+        let Some(parent_height) = self.height_of(&parent_hash) else {
             return Err(ChainError::UnknownParent {
                 block_hash,
-                parent: block.header.prev_block,
+                parent: parent_hash,
             });
-        }
-        self.validate_contextual_timestamps(&block)?;
-
-        let parent_work = self
-            .cumulative_work
-            .get(&block.header.prev_block)
-            .expect("parent work must exist")
-            .clone();
-        let candidate_work = parent_work + chainwork_for_target(block.header.target);
-
-        self.headers.insert(block_hash, block.header.clone());
-        self.blocks.insert(block_hash, block);
-        self.cumulative_work
-            .insert(block_hash, candidate_work.clone());
-
-        let current_tip = self.tip_hash();
-        let current_work = self
-            .cumulative_work
-            .get(&current_tip)
-            .expect("tip work must exist")
-            .clone();
-        if candidate_work <= current_work {
-            // Side-branch blocks are not part of the active chain yet.
-            self.undo_data.remove(&block_hash);
-            return Ok(BlockSubmissionOutcome::StoredSideBranch { block_hash });
-        }
-
-        let utxo_backup = self.utxos.clone();
-        let main_chain_backup = self.main_chain.clone();
-        let undo_backup = self.undo_data.clone();
-
-        let candidate_chain = self.collect_chain_to_genesis(block_hash)?;
-        if let Err(err) = self.reorganize_to_chain(&candidate_chain) {
-            self.utxos = utxo_backup;
-            self.main_chain = main_chain_backup;
-            self.undo_data = undo_backup;
-            self.headers.remove(&block_hash);
-            self.blocks.remove(&block_hash);
-            self.cumulative_work.remove(&block_hash);
-            return Err(err);
-        }
-
-        let new_tip = self.tip_hash();
-        if self
-            .headers
-            .get(&new_tip)
-            .expect("new tip header must exist")
-            .prev_block
-            == current_tip
-        {
-            return Ok(BlockSubmissionOutcome::ExtendedTip {
-                new_tip,
-                new_height: self.tip_height(),
-            });
-        }
-
-        Ok(BlockSubmissionOutcome::Reorged {
-            old_tip: current_tip,
-            new_tip,
-            new_height: self.tip_height(),
-        })
-    }
-
-    fn collect_chain_to_genesis(&self, tip_hash: Hash256) -> Result<Vec<Hash256>, ChainError> {
-        let genesis_hash = self.main_chain[0];
-        let mut cursor = tip_hash;
-        let mut reversed = Vec::<Hash256>::new();
-
-        loop {
-            reversed.push(cursor);
-            if cursor == genesis_hash {
-                break;
-            }
-
-            let header = self
-                .headers
-                .get(&cursor)
-                .ok_or(ChainError::MissingHeader { block_hash: cursor })?;
-            if !self.headers.contains_key(&header.prev_block) {
-                return Err(ChainError::UnknownParent {
-                    block_hash: cursor,
-                    parent: header.prev_block,
-                });
-            }
-            cursor = header.prev_block;
-        }
-
-        reversed.reverse();
-        Ok(reversed)
-    }
-
-    fn reorganize_to_chain(&mut self, chain_hashes: &[Hash256]) -> Result<(), ChainError> {
-        let Some(_) = chain_hashes.first() else {
-            return Err(ChainError::InvalidRuntime(
-                "candidate chain cannot be empty".to_owned(),
-            ));
         };
-
-        let fork_height = self.find_fork_height(chain_hashes)?;
-        let mut disconnect_guard = self.main_chain.len().saturating_add(1);
-        while self.main_chain.len().saturating_sub(1) > fork_height {
-            let len_before = self.main_chain.len();
-            self.disconnect_tip_block()?;
-            if self.main_chain.len() >= len_before {
-                return Err(ChainError::InvalidRuntime(
-                    "disconnect_tip_block made no progress during reorg".to_owned(),
-                ));
-            }
-            disconnect_guard = disconnect_guard.saturating_sub(1);
-            if disconnect_guard == 0 {
-                return Err(ChainError::InvalidRuntime(
-                    "reorg disconnect guard exhausted".to_owned(),
-                ));
-            }
-        }
-        for hash in chain_hashes.iter().copied().skip(fork_height + 1) {
-            self.connect_known_block(hash)?;
-        }
-        Ok(())
-    }
-
-    fn find_fork_height(&self, chain_hashes: &[Hash256]) -> Result<usize, ChainError> {
-        let mut fork = None;
-        for (height, candidate_hash) in chain_hashes.iter().enumerate() {
-            match self.main_chain.get(height) {
-                Some(local_hash) if local_hash == candidate_hash => {
-                    fork = Some(height);
-                }
-                _ => break,
-            }
-        }
-        fork.ok_or_else(|| {
-            ChainError::InvalidRuntime("candidate chain does not share local genesis".to_owned())
-        })
-    }
-
-    fn connect_known_block(&mut self, block_hash: Hash256) -> Result<(), ChainError> {
-        let block = self
-            .blocks
-            .get(&block_hash)
-            .ok_or(ChainError::MissingBlock { block_hash })?
-            .clone();
-
-        if block.header.prev_block != self.tip_hash() {
-            return Err(ChainError::PrevBlockMustBeTip {
-                expected_tip: self.tip_hash(),
-                got_prev: block.header.prev_block,
+        let height = parent_height + 1;
+        let tip_height = self.tip_height();
+        if height.saturating_add(self.max_reorg_depth) <= tip_height {
+            return Err(ChainError::ForkTooDeep {
+                block_hash,
+                fork_height: parent_height,
+                tip_height,
+                max_reorg_depth: self.max_reorg_depth,
             });
         }
-        self.validate_contextual_timestamps(&block)?;
-        let expected_target = self.expected_target_for_next_block()?;
+        self.validate_contextual_timestamps(&block, true)?;
+        // The claimed target must be the one this branch requires; otherwise
+        // a side-branch block could carry `Target::MAX` and cost nothing.
+        let expected_target = self.expected_target_for_child_of(parent_hash)?;
         if block.header.target != expected_target {
             return Err(ChainError::UnexpectedTarget {
                 expected: expected_target,
@@ -533,22 +891,167 @@ impl ChainRuntime {
             });
         }
 
-        let undo = self.collect_block_undo(&block)?;
-        let next_height = self.tip_height().saturating_add(1);
-        validate_and_apply_block(
-            &block,
-            next_height,
-            self.config.block_subsidy,
-            self.config.coinbase_maturity as u64,
-            self.config.network_id.as_bytes(),
-            &mut self.utxos,
-        )?;
+        let parent_work = self
+            .cumulative_work
+            .get(&parent_hash)
+            .expect("parent work must exist")
+            .clone();
+        let candidate_work = parent_work + chainwork_for_target(block.header.target);
+        let current_tip = self.tip_hash();
+        let current_work = self.cumulative_work().clone();
+
+        self.headers.insert(block_hash, block.header.clone());
+        self.heights.insert(block_hash, height);
+        self.blocks.insert(block_hash, block);
+        self.cumulative_work
+            .insert(block_hash, candidate_work.clone());
+
+        if candidate_work <= current_work {
+            // Side-branch blocks are not part of the active chain yet.
+            return Ok(BlockSubmissionOutcome::StoredSideBranch { block_hash });
+        }
+
+        if parent_hash == current_tip {
+            if let Err(err) = self.connect_known_block(block_hash) {
+                self.reject_blocks(&[block_hash], &err);
+                return Err(err);
+            }
+            self.on_tip_changed();
+            return Ok(BlockSubmissionOutcome::ExtendedTip {
+                new_tip: block_hash,
+                new_height: self.tip_height(),
+            });
+        }
+
+        let (fork_height, branch) = self.branch_from_main_chain(block_hash)?;
+        let depth = tip_height - fork_height;
+        if depth > self.max_reorg_depth {
+            return Err(ChainError::ForkTooDeep {
+                block_hash,
+                fork_height,
+                tip_height,
+                max_reorg_depth: self.max_reorg_depth,
+            });
+        }
+        self.reorganize(fork_height, &branch)?;
+        self.on_tip_changed();
+
+        Ok(BlockSubmissionOutcome::Reorged {
+            old_tip: current_tip,
+            new_tip: self.tip_hash(),
+            new_height: self.tip_height(),
+        })
+    }
+
+    /// Walk back from `tip_hash` until the main chain. Returns the fork
+    /// height and the side-branch hashes above it, oldest first.
+    fn branch_from_main_chain(&self, tip_hash: Hash256) -> Result<(u64, Vec<Hash256>), ChainError> {
+        let mut branch = Vec::new();
+        let mut cursor = tip_hash;
+        loop {
+            let height = self
+                .height_of(&cursor)
+                .ok_or(ChainError::MissingHeader { block_hash: cursor })?;
+            if self.is_on_main_chain(&cursor, height) {
+                branch.reverse();
+                return Ok((height, branch));
+            }
+            if height == 0 {
+                return Err(ChainError::InvalidRuntime(
+                    "candidate chain does not share local genesis".to_owned(),
+                ));
+            }
+            branch.push(cursor);
+            cursor = self
+                .headers
+                .get(&cursor)
+                .ok_or(ChainError::MissingHeader { block_hash: cursor })?
+                .prev_block;
+        }
+    }
+
+    /// Disconnect down to `fork_height`, then connect `branch`. If any branch
+    /// block fails, the original chain is restored and the failing block and
+    /// its stored descendants on `branch` are marked invalid.
+    fn reorganize(&mut self, fork_height: u64, branch: &[Hash256]) -> Result<(), ChainError> {
+        let mut disconnected = Vec::new();
+        while self.tip_height() > fork_height {
+            disconnected.push(self.disconnect_tip_block()?);
+        }
+
+        let mut failure = None;
+        for (idx, hash) in branch.iter().enumerate() {
+            if let Err(err) = self.connect_known_block(*hash) {
+                failure = Some((idx, err));
+                break;
+            }
+        }
+        let Some((failed_idx, err)) = failure else {
+            return Ok(());
+        };
+
+        for _ in 0..failed_idx {
+            self.disconnect_tip_block()?;
+        }
+        for hash in disconnected.into_iter().rev() {
+            self.connect_known_block(hash).map_err(|restore_err| {
+                ChainError::InvalidRuntime(format!(
+                    "failed to restore block {hash} after aborted reorg: {restore_err}"
+                ))
+            })?;
+        }
+        self.reject_blocks(&branch[failed_idx..], &err);
+        Err(err)
+    }
+
+    /// Forget blocks that failed to connect. Consensus failures are also
+    /// remembered as invalid so descendants are refused cheaply.
+    fn reject_blocks(&mut self, hashes: &[Hash256], err: &ChainError) {
+        let consensus_invalid = matches!(
+            err,
+            ChainError::Validation(_)
+                | ChainError::InvalidBlockStructure(_)
+                | ChainError::UnexpectedTarget { .. }
+                | ChainError::TimestampTooOld { .. }
+        );
+        for hash in hashes {
+            self.forget_block(hash);
+            if consensus_invalid {
+                self.invalid_blocks.insert(*hash);
+            }
+        }
+    }
+
+    fn forget_block(&mut self, hash: &Hash256) {
+        self.blocks.remove(hash);
+        self.headers.remove(hash);
+        self.heights.remove(hash);
+        self.cumulative_work.remove(hash);
+        self.undo_data.remove(hash);
+    }
+
+    fn connect_known_block(&mut self, block_hash: Hash256) -> Result<(), ChainError> {
+        // Take the body out while validating to avoid cloning it.
+        let block = self
+            .blocks
+            .remove(&block_hash)
+            .ok_or(ChainError::MissingBlock { block_hash })?;
+        let result = if block.header.prev_block != self.tip_hash() {
+            Err(ChainError::PrevBlockMustBeTip {
+                expected_tip: self.tip_hash(),
+                got_prev: block.header.prev_block,
+            })
+        } else {
+            self.validate_and_connect(&block, false)
+        };
+        self.blocks.insert(block_hash, block);
+        let (_, undo) = result?;
         self.main_chain.push(block_hash);
         self.undo_data.insert(block_hash, undo);
         Ok(())
     }
 
-    fn disconnect_tip_block(&mut self) -> Result<(), ChainError> {
+    fn disconnect_tip_block(&mut self) -> Result<Hash256, ChainError> {
         if self.main_chain.len() <= 1 {
             return Err(ChainError::InvalidRuntime(
                 "cannot disconnect genesis block".to_owned(),
@@ -561,54 +1064,110 @@ impl ChainRuntime {
             .ok_or(ChainError::MissingUndoData {
                 block_hash: tip_hash,
             })?;
-
-        for outpoint in undo.created_outpoints {
-            if self.utxos.remove(&outpoint).is_none() {
-                return Err(ChainError::DisconnectMissingCreatedUtxo {
-                    block_hash: tip_hash,
-                    outpoint,
-                });
-            }
-        }
-        for (outpoint, entry) in undo.spent_entries {
-            self.utxos.insert(outpoint, entry);
+        if let Err(err) = revert_block_undo(&undo, &mut self.utxos) {
+            self.undo_data.insert(tip_hash, undo);
+            return Err(ChainError::Undo {
+                block_hash: tip_hash,
+                source: err,
+            });
         }
         self.main_chain.pop();
-        Ok(())
+        Ok(tip_hash)
     }
 
-    fn collect_block_undo(&self, block: &Block) -> Result<BlockUndo, ChainError> {
-        let block_hash = block.header.block_hash();
-        let mut spent_entries = Vec::<(scam_core::OutPoint, UtxoEntry)>::new();
-        for tx in block.transactions.iter().skip(1) {
-            for input in &tx.inputs {
-                let utxo =
-                    self.utxos
-                        .get(&input.prev_out)
-                        .ok_or(ChainError::MissingUndoSpentUtxo {
-                            block_hash,
-                            outpoint: input.prev_out.clone(),
-                        })?;
-                spent_entries.push((input.prev_out.clone(), utxo.clone()));
-            }
+    /// Periodically drop state that can no longer matter: undo records and
+    /// side branches deeper than `max_reorg_depth`.
+    fn on_tip_changed(&mut self) {
+        self.tip_changes = self.tip_changes.wrapping_add(1);
+        if !self.tip_changes.is_multiple_of(PRUNE_INTERVAL_BLOCKS) {
+            return;
         }
-
-        let mut created_outpoints = Vec::<scam_core::OutPoint>::new();
-        for tx in &block.transactions {
-            let txid = tx.txid();
-            for (vout, _) in tx.outputs.iter().enumerate() {
-                created_outpoints.push(scam_core::OutPoint {
-                    txid,
-                    vout: vout as u32,
-                });
-            }
-        }
-
-        Ok(BlockUndo {
-            spent_entries,
-            created_outpoints,
-        })
+        self.prune_below_reorg_horizon();
     }
+
+    fn prune_below_reorg_horizon(&mut self) {
+        let tip_height = self.tip_height();
+        let Some(horizon) = tip_height.checked_sub(self.max_reorg_depth) else {
+            return;
+        };
+        let stale = self
+            .heights
+            .iter()
+            .filter(|(hash, height)| **height <= horizon && !self.is_on_main_chain(hash, **height))
+            .map(|(hash, _)| *hash)
+            .collect::<Vec<_>>();
+        for hash in stale {
+            self.forget_block(&hash);
+        }
+        let heights = &self.heights;
+        self.undo_data.retain(|hash, _| {
+            heights
+                .get(hash)
+                .is_some_and(|height| height.saturating_add(self.max_reorg_depth) > tip_height)
+        });
+    }
+}
+
+/// Headers visible to a difficulty/MTP computation: the runtime's, plus —
+/// for a branch proven by headers alone — a window of headers it does not
+/// store.
+struct HeaderLookup<'a> {
+    runtime: &'a ChainRuntime,
+    extra: Option<&'a HashMap<Hash256, (BlockHeader, u64)>>,
+}
+
+impl HeaderLookup<'_> {
+    fn header(&self, hash: &Hash256) -> Option<&BlockHeader> {
+        self.extra
+            .and_then(|extra| extra.get(hash).map(|(header, _)| header))
+            .or_else(|| self.runtime.headers.get(hash))
+    }
+
+    fn height(&self, hash: &Hash256) -> Option<u64> {
+        self.extra
+            .and_then(|extra| extra.get(hash).map(|(_, height)| *height))
+            .or_else(|| self.runtime.height_of(hash))
+    }
+
+    fn ancestor(
+        &self,
+        from: Hash256,
+        from_height: u64,
+        target_height: u64,
+    ) -> Result<Hash256, ChainError> {
+        let in_extra = self.extra.is_some_and(|extra| extra.contains_key(&from));
+        if !in_extra && self.runtime.is_on_main_chain(&from, from_height) {
+            return self
+                .runtime
+                .block_hash_at_height(target_height)
+                .ok_or(ChainError::MissingHeader { block_hash: from });
+        }
+        let mut cursor = from;
+        for _ in target_height..from_height {
+            cursor = self
+                .header(&cursor)
+                .ok_or(ChainError::MissingHeader { block_hash: cursor })?
+                .prev_block;
+        }
+        Ok(cursor)
+    }
+}
+
+fn median_time_past_in(lookup: &HeaderLookup<'_>, parent_hash: Hash256) -> Result<u64, ChainError> {
+    let mut timestamps = Vec::with_capacity(MEDIAN_TIME_PAST_WINDOW);
+    let mut cursor = parent_hash;
+    for _ in 0..MEDIAN_TIME_PAST_WINDOW {
+        let header = lookup
+            .header(&cursor)
+            .ok_or(ChainError::MissingHeader { block_hash: cursor })?;
+        timestamps.push(header.timestamp);
+        if header.prev_block == Hash256::ZERO {
+            break;
+        }
+        cursor = header.prev_block;
+    }
+    timestamps.sort_unstable();
+    Ok(timestamps[timestamps.len() / 2])
 }
 
 fn current_unix_timestamp() -> Result<u64, ChainError> {
@@ -620,6 +1179,8 @@ fn current_unix_timestamp() -> Result<u64, ChainError> {
 
 #[derive(Debug, Error)]
 pub enum ChainError {
+    #[error("deep branch rejected: {reason}")]
+    DeepBranch { reason: String },
     #[error("chain config error: {0}")]
     Config(#[from] scam_core::ChainConfigError),
     #[error("tx/block validation error: {0}")]
@@ -644,15 +1205,27 @@ pub enum ChainError {
     MissingBlock { block_hash: Hash256 },
     #[error("missing undo data for connected block {block_hash}")]
     MissingUndoData { block_hash: Hash256 },
-    #[error("cannot build undo data for block {block_hash}: missing spent utxo {outpoint:?}")]
-    MissingUndoSpentUtxo {
+    #[error("cannot disconnect block {block_hash}: {source}")]
+    Undo {
         block_hash: Hash256,
-        outpoint: scam_core::OutPoint,
+        #[source]
+        source: UndoError,
     },
-    #[error("disconnect failed for block {block_hash}: missing created utxo {outpoint:?}")]
-    DisconnectMissingCreatedUtxo {
+    #[error("block {block_hash} was already found invalid")]
+    KnownInvalid { block_hash: Hash256 },
+    #[error("block {block_hash} descends from invalid block {ancestor}")]
+    InvalidAncestor {
         block_hash: Hash256,
-        outpoint: scam_core::OutPoint,
+        ancestor: Hash256,
+    },
+    #[error(
+        "block {block_hash} forks at height {fork_height}, deeper than the max reorg depth {max_reorg_depth} below tip {tip_height}"
+    )]
+    ForkTooDeep {
+        block_hash: Hash256,
+        fork_height: u64,
+        tip_height: u64,
+        max_reorg_depth: u64,
     },
     #[error("unexpected block target: expected {expected}, got {got}")]
     UnexpectedTarget { expected: Target, got: Target },
@@ -679,21 +1252,500 @@ mod tests {
     use scam_core::{Hash256, OutPoint, Transaction, TxIn, TxOut};
     use scam_miner::{BlockTemplate, mine_block};
 
-    use super::{asert_next, chainwork_for_target, lwma_next, retarget_next};
+    use super::{
+        PRUNE_INTERVAL_BLOCKS, asert_next, chainwork_for_target, lwma_next, retarget_next,
+    };
     use crate::{BlockSubmissionOutcome, ChainError, ChainRuntime};
 
-    fn coinbase(value: u64, key_hash20: [u8; 20], tag: &[u8]) -> Transaction {
+    fn coinbase(height: u64, value: u64, key_hash20: [u8; 20], tag: &[u8]) -> Transaction {
         Transaction {
             version: 1,
             inputs: vec![TxIn {
                 prev_out: OutPoint::coinbase(),
-                signature: tag.to_vec(),
+                signature: scam_core::coinbase_script(height, tag),
                 pubkey_compressed: vec![],
                 sequence: u32::MAX,
             }],
             outputs: vec![TxOut { value, key_hash20 }],
             lock_time: 0,
         }
+    }
+
+    fn devnet_config() -> scam_core::ChainConfig {
+        toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse")
+    }
+
+    /// Mine a coinbase-only block on `parent` with the target the runtime
+    /// expects for that branch.
+    fn mine_on(
+        runtime: &ChainRuntime,
+        parent: Hash256,
+        timestamp: u64,
+        tag: &str,
+        extra: Vec<Transaction>,
+    ) -> scam_core::Block {
+        let config = runtime.config().clone();
+        let mut txs = vec![coinbase(
+            runtime.height_of(&parent).expect("parent height") + 1,
+            config.block_subsidy,
+            config.genesis_reward_key_hash20().expect("key"),
+            tag.as_bytes(),
+        )];
+        txs.extend(extra);
+        let template = BlockTemplate {
+            version: 1,
+            prev_block: parent,
+            timestamp,
+            target: runtime
+                .expected_target_for_child_of(parent)
+                .expect("branch target"),
+            transactions: txs,
+        };
+        mine_block(&template, 2_000_000).expect("mine")
+    }
+
+    fn signing_key(seed: u8) -> (secp256k1::Keypair, Vec<u8>, [u8; 20]) {
+        let secp = secp256k1::Secp256k1::new();
+        let secret = secp256k1::SecretKey::from_slice(&[seed; 32]).expect("secret");
+        let keypair = secp256k1::Keypair::from_secret_key(&secp, &secret);
+        let pubkey = secp256k1::PublicKey::from_secret_key(&secp, &secret)
+            .serialize()
+            .to_vec();
+        let hash = scam_core::hash160_blake3(&pubkey);
+        (keypair, pubkey, hash)
+    }
+
+    fn signed_spend(
+        prev: OutPoint,
+        value: u64,
+        to: [u8; 20],
+        keypair: &secp256k1::Keypair,
+        pubkey: &[u8],
+        chain_domain: &[u8],
+    ) -> Transaction {
+        let mut tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: prev,
+                signature: vec![],
+                pubkey_compressed: pubkey.to_vec(),
+                sequence: u32::MAX,
+            }],
+            outputs: vec![TxOut {
+                value,
+                key_hash20: to,
+            }],
+            lock_time: 0,
+        };
+        let digest = tx
+            .signing_digest_with_chain_domain(0, chain_domain)
+            .expect("digest");
+        let message = secp256k1::Message::from_digest_slice(&digest.0).expect("msg");
+        let sig = secp256k1::Secp256k1::new().sign_schnorr_no_aux_rand(&message, keypair);
+        tx.inputs[0].signature = sig.as_ref().to_vec();
+        tx
+    }
+
+    /// C2: a side-branch block must carry the target its branch requires.
+    /// Before the fix a `Target::MAX` side block was stored for free.
+    #[test]
+    fn side_branch_block_with_easier_than_expected_target_is_rejected() {
+        let mut config = devnet_config();
+        config.difficulty_algorithm = scam_core::DifficultyAlgorithm::Windowed;
+        config.difficulty_adjustment_window = 2;
+        let mut runtime = ChainRuntime::from_config(config.clone()).expect("runtime");
+        let genesis_ts = runtime.tip_header().timestamp;
+        // Fast block ⇒ retarget at height 2 makes the next target harder.
+        let b1 = mine_on(&runtime, runtime.tip_hash(), genesis_ts + 1, "b1", vec![]);
+        let b1_hash = b1.header.block_hash();
+        runtime.apply_next_block(b1).expect("b1");
+        let required = runtime.expected_target_for_child_of(b1_hash).expect("t");
+        assert!(required < scam_core::Target::MAX, "retarget must tighten");
+        let b2 = mine_on(&runtime, b1_hash, genesis_ts + 2, "b2", vec![]);
+        runtime.apply_next_block(b2).expect("b2");
+
+        let cheap = BlockTemplate {
+            version: 1,
+            prev_block: b1_hash,
+            timestamp: genesis_ts + 3,
+            target: scam_core::Target::MAX,
+            transactions: vec![coinbase(
+                2,
+                config.block_subsidy,
+                config.genesis_reward_key_hash20().expect("key"),
+                b"cheap-side",
+            )],
+        };
+        let cheap = mine_block(&cheap, 10).expect("free block");
+        let cheap_hash = cheap.header.block_hash();
+        let err = runtime.submit_block(cheap).expect_err("must reject");
+        assert!(
+            matches!(err, ChainError::UnexpectedTarget { .. }),
+            "{err:?}"
+        );
+        assert!(runtime.block_by_hash(&cheap_hash).is_none(), "not stored");
+    }
+
+    /// C3: a tx spending an output created earlier in the same block must
+    /// connect, and disconnecting it (reorg) must restore the UTXO set.
+    #[test]
+    fn in_block_parent_child_spend_connects_and_reorgs_cleanly() {
+        let mut config = devnet_config();
+        config.coinbase_maturity = 1;
+        let (keypair, pubkey, key_hash) = signing_key(7);
+        let (_, _, other_hash) = signing_key(8);
+        let domain = config.network_id.as_bytes().to_vec();
+        let mut runtime = ChainRuntime::from_config(config.clone()).expect("runtime");
+        let ts = runtime.tip_header().timestamp;
+
+        let cb1 = coinbase(
+            runtime.tip_height() + 1,
+            config.block_subsidy,
+            key_hash,
+            b"b1-pay-me",
+        );
+        assert!(cb1.is_coinbase());
+        let template = BlockTemplate {
+            version: 1,
+            prev_block: runtime.tip_hash(),
+            timestamp: ts + 30,
+            target: runtime.expected_target_for_next_block().expect("t"),
+            transactions: vec![cb1.clone()],
+        };
+        runtime
+            .apply_next_block(mine_block(&template, 200_000).expect("mine"))
+            .expect("b1");
+        let b1_hash = runtime.tip_hash();
+        let after_b1 = runtime.utxo_set().clone();
+        // The miner appends an extra-nonce to the coinbase, so read the
+        // final txid back from the stored block.
+        let cb1_txid = runtime.block_by_hash(&b1_hash).expect("b1").transactions[0].txid();
+
+        let parent = signed_spend(
+            OutPoint {
+                txid: cb1_txid,
+                vout: 0,
+            },
+            config.block_subsidy - 10,
+            key_hash,
+            &keypair,
+            &pubkey,
+            &domain,
+        );
+        let child = signed_spend(
+            OutPoint {
+                txid: parent.txid(),
+                vout: 0,
+            },
+            config.block_subsidy - 20,
+            other_hash,
+            &keypair,
+            &pubkey,
+            &domain,
+        );
+        let b2 = mine_on(&runtime, b1_hash, ts + 60, "b2", vec![parent, child]);
+        runtime
+            .apply_next_block(b2)
+            .expect("CPFP-shaped block must connect");
+        assert_eq!(runtime.tip_height(), 2);
+
+        // Heavier fork from b1 disconnects b2.
+        let f2 = mine_on(&runtime, b1_hash, ts + 61, "f2", vec![]);
+        let f2_hash = f2.header.block_hash();
+        runtime.submit_block(f2).expect("f2 side");
+        let f3 = mine_on(&runtime, f2_hash, ts + 62, "f3", vec![]);
+        let outcome = runtime.submit_block(f3).expect("f3 reorg");
+        assert!(matches!(outcome, BlockSubmissionOutcome::Reorged { .. }));
+        for (outpoint, entry) in &after_b1 {
+            assert_eq!(runtime.utxo_set().get(outpoint), Some(entry), "restored");
+        }
+        assert_eq!(
+            runtime.utxo_len(),
+            after_b1.len() + 2,
+            "plus f2/f3 coinbases"
+        );
+    }
+
+    /// C11: a failing reorg restores the old chain, and the bad block and its
+    /// descendants are remembered as invalid.
+    #[test]
+    fn failed_reorg_restores_chain_and_marks_branch_invalid() {
+        let config = devnet_config();
+        let mut runtime = ChainRuntime::from_config(config.clone()).expect("runtime");
+        let genesis = runtime.tip_hash();
+        let ts = runtime.tip_header().timestamp;
+        for i in 0..2u64 {
+            let block = mine_on(
+                &runtime,
+                runtime.tip_hash(),
+                ts + 30 * (i + 1),
+                &format!("m{i}"),
+                vec![],
+            );
+            runtime.apply_next_block(block).expect("main");
+        }
+        let main_tip = runtime.tip_hash();
+        let utxo_before = runtime.utxo_set().clone();
+
+        let f1 = mine_on(&runtime, genesis, ts + 31, "f1", vec![]);
+        let f1_hash = f1.header.block_hash();
+        runtime.submit_block(f1).expect("f1 side");
+        // f2 pays itself more than the subsidy ⇒ consensus-invalid.
+        let mut f2_template = BlockTemplate {
+            version: 1,
+            prev_block: f1_hash,
+            timestamp: ts + 62,
+            target: runtime.expected_target_for_child_of(f1_hash).expect("t"),
+            transactions: vec![coinbase(
+                2,
+                config.block_subsidy + 1,
+                config.genesis_reward_key_hash20().expect("key"),
+                b"f2-greedy",
+            )],
+        };
+        let f2 = mine_block(&f2_template, 200_000).expect("mine f2");
+        let f2_hash = f2.header.block_hash();
+        runtime
+            .submit_block(f2)
+            .expect("f2 stored as side branch (equal work)");
+        f2_template.prev_block = f2_hash;
+        f2_template.timestamp = ts + 93;
+        f2_template.transactions = vec![coinbase(
+            3,
+            config.block_subsidy,
+            config.genesis_reward_key_hash20().expect("key"),
+            b"f3",
+        )];
+        let f3 = mine_block(&f2_template, 200_000).expect("mine f3");
+        let f3_hash = f3.header.block_hash();
+        let err = runtime.submit_block(f3).expect_err("reorg must fail");
+        assert!(matches!(err, ChainError::Validation(_)), "{err:?}");
+
+        assert_eq!(runtime.tip_hash(), main_tip, "old chain restored");
+        assert_eq!(runtime.utxo_set(), &utxo_before, "UTXO set restored");
+        assert!(runtime.is_known_invalid(&f2_hash));
+        assert!(runtime.is_known_invalid(&f3_hash));
+        assert!(runtime.block_by_hash(&f2_hash).is_none());
+
+        f2_template.prev_block = f3_hash;
+        f2_template.timestamp = ts + 124;
+        let f4 = mine_block(&f2_template, 200_000).expect("mine f4");
+        let err = runtime.submit_block(f4).expect_err("descendant of invalid");
+        assert!(
+            matches!(
+                err,
+                ChainError::UnknownParent { .. } | ChainError::InvalidAncestor { .. }
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// C12/C10: forks deeper than the reorg limit are refused, and stale
+    /// side branches are pruned.
+    /// Mine `count` blocks on `parent` in `runtime` (a branch runtime that
+    /// stores them), returning them oldest first.
+    fn mine_branch(
+        runtime: &mut ChainRuntime,
+        count: u64,
+        ts: u64,
+        tag: &str,
+    ) -> Vec<scam_core::Block> {
+        let spacing = runtime.config().target_block_time_sec;
+        let mut out = Vec::new();
+        for i in 0..count {
+            let block = mine_on(
+                runtime,
+                runtime.tip_hash(),
+                ts + spacing * (i + 1),
+                &format!("{tag}{i}"),
+                vec![],
+            );
+            runtime
+                .apply_next_block(block.clone())
+                .expect("branch block");
+            out.push(block);
+        }
+        out
+    }
+
+    /// C21: a heavier branch forking below the reorg window is proven by its
+    /// headers, then adopted by rebuilding the state along it; a lighter one
+    /// is not; bad headers and invalid bodies are refused without changing
+    /// the active chain.
+    #[test]
+    fn deep_branch_is_adopted_only_when_heavier_and_valid() {
+        let config = devnet_config();
+        let mut active = ChainRuntime::from_config(config.clone()).expect("runtime");
+        active.max_reorg_depth = 2;
+        let genesis = active.tip_hash();
+        let ts = active.tip_header().timestamp;
+        mine_branch(&mut active, 4, ts, "a");
+        let mut other = ChainRuntime::from_config(config.clone()).expect("other");
+        let branch = mine_branch(&mut other, 6, ts + 7, "b");
+        let headers = branch.iter().map(|b| b.header.clone()).collect::<Vec<_>>();
+        let now = ts + 10_000;
+
+        // Too deep for an undo reorg.
+        let err = active.submit_block(branch[0].clone()).expect_err("deep");
+        assert!(matches!(err, ChainError::ForkTooDeep { .. }), "{err:?}");
+        assert!(active.is_deep_fork_point(&genesis));
+
+        // Headers prove more work.
+        let mut probe = active.begin_deep_branch_probe(genesis).expect("probe");
+        active
+            .extend_deep_branch_probe(&mut probe, &headers[..3], now)
+            .expect("first headers");
+        assert!(!active.deep_branch_outworks(&probe), "not heavier yet");
+        active
+            .extend_deep_branch_probe(&mut probe, &headers[3..], now)
+            .expect("rest");
+        assert!(active.deep_branch_outworks(&probe));
+        assert_eq!(probe.hashes().len(), 6);
+
+        // An invalid body (merkle mismatch) is refused; nothing changes and
+        // the branch is remembered as invalid from that block on.
+        let mut tampered = branch.clone();
+        tampered[4].transactions[0].outputs[0].value += 1;
+        let tip_before = active.tip_hash();
+        assert!(active.adopt_deep_branch(&probe, tampered.clone()).is_err());
+        assert_eq!(active.tip_hash(), tip_before);
+        // (the tampered block keeps its header hash, so it now is invalid)
+        assert!(active.is_known_invalid(&branch[4].header.block_hash()));
+        assert!(!active.is_known_invalid(&branch[3].header.block_hash()));
+
+        // A fresh active chain adopts the valid branch.
+        let mut active = ChainRuntime::from_config(config.clone()).expect("runtime");
+        active.max_reorg_depth = 2;
+        mine_branch(&mut active, 4, ts, "a");
+        let mut probe = active.begin_deep_branch_probe(genesis).expect("probe");
+        active
+            .extend_deep_branch_probe(&mut probe, &headers, now)
+            .expect("headers");
+        let outcome = active
+            .adopt_deep_branch(&probe, branch.clone())
+            .expect("adopt");
+        assert!(matches!(outcome, BlockSubmissionOutcome::Reorged { .. }));
+        assert_eq!(active.tip_hash(), other.tip_hash());
+        assert_eq!(active.utxo_set(), other.utxo_set());
+
+        // A lighter deep branch is never adopted.
+        let mut light_active = ChainRuntime::from_config(config.clone()).expect("runtime");
+        light_active.max_reorg_depth = 2;
+        mine_branch(&mut light_active, 8, ts, "a");
+        let mut probe = light_active
+            .begin_deep_branch_probe(genesis)
+            .expect("probe");
+        light_active
+            .extend_deep_branch_probe(&mut probe, &headers, now)
+            .expect("headers");
+        assert!(!light_active.deep_branch_outworks(&probe));
+        assert!(
+            light_active
+                .adopt_deep_branch(&probe, branch.clone())
+                .is_err()
+        );
+
+        // Header rules: linkage, target, future time.
+        let fresh = || {
+            let mut runtime = ChainRuntime::from_config(config.clone()).expect("runtime");
+            runtime.max_reorg_depth = 2;
+            mine_branch(&mut runtime, 4, ts, "a");
+            runtime
+        };
+        let runtime = fresh();
+        let mut probe = runtime.begin_deep_branch_probe(genesis).expect("probe");
+        assert!(
+            runtime
+                .extend_deep_branch_probe(&mut probe, &headers[1..], now)
+                .is_err(),
+            "gap"
+        );
+        let mut probe = runtime.begin_deep_branch_probe(genesis).expect("probe");
+        let mut wrong = headers[0].clone();
+        wrong.target =
+            scam_core::Target::from_hex(&format!("{}01", "00".repeat(31))).expect("target");
+        assert!(
+            runtime
+                .extend_deep_branch_probe(&mut probe, &[wrong], now)
+                .is_err(),
+            "target"
+        );
+        let mut probe = runtime.begin_deep_branch_probe(genesis).expect("probe");
+        let too_early_now = headers[0].timestamp - super::MAX_FUTURE_BLOCK_TIME_SEC - 1;
+        assert!(
+            runtime
+                .extend_deep_branch_probe(&mut probe, &headers[..1], too_early_now)
+                .is_err(),
+            "future"
+        );
+        assert!(
+            runtime.begin_deep_branch_probe(runtime.tip_hash()).is_err(),
+            "not deep"
+        );
+    }
+
+    #[test]
+    fn deep_forks_are_refused_and_stale_side_branches_pruned() {
+        let config = devnet_config();
+        let mut runtime = ChainRuntime::from_config(config).expect("runtime");
+        runtime.max_reorg_depth = 3;
+        let genesis = runtime.tip_hash();
+        let ts = runtime.tip_header().timestamp;
+        let spacing = runtime.config().target_block_time_sec;
+
+        let side = mine_on(&runtime, genesis, ts + spacing - 1, "early-side", vec![]);
+        let side_hash = side.header.block_hash();
+        let b1 = mine_on(&runtime, genesis, ts + spacing, "b1", vec![]);
+        runtime.apply_next_block(b1).expect("b1");
+        runtime.submit_block(side).expect("side within depth");
+        assert!(runtime.block_by_hash(&side_hash).is_some());
+
+        for i in 0..3u64 {
+            let block = mine_on(
+                &runtime,
+                runtime.tip_hash(),
+                ts + spacing * (2 + i),
+                &format!("m{i}"),
+                vec![],
+            );
+            runtime.apply_next_block(block).expect("main");
+        }
+        let deep = mine_on(&runtime, genesis, ts + spacing + 1, "deep", vec![]);
+        let err = runtime.submit_block(deep).expect_err("too deep");
+        assert!(matches!(err, ChainError::ForkTooDeep { .. }), "{err:?}");
+
+        for i in 0..PRUNE_INTERVAL_BLOCKS {
+            let block = mine_on(
+                &runtime,
+                runtime.tip_hash(),
+                ts + spacing * (10 + i),
+                &format!("p{i}"),
+                vec![],
+            );
+            runtime.apply_next_block(block).expect("main");
+        }
+        assert!(runtime.block_by_hash(&side_hash).is_none(), "side pruned");
+        assert!(runtime.undo_data.len() as u64 <= runtime.max_reorg_depth + PRUNE_INTERVAL_BLOCKS);
+        assert!(runtime.undo_data.contains_key(&runtime.tip_hash()));
+    }
+
+    /// C13: replaying locally stored blocks must not apply the wall-clock
+    /// future-time rule (a host whose clock is behind could not restart).
+    #[test]
+    fn local_replay_ignores_wall_clock_future_rule() {
+        let config = devnet_config();
+        let mut runtime = ChainRuntime::from_config(config.clone()).expect("runtime");
+        let far_future = super::current_unix_timestamp().expect("now") + 10 * 3_600;
+        let block = mine_on(&runtime, runtime.tip_hash(), far_future, "future", vec![]);
+        let err = runtime
+            .apply_next_block(block.clone())
+            .expect_err("live path checks clock");
+        assert!(matches!(err, ChainError::TimestampTooFarInFuture { .. }));
+
+        let genesis = config.build_genesis_block().expect("genesis");
+        let replayed =
+            ChainRuntime::from_ordered_blocks(config, vec![genesis, block]).expect("replay");
+        assert_eq!(replayed.tip_height(), 1);
     }
 
     #[test]
@@ -721,7 +1773,12 @@ mod tests {
             prev_block: runtime.tip_hash(),
             timestamp: runtime.tip_header().timestamp + 30,
             target,
-            transactions: vec![coinbase(config.block_subsidy, reward, b"accessor-work")],
+            transactions: vec![coinbase(
+                runtime.tip_height() + 1,
+                config.block_subsidy,
+                reward,
+                b"accessor-work",
+            )],
         };
         let block = mine_block(&template, 200_000).expect("mine");
         runtime.apply_next_block(block).expect("apply");
@@ -764,7 +1821,12 @@ mod tests {
             prev_block: runtime.tip_hash(),
             timestamp: runtime.tip_header().timestamp.saturating_add(30),
             target: runtime.expected_target_for_next_block().expect("target"),
-            transactions: vec![coinbase(config.block_subsidy, reward, b"w1")],
+            transactions: vec![coinbase(
+                runtime.tip_height() + 1,
+                config.block_subsidy,
+                reward,
+                b"w1",
+            )],
         };
         let block = mine_block(&template, 200_000).expect("mine");
         runtime.apply_next_block(block).expect("apply");
@@ -780,6 +1842,8 @@ mod tests {
             .expect("tip header")
             .target = overridden_tip_target;
 
+        // First boundary (next height 2, window 2): windows overlap, so the
+        // span starts at genesis and covers exactly one interval.
         let start_hash = runtime.block_hash_at_height(0).expect("genesis");
         let start_ts = runtime
             .headers
@@ -790,7 +1854,7 @@ mod tests {
         let expected = retarget_next(
             overridden_tip_target,
             tip_ts.saturating_sub(start_ts).max(1),
-            2 * config.target_block_time_sec,
+            config.target_block_time_sec,
             config.difficulty_clamp_down,
             config.difficulty_clamp_up,
             config.genesis_target().expect("max target"),
@@ -832,6 +1896,7 @@ mod tests {
                 timestamp: runtime.tip_header().timestamp + (i + 1) as u64 * 15,
                 target: runtime.expected_target_for_next_block().expect("target"),
                 transactions: vec![coinbase(
+                    runtime.tip_height() + 1,
                     config.block_subsidy,
                     reward,
                     format!("lwma-{i}").as_bytes(),
@@ -890,7 +1955,12 @@ mod tests {
             prev_block: runtime.tip_hash(),
             timestamp: runtime.tip_header().timestamp.saturating_add(45),
             target: runtime.expected_target_for_next_block().expect("target"),
-            transactions: vec![coinbase(config.block_subsidy, reward, b"asert-1")],
+            transactions: vec![coinbase(
+                runtime.tip_height() + 1,
+                config.block_subsidy,
+                reward,
+                b"asert-1",
+            )],
         };
         let block = mine_block(&template, 200_000).expect("mine");
         runtime.apply_next_block(block).expect("apply");
@@ -940,13 +2010,14 @@ mod tests {
                 nonce: 0,
             },
             transactions: vec![coinbase(
+                1,
                 config.block_subsidy,
                 config.genesis_reward_key_hash20().expect("key"),
                 b"unknown-parent",
             )],
         };
         let err = runtime
-            .validate_contextual_timestamps(&block)
+            .validate_contextual_timestamps(&block, true)
             .expect_err("must reject unknown parent");
         assert!(matches!(err, ChainError::MissingHeader { .. }));
     }
@@ -970,7 +2041,12 @@ mod tests {
             prev_block: runtime.tip_hash(),
             timestamp: runtime.tip_header().timestamp.saturating_add(30),
             target: wrong_target,
-            transactions: vec![coinbase(config.block_subsidy, reward, b"wrong-target")],
+            transactions: vec![coinbase(
+                runtime.tip_height() + 1,
+                config.block_subsidy,
+                reward,
+                b"wrong-target",
+            )],
         }
         .build_with_nonce(0);
         let err = runtime
@@ -983,7 +2059,12 @@ mod tests {
             prev_block: runtime.tip_hash(),
             timestamp: runtime.tip_header().timestamp.saturating_add(30),
             target: expected_target,
-            transactions: vec![coinbase(config.block_subsidy, reward, b"right-target")],
+            transactions: vec![coinbase(
+                runtime.tip_height() + 1,
+                config.block_subsidy,
+                reward,
+                b"right-target",
+            )],
         };
         let mined = mine_block(&ok_block, 200_000).expect("mine");
         runtime.apply_next_block(mined).expect("accept block");
@@ -1009,6 +2090,7 @@ mod tests {
                 timestamp,
                 target,
                 transactions: vec![coinbase(
+                    runtime.tip_height() + 1,
                     config.block_subsidy,
                     config.genesis_reward_key_hash20().expect("key"),
                     format!("b{i}").as_bytes(),
@@ -1038,6 +2120,7 @@ mod tests {
                 timestamp,
                 target: runtime.expected_target_for_next_block().expect("target"),
                 transactions: vec![coinbase(
+                    runtime.tip_height() + 1,
                     config.block_subsidy,
                     config.genesis_reward_key_hash20().expect("key"),
                     format!("main-{i}").as_bytes(),
@@ -1068,6 +2151,7 @@ mod tests {
                 timestamp: fork_ts,
                 target: fork_target,
                 transactions: vec![coinbase(
+                    2 + i,
                     config.block_subsidy,
                     config.genesis_reward_key_hash20().expect("key"),
                     format!("fork-{i}").as_bytes(),
@@ -1087,7 +2171,7 @@ mod tests {
     }
 
     #[test]
-    fn find_fork_height_tracks_deepest_matching_prefix() {
+    fn branch_from_main_chain_resolves_fork_point() {
         let config: scam_core::ChainConfig =
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
         let mut runtime = ChainRuntime::from_config(config.clone()).expect("runtime");
@@ -1101,6 +2185,7 @@ mod tests {
                 timestamp,
                 target: runtime.expected_target_for_next_block().expect("target"),
                 transactions: vec![coinbase(
+                    runtime.tip_height() + 1,
                     config.block_subsidy,
                     reward,
                     format!("fork-height-{i}").as_bytes(),
@@ -1111,18 +2196,17 @@ mod tests {
             timestamp += 30;
         }
 
-        let local_chain = runtime.main_chain.clone();
-        let fork_height = runtime
-            .find_fork_height(&local_chain)
-            .expect("fork height on identical chain");
-        assert_eq!(fork_height, runtime.tip_height() as usize);
+        let tip = runtime.tip_hash();
+        let (fork_height, branch) = runtime
+            .branch_from_main_chain(tip)
+            .expect("main-chain tip is its own fork point");
+        assert_eq!(fork_height, runtime.tip_height());
+        assert!(branch.is_empty());
 
-        let mut no_shared_genesis = local_chain.clone();
-        no_shared_genesis[0] = Hash256([0xEE; 32]);
         let err = runtime
-            .find_fork_height(&no_shared_genesis)
-            .expect_err("mismatched genesis must fail");
-        assert!(matches!(err, ChainError::InvalidRuntime(_)));
+            .branch_from_main_chain(Hash256([0xEE; 32]))
+            .expect_err("unknown block must fail");
+        assert!(matches!(err, ChainError::MissingHeader { .. }));
     }
 
     #[test]
@@ -1137,7 +2221,12 @@ mod tests {
             prev_block: runtime.tip_hash(),
             timestamp: runtime.tip_header().timestamp + 30,
             target: runtime.expected_target_for_next_block().expect("target"),
-            transactions: vec![coinbase(config.block_subsidy, reward, b"disconnect-tip")],
+            transactions: vec![coinbase(
+                runtime.tip_height() + 1,
+                config.block_subsidy,
+                reward,
+                b"disconnect-tip",
+            )],
         };
         let block = mine_block(&template, 200_000).expect("mine");
         runtime.apply_next_block(block).expect("apply");
@@ -1165,6 +2254,7 @@ mod tests {
                 timestamp,
                 target: runtime.expected_target_for_next_block().expect("target"),
                 transactions: vec![coinbase(
+                    runtime.tip_height() + 1,
                     config.block_subsidy,
                     reward,
                     format!("mtp-main-{i}").as_bytes(),
@@ -1183,7 +2273,12 @@ mod tests {
             prev_block: runtime.tip_hash(),
             timestamp: mtp,
             target: runtime.expected_target_for_next_block().expect("target"),
-            transactions: vec![coinbase(config.block_subsidy, reward, b"mtp-reject")],
+            transactions: vec![coinbase(
+                runtime.tip_height() + 1,
+                config.block_subsidy,
+                reward,
+                b"mtp-reject",
+            )],
         };
         let block = mine_block(&template, 200_000).expect("mine");
         let err = runtime.apply_next_block(block).expect_err("must reject");
@@ -1207,6 +2302,7 @@ mod tests {
                 timestamp: base.saturating_add(delta),
                 target: runtime.expected_target_for_next_block().expect("target"),
                 transactions: vec![coinbase(
+                    runtime.tip_height() + 1,
                     config.block_subsidy,
                     reward,
                     format!("mtp-tip-{idx}").as_bytes(),
@@ -1251,6 +2347,7 @@ mod tests {
             timestamp: future_timestamp,
             target: runtime.expected_target_for_next_block().expect("target"),
             transactions: vec![coinbase(
+                runtime.tip_height() + 1,
                 config.block_subsidy,
                 config.genesis_reward_key_hash20().expect("key"),
                 b"future-reject",
@@ -1277,7 +2374,12 @@ mod tests {
             prev_block: runtime.tip_hash(),
             timestamp: near_future_timestamp,
             target: runtime.expected_target_for_next_block().expect("target"),
-            transactions: vec![coinbase(config.block_subsidy, reward, b"within-future")],
+            transactions: vec![coinbase(
+                runtime.tip_height() + 1,
+                config.block_subsidy,
+                reward,
+                b"within-future",
+            )],
         };
         let block = mine_block(&template, 200_000).expect("mine");
         runtime
@@ -1299,7 +2401,12 @@ mod tests {
             prev_block: runtime.tip_hash(),
             timestamp: boundary_timestamp,
             target: runtime.expected_target_for_next_block().expect("target"),
-            transactions: vec![coinbase(config.block_subsidy, reward, b"future-boundary")],
+            transactions: vec![coinbase(
+                runtime.tip_height() + 1,
+                config.block_subsidy,
+                reward,
+                b"future-boundary",
+            )],
         };
         let block = mine_block(&template, 200_000).expect("mine");
         runtime
@@ -1323,6 +2430,7 @@ mod tests {
                 timestamp: runtime.tip_header().timestamp + 30 + i as u64,
                 target: runtime.expected_target_for_next_block().expect("target"),
                 transactions: vec![coinbase(
+                    runtime.tip_height() + 1,
                     config.block_subsidy,
                     reward,
                     format!("window-boundary-{i}").as_bytes(),
@@ -1392,6 +2500,7 @@ mod tests {
                 timestamp: runtime.tip_header().timestamp + 40 + i as u64,
                 target: runtime.expected_target_for_next_block().expect("target"),
                 transactions: vec![coinbase(
+                    runtime.tip_height() + 1,
                     config.block_subsidy,
                     reward,
                     format!("lwma-window-{i}").as_bytes(),
@@ -1437,7 +2546,7 @@ mod tests {
     }
 
     #[test]
-    fn expected_target_windowed_boundary_uses_subtractive_window_start() {
+    fn expected_target_windowed_boundary_measures_from_previous_window_last_block() {
         let mut config: scam_core::ChainConfig =
             toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
         config.difficulty_algorithm = scam_core::DifficultyAlgorithm::Windowed;
@@ -1452,6 +2561,7 @@ mod tests {
                 timestamp: runtime.tip_header().timestamp + 20 + i as u64,
                 target: runtime.expected_target_for_next_block().expect("target"),
                 transactions: vec![coinbase(
+                    runtime.tip_height() + 1,
                     config.block_subsidy,
                     reward,
                     format!("window-start-{i}").as_bytes(),
@@ -1464,6 +2574,7 @@ mod tests {
 
         let tip_hash = runtime.tip_hash();
         let h2 = runtime.block_hash_at_height(2).expect("h2 hash");
+        let h3 = runtime.block_hash_at_height(3).expect("h3 hash");
         let h4 = runtime.block_hash_at_height(4).expect("h4 hash");
         let target_override = scam_core::Target::from_hex(
             "00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
@@ -1481,11 +2592,14 @@ mod tests {
             .expect("tip header")
             .timestamp = 5_000;
         runtime.headers.get_mut(&h2).expect("h2 header").timestamp = 4_500;
+        runtime.headers.get_mut(&h3).expect("h3 header").timestamp = 4_700;
         runtime.headers.get_mut(&h4).expect("h4 header").timestamp = 4_900;
 
+        // Next height 8 closes window [4..=7]; the span is measured from
+        // h3 (last block of the previous window), i.e. 4 full intervals.
         let expected = retarget_next(
             target_override,
-            5_000u64.saturating_sub(4_900),
+            5_000u64.saturating_sub(4_700),
             4 * config.target_block_time_sec,
             config.difficulty_clamp_down,
             config.difficulty_clamp_up,
@@ -1511,7 +2625,12 @@ mod tests {
             prev_block: runtime.tip_hash(),
             timestamp: runtime.tip_header().timestamp + 30,
             target: runtime.expected_target_for_next_block().expect("target"),
-            transactions: vec![coinbase(config.block_subsidy, reward, b"submit-extend")],
+            transactions: vec![coinbase(
+                runtime.tip_height() + 1,
+                config.block_subsidy,
+                reward,
+                b"submit-extend",
+            )],
         };
         let block = mine_block(&template, 200_000).expect("mine");
         let submitted_hash = block.header.block_hash();
@@ -1540,6 +2659,7 @@ mod tests {
             timestamp: runtime.tip_header().timestamp + 30,
             target: runtime.expected_target_for_next_block().expect("target"),
             transactions: vec![coinbase(
+                runtime.tip_height() + 1,
                 config.block_subsidy,
                 config.genesis_reward_key_hash20().expect("key"),
                 b"restore-1",

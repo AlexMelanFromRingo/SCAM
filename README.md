@@ -57,12 +57,15 @@ This README is written as an operator+developer manual: what the protocol does, 
 - Headers-first sync + block download/apply.
 - Peer book persistence (`redb`) + DNS seed ingestion.
 - Outbound diversity and rotation for eclipse-risk reduction.
-- Long-lived relay runtime (`relay-serve`) with per-peer replacement-rate controls.
+- The node process (`serve`): P2P relay with per-peer replacement-rate
+  controls, plus in-process RPC/web console and stratum pool on one chain
+  and mempool; it owns its data directory (stores opened once, locked).
 
 ### Stratum / SV2 subset
 - Binary framing + typed message state machine.
-- Pool endpoint (`stratum-serve`) + worker client (`stratum-mine`).
-- `stratum-serve` uses async tokio socket I/O with bounded concurrent sessions.
+- Pool endpoint (`serve --stratum`, or standalone `stratum-serve`) + worker
+  client (`stratum-mine`).
+- The pool uses async tokio socket I/O with bounded concurrent sessions.
 - Role split services:
   - `sv2-template-provider`
   - `sv2-job-declarator`
@@ -385,36 +388,56 @@ cargo run -p scam-node -- sync-book \
   --runtime-db data/devnet.runtime.redb
 ```
 
-### 6.5 Long-lived relay runtime
+### 6.5 The node process (`serve`)
+
+A node is one process: the P2P relay plus, optionally, the RPC/web console
+and the stratum pool, all on the same in-memory chain and mempool. The
+process owns its data directory — every store is opened once and locked —
+so a second process on the same files (another `serve`, `relay-serve`,
+`rpc-serve`, `stratum-serve`, or a CLI tool that writes the stores) is
+refused with "database ... is held by another running process". Talk to a
+running node through its RPC instead.
 
 ```bash
-cargo run -p scam-node -- relay-serve \
+cargo run -p scam-node -- serve \
   --network devnet \
   --config config/devnet.toml \
   --runtime-db data/devnet.runtime.redb \
+  --peers-dir data/peers \
   --bind 0.0.0.0:18444 \
-  --telemetry-out data/relay.telemetry.jsonl
+  --outbound-connect \
+  --telemetry-out data/relay.telemetry.jsonl \
+  --rpc "--bind 127.0.0.1:18080 --ui-dir web" \
+  --stratum "--bind 127.0.0.1:3347"
 ```
+
+`--rpc` and `--stratum` take the options of `rpc-serve` / `stratum-serve` as
+one string (quote values with spaces: `--ui-dir 'my web'`); network, config
+and runtime DB are always the node's. A failing service stops the node.
+
+`relay-serve`, `rpc-serve` and `stratum-serve` still exist for a process that
+is alone on its data directory: a relay without services, an explorer over
+a stopped node's data, or a test pool (as the SV2 conformance matrix uses).
 
 ### 6.6 RPC + Web Console (Explorer + Wallet UI)
 
-Start RPC against persisted runtime state and serve web UI assets:
-
-```bash
-cargo run -p scam-node -- rpc-serve \
-  --network devnet \
-  --config config/devnet.toml \
-  --runtime-db data/devnet.runtime.redb \
-  --bind 127.0.0.1:18080 \
-  --ui-dir web \
-  --relay-telemetry data/relay.telemetry.jsonl
-```
-
-Then open:
+Run it inside the node (`serve --rpc "..."`, above). Then open:
 
 ```text
 http://127.0.0.1:18080/
 ```
+
+RPC security model:
+- Every state-changing request must be `POST` with `Content-Type: application/json`
+  (blocks cross-site form posts); a browser `Origin` must be loopback.
+- The `Host` header must be loopback (DNS-rebinding protection), so expose the
+  RPC beyond the host only through a reverse proxy that you control.
+- Binding to a non-loopback address requires a bearer token:
+  `--auth-token-file <file>` (or `SCAM_RPC_AUTH_TOKEN`); clients then send
+  `Authorization: Bearer <token>` on every `POST`.
+- `--disable-wallet-rpc` turns off the routes that accept a mnemonic
+  (`/wallet/new|address|balance|send-preview|send`). Use it for any shared,
+  proxied or public deployment.
 
 RPC endpoints used by the console:
 - GET: `/health`, `/status`, `/block/<height>`, `/tx/<height>/<index>`, `/mempool`, `/events` (SSE snapshots)
@@ -488,21 +511,24 @@ cargo run -p scam-node -- wallet balance-address \
   --address <address>
 ```
 
-Send:
+Send (`--fee` is optional; without it the minimum relay fee for the
+transaction size is paid). Secrets can be passed via `SCAM_WALLET_MNEMONIC`,
+`SCAM_WALLET_PASSPHRASE` and `SCAM_WALLET_PASSWORD` instead of arguments, which
+are visible to other users in `ps`:
 
 ```bash
-cargo run -p scam-node -- wallet send \
+SCAM_WALLET_MNEMONIC="<words>" cargo run -p scam-node -- wallet send \
   --network devnet \
   --config config/devnet.toml \
-  --mnemonic "<words>" \
   --to <address> \
-  --amount 1000 \
-  --fee 1
+  --amount 1000
 ```
 
 ### 7.2 Encrypted wallet vault (recommended)
 
-Create secure vault:
+Create secure vault (refuses to overwrite an existing file; pass `--force` to
+replace it — the old wallet is then gone unless its mnemonic is backed up).
+The vault is written with owner-only permissions on Unix:
 
 ```bash
 cargo run -p scam-node -- wallet secure-new \
@@ -545,13 +571,10 @@ cargo run -p scam-node -- wallet qr --address <address> --amount 12345 --label "
 
 ### 8.1 Local pool server
 
-```bash
-cargo run -p scam-node -- stratum-serve \
-  --network devnet \
-  --config config/devnet.toml \
-  --runtime-db data/devnet.runtime.redb \
-  --bind 127.0.0.1:3347
-```
+Run the pool inside the node so it builds templates from the node's mempool
+and its blocks reach peers at once (`serve --stratum "--bind 127.0.0.1:3347
+--pool-payout-mode solo"`, see 6.5). Payout secrets come from the
+environment (`SCAM_POOL_PAYOUT_MNEMONIC`, `SCAM_POOL_PAYOUT_PASSPHRASE`).
 
 ### 8.2 Worker
 
@@ -572,16 +595,15 @@ cargo run -p scam-node -- sv2-job-declarator --bind 127.0.0.1:3551
 cargo run -p scam-node -- sv2-translator --bind 127.0.0.1:3552
 ```
 
-Wire pool to external roles:
+Wire the node's pool to external roles:
 
 ```bash
-cargo run -p scam-node -- stratum-serve \
+cargo run -p scam-node -- serve \
   --network devnet \
   --config config/devnet.toml \
   --runtime-db data/devnet.runtime.redb \
-  --bind 127.0.0.1:3347 \
-  --template-provider-addr 127.0.0.1:3550 \
-  --job-declarator-addr 127.0.0.1:3551
+  --bind 0.0.0.0:18444 \
+  --stratum "--bind 127.0.0.1:3347 --template-provider-addr 127.0.0.1:3550 --job-declarator-addr 127.0.0.1:3551"
 ```
 
 ---
@@ -608,14 +630,13 @@ cargo run -p scam-node -- stratum-key-rotate \
 ### 9.3 `noise_xx` secure server
 
 ```bash
-cargo run -p scam-node -- stratum-serve \
+export SCAM_STRATUM_STATIC_SECRET_KEY_HEX=<server_secret_hex32>
+cargo run -p scam-node -- serve \
   --network devnet \
   --config config/devnet.toml \
   --runtime-db data/devnet.runtime.redb \
-  --bind 127.0.0.1:3347 \
-  --secure-transport \
-  --secure-transport-mode noise-xx \
-  --secure-static-secret-key-hex <server_secret_hex32>
+  --bind 0.0.0.0:18444 \
+  --stratum "--bind 127.0.0.1:3347 --secure-transport --secure-transport-mode noise-xx"
 ```
 
 ### 9.4 `noise_xx` secure worker

@@ -80,10 +80,22 @@ pub fn lwma_next(
     let mut weighted_solvetime_sum = 0u128;
     let mut weighted_target_sum = BigUint::zero();
 
+    // Out-of-sequence timestamps are treated as `previous + 1` and the
+    // running "previous" never moves backwards (zawy LWMA-1 handling).
+    // Using raw pairwise deltas with a 1-second floor let a miner
+    // alternate future/past stamps — `+6T` then `≈0` — and record
+    // `6T + 1` for two blocks that took `2T`, ratcheting difficulty down.
+    let mut previous_timestamp = recent_timestamps[0];
     for i in 1..=n {
-        let solve_time = recent_timestamps[i]
-            .saturating_sub(recent_timestamps[i - 1])
+        let this_timestamp = if recent_timestamps[i] > previous_timestamp {
+            recent_timestamps[i]
+        } else {
+            previous_timestamp.saturating_add(1)
+        };
+        let solve_time = this_timestamp
+            .saturating_sub(previous_timestamp)
             .clamp(1, max_solve_time);
+        previous_timestamp = this_timestamp;
         let weight = i as u128;
         weighted_solvetime_sum = weighted_solvetime_sum
             .checked_add((solve_time as u128).saturating_mul(weight))
@@ -124,35 +136,39 @@ pub fn asert_next(
         ));
     }
 
+    // Integer-only fixed-point evaluation (BCH aserti3-2d). Consensus math
+    // must not use `f64::powf`: libm implementations differ across
+    // platforms, so nodes could disagree on the next target.
     let delta = (observed_solvetime_sec as i128) - (target_block_time_sec as i128);
-    let exponent = (delta as f64) / (half_life_sec as f64);
-    let int_part = exponent.floor() as i64;
-    let frac_part = exponent - (int_part as f64);
-    let frac_multiplier = 2f64.powf(frac_part);
-    let frac_scale = 1_000_000_000u64;
-    let frac_scaled = (frac_multiplier * frac_scale as f64).round().max(1.0) as u64;
+    let exponent = (delta * 65_536).div_euclid(half_life_sec as i128);
+    let shifts = exponent >> 16;
+    let frac = (exponent & 0xffff) as u128;
+    // 2^(frac/65536) * 65536, approximated by a cubic with < 0.013% error.
+    let factor = 65_536u128
+        + ((195_766_423_245_049u128 * frac
+            + 971_821_376u128 * frac * frac
+            + 5_127u128 * frac * frac * frac
+            + (1u128 << 47))
+            >> 48);
 
-    let mut base = target_to_biguint(previous_target);
-    if int_part >= 0 {
-        base <<= int_part as usize;
+    let max = target_to_biguint(max_target);
+    let mut next = target_to_biguint(previous_target) * BigUint::from(factor);
+    // Net shift is `shifts - 16`; saturate early so an absurd solvetime
+    // cannot make us allocate a huge integer.
+    let net_shift = shifts - 16;
+    if net_shift >= 256 {
+        next = max.clone();
+    } else if net_shift >= 0 {
+        next <<= net_shift as usize;
+    } else if net_shift <= -(256 + 64) {
+        next = BigUint::zero();
     } else {
-        let shift = (-int_part) as usize;
-        if shift >= 256 {
-            base = BigUint::one();
-        } else {
-            base >>= shift;
-            if base.is_zero() {
-                base = BigUint::one();
-            }
-        }
+        next >>= (-net_shift) as usize;
     }
-
-    let mut next = (base * BigUint::from(frac_scaled)) / BigUint::from(frac_scale);
     if next.is_zero() {
         next = BigUint::one();
     }
 
-    let max = target_to_biguint(max_target);
     next = next.min(max);
 
     biguint_to_target(&next)
@@ -190,6 +206,8 @@ pub enum DifficultyError {
 
 #[cfg(test)]
 mod tests {
+    use num_bigint::BigUint;
+    use num_traits::ToPrimitive;
     use scam_core::Target;
 
     use crate::difficulty::{asert_next, chainwork_for_target, lwma_next, retarget_next};
@@ -544,6 +562,66 @@ mod tests {
         );
     }
 
+    /// Alternating future/past timestamps must not lower difficulty. With
+    /// raw pairwise deltas each `(+5T, back)` pair recorded `6T + 1`
+    /// seconds for `2T` of real time.
+    #[test]
+    fn lwma_resists_alternating_timestamp_manipulation() {
+        let t = 120u64;
+        let window = 30usize;
+        let target =
+            Target::from_hex("0000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+                .expect("target parse");
+        let targets = vec![target; window + 1];
+        let honest: Vec<u64> = (0..=window as u64).map(|i| 10_000 + i * t).collect();
+        let manipulated: Vec<u64> = honest
+            .iter()
+            .enumerate()
+            .map(|(i, ts)| if i % 2 == 1 { ts + 5 * t } else { *ts })
+            .collect();
+
+        let honest_next = lwma_next(&targets, &honest, t, Target::MAX).expect("honest");
+        let manipulated_next =
+            lwma_next(&targets, &manipulated, t, Target::MAX).expect("manipulated");
+        let honest_big = BigUint::from_bytes_be(&honest_next.0);
+        let manipulated_big = BigUint::from_bytes_be(&manipulated_next.0);
+        // Allow a small one-off gain from the first forward stamp, but not
+        // the ~3x ratchet the old code produced.
+        assert!(
+            manipulated_big * BigUint::from(4u32) <= honest_big * BigUint::from(5u32),
+            "manipulated target {manipulated_next} must stay within 25% of honest {honest_next}"
+        );
+    }
+
+    /// The integer approximation must track the exact `2^x` closely across
+    /// the whole fractional range (test-only use of `powf` as a reference).
+    #[test]
+    fn asert_integer_factor_tracks_exact_exponential() {
+        let base =
+            Target::from_hex("0000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+                .expect("target parse");
+        let base_f = BigUint::from_bytes_be(&base.0).to_f64().expect("f64");
+        for observed in (0u64..=7_200).step_by(37) {
+            let next = asert_next(base, observed, 120, 3_600, Target::MAX).expect("asert");
+            let got = BigUint::from_bytes_be(&next.0).to_f64().expect("f64");
+            let exact = base_f * 2f64.powf((observed as f64 - 120.0) / 3_600.0);
+            let rel = ((got - exact) / exact).abs();
+            assert!(rel < 2e-4, "observed={observed} rel_err={rel}");
+        }
+    }
+
+    #[test]
+    fn asert_huge_solvetime_saturates_without_huge_allocation() {
+        let base =
+            Target::from_hex("0000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+                .expect("target parse");
+        let next = asert_next(base, u64::MAX, 120, 1, Target::MAX).expect("asert");
+        assert_eq!(next, Target::MAX);
+    }
+
+    /// Vectors for the integer (aserti3-2d style) evaluation. They must be
+    /// bit-identical on every platform; regenerate only with a deliberate
+    /// consensus change.
     #[test]
     fn asert_matches_reference_vectors() {
         let max = Target::MAX;
@@ -561,14 +639,14 @@ mod tests {
         let v2 = asert_next(base, 240, 120, 3_600, max).expect("asert v2");
         assert_eq!(
             v2,
-            Target::from_hex("0105fbd4d5b861637ad73f4a206832f7d79b0f9902ce6f16ecb4266b57449309")
+            Target::from_hex("0105fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe")
                 .expect("target parse")
         );
 
         let v3 = asert_next(base, 60, 120, 3_600, max).expect("asert v3");
         assert_eq!(
             v3,
-            Target::from_hex("00fd0f413daf5a6d812f36f1a61778b9f276f7d07dfeaae2b99584d96583dfbe")
+            Target::from_hex("00fd107fffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
                 .expect("target parse")
         );
 
@@ -578,7 +656,7 @@ mod tests {
         let v4 = asert_next(harder, 7_200, 120, 600, max).expect("asert v4");
         assert_eq!(
             v4,
-            Target::from_hex("0dedc66d7bf32f50ea42176b70554169c686fc4cdbea90c6d0f91b2335d3d847")
+            Target::from_hex("0dee17fffffffffffffffffffffffffffffffffffffffffffffffffffffff211")
                 .expect("target parse")
         );
 

@@ -74,6 +74,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - name: Install libclang (minisketch-rs bindgen)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang libclang-dev
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:

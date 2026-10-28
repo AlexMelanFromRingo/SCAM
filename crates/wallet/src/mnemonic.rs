@@ -38,6 +38,12 @@ pub struct WalletMnemonic {
     phrase: String,
 }
 
+impl Drop for WalletMnemonic {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.phrase);
+    }
+}
+
 impl WalletMnemonic {
     pub fn parse(phrase: &str) -> Result<Self, MnemonicError> {
         let normalized = phrase.trim();

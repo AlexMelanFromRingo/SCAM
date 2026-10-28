@@ -51,9 +51,26 @@ pub struct Transaction {
     pub lock_time: u32,
 }
 
+/// Coinbase input script committing to `height` (BIP34-style): the height
+/// as 8 little-endian bytes, then free-form `tag` bytes.
+pub fn coinbase_script(height: u64, tag: &[u8]) -> Vec<u8> {
+    let mut script = height.to_le_bytes().to_vec();
+    script.extend_from_slice(tag);
+    script
+}
+
 impl Transaction {
     pub fn is_coinbase(&self) -> bool {
         self.inputs.len() == 1 && self.inputs[0].prev_out.is_coinbase()
+    }
+
+    /// Consensus rule from height 1 on (genesis is exempt): the coinbase
+    /// script starts with the block height as 8 little-endian bytes. Fixed
+    /// width leaves no encoding ambiguity, and it makes every coinbase txid
+    /// unique, so no coinbase can duplicate an earlier one (BIP34).
+    pub fn coinbase_commits_to_height(&self, height: u64) -> bool {
+        height == 0
+            || (self.is_coinbase() && self.inputs[0].signature.starts_with(&height.to_le_bytes()))
     }
 
     pub fn txid(&self) -> Hash256 {

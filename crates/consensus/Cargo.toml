@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+bincode.workspace = true
 num-bigint.workspace = true
 num-traits.workspace = true
 scam-core = { path = "../core" }
