@@ -10,6 +10,7 @@ use scam_consensus::{
 };
 use scam_core::{
     Block, BlockHeader, ChainConfig, DifficultyAlgorithm, Hash256, Target, block_meets_pow,
+    header_meets_pow,
 };
 use thiserror::Error;
 
@@ -21,6 +22,57 @@ const MAX_FUTURE_BLOCK_TIME_SEC: u64 = 2 * 60 * 60;
 /// side-branch storage and undo records; a deeper reorg requires an
 /// operator to resync from a trusted peer.
 pub const MAX_REORG_DEPTH: u64 = 720;
+/// A deep branch may be this many times longer than the active chain
+/// above the fork (plus `DEEP_BRANCH_LENGTH_SLACK`) before a probe gives up.
+const DEEP_BRANCH_LENGTH_FACTOR: u64 = 4;
+const DEEP_BRANCH_LENGTH_SLACK: u64 = 10_000;
+
+/// Headers of a branch that forks below the reorg window, checked and summed
+/// without storing the branch: a sliding window of headers (for difficulty
+/// and median-time-past) and one hash per header. It proves the branch
+/// carries more work than the active chain before any of its blocks is
+/// downloaded or stored, so a long cheap branch from an old, low-difficulty
+/// fork costs a node no more than its hashes.
+#[derive(Clone, Debug)]
+pub struct DeepBranchProbe {
+    fork_hash: Hash256,
+    fork_height: u64,
+    tip_hash: Hash256,
+    tip_height: u64,
+    work: BigUint,
+    hashes: Vec<Hash256>,
+    window: HashMap<Hash256, (BlockHeader, u64)>,
+    window_order: std::collections::VecDeque<Hash256>,
+    max_len: u64,
+}
+
+impl DeepBranchProbe {
+    pub fn fork_hash(&self) -> Hash256 {
+        self.fork_hash
+    }
+
+    pub fn fork_height(&self) -> u64 {
+        self.fork_height
+    }
+
+    pub fn tip_hash(&self) -> Hash256 {
+        self.tip_hash
+    }
+
+    pub fn tip_height(&self) -> u64 {
+        self.tip_height
+    }
+
+    /// Cumulative work of the branch tip (including the shared prefix).
+    pub fn work(&self) -> &BigUint {
+        &self.work
+    }
+
+    /// Branch block hashes above the fork, oldest first.
+    pub fn hashes(&self) -> &[Hash256] {
+        &self.hashes
+    }
+}
 /// Prune side branches / undo data every this many tip changes.
 const PRUNE_INTERVAL_BLOCKS: u64 = 64;
 
@@ -168,6 +220,205 @@ impl ChainRuntime {
             invalid_blocks: HashSet::new(),
             max_reorg_depth: MAX_REORG_DEPTH,
             tip_changes: 0,
+        })
+    }
+
+    /// Reorgs up to `depth` blocks use undo data; deeper branches are
+    /// adopted through a `DeepBranchProbe` (default `MAX_REORG_DEPTH`).
+    pub fn with_max_reorg_depth(mut self, depth: u64) -> Self {
+        self.max_reorg_depth = depth.max(1);
+        self
+    }
+
+    /// Whether `parent` is a main-chain block too deep for an undo reorg: a
+    /// branch from it is adopted only through a `DeepBranchProbe`.
+    pub fn is_deep_fork_point(&self, parent: &Hash256) -> bool {
+        self.height_of(parent).is_some_and(|height| {
+            self.is_on_main_chain(parent, height)
+                && height
+                    .saturating_add(1)
+                    .saturating_add(self.max_reorg_depth)
+                    <= self.tip_height()
+        })
+    }
+
+    pub fn begin_deep_branch_probe(
+        &self,
+        fork_hash: Hash256,
+    ) -> Result<DeepBranchProbe, ChainError> {
+        if !self.is_deep_fork_point(&fork_hash) {
+            return Err(ChainError::DeepBranch {
+                reason: format!("{fork_hash} is not a main-chain block below the reorg window"),
+            });
+        }
+        let fork_height = self
+            .height_of(&fork_hash)
+            .ok_or(ChainError::MissingHeader {
+                block_hash: fork_hash,
+            })?;
+        let work = self
+            .cumulative_work
+            .get(&fork_hash)
+            .ok_or(ChainError::MissingHeader {
+                block_hash: fork_hash,
+            })?
+            .clone();
+        let active_len = self.tip_height() - fork_height;
+        Ok(DeepBranchProbe {
+            fork_hash,
+            fork_height,
+            tip_hash: fork_hash,
+            tip_height: fork_height,
+            work,
+            hashes: Vec::new(),
+            window: HashMap::new(),
+            window_order: std::collections::VecDeque::new(),
+            max_len: active_len
+                .saturating_mul(DEEP_BRANCH_LENGTH_FACTOR)
+                .saturating_add(DEEP_BRANCH_LENGTH_SLACK),
+        })
+    }
+
+    /// Check the next contiguous headers of the probed branch with the
+    /// consensus header rules (link, proof of work, the branch's expected
+    /// target, median-time-past, future limit) and add their work.
+    pub fn extend_deep_branch_probe(
+        &self,
+        probe: &mut DeepBranchProbe,
+        headers: &[BlockHeader],
+        now_unix_sec: u64,
+    ) -> Result<(), ChainError> {
+        let keep = (self.config.difficulty_adjustment_window as usize + 2)
+            .max(MEDIAN_TIME_PAST_WINDOW + 1);
+        for header in headers {
+            if header.prev_block != probe.tip_hash {
+                return Err(ChainError::DeepBranch {
+                    reason: "headers do not extend the probed branch".to_owned(),
+                });
+            }
+            if probe.hashes.len() as u64 >= probe.max_len {
+                return Err(ChainError::DeepBranch {
+                    reason: format!("branch longer than {} blocks", probe.max_len),
+                });
+            }
+            let hash = header.block_hash();
+            if self.invalid_blocks.contains(&hash) {
+                return Err(ChainError::KnownInvalid { block_hash: hash });
+            }
+            if !header_meets_pow(header) {
+                return Err(ChainError::DeepBranch {
+                    reason: format!("header {hash} fails proof of work"),
+                });
+            }
+            let lookup = self.lookup(Some(&probe.window));
+            let expected = self.expected_target_in(&lookup, probe.tip_hash)?;
+            if header.target != expected {
+                return Err(ChainError::UnexpectedTarget {
+                    expected,
+                    got: header.target,
+                });
+            }
+            let median_time_past = median_time_past_in(&lookup, probe.tip_hash)?;
+            if header.timestamp <= median_time_past {
+                return Err(ChainError::TimestampTooOld {
+                    block_hash: hash,
+                    median_time_past,
+                    got: header.timestamp,
+                });
+            }
+            let max_allowed = now_unix_sec.saturating_add(MAX_FUTURE_BLOCK_TIME_SEC);
+            if header.timestamp > max_allowed {
+                return Err(ChainError::TimestampTooFarInFuture {
+                    block_hash: hash,
+                    got: header.timestamp,
+                    max_allowed,
+                });
+            }
+            let height = probe.tip_height + 1;
+            probe.window.insert(hash, (header.clone(), height));
+            probe.window_order.push_back(hash);
+            while probe.window_order.len() > keep {
+                if let Some(old) = probe.window_order.pop_front() {
+                    probe.window.remove(&old);
+                }
+            }
+            probe.work += chainwork_for_target(header.target);
+            probe.tip_hash = hash;
+            probe.tip_height = height;
+            probe.hashes.push(hash);
+        }
+        Ok(())
+    }
+
+    /// The heaviest valid chain wins at any depth: true once the probed
+    /// branch carries more work than the active chain.
+    pub fn deep_branch_outworks(&self, probe: &DeepBranchProbe) -> bool {
+        probe.work > *self.cumulative_work()
+    }
+
+    /// Switch to a probed branch that out-works the active chain: rebuild
+    /// the chain state from genesis along it, validating every block (the
+    /// undo data to disconnect this deep does not exist). On failure nothing
+    /// changes, and the branch from the first invalid block on is remembered
+    /// as invalid.
+    pub fn adopt_deep_branch(
+        &mut self,
+        probe: &DeepBranchProbe,
+        branch_blocks: Vec<Block>,
+    ) -> Result<BlockSubmissionOutcome, ChainError> {
+        if !self.deep_branch_outworks(probe) {
+            return Err(ChainError::DeepBranch {
+                reason: "branch does not carry more work than the active chain".to_owned(),
+            });
+        }
+        if !self.is_on_main_chain(&probe.fork_hash, probe.fork_height) {
+            return Err(ChainError::DeepBranch {
+                reason: "fork point left the active chain".to_owned(),
+            });
+        }
+        if branch_blocks.len() != probe.hashes.len()
+            || branch_blocks
+                .iter()
+                .zip(&probe.hashes)
+                .any(|(block, hash)| block.header.block_hash() != *hash)
+        {
+            return Err(ChainError::DeepBranch {
+                reason: "blocks do not match the probed headers".to_owned(),
+            });
+        }
+        let genesis_hash = self.main_chain[0];
+        let genesis = self
+            .blocks
+            .get(&genesis_hash)
+            .cloned()
+            .ok_or(ChainError::MissingBlock {
+                block_hash: genesis_hash,
+            })?;
+        let mut rebuilt = Self::new(self.config.clone(), genesis)?;
+        rebuilt.max_reorg_depth = self.max_reorg_depth;
+        for height in 1..=probe.fork_height as usize {
+            let hash = self.main_chain[height];
+            let block = self
+                .blocks
+                .get(&hash)
+                .cloned()
+                .ok_or(ChainError::MissingBlock { block_hash: hash })?;
+            rebuilt.apply_next_block_inner(block, false)?;
+        }
+        for (index, block) in branch_blocks.into_iter().enumerate() {
+            if let Err(err) = rebuilt.apply_next_block_inner(block, false) {
+                self.invalid_blocks
+                    .extend(probe.hashes[index..].iter().copied());
+                return Err(err);
+            }
+        }
+        rebuilt.invalid_blocks = std::mem::take(&mut self.invalid_blocks);
+        let old_tip = self.tip_hash();
+        *self = rebuilt;
+        Ok(BlockSubmissionOutcome::Reorged {
+            old_tip,
+            new_tip: self.tip_hash(),
+            new_height: self.tip_height(),
         })
     }
 
@@ -354,32 +605,17 @@ impl ChainRuntime {
     }
 
     fn median_time_past(&self, parent_hash: Hash256) -> Result<u64, ChainError> {
-        let mut timestamps = Vec::with_capacity(MEDIAN_TIME_PAST_WINDOW);
-        let mut cursor = Some(parent_hash);
+        median_time_past_in(&self.lookup(None), parent_hash)
+    }
 
-        for _ in 0..MEDIAN_TIME_PAST_WINDOW {
-            let Some(hash) = cursor else {
-                break;
-            };
-            let header = self
-                .headers
-                .get(&hash)
-                .ok_or(ChainError::MissingHeader { block_hash: hash })?;
-            timestamps.push(header.timestamp);
-
-            if header.prev_block == Hash256::ZERO {
-                break;
-            }
-            cursor = Some(header.prev_block);
+    fn lookup<'a>(
+        &'a self,
+        extra: Option<&'a HashMap<Hash256, (BlockHeader, u64)>>,
+    ) -> HeaderLookup<'a> {
+        HeaderLookup {
+            runtime: self,
+            extra,
         }
-
-        if timestamps.is_empty() {
-            return Err(ChainError::InvalidRuntime(
-                "cannot compute median-time-past without headers".to_owned(),
-            ));
-        }
-        timestamps.sort_unstable();
-        Ok(timestamps[timestamps.len() / 2])
     }
 
     fn validate_contextual_timestamps(
@@ -419,20 +655,27 @@ impl ChainRuntime {
     /// Difficulty a child of `parent_hash` must carry, evaluated on the
     /// parent's own branch (main chain or side branch).
     pub fn expected_target_for_child_of(&self, parent_hash: Hash256) -> Result<Target, ChainError> {
+        self.expected_target_in(&self.lookup(None), parent_hash)
+    }
+
+    fn expected_target_in(
+        &self,
+        lookup: &HeaderLookup<'_>,
+        parent_hash: Hash256,
+    ) -> Result<Target, ChainError> {
         let window = self.config.difficulty_adjustment_window as u64;
         if window == 0 {
             return Err(ChainError::InvalidRuntime(
                 "difficulty_adjustment_window must be > 0".to_owned(),
             ));
         }
-        let parent_height = self
-            .height_of(&parent_hash)
+        let parent_height = lookup
+            .height(&parent_hash)
             .ok_or(ChainError::MissingHeader {
                 block_hash: parent_hash,
             })?;
-        let parent = self
-            .headers
-            .get(&parent_hash)
+        let parent = lookup
+            .header(&parent_hash)
             .ok_or(ChainError::MissingHeader {
                 block_hash: parent_hash,
             })?;
@@ -451,13 +694,12 @@ impl ChainRuntime {
                 // and the next window's first block is never measured,
                 // which is the classic timewarp hole.
                 let start_height = next_height.saturating_sub(window + 1);
-                let start_hash = self.ancestor_hash(parent_hash, parent_height, start_height)?;
-                let start_header =
-                    self.headers
-                        .get(&start_hash)
-                        .ok_or(ChainError::MissingHeader {
-                            block_hash: start_hash,
-                        })?;
+                let start_hash = lookup.ancestor(parent_hash, parent_height, start_height)?;
+                let start_header = lookup
+                    .header(&start_hash)
+                    .ok_or(ChainError::MissingHeader {
+                        block_hash: start_hash,
+                    })?;
                 let intervals = (parent_height - start_height).max(1);
                 let actual_timespan = parent
                     .timestamp
@@ -484,9 +726,8 @@ impl ChainRuntime {
                 let mut timestamps = Vec::with_capacity(window as usize + 1);
                 let mut cursor = parent_hash;
                 for _ in 0..=window {
-                    let header = self
-                        .headers
-                        .get(&cursor)
+                    let header = lookup
+                        .header(&cursor)
                         .ok_or(ChainError::MissingHeader { block_hash: cursor })?;
                     targets.push(header.target);
                     timestamps.push(header.timestamp);
@@ -508,8 +749,8 @@ impl ChainRuntime {
                     return Ok(parent.target);
                 }
                 let grandparent =
-                    self.headers
-                        .get(&parent.prev_block)
+                    lookup
+                        .header(&parent.prev_block)
                         .ok_or(ChainError::MissingHeader {
                             block_hash: parent.prev_block,
                         })?;
@@ -527,29 +768,6 @@ impl ChainRuntime {
                 .map_err(ChainError::Difficulty)
             }
         }
-    }
-
-    /// Hash of the ancestor of `from` (at `from_height`) at `target_height`.
-    fn ancestor_hash(
-        &self,
-        from: Hash256,
-        from_height: u64,
-        target_height: u64,
-    ) -> Result<Hash256, ChainError> {
-        if self.is_on_main_chain(&from, from_height) {
-            return self
-                .block_hash_at_height(target_height)
-                .ok_or(ChainError::MissingHeader { block_hash: from });
-        }
-        let mut cursor = from;
-        for _ in target_height..from_height {
-            cursor = self
-                .headers
-                .get(&cursor)
-                .ok_or(ChainError::MissingHeader { block_hash: cursor })?
-                .prev_block;
-        }
-        Ok(cursor)
     }
 
     fn is_on_main_chain(&self, hash: &Hash256, height: u64) -> bool {
@@ -890,6 +1108,68 @@ impl ChainRuntime {
     }
 }
 
+/// Headers visible to a difficulty/MTP computation: the runtime's, plus —
+/// for a branch proven by headers alone — a window of headers it does not
+/// store.
+struct HeaderLookup<'a> {
+    runtime: &'a ChainRuntime,
+    extra: Option<&'a HashMap<Hash256, (BlockHeader, u64)>>,
+}
+
+impl HeaderLookup<'_> {
+    fn header(&self, hash: &Hash256) -> Option<&BlockHeader> {
+        self.extra
+            .and_then(|extra| extra.get(hash).map(|(header, _)| header))
+            .or_else(|| self.runtime.headers.get(hash))
+    }
+
+    fn height(&self, hash: &Hash256) -> Option<u64> {
+        self.extra
+            .and_then(|extra| extra.get(hash).map(|(_, height)| *height))
+            .or_else(|| self.runtime.height_of(hash))
+    }
+
+    fn ancestor(
+        &self,
+        from: Hash256,
+        from_height: u64,
+        target_height: u64,
+    ) -> Result<Hash256, ChainError> {
+        let in_extra = self.extra.is_some_and(|extra| extra.contains_key(&from));
+        if !in_extra && self.runtime.is_on_main_chain(&from, from_height) {
+            return self
+                .runtime
+                .block_hash_at_height(target_height)
+                .ok_or(ChainError::MissingHeader { block_hash: from });
+        }
+        let mut cursor = from;
+        for _ in target_height..from_height {
+            cursor = self
+                .header(&cursor)
+                .ok_or(ChainError::MissingHeader { block_hash: cursor })?
+                .prev_block;
+        }
+        Ok(cursor)
+    }
+}
+
+fn median_time_past_in(lookup: &HeaderLookup<'_>, parent_hash: Hash256) -> Result<u64, ChainError> {
+    let mut timestamps = Vec::with_capacity(MEDIAN_TIME_PAST_WINDOW);
+    let mut cursor = parent_hash;
+    for _ in 0..MEDIAN_TIME_PAST_WINDOW {
+        let header = lookup
+            .header(&cursor)
+            .ok_or(ChainError::MissingHeader { block_hash: cursor })?;
+        timestamps.push(header.timestamp);
+        if header.prev_block == Hash256::ZERO {
+            break;
+        }
+        cursor = header.prev_block;
+    }
+    timestamps.sort_unstable();
+    Ok(timestamps[timestamps.len() / 2])
+}
+
 fn current_unix_timestamp() -> Result<u64, ChainError> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -899,6 +1179,8 @@ fn current_unix_timestamp() -> Result<u64, ChainError> {
 
 #[derive(Debug, Error)]
 pub enum ChainError {
+    #[error("deep branch rejected: {reason}")]
+    DeepBranch { reason: String },
     #[error("chain config error: {0}")]
     Config(#[from] scam_core::ChainConfigError),
     #[error("tx/block validation error: {0}")]
@@ -1260,6 +1542,148 @@ mod tests {
 
     /// C12/C10: forks deeper than the reorg limit are refused, and stale
     /// side branches are pruned.
+    /// Mine `count` blocks on `parent` in `runtime` (a branch runtime that
+    /// stores them), returning them oldest first.
+    fn mine_branch(
+        runtime: &mut ChainRuntime,
+        count: u64,
+        ts: u64,
+        tag: &str,
+    ) -> Vec<scam_core::Block> {
+        let spacing = runtime.config().target_block_time_sec;
+        let mut out = Vec::new();
+        for i in 0..count {
+            let block = mine_on(
+                runtime,
+                runtime.tip_hash(),
+                ts + spacing * (i + 1),
+                &format!("{tag}{i}"),
+                vec![],
+            );
+            runtime
+                .apply_next_block(block.clone())
+                .expect("branch block");
+            out.push(block);
+        }
+        out
+    }
+
+    /// C21: a heavier branch forking below the reorg window is proven by its
+    /// headers, then adopted by rebuilding the state along it; a lighter one
+    /// is not; bad headers and invalid bodies are refused without changing
+    /// the active chain.
+    #[test]
+    fn deep_branch_is_adopted_only_when_heavier_and_valid() {
+        let config = devnet_config();
+        let mut active = ChainRuntime::from_config(config.clone()).expect("runtime");
+        active.max_reorg_depth = 2;
+        let genesis = active.tip_hash();
+        let ts = active.tip_header().timestamp;
+        mine_branch(&mut active, 4, ts, "a");
+        let mut other = ChainRuntime::from_config(config.clone()).expect("other");
+        let branch = mine_branch(&mut other, 6, ts + 7, "b");
+        let headers = branch.iter().map(|b| b.header.clone()).collect::<Vec<_>>();
+        let now = ts + 10_000;
+
+        // Too deep for an undo reorg.
+        let err = active.submit_block(branch[0].clone()).expect_err("deep");
+        assert!(matches!(err, ChainError::ForkTooDeep { .. }), "{err:?}");
+        assert!(active.is_deep_fork_point(&genesis));
+
+        // Headers prove more work.
+        let mut probe = active.begin_deep_branch_probe(genesis).expect("probe");
+        active
+            .extend_deep_branch_probe(&mut probe, &headers[..3], now)
+            .expect("first headers");
+        assert!(!active.deep_branch_outworks(&probe), "not heavier yet");
+        active
+            .extend_deep_branch_probe(&mut probe, &headers[3..], now)
+            .expect("rest");
+        assert!(active.deep_branch_outworks(&probe));
+        assert_eq!(probe.hashes().len(), 6);
+
+        // An invalid body (merkle mismatch) is refused; nothing changes and
+        // the branch is remembered as invalid from that block on.
+        let mut tampered = branch.clone();
+        tampered[4].transactions[0].outputs[0].value += 1;
+        let tip_before = active.tip_hash();
+        assert!(active.adopt_deep_branch(&probe, tampered.clone()).is_err());
+        assert_eq!(active.tip_hash(), tip_before);
+        // (the tampered block keeps its header hash, so it now is invalid)
+        assert!(active.is_known_invalid(&branch[4].header.block_hash()));
+        assert!(!active.is_known_invalid(&branch[3].header.block_hash()));
+
+        // A fresh active chain adopts the valid branch.
+        let mut active = ChainRuntime::from_config(config.clone()).expect("runtime");
+        active.max_reorg_depth = 2;
+        mine_branch(&mut active, 4, ts, "a");
+        let mut probe = active.begin_deep_branch_probe(genesis).expect("probe");
+        active
+            .extend_deep_branch_probe(&mut probe, &headers, now)
+            .expect("headers");
+        let outcome = active
+            .adopt_deep_branch(&probe, branch.clone())
+            .expect("adopt");
+        assert!(matches!(outcome, BlockSubmissionOutcome::Reorged { .. }));
+        assert_eq!(active.tip_hash(), other.tip_hash());
+        assert_eq!(active.utxo_set(), other.utxo_set());
+
+        // A lighter deep branch is never adopted.
+        let mut light_active = ChainRuntime::from_config(config.clone()).expect("runtime");
+        light_active.max_reorg_depth = 2;
+        mine_branch(&mut light_active, 8, ts, "a");
+        let mut probe = light_active
+            .begin_deep_branch_probe(genesis)
+            .expect("probe");
+        light_active
+            .extend_deep_branch_probe(&mut probe, &headers, now)
+            .expect("headers");
+        assert!(!light_active.deep_branch_outworks(&probe));
+        assert!(
+            light_active
+                .adopt_deep_branch(&probe, branch.clone())
+                .is_err()
+        );
+
+        // Header rules: linkage, target, future time.
+        let fresh = || {
+            let mut runtime = ChainRuntime::from_config(config.clone()).expect("runtime");
+            runtime.max_reorg_depth = 2;
+            mine_branch(&mut runtime, 4, ts, "a");
+            runtime
+        };
+        let runtime = fresh();
+        let mut probe = runtime.begin_deep_branch_probe(genesis).expect("probe");
+        assert!(
+            runtime
+                .extend_deep_branch_probe(&mut probe, &headers[1..], now)
+                .is_err(),
+            "gap"
+        );
+        let mut probe = runtime.begin_deep_branch_probe(genesis).expect("probe");
+        let mut wrong = headers[0].clone();
+        wrong.target =
+            scam_core::Target::from_hex(&format!("{}01", "00".repeat(31))).expect("target");
+        assert!(
+            runtime
+                .extend_deep_branch_probe(&mut probe, &[wrong], now)
+                .is_err(),
+            "target"
+        );
+        let mut probe = runtime.begin_deep_branch_probe(genesis).expect("probe");
+        let too_early_now = headers[0].timestamp - super::MAX_FUTURE_BLOCK_TIME_SEC - 1;
+        assert!(
+            runtime
+                .extend_deep_branch_probe(&mut probe, &headers[..1], too_early_now)
+                .is_err(),
+            "future"
+        );
+        assert!(
+            runtime.begin_deep_branch_probe(runtime.tip_hash()).is_err(),
+            "not deep"
+        );
+    }
+
     #[test]
     fn deep_forks_are_refused_and_stale_side_branches_pruned() {
         let config = devnet_config();

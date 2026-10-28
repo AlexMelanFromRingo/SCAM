@@ -2750,6 +2750,7 @@ fn run_status(args: StatusArgs) -> Result<(), NodeError> {
         stratum_active_clients: None,
         stratum_workers_active: None,
         stratum_pool_hashrate_hps: None,
+        deep_fork: None,
     };
 
     if args.json {
@@ -6149,6 +6150,7 @@ struct RelayServerState {
     /// on `relay_flush_pending_peer_book_updates`.
     addr_table: AddrTable,
     addr_sample_nonce: u64,
+    deep_fork: Option<RelayDeepFork>,
     outbound_worker_starts_total: u64,
     outbound_supervisor_starts_total: u64,
 }
@@ -6180,6 +6182,7 @@ impl RelayServerState {
             // Replaced by the persisted table (and its secret) on startup.
             addr_table: AddrTable::new(rand::random()),
             addr_sample_nonce: 0,
+            deep_fork: None,
             outbound_worker_starts_total: 0,
             outbound_supervisor_starts_total: 0,
         }
@@ -6290,6 +6293,10 @@ struct RelayServerTelemetrySnapshot {
     orphan_expired_total: u64,
     orphan_promoted_total: u64,
     gossip_replacement_rate_limited_total: u64,
+    /// A branch forking below the reorg window that is being proven or
+    /// fetched (operators: see the deep-fork runbook section).
+    #[serde(default)]
+    deep_fork: Option<RelayDeepForkStatus>,
 }
 
 const STRATUM_HASHRATE_WINDOW_SEC: u64 = 120;
@@ -8205,6 +8212,7 @@ fn relay_server_snapshot(
         orphan_expired_total: orphan.expired_total,
         orphan_promoted_total: orphan.promoted_total,
         gossip_replacement_rate_limited_total: gossip.replacement_rate_limited_total,
+        deep_fork: relay_deep_fork_status(state),
     }
 }
 
@@ -8487,6 +8495,229 @@ fn relay_try_build_block_from_compact(
             .filter_map(Clone::clone)
             .collect::<Vec<_>>(),
     })
+}
+
+/// Blocks of a proven deep branch requested per round trip.
+const RELAY_DEEP_FORK_BLOCK_BATCH: usize = 64;
+/// A deep-fork probe that makes no progress for this long is dropped.
+const RELAY_DEEP_FORK_STALL_SEC: u64 = 180;
+
+/// A branch forking below the reorg window, being proven by its headers
+/// and then fetched from one peer (one at a time). The heaviest valid chain
+/// wins at any depth, but a branch's blocks are fetched only after its
+/// headers prove it carries more work than the active chain.
+struct RelayDeepFork {
+    peer_id: u64,
+    probe: scam_chain::DeepBranchProbe,
+    /// `Some` once the branch out-works the active chain: blocks received.
+    blocks: Option<HashMap<Hash256, scam_core::Block>>,
+    requested: usize,
+    last_progress_unix_sec: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+struct RelayDeepForkStatus {
+    peer_id: u64,
+    fork_height: u64,
+    branch_tip_height: u64,
+    /// "proving-headers" or "fetching-blocks".
+    stage: String,
+    blocks_received: usize,
+}
+
+fn relay_deep_fork_status(state: &RelayServerState) -> Option<RelayDeepForkStatus> {
+    state.deep_fork.as_ref().map(|fork| RelayDeepForkStatus {
+        peer_id: fork.peer_id,
+        fork_height: fork.probe.fork_height(),
+        branch_tip_height: fork.probe.tip_height(),
+        stage: if fork.blocks.is_some() {
+            "fetching-blocks"
+        } else {
+            "proving-headers"
+        }
+        .to_owned(),
+        blocks_received: fork.blocks.as_ref().map_or(0, HashMap::len),
+    })
+}
+
+fn relay_drop_stalled_deep_fork(state: &mut RelayServerState, now_unix_sec: u64) {
+    if state.deep_fork.as_ref().is_some_and(|fork| {
+        now_unix_sec.saturating_sub(fork.last_progress_unix_sec) > RELAY_DEEP_FORK_STALL_SEC
+    }) {
+        eprintln!("warning: deep fork: probe stalled; dropped");
+        state.deep_fork = None;
+    }
+}
+
+fn relay_forget_deep_fork_peer(state: &mut RelayServerState, peer_id: u64) {
+    if state
+        .deep_fork
+        .as_ref()
+        .is_some_and(|fork| fork.peer_id == peer_id)
+    {
+        eprintln!("warning: deep fork: peer {peer_id} disconnected; probe dropped");
+        state.deep_fork = None;
+    }
+}
+
+/// Next GetData of the deep branch's blocks, oldest first.
+fn relay_deep_fork_next_batch(fork: &mut RelayDeepFork) -> Option<WireMessage> {
+    let hashes = fork.probe.hashes();
+    if fork.requested >= hashes.len() {
+        return None;
+    }
+    let end = (fork.requested + RELAY_DEEP_FORK_BLOCK_BATCH).min(hashes.len());
+    let items = hashes[fork.requested..end]
+        .iter()
+        .map(|hash| InventoryItem::Block(*hash))
+        .collect();
+    fork.requested = end;
+    Some(WireMessage::GetData { items })
+}
+
+/// Headers whose first parent is a main-chain block below the reorg window
+/// (or that continue the branch being proven) feed the deep-fork probe
+/// instead of the normal path, which can only refuse them (`ForkTooDeep`).
+/// `None`: not deep-fork headers.
+fn relay_deep_fork_on_headers(
+    state: &mut RelayServerState,
+    peer_id: u64,
+    headers: &[scam_core::BlockHeader],
+    now_unix_sec: u64,
+) -> Result<Option<Vec<WireMessage>>, NodeError> {
+    let Some(first) = headers.first() else {
+        return Ok(None);
+    };
+    relay_drop_stalled_deep_fork(state, now_unix_sec);
+    let continues = state.deep_fork.as_ref().is_some_and(|fork| {
+        fork.peer_id == peer_id
+            && fork.blocks.is_none()
+            && fork.probe.tip_hash() == first.prev_block
+    });
+    if !continues {
+        if !state.runtime.is_deep_fork_point(&first.prev_block) {
+            return Ok(None);
+        }
+        if state.deep_fork.is_some() {
+            // One deep branch at a time; this peer can retry later.
+            return Ok(Some(Vec::new()));
+        }
+        let probe = state.runtime.begin_deep_branch_probe(first.prev_block)?;
+        eprintln!(
+            "warning: deep fork: peer {peer_id} announces a branch from height {} (below the {}-block reorg window); proving its work by headers",
+            probe.fork_height(),
+            scam_chain::MAX_REORG_DEPTH
+        );
+        state.deep_fork = Some(RelayDeepFork {
+            peer_id,
+            probe,
+            blocks: None,
+            requested: 0,
+            last_progress_unix_sec: now_unix_sec,
+        });
+    }
+    let Some(fork) = state.deep_fork.as_mut() else {
+        return Ok(Some(Vec::new()));
+    };
+    if let Err(err) = state
+        .runtime
+        .extend_deep_branch_probe(&mut fork.probe, headers, now_unix_sec)
+    {
+        state.deep_fork = None;
+        return Err(relay_protocol_violation(
+            state,
+            peer_id,
+            now_unix_sec,
+            format!("invalid deep-branch headers: {err}"),
+        ));
+    }
+    fork.last_progress_unix_sec = now_unix_sec;
+    if state.runtime.deep_branch_outworks(&fork.probe) {
+        eprintln!(
+            "warning: deep fork: branch from height {} to {} carries more work than the active chain (tip {}); fetching {} blocks to switch",
+            fork.probe.fork_height(),
+            fork.probe.tip_height(),
+            state.runtime.tip_height(),
+            fork.probe.hashes().len()
+        );
+        fork.blocks = Some(HashMap::new());
+        return Ok(Some(relay_deep_fork_next_batch(fork).into_iter().collect()));
+    }
+    if headers.len() >= RELAY_MAX_HEADERS_PER_ANNOUNCEMENT {
+        // The peer has more: keep proving from the branch tip.
+        return Ok(Some(vec![WireMessage::GetHeaders {
+            locator: vec![fork.probe.tip_hash()],
+            stop: None,
+        }]));
+    }
+    eprintln!(
+        "warning: deep fork: branch from height {} ends at {} without out-working the active chain; ignored",
+        fork.probe.fork_height(),
+        fork.probe.tip_height()
+    );
+    state.deep_fork = None;
+    Ok(Some(Vec::new()))
+}
+
+/// A block of the deep branch being fetched: staged until all are here,
+/// then the node switches by rebuilding its state along the branch.
+/// `None`: not a deep-branch block.
+fn relay_deep_fork_on_block(
+    state: &mut RelayServerState,
+    peer_id: u64,
+    block: &scam_core::Block,
+    now_unix_sec: u64,
+) -> Result<Option<Vec<WireMessage>>, NodeError> {
+    let hash = block.header.block_hash();
+    let Some(fork) = state.deep_fork.as_mut() else {
+        return Ok(None);
+    };
+    let Some(staged) = fork.blocks.as_mut() else {
+        return Ok(None);
+    };
+    if fork.peer_id != peer_id || !fork.probe.hashes().contains(&hash) {
+        return Ok(None);
+    }
+    staged.insert(hash, block.clone());
+    fork.last_progress_unix_sec = now_unix_sec;
+    if staged.len() < fork.probe.hashes().len() {
+        if staged.len() == fork.requested {
+            return Ok(Some(relay_deep_fork_next_batch(fork).into_iter().collect()));
+        }
+        return Ok(Some(Vec::new()));
+    }
+    let Some(fork) = state.deep_fork.take() else {
+        return Ok(Some(Vec::new()));
+    };
+    let mut staged = fork.blocks.unwrap_or_default();
+    let blocks = fork
+        .probe
+        .hashes()
+        .iter()
+        .filter_map(|hash| staged.remove(hash))
+        .collect::<Vec<_>>();
+    let chain_before = state.runtime.block_hashes().to_vec();
+    let old_tip_height = state.runtime.tip_height();
+    match state.runtime.adopt_deep_branch(&fork.probe, blocks) {
+        Ok(_) => {
+            let chain_after = state.runtime.block_hashes().to_vec();
+            eprintln!(
+                "warning: DEEP REORG: switched to the heavier branch from height {}: {} blocks disconnected, new tip {} at height {}",
+                fork.probe.fork_height(),
+                old_tip_height.saturating_sub(fork.probe.fork_height()),
+                state.runtime.tip_hash(),
+                state.runtime.tip_height()
+            );
+            relay_apply_main_chain_transition(state, &chain_before, &chain_after, now_unix_sec);
+            Ok(Some(Vec::new()))
+        }
+        Err(err) => Err(relay_protocol_violation(
+            state,
+            peer_id,
+            now_unix_sec,
+            format!("deep branch failed validation: {err}"),
+        )),
+    }
 }
 
 /// Submit a block rebuilt from a compact announcement. A merkle mismatch
@@ -9423,6 +9654,9 @@ fn process_relay_wire_message_inner(
             Ok(vec![WireMessage::Inv { items }])
         }
         WireMessage::Headers { headers } => {
+            if let Some(out) = relay_deep_fork_on_headers(state, peer_id, &headers, now_unix_sec)? {
+                return Ok(out);
+            }
             let (missing, has_parent_gap) = relay_missing_blocks_from_headers(state, &headers)
                 .map_err(|err| {
                     relay_protocol_violation(
@@ -9765,6 +9999,9 @@ fn process_relay_wire_message_inner(
         }
         WireMessage::Block { block } => {
             relay_clear_inflight_block_request(state, block.header.block_hash());
+            if let Some(out) = relay_deep_fork_on_block(state, peer_id, &block, now_unix_sec)? {
+                return Ok(out);
+            }
             let tip_before = state.runtime.tip_height();
             let mut out = relay_submit_reconstructed_block(state, block, now_unix_sec)?;
             let tip_after = state.runtime.tip_height();
@@ -11842,6 +12079,7 @@ fn run_relay_peer_session<IO: Read + Write>(
         guard.relay.gossip.disconnect_peer(peer_id);
         guard.peer_compact_pref.remove(&peer_id);
         relay_forget_peer_tip_height(&mut guard, peer_id);
+        relay_forget_deep_fork_peer(&mut guard, peer_id);
     }
     if let Ok(mut active_guard) = active.lock() {
         *active_guard = active_guard.saturating_sub(1);
@@ -12168,6 +12406,7 @@ async fn run_relay_peer_session_async<S: AsyncRead + AsyncWrite + Unpin>(
         guard.relay.gossip.disconnect_peer(peer_id);
         guard.peer_compact_pref.remove(&peer_id);
         relay_forget_peer_tip_height(&mut guard, peer_id);
+        relay_forget_deep_fork_peer(&mut guard, peer_id);
     }
     if let Ok(mut active_guard) = active.lock() {
         *active_guard = active_guard.saturating_sub(1);
@@ -19386,6 +19625,20 @@ fn axum_status_payload(state: &AxumRpcState) -> Result<StatusResponse, NodeError
             },
             None => (None, None, None),
         };
+    let deep_fork = match &state.chain {
+        ChainHandle::Node(node) => {
+            let guard = node
+                .lock()
+                .map_err(|_| NodeError::Runtime("node state mutex poisoned".to_owned()))?;
+            relay_deep_fork_status(&guard).map(|status| scam_rpc::DeepForkStatusResponse {
+                fork_height: status.fork_height,
+                branch_tip_height: status.branch_tip_height,
+                stage: status.stage,
+                blocks_received: status.blocks_received,
+            })
+        }
+        ChainHandle::Own(_) => None,
+    };
     Ok(StatusResponse {
         network_id: state.cfg.network_id.clone(),
         tip_height,
@@ -19396,6 +19649,7 @@ fn axum_status_payload(state: &AxumRpcState) -> Result<StatusResponse, NodeError
         stratum_active_clients,
         stratum_workers_active,
         stratum_pool_hashrate_hps,
+        deep_fork,
     })
 }
 
@@ -22931,6 +23185,7 @@ mod tests {
             orphan_expired_total: 0,
             orphan_promoted_total: 0,
             gossip_replacement_rate_limited_total: 0,
+            deep_fork: None,
         };
         super::append_jsonl_record(&relay_telemetry, &blocked_snapshot, "test relay telemetry")
             .expect("write telemetry");
@@ -25891,6 +26146,97 @@ mod tests {
         let _ = fs::remove_dir_all(work_dir);
     }
 
+    /// C21: a peer's heavier branch forking below the reorg window is proven
+    /// by its headers, fetched, and adopted; the relay reports it while in
+    /// progress and the mempool follows the new chain.
+    #[test]
+    fn relay_adopts_a_heavier_deep_branch_from_a_peer() {
+        let cfg: ChainConfig =
+            toml::from_str(include_str!("../../../config/devnet.toml")).expect("config parse");
+        let mine = |runtime: &mut ChainRuntime, tag: &str| {
+            mine_block_with_transactions(runtime, 30, 500_000, [7u8; 20], tag.to_owned(), vec![])
+                .expect("mine");
+        };
+        let mut local = relay_state_for_tests();
+        local.runtime = ChainRuntime::from_config(cfg.clone())
+            .expect("runtime")
+            .with_max_reorg_depth(2);
+        for i in 0..4 {
+            mine(&mut local.runtime, &format!("a{i}"));
+        }
+        let mut peer_chain = ChainRuntime::from_config(cfg.clone()).expect("peer");
+        for i in 0..7 {
+            mine(&mut peer_chain, &format!("b{i}"));
+        }
+        let branch = (1..=peer_chain.tip_height())
+            .map(|h| {
+                peer_chain
+                    .block_by_hash(&peer_chain.block_hash_at_height(h).expect("hash"))
+                    .expect("block")
+                    .clone()
+            })
+            .collect::<Vec<_>>();
+        let now = super::current_unix_sec().expect("now");
+
+        let out = process_relay_wire_message(
+            &mut local,
+            9,
+            WireMessage::Headers {
+                headers: branch.iter().map(|b| b.header.clone()).collect(),
+            },
+            now,
+        )
+        .expect("headers");
+        let requested = out
+            .iter()
+            .find_map(|m| match m {
+                WireMessage::GetData { items } => Some(items.len()),
+                _ => None,
+            })
+            .expect("blocks requested once the branch out-works ours");
+        assert_eq!(requested, branch.len());
+        let status = super::relay_deep_fork_status(&local).expect("in progress");
+        assert_eq!(
+            (status.fork_height, status.stage.as_str()),
+            (0, "fetching-blocks")
+        );
+
+        for block in &branch {
+            process_relay_wire_message(
+                &mut local,
+                9,
+                WireMessage::Block {
+                    block: block.clone(),
+                },
+                now,
+            )
+            .expect("block");
+        }
+        assert_eq!(local.runtime.tip_hash(), peer_chain.tip_hash(), "switched");
+        assert!(super::relay_deep_fork_status(&local).is_none());
+
+        // Another peer's lighter deep branch is proven and ignored.
+        let mut light = ChainRuntime::from_config(cfg.clone()).expect("light");
+        mine(&mut light, "c0");
+        let light_header = light
+            .block_by_hash(&light.tip_hash())
+            .expect("block")
+            .header
+            .clone();
+        let out = process_relay_wire_message(
+            &mut local,
+            10,
+            WireMessage::Headers {
+                headers: vec![light_header],
+            },
+            now,
+        )
+        .expect("light headers");
+        assert!(out.is_empty());
+        assert!(super::relay_deep_fork_status(&local).is_none());
+        assert_eq!(local.runtime.tip_hash(), peer_chain.tip_hash());
+    }
+
     #[test]
     fn serve_service_options_split_like_a_shell_and_parse_as_their_commands() {
         assert_eq!(
@@ -27394,6 +27740,7 @@ mod tests {
             orphan_expired_total: 12,
             orphan_promoted_total: 13,
             gossip_replacement_rate_limited_total: 14,
+            deep_fork: None,
         };
         super::append_relay_telemetry_snapshot(&relay_path, &relay_snapshot).expect("relay append");
         assert!(relay_path.exists(), "relay telemetry file must exist");

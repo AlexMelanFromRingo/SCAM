@@ -104,6 +104,50 @@ cp data/devnet.runtime.redb data/devnet.runtime.redb.bak.$(date +%Y%m%d-%H%M%S)
 cargo run -p scam-node -- reindex-runtime --network devnet --config config/devnet.toml --runtime-db data/devnet.runtime.redb
 ```
 
+## 5.1) Deep Forks and Resynchronisation
+
+Fork choice is "the heaviest valid chain wins", at any depth:
+
+- A reorg of up to 720 blocks (`MAX_REORG_DEPTH`, about a day at 2-minute
+  blocks) disconnects blocks with stored undo data, as usual.
+- A branch that forks deeper (a node or a part of the network was cut off
+  for longer) is first proven by its headers alone: links, proof of work,
+  the branch's own difficulty, median-time-past and the future limit, while
+  its cumulative work is summed. Only one such branch is probed at a time,
+  and it may be at most 4× as long as the local chain above the fork (plus
+  10 000 blocks), so a long cheap branch from an old fork costs the node
+  nothing but hashes.
+- Once the headers show more work than the local chain, the node fetches
+  the branch's blocks and rebuilds its state from genesis along the new
+  chain, validating every block. This takes as long as a full sync and the
+  node does not serve requests meanwhile. If any block is invalid, the node
+  stays on its chain, marks the branch invalid and bans the peer.
+
+Signals:
+
+- Logs: `deep fork: peer … announces a branch from height …`, `deep fork:
+  branch … carries more work …; fetching N blocks`, and
+  `DEEP REORG: switched to the heavier branch from height … blocks
+  disconnected, new tip … at height …` (or `… ends … without out-working the
+  active chain; ignored`, `… probe stalled; dropped`).
+- `GET /status` gains `deep_fork: {fork_height, branch_tip_height, stage,
+  blocks_received}` while a branch is being proven (`proving-headers`) or
+  fetched (`fetching-blocks`); the relay telemetry snapshot carries the same.
+
+Manual resynchronisation (no peer on the heavier chain is reachable, or you
+want to force a fresh copy):
+
+1. Stop the node (`scripts/run-node-*.sh stop`, or stop `scam-node serve`).
+2. Move the runtime DB aside (`mv data/devnet.runtime.redb{,.bak}`); keep the
+   mempool and pool-ledger DBs and the peer book.
+3. Add peers known to follow the right chain:
+   `scam-node add-peer --network <net> --peers-dir <dir> --peer host:port`.
+4. Start the node with `--outbound-connect`; it syncs from genesis.
+
+To rebuild only the derived state (UTXO set, undo data) from the local block
+archive, stop the node and run `scam-node reindex-runtime --network <net>
+--runtime-db <path>`.
+
 ## 6) Durability and Soak
 
 ```bash

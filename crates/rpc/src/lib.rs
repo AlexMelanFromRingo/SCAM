@@ -14,6 +14,19 @@ pub struct StatusResponse {
     pub stratum_active_clients: Option<usize>,
     pub stratum_workers_active: Option<usize>,
     pub stratum_pool_hashrate_hps: Option<f64>,
+    /// A branch forking below the reorg window that the node is proving
+    /// (by headers) or fetching to switch to (the heaviest chain wins).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deep_fork: Option<DeepForkStatusResponse>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct DeepForkStatusResponse {
+    pub fork_height: u64,
+    pub branch_tip_height: u64,
+    /// "proving-headers" or "fetching-blocks".
+    pub stage: String,
+    pub blocks_received: usize,
 }
 
 #[derive(Clone, Debug, Serialize)]

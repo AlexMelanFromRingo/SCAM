@@ -26,7 +26,7 @@ Baseline at start: `fmt`/`clippy -D warnings`/`cargo test --workspace
 | C9 | high | Every tip-extending block cloned the full UTXO set twice, all undo data and `main_chain` ⇒ O(state) per block. | `chain/src/lib.rs`, `consensus/src/utxo.rs` | fixed (overlay apply, tip fast path, journaled reorg rollback) |
 | C10 | medium | `undo_data` kept forever; side branches never pruned. | `chain/src/lib.rs` | fixed (`MAX_REORG_DEPTH`=720, prune every 64 tip changes) |
 | C11 | medium | No invalid-block cache ⇒ each descendant of a bad side block retriggers a full failing reorg. | `chain/src/lib.rs` | fixed |
-| C12 | medium | No max reorg depth. | `chain/src/lib.rs` | fixed (720 blocks; deeper reorg needs operator resync) |
+| C12 | medium | No max reorg depth. | `chain/src/lib.rs` | fixed (undo-based reorgs are bounded to 720 blocks; a deeper heavier branch is adopted by header-proven rebuild, see C21) |
 | C13 | medium | Local replay (`from_ordered_blocks`) applies the wall-clock "≤ now+2h" rule ⇒ host with a clock behind cannot restart; reindex cannot recover. | `chain/src/lib.rs` | fixed |
 | C14 | high | Local miner coinbase tag has no height (`mine-once`, mining loop) ⇒ identical coinbases (now invalid under C1). | `main.rs::build_coinbase_tx` callers | fixed (height in tag; reproduced by soak tests) |
 | C15 | high | Stratum template and other node paths use `cfg.block_subsidy` instead of `subsidy_at_height(h)` ⇒ after the first halving every pool block is invalid. | `main.rs` (~20 non-test sites) | fixed (local miner, stratum template, TP request, round reward) |
@@ -34,7 +34,7 @@ Baseline at start: `fmt`/`clippy -D warnings`/`cargo test --workspace
 | C17 | low | BIP113 not applied: absolute `lock_time` compared to header time, not MTP. | `consensus/src/utxo.rs` | fixed (lock_time vs MTP) |
 | C18 | low | BIP34 (height in coinbase) not a consensus rule; C1 covers safety. | consensus | fixed (consensus: from height 1 the coinbase script starts with the height as 8 LE bytes — `CoinbaseHeightMismatch`; genesis exempt so its hash is unchanged; every coinbase builder — local miner, stratum template, SV2 template provider, chaos tools — commits to the height) |
 | C20 | low | CSV deviates from BIP68 by one: height locks need `spend > created + value` (BIP68: `>=`), time locks compare with the creating block's own header time (BIP68: MTP of its parent). Deterministic, not exploitable; docs claim "verbatim BIP68". | `consensus/src/csv.rs` | fixed (exact BIP68: `>=`, coin time = creation MTP) |
-| C21 | high | The reorg depth cap introduced for C12 (`MAX_REORG_DEPTH`=720, ~1 day at 2-min blocks) is hard-coded; a node or network part partitioned longer stays on its branch forever, silently (no log/status signal that a heavier branch was refused); no documented resync procedure. Threshold value is the owner's decision before mainnet. | `chain/src/lib.rs`, `main.rs`, `OPERATOR_RUNBOOK.md` | open — owner decision (2026-10-28): the heaviest valid chain always wins; deeper than the in-memory undo window the node rebuilds its state along the heavier branch once its headers prove more cumulative work; signal in logs and `/status`; runbook section |
+| C21 | high | The reorg depth cap introduced for C12 (`MAX_REORG_DEPTH`=720, ~1 day at 2-min blocks) is hard-coded; a node or network part partitioned longer stays on its branch forever, silently (no log/status signal that a heavier branch was refused); no documented resync procedure. Threshold value is the owner's decision before mainnet. | `chain/src/lib.rs`, `main.rs`, `OPERATOR_RUNBOOK.md` | fixed (owner decision 2026-10-28: heaviest valid chain wins at any depth. A branch forking below the 720-block undo window is proven by headers first — `DeepBranchProbe`: links, PoW, branch difficulty, MTP, future limit, summed work; memory = sliding window + one hash per header, length ≤ 4× local + 10 000 — then fetched and adopted by rebuilding state from genesis with full validation; invalid branches are marked invalid and the peer banned. Logs, `/status.deep_fork` and relay telemetry report it; runbook §5.1 covers signals and manual resync) |
 | C19 | info | `config/mainnet.toml` has halvings disabled ⇒ constant 50/block forever. Policy decision for the owner. | config | decided: intentional (owner, 2026-10-28) |
 
 ## Mempool / block templates
@@ -135,8 +135,10 @@ but **existing devnet/testnet chains and nodes must be upgraded together**:
   older code can fail to replay — rebuild devnet/testnet data from genesis.
 - P2P handshake fingerprint is `v2` (now covers halving/tail emission and
   versionbits); old and new nodes refuse each other.
-- Reorganizations deeper than 720 blocks (`scam_chain::MAX_REORG_DEPTH`) are
-  refused; a node stuck behind such a split must be resynced by an operator.
+- Fork choice is "heaviest valid chain wins" at any depth. Reorgs up to 720
+  blocks use undo data; a deeper heavier branch is proven by its headers,
+  fetched and adopted by rebuilding the state from genesis (logged as
+  `DEEP REORG`, shown in `/status.deep_fork`; runbook §5.1).
 - Peers that send data invalid in every context (bad signature, wrong target,
   malformed frames) are banned by IP for 24 h.
 - `/tx/submit` stores the transaction's real fee; a `fee` field that differs
@@ -191,13 +193,15 @@ but **existing devnet/testnet chains and nodes must be upgraded together**:
 
 - `cargo fmt --all -- --check`, `cargo check --workspace`,
   `cargo clippy --workspace --all-targets -- -D warnings`: clean.
-- `cargo test --workspace --exclude scam-node`: 476 passed, 0 failed
-  (baseline 463 before this pass's new tests).
-- `cargo test -p scam-node --bin scam-node -- --test-threads=1`: 370 passed,
-  0 failed (baseline 360); `--test cli_main`: 1 passed.
-- `scripts/local-e2e-flow.sh` (release build, 2 nodes + miner): `[e2e]
-  success` — wallet-01 → wallet-02 tx admitted on node-0, mined, propagated,
-  credited on node-1; no new warnings in relay/rpc/stratum logs.
+- `cargo test --workspace --exclude scam-node`: 494 passed, 0 failed.
+- `cargo test -p scam-node --bin scam-node -- --test-threads=1`: 348 passed,
+  0 failed (the legacy RPC backend and the DB re-read machinery were removed
+  with their tests); `--test cli_main`: 1 passed.
+- `scripts/local-e2e-flow.sh` (2 nodes, one `serve` process each, miner):
+  `[e2e] success` — wallet-01 → wallet-02 tx submitted over node-0's RPC,
+  mined by node-0's pool, propagated, credited on node-1; no new warnings.
+- `scripts/sv2-conformance-matrix.sh`: 2/2 (plain + noise_xx) on a fresh
+  data dir; the gate now fails when a local stack fails (T1).
 - Not run: mutation stages, fuzzing, multi-hour soak/WAN profiles.
 
 ## Fix order
